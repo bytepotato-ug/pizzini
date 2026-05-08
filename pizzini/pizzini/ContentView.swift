@@ -130,6 +130,7 @@ struct ContentView: View {
                     withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                 }
             }
+            .scrollDismissesKeyboard(.interactively)
         }
     }
 

@@ -122,3 +122,14 @@ AGPL-3.0-or-later. See [LICENSE](LICENSE).
 - 2026-05-08 — XCFramework build script working (device + arm64 sim); Swift Package at repo root wraps the FFI as `PizziniCryptoCore`; xcodebuild test on iPhone 17 Pro sim — 3/3 Swift tests pass; FFI bridge proven end-to-end Rust → C → Swift on iOS — next: wire local SwiftPM package into the pizzini.xcodeproj app target (manual Xcode click), then start on Tor.framework integration
 - 2026-05-08 — local SwiftPM package wired into the iOS app target (XCSwiftPackageProductDependency + framework link); ContentView smoke-tests `PizziniCryptoCore.version` and `IdentityKeyPair.generate()`; deployed and launched on physical iPhone 15 Pro — 69-byte identity returned across the FFI, screen renders correctly — next: expand FFI to expose actual session APIs
 - 2026-05-08 — loopback chat: in-process Alice↔Bob session exposed via opaque-handle FFI (pizzini_loopback_{new,free,alice_send,bob_send}); Swift `LoopbackSession` class wraps it; chat UI in ContentView shows bubbles with sender/type/ciphertext-bytes metadata; Keychain wrapper persists identity bytes between launches; reset menu for both identity and session — next: replace loopback with proper remote-peer FFI (PreKey bundle, session encrypt/decrypt as separate calls), then transport (Tor)
+- 2026-05-08 — UX + infra polish: empty-state "Run a demo exchange" button auto-plays a 4-message script; iOS deployment target lowered 26→17 (aligns with Package.swift, opens up CI on macos-15 runners, keeps Lockdown Mode etc.); release-mode XCFramework verified clean (32MB device .a vs 73MB debug); GitHub Actions workflow drafted at .github/workflows/ci.yml (cargo + iOS build + header-drift check) — staged locally, awaits `gh auth refresh -h github.com -s workflow` to push; scrollDismissesKeyboard for chat UX — running on iPhone 15 Pro with persistent identity, ratchet flips visible — next: replace loopback with real remote-peer flow (bundle serialize/deserialize, separate session encrypt/decrypt) so two devices can talk over copy-paste / QR before we wire Tor
+
+## Done in early sessions
+
+| Layer | What works |
+|---|---|
+| Rust crypto-core | libsignal-protocol v0.93.2 pinned; cbindgen FFI surface; `pizzini_identity_keypair_generate`, `pizzini_loopback_*` (opaque handle, alice_send / bob_send) |
+| Tests | 10 Rust unit/integration (PQXDH roundtrip, ratchet flip), 5 Swift Testing on iOS Simulator |
+| Build | `scripts/build-xcframework.sh` (debug+release, drops modulemap, two ios slices), 32 MB release `.a` |
+| Swift | `Package.swift` at repo root wraps the xcframework as `PizziniCryptoCore`; `IdentityKeyPair`, `LoopbackSession`, `Keychain` |
+| iOS app | Chat UI driving LoopbackSession; identity persisted in iOS Keychain (AfterFirstUnlockThisDeviceOnly); reset menu; demo script button; running on physical iPhone 15 Pro |
