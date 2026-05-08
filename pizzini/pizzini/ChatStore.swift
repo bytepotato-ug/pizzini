@@ -269,7 +269,7 @@ extension ChatStore: RelayClientDelegate {
 
     nonisolated func relayClient(_ client: RelayClient, didReceiveBundleRequestFrom fromPeer: Data) {
         Task { @MainActor in
-            guard self.contactIndex(forIdentity: fromPeer) != nil,
+            guard let idx = self.contactIndex(forIdentity: fromPeer),
                   let session = self.session
             else {
                 NSLog("[pizzini] dropped BUNDLE_REQUEST from unknown peer \(self.short(fromPeer))")
@@ -279,6 +279,14 @@ extension ChatStore: RelayClientDelegate {
                 let bundle = try session.publishBundle()
                 client.sendBundle(toPeer: fromPeer, bundle: bundle)
                 self.persistAll()
+                // The peer just proved they have us in their contacts (we
+                // only get here if our own contact-gate let them through).
+                // If we haven't yet got a session ourselves — typical when
+                // we were the second of the two to add the other — ask
+                // for their bundle now too. Closes the asymmetric pairing.
+                if !self.state.contacts[idx].sessionEstablished {
+                    client.requestBundle(fromPeer: fromPeer)
+                }
             } catch {
                 NSLog("[pizzini] publishBundle failed: \(error)")
             }
