@@ -21,8 +21,9 @@ target/
 *.rs.bk
 *.pdb
 
-# Generated FFI artifacts
-crypto-core/include/
+# Generated FFI artifacts.
+# crypto-core/include/pizzini_crypto_core.h is committed; cbindgen regenerates it
+# on each build. CI should fail if the working tree differs after `cargo build`.
 *.xcframework/
 
 # Editors
