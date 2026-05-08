@@ -1,6 +1,6 @@
 [package]
 name = "pizzini-relay"
-description = "Pizzini stateless Tor relay. Deployed in CH/IS/PA initially."
+description = "Pizzini stateless relay (dev: LAN TCP; prod target: Tor onion)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,7 +13,7 @@ name = "pizzini-relay"
 path = "src/main.rs"
 
 [dependencies]
-# tokio + actual relay deps land when we implement the wire protocol.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "signal"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
