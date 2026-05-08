@@ -53,11 +53,45 @@ If you need anything else, stop and ask.
 ```
 pizzini/
 ├── pizzini/           iOS app (Xcode project, SwiftUI)
-├── crypto-core/       Rust crate: libsignal wrapper, FFI surface
+├── crypto-core/       Rust crate: libsignal wrapper, FFI surface (cbindgen)
 ├── relay/             Rust crate: stateless Tor relay server
+├── swift/             Swift wrapper consuming the XCFramework
 ├── scripts/           Build helpers (XCFramework, reproducible build)
-└── Cargo.toml         Rust workspace
+├── Package.swift      SwiftPM manifest at repo root — adds local-package dep
+├── Cargo.toml         Rust workspace
+└── build/             generated XCFramework lives here (gitignored)
 ```
+
+## Building
+
+```sh
+# Rust (host) — runs all crypto-core tests including the PQXDH roundtrip
+cargo test --workspace
+cargo run --example pqxdh_roundtrip -p pizzini-crypto-core
+
+# Build the iOS XCFramework (device + Apple Silicon simulator)
+scripts/build-xcframework.sh                # release (default)
+PROFILE=debug scripts/build-xcframework.sh  # faster, for dev
+
+# Run the Swift package's iOS-sim tests
+xcodebuild test -scheme PizziniCryptoCore \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
+```
+
+## Wiring crypto-core into the iOS app
+
+The repo root is also a SwiftPM package (`Package.swift`) that wraps the
+XCFramework. To consume it from the Xcode app target:
+
+1. Run `scripts/build-xcframework.sh` once (produces `build/PizziniCryptoCore.xcframework`).
+2. In Xcode: `File → Add Package Dependencies… → Add Local…`, select the repo root.
+3. On the `pizzini` app target, add the `PizziniCryptoCore` library product to
+   "Frameworks, Libraries, and Embedded Content".
+4. In Swift code: `import PizziniCryptoCore` and call `PizziniCryptoCore.version`
+   or `IdentityKeyPair.generate()`.
+
+After wiring, regenerate the XCFramework whenever the Rust FFI changes; Xcode
+will pick up the new binary on next build.
 
 ## Status
 
@@ -85,3 +119,4 @@ AGPL-3.0-or-later. See [LICENSE](LICENSE).
 - 2026-05-08 — repo skeleton, Cargo workspace, iOS project renamed pizzini.app→pizzini — next: libsignal wrapper in crypto-core
 - 2026-05-08 — libsignal-protocol pinned at v0.93.2; FFI surface for IdentityKeyPair generation; cbindgen header generation wired via build.rs; 5 tests pass — next: PreKey bundle generation + session establishment in crypto-core, then iOS bridging
 - 2026-05-08 — full PQXDH handshake roundtrip working in-process (Alice ↔ Bob via InMemSignalProtocolStore), including bidirectional ratchet step (PreKey→Whisper transition); 7 tests pass — next: iOS bridging (XCFramework build phase + Swift wrappers)
+- 2026-05-08 — XCFramework build script working (device + arm64 sim); Swift Package at repo root wraps the FFI as `PizziniCryptoCore`; xcodebuild test on iPhone 17 Pro sim — 3/3 Swift tests pass; FFI bridge proven end-to-end Rust → C → Swift on iOS — next: wire local SwiftPM package into the pizzini.xcodeproj app target (manual Xcode click), then start on Tor.framework integration

@@ -11,7 +11,8 @@ build/
 *.dSYM
 *.dSYM.zip
 
-# Swift Package Manager
+# Swift Package Manager — keep Package.resolved when the local package has
+# external deps; nothing pinned today.
 .swiftpm/
 .build/
 Package.resolved
