@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		3DD827FC2FAE791900977B79 /* PizziniCryptoCore in Frameworks */ = {isa = PBXBuildFile; productRef = 3DD827FB2FAE791900977B79 /* PizziniCryptoCore */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		3DA1C5F02FAE69AB00B75E2A /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -52,6 +56,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				3DD827FC2FAE791900977B79 /* PizziniCryptoCore in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -78,6 +83,7 @@
 				3DA1C5E42FAE69AA00B75E2A /* pizzini */,
 				3DA1C5F22FAE69AB00B75E2A /* pizziniTests */,
 				3DA1C5FC2FAE69AB00B75E2A /* pizziniUITests */,
+				3DD827FA2FAE791900977B79 /* Frameworks */,
 				3DA1C5E32FAE69AA00B75E2A /* Products */,
 			);
 			sourceTree = "<group>";
@@ -90,6 +96,13 @@
 				3DA1C5F92FAE69AB00B75E2A /* pizziniUITests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		3DD827FA2FAE791900977B79 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -112,6 +125,7 @@
 			);
 			name = pizzini;
 			packageProductDependencies = (
+				3DD827FB2FAE791900977B79 /* PizziniCryptoCore */,
 			);
 			productName = pizzini;
 			productReference = 3DA1C5E22FAE69AA00B75E2A /* pizzini.app */;
@@ -195,6 +209,9 @@
 			);
 			mainGroup = 3DA1C5D92FAE69AA00B75E2A;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				3DD827F92FAE780C00977B79 /* XCLocalSwiftPackageReference "../../pizzini" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 3DA1C5E32FAE69AA00B75E2A /* Products */;
 			projectDirPath = "";
@@ -410,7 +427,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.bytepotato.pizzini";
+				PRODUCT_BUNDLE_IDENTIFIER = com.bytepotato.pizzini;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -442,7 +459,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.bytepotato.pizzini";
+				PRODUCT_BUNDLE_IDENTIFIER = com.bytepotato.pizzini;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -464,7 +481,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.bytepotato.pizziniTests";
+				PRODUCT_BUNDLE_IDENTIFIER = com.bytepotato.pizziniTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -486,7 +503,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.bytepotato.pizziniTests";
+				PRODUCT_BUNDLE_IDENTIFIER = com.bytepotato.pizziniTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -506,7 +523,7 @@
 				DEVELOPMENT_TEAM = N3WYDR67GB;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.bytepotato.pizziniUITests";
+				PRODUCT_BUNDLE_IDENTIFIER = com.bytepotato.pizziniUITests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -526,7 +543,7 @@
 				DEVELOPMENT_TEAM = N3WYDR67GB;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.bytepotato.pizziniUITests";
+				PRODUCT_BUNDLE_IDENTIFIER = com.bytepotato.pizziniUITests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -578,6 +595,21 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		3DD827F92FAE780C00977B79 /* XCLocalSwiftPackageReference "../../pizzini" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../../pizzini;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		3DD827FB2FAE791900977B79 /* PizziniCryptoCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 3DD827F92FAE780C00977B79 /* XCLocalSwiftPackageReference "../../pizzini" */;
+			productName = PizziniCryptoCore;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 3DA1C5DA2FAE69AA00B75E2A /* Project object */;
 }
