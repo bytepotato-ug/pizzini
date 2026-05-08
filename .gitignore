@@ -35,6 +35,7 @@ target/
 
 # Secrets — never commit
 *.p12
+*.p8
 *.mobileprovision
 *.cer
 .env
