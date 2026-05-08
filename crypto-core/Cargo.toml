@@ -16,14 +16,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # Pinned by tag; Cargo.lock records the resolved commit.
 libsignal-protocol = { git = "https://github.com/signalapp/libsignal.git", tag = "v0.93.2" }
 rand = "0.9"
+# now_or_never() — the in-mem libsignal stores resolve futures synchronously,
+# so we don't need a real runtime. Promoted from dev-dep when LoopbackState
+# moved into the library proper.
+futures-util = { version = "0.3", default-features = false }
 
 [build-dependencies]
 cbindgen = "0.29"
-
-[dev-dependencies]
-# now_or_never() — the in-mem libsignal stores resolve futures synchronously,
-# so we don't need a runtime in tests/examples.
-futures-util = "0.3"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
