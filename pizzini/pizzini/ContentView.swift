@@ -9,7 +9,7 @@ import SwiftUI
 import PizziniCryptoCore
 
 struct ContentView: View {
-    @State private var store = ChatStore()
+    @State private var store = ChatStore.shared
     @State private var showScanner = false
     @State private var showMyQR = false
     @State private var showRelaySheet = false

@@ -14,6 +14,12 @@ import SwiftUI
 @MainActor
 @Observable
 final class ChatStore: NSObject {
+    /// SwiftUI's `@State private var store = ChatStore()` autoclosure can
+    /// fire multiple times before the framework settles which instance to
+    /// retain. With a singleton, every fire returns the same coordinator —
+    /// `init` runs exactly once, so we open exactly one relay connection.
+    static let shared = ChatStore()
+
     private static let relayPort: UInt16 = 7777
 
     // Public, observable.
@@ -47,7 +53,14 @@ final class ChatStore: NSObject {
 
     private func connectRelay() {
         guard let session else { return }
-        relay?.disconnect()
+        // Clear the OLD client's delegate before disconnecting — its
+        // NWConnection cancellation fires asynchronously, and we don't
+        // want its dying `.idle` callback to clobber our relayState
+        // after the new client is already connected.
+        if let oldRelay = relay {
+            oldRelay.delegate = nil
+            oldRelay.disconnect()
+        }
         guard let myId = myIdentityPublicCached ?? (try? session.identityPublic()) else {
             return
         }
