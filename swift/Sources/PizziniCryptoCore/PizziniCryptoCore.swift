@@ -44,10 +44,168 @@ public struct IdentityKeyPair: Sendable {
     }
 }
 
-// MARK: - Loopback session
+// MARK: - Per-device session store
+
+/// Owns one libsignal `InMemSignalProtocolStore` on the Rust side. Use this
+/// for real two-device messaging: each device has one Session, peers exchange
+/// PreKey bundles out-of-band, then encrypt / decrypt via wire bytes.
+public final class Session: @unchecked Sendable {
+    public enum MessageType: Sendable {
+        case preKey
+        case whisper
+    }
+
+    public struct EncryptResult: Sendable {
+        public let ciphertext: Data
+        public let messageType: MessageType
+    }
+
+    private var handle: OpaquePointer?
+
+    /// Create a session for a brand-new identity (fresh keypair, fresh
+    /// registration id). Persist `identityKeypairBytes` in Keychain to
+    /// rehydrate the same identity later.
+    public init() throws {
+        guard let h = pizzini_store_new(nil, 0) else {
+            throw CryptoCoreError.internalError
+        }
+        self.handle = h
+    }
+
+    /// Rehydrate from a previously-saved `identityKeypairBytes` blob.
+    public init(identitySeed seed: Data) throws {
+        let h = seed.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) -> OpaquePointer? in
+            pizzini_store_new(ptr.bindMemory(to: UInt8.self).baseAddress, UInt(seed.count))
+        }
+        guard let h else { throw CryptoCoreError.internalError }
+        self.handle = h
+    }
+
+    deinit {
+        if let h = handle {
+            pizzini_store_free(h)
+        }
+    }
+
+    /// Bytes to persist in Keychain — opaque libsignal IdentityKeyPair.
+    public func identityKeypairBytes() throws -> Data {
+        try readBlob { handle, buf, cap, len in
+            pizzini_store_identity_keypair(handle, buf, cap, len)
+        }
+    }
+
+    /// Routing peer-id: 33-byte serialized public IdentityKey. Pass this to
+    /// the relay and to peers as your address.
+    public func identityPublic() throws -> Data {
+        try readBlob { handle, buf, cap, len in
+            pizzini_store_identity_public(handle, buf, cap, len)
+        }
+    }
+
+    /// Generate a fresh PreKey bundle (rotates one-time / signed / Kyber
+    /// pre-keys), persist them in the store, and return the wire bytes.
+    public func publishBundle() throws -> Data {
+        try readBlob(initialCap: 4096) { handle, buf, cap, len in
+            pizzini_store_publish_bundle(handle, buf, cap, len)
+        }
+    }
+
+    /// Run PQXDH against a peer's bundle. After this, `encrypt`/`decrypt`
+    /// against `peerIdentity` will produce / accept real ciphertexts.
+    public func initiateSession(peerIdentity: Data, bundle: Data) throws {
+        guard let handle else { throw CryptoCoreError.invalidArgument }
+        let rc = peerIdentity.withUnsafeBytes { peerPtr in
+            bundle.withUnsafeBytes { bundlePtr in
+                pizzini_store_initiate_session(
+                    handle,
+                    peerPtr.bindMemory(to: UInt8.self).baseAddress, UInt(peerIdentity.count),
+                    bundlePtr.bindMemory(to: UInt8.self).baseAddress, UInt(bundle.count)
+                )
+            }
+        }
+        try mapRC(rc)
+    }
+
+    public func encrypt(peerIdentity: Data, plaintext: Data) throws -> EncryptResult {
+        guard let handle else { throw CryptoCoreError.invalidArgument }
+        var ct = [UInt8](repeating: 0, count: max(plaintext.count + 256, 4096))
+        var ctLen: UInt = 0
+        var msgType: UInt32 = 0
+        let rc = peerIdentity.withUnsafeBytes { peerPtr -> Int32 in
+            plaintext.withUnsafeBytes { plainPtr -> Int32 in
+                ct.withUnsafeMutableBufferPointer { ctPtr in
+                    pizzini_store_encrypt(
+                        handle,
+                        peerPtr.bindMemory(to: UInt8.self).baseAddress, UInt(peerIdentity.count),
+                        plainPtr.bindMemory(to: UInt8.self).baseAddress, UInt(plaintext.count),
+                        ctPtr.baseAddress, UInt(ctPtr.count), &ctLen,
+                        &msgType
+                    )
+                }
+            }
+        }
+        try mapRC(rc)
+        let mt: MessageType = (msgType == UInt32(PIZZINI_MSG_TYPE_PREKEY)) ? .preKey : .whisper
+        return EncryptResult(ciphertext: Data(ct.prefix(Int(ctLen))), messageType: mt)
+    }
+
+    public func decrypt(peerIdentity: Data, ciphertext: Data, isPreKey: Bool) throws -> Data {
+        guard let handle else { throw CryptoCoreError.invalidArgument }
+        var pt = [UInt8](repeating: 0, count: max(ciphertext.count + 256, 1024))
+        var ptLen: UInt = 0
+        let rc = peerIdentity.withUnsafeBytes { peerPtr -> Int32 in
+            ciphertext.withUnsafeBytes { ctPtr -> Int32 in
+                pt.withUnsafeMutableBufferPointer { ptPtr in
+                    pizzini_store_decrypt(
+                        handle,
+                        peerPtr.bindMemory(to: UInt8.self).baseAddress, UInt(peerIdentity.count),
+                        ctPtr.bindMemory(to: UInt8.self).baseAddress, UInt(ciphertext.count),
+                        isPreKey ? 1 : 0,
+                        ptPtr.baseAddress, UInt(ptPtr.count), &ptLen
+                    )
+                }
+            }
+        }
+        try mapRC(rc)
+        return Data(pt.prefix(Int(ptLen)))
+    }
+
+    private func readBlob(
+        initialCap: Int = 256,
+        _ body: (OpaquePointer, UnsafeMutablePointer<UInt8>, UInt, UnsafeMutablePointer<UInt>) -> Int32
+    ) throws -> Data {
+        guard let handle else { throw CryptoCoreError.invalidArgument }
+        var buf = [UInt8](repeating: 0, count: initialCap)
+        var len: UInt = 0
+        var rc = buf.withUnsafeMutableBufferPointer { ptr in
+            body(handle, ptr.baseAddress!, UInt(ptr.count), &len)
+        }
+        if rc == PIZZINI_ERR_BUFFER_TOO_SMALL {
+            buf = [UInt8](repeating: 0, count: Int(len))
+            rc = buf.withUnsafeMutableBufferPointer { ptr in
+                body(handle, ptr.baseAddress!, UInt(ptr.count), &len)
+            }
+        }
+        try mapRC(rc)
+        return Data(buf.prefix(Int(len)))
+    }
+
+    private func mapRC(_ rc: Int32) throws {
+        switch rc {
+        case PIZZINI_OK: return
+        case PIZZINI_ERR_INVALID_ARG: throw CryptoCoreError.invalidArgument
+        case PIZZINI_ERR_BUFFER_TOO_SMALL: throw CryptoCoreError.bufferTooSmall(required: 0)
+        case PIZZINI_ERR_INTERNAL: throw CryptoCoreError.internalError
+        default: throw CryptoCoreError.unknown(code: rc)
+        }
+    }
+}
+
+// MARK: - Loopback session (deprecated)
 
 /// In-process Alice ↔ Bob session for demoing the full PQXDH + ratchet stack.
 /// Holds a Rust-allocated handle and frees it on deinit.
+@available(*, deprecated, message: "Use `Session` for real two-device messaging.")
 public final class LoopbackSession: @unchecked Sendable {
     public enum MessageType: Sendable {
         case preKey

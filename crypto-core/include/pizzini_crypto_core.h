@@ -19,6 +19,8 @@
 
 #define PIZZINI_MSG_TYPE_WHISPER 1
 
+typedef struct DeviceStore DeviceStore;
+
 typedef struct LoopbackState LoopbackState;
 
 /**
@@ -101,5 +103,117 @@ int32_t pizzini_loopback_bob_send(struct LoopbackState *state,
                                   uintptr_t out_decrypted_cap,
                                   uintptr_t *out_decrypted_len,
                                   uint32_t *out_message_type);
+
+/**
+ * Creates a new device store.
+ *
+ * If `seed_ptr` is null, a fresh identity keypair is generated. Otherwise
+ * `(seed_ptr, seed_len)` must be the bytes returned by a prior
+ * `pizzini_store_identity_keypair` call (libsignal's serialized
+ * IdentityKeyPair) — used to rehydrate an identity from Keychain.
+ *
+ * Returns a non-null opaque handle on success, null on failure.
+ *
+ * # Safety
+ * `seed_ptr` must either be null or point to `seed_len` readable bytes.
+ */
+struct DeviceStore *pizzini_store_new(const uint8_t *seed_ptr, uintptr_t seed_len);
+
+/**
+ * Releases a device-store handle. Safe to call with null.
+ *
+ * # Safety
+ * `store` must be a pointer previously returned by `pizzini_store_new` and
+ * not yet freed.
+ */
+void pizzini_store_free(struct DeviceStore *store);
+
+/**
+ * Writes the serialized `IdentityKeyPair` (private + public) to `out_buf`.
+ * Persist these bytes in the Keychain; pass them back to `pizzini_store_new`
+ * on the next launch.
+ *
+ * # Safety
+ * `store` must be a live handle. `out_buf` must point to `out_buf_cap`
+ * writable bytes; `out_len` must point to a valid `usize`.
+ */
+int32_t pizzini_store_identity_keypair(struct DeviceStore *store,
+                                       uint8_t *out_buf,
+                                       uintptr_t out_buf_cap,
+                                       uintptr_t *out_len);
+
+/**
+ * Writes the 33-byte serialized public IdentityKey. This is the routable
+ * peer-id used for transport addressing and ProtocolAddress naming.
+ *
+ * # Safety
+ * Same as `pizzini_store_identity_keypair`.
+ */
+int32_t pizzini_store_identity_public(struct DeviceStore *store,
+                                      uint8_t *out_buf,
+                                      uintptr_t out_buf_cap,
+                                      uintptr_t *out_len);
+
+/**
+ * Generates a fresh PreKey bundle (rotates one-time, signed, and Kyber
+ * pre-keys), persists them in the store, and writes the wire-format bytes.
+ * See `store.rs` for the format. Hand to a peer over QR / pairing.
+ *
+ * # Safety
+ * Same as `pizzini_store_identity_keypair`.
+ */
+int32_t pizzini_store_publish_bundle(struct DeviceStore *store,
+                                     uint8_t *out_buf,
+                                     uintptr_t out_buf_cap,
+                                     uintptr_t *out_len);
+
+/**
+ * Processes a peer's PreKey bundle (PQXDH handshake) and stores the
+ * resulting session keyed by `peer_identity` (the peer's 33-byte
+ * IdentityKey bytes). After this returns OK, encrypt/decrypt may be called.
+ *
+ * # Safety
+ * All pointers must be non-null and describe valid slices.
+ */
+int32_t pizzini_store_initiate_session(struct DeviceStore *store,
+                                       const uint8_t *peer_identity,
+                                       uintptr_t peer_identity_len,
+                                       const uint8_t *bundle,
+                                       uintptr_t bundle_len);
+
+/**
+ * Encrypts `plaintext` for `peer_identity`. Writes the wire ciphertext to
+ * `out_ciphertext` and the message type tag to `out_message_type`.
+ *
+ * # Safety
+ * All pointers must be non-null and point to memory of the declared sizes.
+ */
+int32_t pizzini_store_encrypt(struct DeviceStore *store,
+                              const uint8_t *peer_identity,
+                              uintptr_t peer_identity_len,
+                              const uint8_t *plaintext,
+                              uintptr_t plaintext_len,
+                              uint8_t *out_ciphertext,
+                              uintptr_t out_ciphertext_cap,
+                              uintptr_t *out_ciphertext_len,
+                              uint32_t *out_message_type);
+
+/**
+ * Decrypts a wire ciphertext from `peer_identity`. `is_prekey` selects
+ * PreKey vs Whisper parsing — the caller must communicate this out-of-band
+ * (we ship it as a wire-protocol tag, not embedded in the ciphertext).
+ *
+ * # Safety
+ * All pointers must be non-null and point to memory of the declared sizes.
+ */
+int32_t pizzini_store_decrypt(struct DeviceStore *store,
+                              const uint8_t *peer_identity,
+                              uintptr_t peer_identity_len,
+                              const uint8_t *ciphertext,
+                              uintptr_t ciphertext_len,
+                              uint32_t is_prekey,
+                              uint8_t *out_plaintext,
+                              uintptr_t out_plaintext_cap,
+                              uintptr_t *out_plaintext_len);
 
 #endif  /* PIZZINI_CRYPTO_CORE_H */

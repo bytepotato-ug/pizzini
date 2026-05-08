@@ -25,23 +25,36 @@ struct PizziniCryptoCoreTests {
         #expect(a.bytes != b.bytes)
     }
 
-    @Test("loopback first message is PreKey and round-trips")
-    func loopbackPreKey() throws {
-        let s = try LoopbackSession()
-        let r = try s.aliceSend("hello over PQXDH")
-        #expect(r.messageType == .preKey)
-        #expect(String(data: r.decrypted, encoding: .utf8) == "hello over PQXDH")
-        #expect(r.ciphertext.count > 0)
+    @Test("two Session instances exchange messages via wire bytes")
+    func sessionRoundTrip() throws {
+        let alice = try Session()
+        let bob = try Session()
+
+        let bobBundle = try bob.publishBundle()
+        let bobId = try bob.identityPublic()
+        let aliceId = try alice.identityPublic()
+
+        try alice.initiateSession(peerIdentity: bobId, bundle: bobBundle)
+
+        let m1 = try alice.encrypt(peerIdentity: bobId, plaintext: Data("hi bob".utf8))
+        #expect(m1.messageType == .preKey)
+        let pt1 = try bob.decrypt(peerIdentity: aliceId, ciphertext: m1.ciphertext, isPreKey: true)
+        #expect(String(data: pt1, encoding: .utf8) == "hi bob")
+
+        let m2 = try bob.encrypt(peerIdentity: aliceId, plaintext: Data("hi alice".utf8))
+        #expect(m2.messageType == .whisper)
+        let pt2 = try alice.decrypt(peerIdentity: bobId, ciphertext: m2.ciphertext, isPreKey: false)
+        #expect(String(data: pt2, encoding: .utf8) == "hi alice")
     }
 
-    @Test("loopback flips to Whisper after a Bob reply")
-    func loopbackWhisper() throws {
-        let s = try LoopbackSession()
-        _ = try s.aliceSend("first")
-        let bobReply = try s.bobSend("ack")
-        #expect(bobReply.messageType == .whisper)
-        let r3 = try s.aliceSend("second")
-        #expect(r3.messageType == .whisper)
-        #expect(String(data: r3.decrypted, encoding: .utf8) == "second")
+    @Test("Session rehydrates from saved identity seed")
+    func sessionRehydrate() throws {
+        let s = try Session()
+        let seed = try s.identityKeypairBytes()
+        let pubA = try s.identityPublic()
+
+        let s2 = try Session(identitySeed: seed)
+        let pubB = try s2.identityPublic()
+        #expect(pubA == pubB)
     }
 }
