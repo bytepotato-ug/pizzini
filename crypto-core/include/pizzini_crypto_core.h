@@ -21,8 +21,6 @@
 
 typedef struct DeviceStore DeviceStore;
 
-typedef struct LoopbackState LoopbackState;
-
 /**
  * Returns a static null-terminated UTF-8 string with the crate version.
  * The pointer is valid for the lifetime of the process; do not free.
@@ -44,65 +42,6 @@ const char *pizzini_crypto_core_version(void);
 int32_t pizzini_identity_keypair_generate(uint8_t *out_buf,
                                           uintptr_t out_buf_cap,
                                           uintptr_t *out_len);
-
-/**
- * Creates a new in-process loopback session. Returns a non-null opaque
- * handle, or null on internal error. Caller must release with
- * `pizzini_loopback_free`.
- */
-struct LoopbackState *pizzini_loopback_new(void);
-
-/**
- * Releases a loopback handle. Safe to call with null.
- *
- * # Safety
- * `state` must be a pointer previously returned by `pizzini_loopback_new`,
- * and not yet freed. Passing any other pointer is undefined behavior.
- */
-void pizzini_loopback_free(struct LoopbackState *state);
-
-/**
- * Sends `plaintext` from Alice to Bob: encrypts, decrypts, and returns both
- * the wire-format ciphertext and Bob's recovered plaintext along with the
- * CiphertextMessageType (PIZZINI_MSG_TYPE_PREKEY or _WHISPER).
- *
- * On `PIZZINI_ERR_BUFFER_TOO_SMALL`, the corresponding `*out_len` is set to
- * the required size; the other output's `*out_len` is unspecified. Caller
- * should retry with a buffer at least that large. Recommended caps:
- *   - ciphertext: 4096 bytes (covers Kyber1024 PreKey messages comfortably)
- *   - decrypted:  plaintext_len + 256
- *
- * # Safety
- * All pointers must be non-null and point to memory of the declared sizes.
- * `state` must be a live handle from `pizzini_loopback_new`.
- */
-int32_t pizzini_loopback_alice_send(struct LoopbackState *state,
-                                    const uint8_t *plaintext,
-                                    uintptr_t plaintext_len,
-                                    uint8_t *out_ciphertext,
-                                    uintptr_t out_ciphertext_cap,
-                                    uintptr_t *out_ciphertext_len,
-                                    uint8_t *out_decrypted,
-                                    uintptr_t out_decrypted_cap,
-                                    uintptr_t *out_decrypted_len,
-                                    uint32_t *out_message_type);
-
-/**
- * Sends `plaintext` from Bob to Alice. Mirror of `pizzini_loopback_alice_send`.
- *
- * # Safety
- * Same as `pizzini_loopback_alice_send`.
- */
-int32_t pizzini_loopback_bob_send(struct LoopbackState *state,
-                                  const uint8_t *plaintext,
-                                  uintptr_t plaintext_len,
-                                  uint8_t *out_ciphertext,
-                                  uintptr_t out_ciphertext_cap,
-                                  uintptr_t *out_ciphertext_len,
-                                  uint8_t *out_decrypted,
-                                  uintptr_t out_decrypted_cap,
-                                  uintptr_t *out_decrypted_len,
-                                  uint32_t *out_message_type);
 
 /**
  * Creates a new device store.

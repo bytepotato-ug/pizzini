@@ -25,11 +25,26 @@
 //!   u16 peer_id_len + peer_id_bytes
 //!
 //! SEND  (type = 2) — bidirectional. Sender writes; relay forwards verbatim
-//!                    (with from_id rewritten to the connection's HELLO id):
+//!                    if the recipient is online, otherwise drops:
 //!   u16 to_len   + to_id_bytes
 //!   u16 from_len + from_id_bytes
 //!   u8  is_prekey   (0 or 1; surfaces libsignal CiphertextMessageType)
 //!   ciphertext bytes (consume to end-of-payload)
+//!
+//! BUNDLE_REQUEST  (type = 3) — "give me a fresh PreKey bundle to PQXDH with":
+//!   u16 to_len   + to_id_bytes
+//!   u16 from_len + from_id_bytes
+//!
+//! BUNDLE_RESPONSE (type = 4) — reply with the bundle bytes (store.rs format):
+//!   u16 to_len   + to_id_bytes
+//!   u16 from_len + from_id_bytes
+//!   bundle bytes (consume to end-of-payload)
+//!
+//! Bundle exchange exists because Kyber1024 (~1568 B) does not fit a
+//! comfortably-scannable QR. Discovery QRs carry only `peer_id +
+//! lan_address`; the actual bundle hops through the relay on first contact.
+//! This is the same shape Signal uses (server stores bundles for fetch).
+//! For our stateless relay, both peers must be online for first contact.
 //! ```
 //!
 //! Stateless: if the recipient is not currently connected, the SEND is
@@ -48,6 +63,8 @@ use tokio::sync::mpsc;
 const PORT: u16 = 7777;
 const FRAME_TYPE_HELLO: u8 = 1;
 const FRAME_TYPE_SEND: u8 = 2;
+const FRAME_TYPE_BUNDLE_REQUEST: u8 = 3;
+const FRAME_TYPE_BUNDLE_RESPONSE: u8 = 4;
 const MAX_FRAME_BYTES: u32 = 1024 * 1024;
 
 type PeerId = Vec<u8>;
@@ -160,17 +177,19 @@ async fn read_loop(
         }
         match frame[0] {
             FRAME_TYPE_HELLO => return Err(invalid("duplicate HELLO")),
-            FRAME_TYPE_SEND => {
-                let parsed = match parse_send(&frame[1..]) {
+            FRAME_TYPE_SEND
+            | FRAME_TYPE_BUNDLE_REQUEST
+            | FRAME_TYPE_BUNDLE_RESPONSE => {
+                let parsed = match parse_routed(&frame[1..]) {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("malformed SEND: {e}");
+                        eprintln!("malformed routed frame: {e}");
                         continue;
                     }
                 };
                 if parsed.from_id != self_id {
                     eprintln!(
-                        "rejecting SEND with spoofed from_id {} (connection is {})",
+                        "rejecting frame with spoofed from_id {} (connection is {})",
                         short_hex(&parsed.from_id),
                         short_hex(self_id),
                     );
@@ -179,10 +198,9 @@ async fn read_loop(
                 let map = routes.lock().await;
                 let Some(target) = map.get(&parsed.to_id) else {
                     println!(
-                        "drop SEND {} → {} ({} B): recipient offline",
+                        "drop frame {} → {}: recipient offline",
                         short_hex(&parsed.from_id),
                         short_hex(&parsed.to_id),
-                        parsed.ciphertext.len(),
                     );
                     continue;
                 };
@@ -193,12 +211,9 @@ async fn read_loop(
     }
 }
 
-struct ParsedSend {
+struct ParsedRouted {
     to_id: Vec<u8>,
     from_id: Vec<u8>,
-    #[allow(dead_code)]
-    is_prekey: bool,
-    ciphertext: Vec<u8>,
 }
 
 fn parse_hello(body: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -210,18 +225,12 @@ fn parse_hello(body: &[u8]) -> std::io::Result<Vec<u8>> {
     Ok(id)
 }
 
-fn parse_send(body: &[u8]) -> std::io::Result<ParsedSend> {
+fn parse_routed(body: &[u8]) -> std::io::Result<ParsedRouted> {
     let mut c = Cursor::new(body);
     let to_id = c.u16_blob()?.to_vec();
     let from_id = c.u16_blob()?.to_vec();
-    let is_prekey = c.u8()? != 0;
-    let ciphertext = c.rest().to_vec();
-    Ok(ParsedSend {
-        to_id,
-        from_id,
-        is_prekey,
-        ciphertext,
-    })
+    // Anything after the routing prefix is opaque to the relay.
+    Ok(ParsedRouted { to_id, from_id })
 }
 
 async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> std::io::Result<Vec<u8>> {
@@ -297,11 +306,6 @@ struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     fn new(buf: &'a [u8]) -> Self { Self { buf } }
     fn is_empty(&self) -> bool { self.buf.is_empty() }
-    fn rest(&mut self) -> &'a [u8] {
-        let r = self.buf;
-        self.buf = &[];
-        r
-    }
     fn take(&mut self, n: usize) -> std::io::Result<&'a [u8]> {
         if self.buf.len() < n {
             return Err(invalid("truncated frame"));
@@ -309,9 +313,6 @@ impl<'a> Cursor<'a> {
         let (head, tail) = self.buf.split_at(n);
         self.buf = tail;
         Ok(head)
-    }
-    fn u8(&mut self) -> std::io::Result<u8> {
-        Ok(self.take(1)?[0])
     }
     fn u16(&mut self) -> std::io::Result<u16> {
         Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))

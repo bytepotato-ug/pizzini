@@ -210,7 +210,7 @@
 			mainGroup = 3DA1C5D92FAE69AA00B75E2A;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				3DD827F92FAE780C00977B79 /* XCLocalSwiftPackageReference "../../pizzini" */,
+				3DD827F92FAE780C00977B79 /* XCLocalSwiftPackageReference ".." */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 3DA1C5E32FAE69AA00B75E2A /* Products */;
@@ -417,6 +417,7 @@
 				DEVELOPMENT_TEAM = N3WYDR67GB;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSCameraUsageDescription = "Scan a contact's QR code";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -449,6 +450,7 @@
 				DEVELOPMENT_TEAM = N3WYDR67GB;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSCameraUsageDescription = "Scan a contact's QR code";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -597,16 +599,16 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		3DD827F92FAE780C00977B79 /* XCLocalSwiftPackageReference "../../pizzini" */ = {
+		3DD827F92FAE780C00977B79 /* XCLocalSwiftPackageReference ".." */ = {
 			isa = XCLocalSwiftPackageReference;
-			relativePath = ../../pizzini;
+			relativePath = ..;
 		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
 		3DD827FB2FAE791900977B79 /* PizziniCryptoCore */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 3DD827F92FAE780C00977B79 /* XCLocalSwiftPackageReference "../../pizzini" */;
+			package = 3DD827F92FAE780C00977B79 /* XCLocalSwiftPackageReference ".." */;
 			productName = PizziniCryptoCore;
 		};
 /* End XCSwiftPackageProductDependency section */

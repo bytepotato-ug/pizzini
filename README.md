@@ -97,12 +97,13 @@ will pick up the new binary on next build.
 
 - [x] Repo skeleton
 - [x] Rust crypto core (libsignal wrapper, FFI) — minimal: identity keypair gen + cbindgen
-- [ ] iOS app skeleton (SwiftUI, Tor.framework, Keychain integration)
+- [x] iOS app skeleton (SwiftUI + Keychain integration; Tor.framework still TODO)
 - [x] PQXDH handshake working end-to-end (CLI test client) — `cargo run --example pqxdh_roundtrip`
-- [ ] Triple Ratchet messaging working
-- [ ] Stateless relay server
-- [ ] Contact establishment (QR / invite link)
+- [x] Triple Ratchet messaging working (PreKey → Whisper transition visible across two devices)
+- [x] Dev relay (LAN TCP); production Tor onion still TODO
+- [x] Contact establishment (QR + clipboard fallback)
 - [ ] Storage layer (SQLCipher + Secure Enclave)
+- [ ] Session persistence across launches (currently identity persists, ratchet state does not)
 - [ ] Duress passphrase + cryptographic erasure
 - [ ] App Attest + ATS strict
 - [ ] Reproducible build script
@@ -123,13 +124,15 @@ AGPL-3.0-or-later. See [LICENSE](LICENSE).
 - 2026-05-08 — local SwiftPM package wired into the iOS app target (XCSwiftPackageProductDependency + framework link); ContentView smoke-tests `PizziniCryptoCore.version` and `IdentityKeyPair.generate()`; deployed and launched on physical iPhone 15 Pro — 69-byte identity returned across the FFI, screen renders correctly — next: expand FFI to expose actual session APIs
 - 2026-05-08 — loopback chat: in-process Alice↔Bob session exposed via opaque-handle FFI (pizzini_loopback_{new,free,alice_send,bob_send}); Swift `LoopbackSession` class wraps it; chat UI in ContentView shows bubbles with sender/type/ciphertext-bytes metadata; Keychain wrapper persists identity bytes between launches; reset menu for both identity and session — next: replace loopback with proper remote-peer FFI (PreKey bundle, session encrypt/decrypt as separate calls), then transport (Tor)
 - 2026-05-08 — UX + infra polish: empty-state "Run a demo exchange" button auto-plays a 4-message script; iOS deployment target lowered 26→17 (aligns with Package.swift, opens up CI on macos-15 runners, keeps Lockdown Mode etc.); release-mode XCFramework verified clean (32MB device .a vs 73MB debug); GitHub Actions workflow drafted at .github/workflows/ci.yml (cargo + iOS build + header-drift check) — staged locally, awaits `gh auth refresh -h github.com -s workflow` to push; scrollDismissesKeyboard for chat UX — running on iPhone 15 Pro with persistent identity, ratchet flips visible — next: replace loopback with real remote-peer flow (bundle serialize/deserialize, separate session encrypt/decrypt) so two devices can talk over copy-paste / QR before we wire Tor
+- 2026-05-08 — two-device messaging end-to-end: replaced LoopbackState with `DeviceStore` FFI (opaque-handle Session API: identity{Keypair,Public}, publishBundle, initiateSession, encrypt/decrypt over wire bytes; hand-rolled v1 PreKey-bundle wire format documented in store.rs); dev `pizzini-relay` over Tokio TCP on 0.0.0.0:7777 with length-prefixed frames (HELLO/SEND/BUNDLE_REQUEST/BUNDLE_RESPONSE) and stateless drop-on-offline routing (production Tor onion bind is a separate task); Swift `RelayClient` over Network.framework speaks the same protocol; iOS UI rewrite: contact card (QR via CIFilter.qrCodeGenerator, payload `pizzini1://<peerHex>@<host>:<port>`), AVCapture-based QR scanner with NSCameraUsageDescription wired in pbxproj, "Copy mine"/"Paste theirs" clipboard fallback for sims, relay-host editor sheet, per-peer chat with PreKey/Whisper badges; xcodeproj SwiftPM relativePath `../../pizzini` → `..` so the project resolves equally in worktrees and the main repo; LoopbackState/Session removed entirely. Verified: 11 Rust unit + 2 integration + 5 Swift Testing tests pass; sim ↔ sim relay HELLO + 4-frame Python smoke test of routing + a screenshot showing the QR card on iPhone 17 Pro sim (relay connected). Next: real iPhone 15 Pro pairing using the camera scanner; session persistence (sessions still ephemeral — only identity persists); then Tor onion-bound relay.
 
 ## Done in early sessions
 
 | Layer | What works |
 |---|---|
-| Rust crypto-core | libsignal-protocol v0.93.2 pinned; cbindgen FFI surface; `pizzini_identity_keypair_generate`, `pizzini_loopback_*` (opaque handle, alice_send / bob_send) |
-| Tests | 10 Rust unit/integration (PQXDH roundtrip, ratchet flip), 5 Swift Testing on iOS Simulator |
+| Rust crypto-core | libsignal-protocol v0.93.2 pinned; cbindgen FFI surface; `pizzini_identity_keypair_generate`, `pizzini_store_*` (opaque DeviceStore: identity getters, publish_bundle, initiate_session, encrypt/decrypt) |
+| Tests | 11 Rust unit + 2 integration (PQXDH, ratchet flip, store + bundle wire roundtrip) + 5 Swift Testing on iOS Simulator |
 | Build | `scripts/build-xcframework.sh` (debug+release, drops modulemap, two ios slices), 32 MB release `.a` |
-| Swift | `Package.swift` at repo root wraps the xcframework as `PizziniCryptoCore`; `IdentityKeyPair`, `LoopbackSession`, `Keychain` |
-| iOS app | Chat UI driving LoopbackSession; identity persisted in iOS Keychain (AfterFirstUnlockThisDeviceOnly); reset menu; demo script button; running on physical iPhone 15 Pro |
+| Swift | `Package.swift` at repo root wraps the xcframework as `PizziniCryptoCore`; `IdentityKeyPair`, `Session`, `RelayClient`, `Keychain` |
+| Relay | `pizzini-relay` (Tokio, 0.0.0.0:7777) length-prefixed framing + four frame types: HELLO/SEND/BUNDLE_REQUEST/BUNDLE_RESPONSE; stateless drop-on-offline; LAN-IP discovery printed at startup; **DEV ONLY** — production needs onion bind |
+| iOS app | Contact card (CoreImage QR + clipboard fallback) + AVCapture scanner; per-peer chat with PreKey/Whisper badges; identity persisted in Keychain (AfterFirstUnlockThisDeviceOnly); relay-host editor; running on iPhone 17 Pro sim and physical iPhone 15 Pro |

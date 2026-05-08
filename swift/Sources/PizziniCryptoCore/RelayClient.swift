@@ -20,6 +20,14 @@ public protocol RelayClientDelegate: AnyObject, Sendable {
         ciphertext: Data,
         isPreKey: Bool
     )
+    /// Peer asked us for a fresh PreKey bundle to PQXDH with.
+    func relayClient(_ client: RelayClient, didReceiveBundleRequestFrom fromPeer: Data)
+    /// Peer answered our earlier `requestBundle` with the bundle bytes.
+    func relayClient(
+        _ client: RelayClient,
+        didReceiveBundleFrom fromPeer: Data,
+        bundle: Data
+    )
 }
 
 public final class RelayClient: @unchecked Sendable {
@@ -32,6 +40,8 @@ public final class RelayClient: @unchecked Sendable {
 
     private static let frameTypeHello: UInt8 = 1
     private static let frameTypeSend: UInt8 = 2
+    private static let frameTypeBundleRequest: UInt8 = 3
+    private static let frameTypeBundleResponse: UInt8 = 4
     private static let maxFrameBytes: UInt32 = 1024 * 1024
 
     public weak var delegate: RelayClientDelegate?
@@ -103,6 +113,25 @@ public final class RelayClient: @unchecked Sendable {
         writeFrame(payload, on: connection)
     }
 
+    public func requestBundle(fromPeer to: Data) {
+        guard let connection, state == .connected else { return }
+        var payload = Data()
+        payload.append(Self.frameTypeBundleRequest)
+        appendU16Blob(&payload, to)
+        appendU16Blob(&payload, myIdentity)
+        writeFrame(payload, on: connection)
+    }
+
+    public func sendBundle(toPeer to: Data, bundle: Data) {
+        guard let connection, state == .connected else { return }
+        var payload = Data()
+        payload.append(Self.frameTypeBundleResponse)
+        appendU16Blob(&payload, to)
+        appendU16Blob(&payload, myIdentity)
+        payload.append(bundle)
+        writeFrame(payload, on: connection)
+    }
+
     private func sendHello() {
         guard let connection else { return }
         var payload = Data()
@@ -163,21 +192,21 @@ public final class RelayClient: @unchecked Sendable {
 
     private func handleFrame(_ payload: Data) {
         guard let type = payload.first else { return }
+        var cursor = Cursor(payload.dropFirst())
+        guard
+            let to = cursor.u16Blob(),
+            let from = cursor.u16Blob()
+        else { return }
+        // We're the recipient — `to` should equal myIdentity, but the
+        // relay already routed by it. Mismatched senders surface as
+        // libsignal trust failures further up.
+        _ = to
+        let delegate = self.delegate
+        let client = self
         switch type {
         case Self.frameTypeSend:
-            var cursor = Cursor(payload.dropFirst())
-            guard
-                let to = cursor.u16Blob(),
-                let from = cursor.u16Blob(),
-                let isPreByte = cursor.u8()
-            else { return }
-            // We're the recipient — `to` should equal myIdentity, but the
-            // relay already routed by it. No need to re-check; caller
-            // will surface unexpected senders via libsignal trust failures.
-            _ = to
+            guard let isPreByte = cursor.u8() else { return }
             let ciphertext = Data(cursor.rest())
-            let delegate = self.delegate
-            let client = self
             DispatchQueue.main.async {
                 delegate?.relayClient(
                     client,
@@ -185,6 +214,15 @@ public final class RelayClient: @unchecked Sendable {
                     ciphertext: ciphertext,
                     isPreKey: isPreByte != 0
                 )
+            }
+        case Self.frameTypeBundleRequest:
+            DispatchQueue.main.async {
+                delegate?.relayClient(client, didReceiveBundleRequestFrom: from)
+            }
+        case Self.frameTypeBundleResponse:
+            let bundle = Data(cursor.rest())
+            DispatchQueue.main.async {
+                delegate?.relayClient(client, didReceiveBundleFrom: from, bundle: bundle)
             }
         default:
             break

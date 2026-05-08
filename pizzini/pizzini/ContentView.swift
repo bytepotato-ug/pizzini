@@ -9,58 +9,42 @@ import SwiftUI
 import PizziniCryptoCore
 
 struct ContentView: View {
-    @State private var model: ChatModel?
-    @State private var initError: String?
+    @State private var store = ChatStore()
     @State private var draft: String = ""
-    @State private var sender: Sender = .alice
-    @State private var identity: IdentityKeyPair?
-
-    private static let identityAccount = "long-term-identity"
+    @State private var showScanner = false
+    @State private var showRelaySheet = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            if let model {
-                messages(model: model)
-                Divider()
-                composer(model: model)
-            } else if let initError {
-                errorState(initError)
+            if let err = store.initError {
+                errorState(err)
+            } else if store.peer == nil {
+                pairingView
             } else {
-                ProgressView("starting session…")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                chatView
             }
         }
-        .task {
-            loadOrCreateIdentity()
-            do {
-                model = try ChatModel()
-            } catch {
-                initError = String(describing: error)
-            }
+        .sheet(isPresented: $showScanner) {
+            QRScannerView(
+                onScanned: { value in
+                    showScanner = false
+                    store.acceptScannedCard(value)
+                },
+                onCancel: { showScanner = false }
+            )
         }
-    }
-
-    private func loadOrCreateIdentity() {
-        if let existing = Keychain.read(account: Self.identityAccount) {
-            self.identity = IdentityKeyPair(bytes: existing)
-            return
+        .sheet(isPresented: $showRelaySheet) {
+            RelaySettingsSheet(
+                host: store.relayHost,
+                onSave: { newHost in
+                    store.setRelayHost(newHost)
+                    showRelaySheet = false
+                },
+                onCancel: { showRelaySheet = false }
+            )
         }
-        do {
-            let kp = try IdentityKeyPair.generate()
-            _ = Keychain.write(kp.bytes, account: Self.identityAccount)
-            self.identity = kp
-        } catch {
-            // Identity is informational for the loopback demo; if generation
-            // fails the chat still works.
-        }
-    }
-
-    private func resetIdentity() {
-        Keychain.delete(account: Self.identityAccount)
-        self.identity = nil
-        loadOrCreateIdentity()
     }
 
     private var header: some View {
@@ -76,22 +60,18 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             HStack(spacing: 8) {
-                Text("identity")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text(fingerprint)
-                    .font(.caption2.monospaced())
+                relayBadge
                 Spacer()
                 Menu {
+                    Button {
+                        showRelaySheet = true
+                    } label: {
+                        Label("Relay host (\(store.relayHost))", systemImage: "antenna.radiowaves.left.and.right")
+                    }
                     Button(role: .destructive) {
-                        resetIdentity()
+                        store.resetIdentity()
                     } label: {
                         Label("Reset identity", systemImage: "arrow.counterclockwise")
-                    }
-                    Button {
-                        if let model = model { try? model.reset() }
-                    } label: {
-                        Label("Reset session", systemImage: "bubble.left.and.bubble.right")
                     }
                 } label: {
                     Image(systemName: "ellipsis.circle")
@@ -102,85 +82,106 @@ struct ContentView: View {
         .padding()
     }
 
-    private var fingerprint: String {
-        guard let id = identity else { return "—" }
-        let bytes = Array(id.bytes)
-        let hexHead = bytes.prefix(4).map { String(format: "%02x", $0) }.joined()
-        let hexTail = bytes.suffix(4).map { String(format: "%02x", $0) }.joined()
-        return "\(hexHead)…\(hexTail)  (\(bytes.count) B)"
+    private var relayBadge: some View {
+        let (text, color): (String, Color) = {
+            switch store.relayState {
+            case .idle:        return ("idle", .gray)
+            case .connecting:  return ("connecting", .orange)
+            case .connected:   return ("connected", .green)
+            case .failed(let m): return ("failed: \(m)", .red)
+            }
+        }()
+        return HStack(spacing: 4) {
+            Circle().frame(width: 6, height: 6).foregroundStyle(color)
+            Text("relay \(text)")
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+        }
     }
 
-    private func messages(model: ChatModel) -> some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 12) {
-                    if model.messages.isEmpty {
-                        emptyStateView(model: model)
-                    } else {
-                        ForEach(model.messages) { m in
-                            MessageRow(message: m).id(m.id)
+    private var pairingView: some View {
+        ScrollView {
+            VStack(spacing: 24) {
+                if let card = store.myCard {
+                    Text("your contact card")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    ContactCardView(card: card)
+                }
+                Button {
+                    showScanner = true
+                } label: {
+                    Label("Scan a contact's QR", systemImage: "qrcode.viewfinder")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .padding(.horizontal)
+
+                HStack(spacing: 12) {
+                    Button {
+                        if let card = store.myCard {
+                            UIPasteboard.general.string = card.encoded
                         }
+                    } label: {
+                        Label("Copy mine", systemImage: "doc.on.doc")
+                            .frame(maxWidth: .infinity)
                     }
+                    .buttonStyle(.bordered)
+                    Button {
+                        if let s = UIPasteboard.general.string {
+                            store.acceptScannedCard(s)
+                        }
+                    } label: {
+                        Label("Paste theirs", systemImage: "doc.on.clipboard")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
                 }
                 .padding(.horizontal)
-                .padding(.vertical, 12)
+
+                Text("Both peers must be online on the same relay. After scan/paste, Pizzini fetches the peer's PreKey bundle over the relay, runs PQXDH, and you can chat. Clipboard fallback is for sims (no camera).")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
             }
-            .onChange(of: model.messages.count) { _, _ in
-                if let last = model.messages.last {
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+            .padding(.top, 24)
+        }
+    }
+
+    private var chatView: some View {
+        VStack(spacing: 0) {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 12) {
+                        if store.log.isEmpty {
+                            Text("Say hi.")
+                                .foregroundStyle(.secondary)
+                                .padding(.top, 48)
+                        }
+                        ForEach(store.log) { entry in
+                            ChatRow(entry: entry).id(entry.id)
+                        }
+                    }
+                    .padding(.horizontal)
+                    .padding(.vertical, 12)
                 }
+                .onChange(of: store.log.count) { _, _ in
+                    if let last = store.log.last {
+                        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    }
+                }
+                .scrollDismissesKeyboard(.interactively)
             }
-            .scrollDismissesKeyboard(.interactively)
-        }
-    }
-
-    private func emptyStateView(model: ChatModel) -> some View {
-        VStack(spacing: 12) {
-            Text("session ready")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-            Text("alice and bob have completed PQXDH.\nfirst message will be a PreKey signal,\nsubsequent ones flip to Whisper after a reply.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            Button("Run a demo exchange") {
-                Task { await runDemo(model: model) }
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .padding(.top, 4)
-        }
-        .padding(.top, 48)
-    }
-
-    private func runDemo(model: ChatModel) async {
-        let script: [(Sender, String)] = [
-            (.alice, "hi bob"),
-            (.bob,   "hey alice"),
-            (.alice, "look at this PQ ratchet flip"),
-            (.bob,   "wild — Whisper now"),
-        ]
-        for (sender, text) in script {
-            try? await Task.sleep(for: .milliseconds(450))
-            model.send(text, from: sender)
-        }
-    }
-
-    private func composer(model: ChatModel) -> some View {
-        VStack(spacing: 10) {
-            Picker("sender", selection: $sender) {
-                Text("Alice").tag(Sender.alice)
-                Text("Bob").tag(Sender.bob)
-            }
-            .pickerStyle(.segmented)
-
+            Divider()
             HStack {
                 TextField("type a message", text: $draft)
                     .textFieldStyle(.roundedBorder)
                     .submitLabel(.send)
-                    .onSubmit { send(model: model) }
+                    .onSubmit { sendDraft() }
                 Button {
-                    send(model: model)
+                    sendDraft()
                 } label: {
                     Image(systemName: "paperplane.fill")
                         .padding(.horizontal, 4)
@@ -188,14 +189,12 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
+            .padding()
         }
-        .padding()
     }
 
-    private func send(model: ChatModel) {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        model.send(text, from: sender)
+    private func sendDraft() {
+        store.send(draft)
         draft = ""
     }
 
@@ -204,7 +203,7 @@ struct ContentView: View {
             Image(systemName: "exclamationmark.triangle")
                 .font(.largeTitle)
                 .foregroundStyle(.red)
-            Text("session init failed")
+            Text("init failed")
                 .font(.headline)
             Text(msg)
                 .font(.caption.monospaced())
@@ -216,69 +215,16 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Model
+// MARK: - Chat row
 
-enum Sender: String, Sendable {
-    case alice, bob
-}
-
-struct ChatMessage: Identifiable, Sendable {
-    let id = UUID()
-    let sender: Sender
-    let text: String
-    let ciphertextBytes: Int
-    let messageType: LoopbackSession.MessageType
-}
-
-@MainActor
-@Observable
-final class ChatModel {
-    var messages: [ChatMessage] = []
-    private var session: LoopbackSession
-
-    init() throws {
-        self.session = try LoopbackSession()
-    }
-
-    func reset() throws {
-        self.session = try LoopbackSession()
-        self.messages.removeAll()
-    }
-
-    func send(_ text: String, from sender: Sender) {
-        do {
-            let result: LoopbackSession.SendResult
-            switch sender {
-            case .alice: result = try session.aliceSend(text)
-            case .bob:   result = try session.bobSend(text)
-            }
-            messages.append(ChatMessage(
-                sender: sender,
-                text: text,
-                ciphertextBytes: result.ciphertext.count,
-                messageType: result.messageType
-            ))
-        } catch {
-            messages.append(ChatMessage(
-                sender: sender,
-                text: "[error: \(error)]",
-                ciphertextBytes: 0,
-                messageType: .preKey
-            ))
-        }
-    }
-}
-
-// MARK: - Message bubble
-
-struct MessageRow: View {
-    let message: ChatMessage
+struct ChatRow: View {
+    let entry: ChatLogEntry
 
     var body: some View {
         HStack(alignment: .bottom) {
-            if message.sender == .bob { Spacer(minLength: 32) }
-            VStack(alignment: message.sender == .alice ? .leading : .trailing, spacing: 4) {
-                Text(message.text)
+            if entry.side == .peer { Spacer(minLength: 32) }
+            VStack(alignment: entry.side == .me ? .leading : .trailing, spacing: 4) {
+                Text(entry.text)
                     .font(.body)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
@@ -286,31 +232,68 @@ struct MessageRow: View {
                     .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 metadata
             }
-            if message.sender == .alice { Spacer(minLength: 32) }
+            if entry.side == .me { Spacer(minLength: 32) }
         }
     }
 
     private var bubbleColor: Color {
-        switch message.sender {
-        case .alice: return Color.blue.opacity(0.18)
-        case .bob:   return Color.green.opacity(0.18)
+        switch entry.kind {
+        case .system: return Color.gray.opacity(0.15)
+        case .preKey, .whisper:
+            return entry.side == .me
+                ? Color.blue.opacity(0.18)
+                : Color.green.opacity(0.18)
         }
     }
 
     private var metadata: some View {
         HStack(spacing: 6) {
-            Text(message.sender.rawValue)
+            Text(entry.side == .me ? "me" : "peer")
                 .foregroundStyle(.secondary)
-            Text("·")
-                .foregroundStyle(.tertiary)
-            Text(message.messageType == .preKey ? "PreKey" : "Whisper")
-                .foregroundStyle(message.messageType == .preKey ? .orange : .green)
-            Text("·")
-                .foregroundStyle(.tertiary)
-            Text("\(message.ciphertextBytes) B")
-                .foregroundStyle(.secondary)
+            if entry.kind != .system {
+                Text("·").foregroundStyle(.tertiary)
+                Text(entry.kind == .preKey ? "PreKey" : "Whisper")
+                    .foregroundStyle(entry.kind == .preKey ? .orange : .green)
+                Text("·").foregroundStyle(.tertiary)
+                Text("\(entry.bytes) B").foregroundStyle(.secondary)
+            }
         }
         .font(.caption2.monospaced())
+    }
+}
+
+// MARK: - Relay settings
+
+private struct RelaySettingsSheet: View {
+    @State var host: String
+    let onSave: (String) -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("host (e.g. 192.168.x.x)", text: $host)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                } header: {
+                    Text("relay host")
+                } footer: {
+                    Text("Both peers connect to the same relay. Sim → 127.0.0.1; phone → the Mac's LAN IP. Port is fixed at 7777.")
+                }
+            }
+            .navigationTitle("Relay")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", action: onCancel)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") { onSave(host) }
+                }
+            }
+        }
     }
 }
 
