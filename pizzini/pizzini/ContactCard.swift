@@ -9,14 +9,23 @@ import UIKit
 ///
 /// Format: `pizzini1://<peerIdHex>@<host>:<port>`. URL-shaped so iOS QR
 /// scanners and other tooling can recognise it, but parsing is hand-rolled.
-struct ContactCard: Equatable {
+struct ContactCard: Equatable, Identifiable {
     let peerId: Data
     let host: String
     let port: UInt16
 
+    /// peerId is unique per identity, so it doubles as the SwiftUI id.
+    var id: Data { peerId }
+
     var encoded: String {
         let hex = peerId.map { String(format: "%02x", $0) }.joined()
         return "pizzini1://\(hex)@\(host):\(port)"
+    }
+
+    var fingerprintShort: String {
+        let head = peerId.prefix(4).map { String(format: "%02x", $0) }.joined()
+        let tail = peerId.suffix(2).map { String(format: "%02x", $0) }.joined()
+        return "\(head)…\(tail)"
     }
 
     static func decode(_ s: String) -> ContactCard? {

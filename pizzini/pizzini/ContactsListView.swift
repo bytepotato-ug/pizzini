@@ -9,6 +9,7 @@ struct ContactsListView: View {
     @Binding var showRelaySheet: Bool
     @Binding var confirmDeleteAllChats: Bool
     @Binding var confirmReset: Bool
+    let onPasteContact: (String) -> Void
 
     var body: some View {
         ZStack {
@@ -38,7 +39,7 @@ struct ContactsListView: View {
                     } label: { Label("Scan a contact's QR", systemImage: "qrcode.viewfinder") }
                     Button {
                         if let s = UIPasteboard.general.string {
-                            store.acceptScannedCard(s)
+                            onPasteContact(s)
                         }
                     } label: { Label("Paste contact", systemImage: "doc.on.clipboard") }
                     Divider()

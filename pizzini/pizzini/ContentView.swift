@@ -15,6 +15,8 @@ struct ContentView: View {
     @State private var showRelaySheet = false
     @State private var confirmDeleteAllChats = false
     @State private var confirmReset = false
+    @State private var pendingCard: ContactCard?
+    @State private var pendingName: String = ""
 
     var body: some View {
         Group {
@@ -28,7 +30,8 @@ struct ContentView: View {
                         showMyQR: $showMyQR,
                         showRelaySheet: $showRelaySheet,
                         confirmDeleteAllChats: $confirmDeleteAllChats,
-                        confirmReset: $confirmReset
+                        confirmReset: $confirmReset,
+                        onPasteContact: promptForName(decoding:)
                     )
                 }
             }
@@ -37,10 +40,30 @@ struct ContentView: View {
             QRScannerView(
                 onScanned: { value in
                     showScanner = false
-                    store.acceptScannedCard(value)
+                    promptForName(decoding: value)
                 },
                 onCancel: { showScanner = false }
             )
+        }
+        .alert(
+            "Add contact",
+            isPresented: Binding(
+                get: { pendingCard != nil },
+                set: { isPresented in
+                    if !isPresented { resetPending() }
+                }
+            ),
+            presenting: pendingCard
+        ) { card in
+            TextField("name (e.g. Alice)", text: $pendingName)
+                .textInputAutocapitalization(.words)
+            Button("Cancel", role: .cancel) { resetPending() }
+            Button("Add") {
+                store.addContact(card: card, displayName: pendingName)
+                resetPending()
+            }
+        } message: { card in
+            Text("Fingerprint \(card.fingerprintShort)\nVerify it matches the QR you scanned in person.")
         }
         .sheet(isPresented: $showMyQR) {
             MyQRSheet(card: store.myCard, onDone: { showMyQR = false })
@@ -75,6 +98,17 @@ struct ContentView: View {
             }
             Button("Cancel", role: .cancel) {}
         }
+    }
+
+    private func promptForName(decoding raw: String) {
+        guard let card = ContactCard.decode(raw) else { return }
+        pendingName = ""
+        pendingCard = card
+    }
+
+    private func resetPending() {
+        pendingCard = nil
+        pendingName = ""
     }
 
     private func errorState(_ msg: String) -> some View {

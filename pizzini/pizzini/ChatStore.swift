@@ -89,27 +89,27 @@ final class ChatStore: NSObject {
         state.contacts.firstIndex { $0.identityPub == peerId }
     }
 
-    /// Add a freshly-scanned (or pasted) contact. Idempotent: scanning the
-    /// same QR twice is a no-op. Eagerly requests the peer's bundle if the
-    /// relay is up — if both peers have already added each other, the
-    /// session goes live within a round-trip.
+    /// Commit a freshly-scanned (or pasted) contact. Idempotent on
+    /// `card.peerId`: re-adding the same QR is a no-op apart from a bundle
+    /// retry. Eagerly requests the peer's bundle if the relay is up.
+    ///
+    /// `displayName` is what the host (UI) collected from the user at
+    /// pairing time. Empty/whitespace falls back to the fingerprint
+    /// default so the row is still distinguishable.
     ///
     /// Note: `card.host` is *informational* — it's the address the peer
     /// uses to reach the relay. We never adopt it as our own relay host;
     /// scanning a sim's `127.0.0.1` QR from a real iPhone would otherwise
     /// silently break our connection.
-    func acceptScannedCard(_ raw: String) {
-        guard let card = ContactCard.decode(raw) else { return }
+    func addContact(card: ContactCard, displayName: String?) {
         guard let session else { return }
         if state.contacts.contains(where: { $0.identityPub == card.peerId }) {
-            // Already added; just retry the bundle request.
             relay?.requestBundle(fromPeer: card.peerId)
             return
         }
-        let contact = Contact(
-            identityPub: card.peerId,
-            displayName: Contact.defaultName(for: card.peerId)
-        )
+        let trimmed = (displayName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = trimmed.isEmpty ? Contact.defaultName(for: card.peerId) : trimmed
+        let contact = Contact(identityPub: card.peerId, displayName: name)
         state.contacts.append(contact)
         try? session.registerPeer(peerIdentity: card.peerId)
         persistAll()
