@@ -72,10 +72,25 @@ public final class Session: @unchecked Sendable {
         self.handle = h
     }
 
-    /// Rehydrate from a previously-saved `identityKeypairBytes` blob.
+    /// Rehydrate identity only. Loses session/prekey state — for full
+    /// continuity (sessions, ratchet) use `init(serialized:)` instead.
     public init(identitySeed seed: Data) throws {
         let h = seed.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) -> OpaquePointer? in
             pizzini_store_new(ptr.bindMemory(to: UInt8.self).baseAddress, UInt(seed.count))
+        }
+        guard let h else { throw CryptoCoreError.internalError }
+        self.handle = h
+    }
+
+    /// Rehydrate the full store (identity + prekeys + per-peer sessions)
+    /// from the bytes returned by `serialize()`. Pair every meaningful
+    /// state change in the host with a fresh `serialize()` to keep on-disk
+    /// state in sync.
+    public init(serialized blob: Data) throws {
+        let h = blob.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) -> OpaquePointer? in
+            pizzini_store_new_from_serialized(
+                ptr.bindMemory(to: UInt8.self).baseAddress, UInt(blob.count)
+            )
         }
         guard let h else { throw CryptoCoreError.internalError }
         self.handle = h
@@ -108,6 +123,41 @@ public final class Session: @unchecked Sendable {
         try readBlob(initialCap: 4096) { handle, buf, cap, len in
             pizzini_store_publish_bundle(handle, buf, cap, len)
         }
+    }
+
+    /// Snapshot the full store (identity, prekeys, sessions) for persisting
+    /// to Keychain. Pair with `init(serialized:)` on the next launch.
+    public func serialize() throws -> Data {
+        try readBlob(initialCap: 16384) { handle, buf, cap, len in
+            pizzini_store_serialize(handle, buf, cap, len)
+        }
+    }
+
+    /// Idempotently track a peer in the persisted index. Call right after
+    /// adding a contact (e.g. after a QR scan), before the actual handshake
+    /// — so the peer survives `serialize` even if no session exists yet.
+    public func registerPeer(peerIdentity: Data) throws {
+        guard let handle else { throw CryptoCoreError.invalidArgument }
+        let rc = peerIdentity.withUnsafeBytes { ptr in
+            pizzini_store_register_peer(
+                handle,
+                ptr.bindMemory(to: UInt8.self).baseAddress, UInt(peerIdentity.count)
+            )
+        }
+        try mapRC(rc)
+    }
+
+    /// Drop a peer's session and remove from the persisted index. Future
+    /// messages to or from this identity require a fresh PQXDH handshake.
+    public func forgetPeer(peerIdentity: Data) throws {
+        guard let handle else { throw CryptoCoreError.invalidArgument }
+        let rc = peerIdentity.withUnsafeBytes { ptr in
+            pizzini_store_forget_peer(
+                handle,
+                ptr.bindMemory(to: UInt8.self).baseAddress, UInt(peerIdentity.count)
+            )
+        }
+        try mapRC(rc)
     }
 
     /// Run PQXDH against a peer's bundle. After this, `encrypt`/`decrypt`

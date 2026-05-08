@@ -97,7 +97,9 @@ pub unsafe extern "C" fn pizzini_identity_keypair_generate(
 /// If `seed_ptr` is null, a fresh identity keypair is generated. Otherwise
 /// `(seed_ptr, seed_len)` must be the bytes returned by a prior
 /// `pizzini_store_identity_keypair` call (libsignal's serialized
-/// IdentityKeyPair) — used to rehydrate an identity from Keychain.
+/// IdentityKeyPair) — used to rehydrate an identity from Keychain. This
+/// path keeps the identity but loses session/prekey state. For full
+/// continuity (sessions, ratchet) use `pizzini_store_new_from_serialized`.
 ///
 /// Returns a non-null opaque handle on success, null on failure.
 ///
@@ -116,6 +118,30 @@ pub unsafe extern "C" fn pizzini_store_new(
         DeviceStore::from_identity(seed)
     };
     match result {
+        Ok(s) => Box::into_raw(Box::new(s)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Creates a device store from a full serialized snapshot (the bytes
+/// returned by `pizzini_store_serialize`). Restores identity, registration
+/// id, prekeys, signed prekeys, kyber prekeys, and per-peer session state.
+///
+/// Returns null if the blob is malformed.
+///
+/// # Safety
+/// `bytes` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_store_new_from_serialized(
+    bytes: *const u8,
+    len: usize,
+) -> *mut DeviceStore {
+    if bytes.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: caller asserted (bytes, len) describes a readable slice.
+    let blob = unsafe { std::slice::from_raw_parts(bytes, len) };
+    match DeviceStore::from_serialized(blob) {
         Ok(s) => Box::into_raw(Box::new(s)),
         Err(_) => std::ptr::null_mut(),
     }
@@ -353,6 +379,78 @@ unsafe fn write_blob<F: FnOnce(&DeviceStore) -> Vec<u8>>(
     unsafe { copy_or_size_out(&bytes, out_buf, out_buf_cap, out_len) }
 }
 
+/// Snapshot the entire store (identity + prekeys + sessions) to a versioned
+/// binary blob. Persist this in Keychain or SQLCipher; pass it back to
+/// `pizzini_store_new_from_serialized` on the next launch.
+///
+/// # Safety
+/// `store` must be a live handle. `out_buf`/`out_len` as for the other
+/// blob-returning calls.
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_store_serialize(
+    store: *mut DeviceStore,
+    out_buf: *mut u8,
+    out_buf_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if store.is_null() || out_buf.is_null() || out_len.is_null() {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted preconditions.
+    let s = unsafe { &*store };
+    let bytes = match s.serialize() {
+        Ok(b) => b,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    // SAFETY: out_buf/out_len asserted valid.
+    unsafe { copy_or_size_out(&bytes, out_buf, out_buf_cap, out_len) }
+}
+
+/// Idempotently track an identity_pub. Called by the host right after
+/// scanning a peer's QR — pre-seeds the peer so it survives serialize even
+/// before the actual session handshake completes.
+///
+/// # Safety
+/// `store` must be a live handle. `peer_identity` must point to
+/// `peer_identity_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_store_register_peer(
+    store: *mut DeviceStore,
+    peer_identity: *const u8,
+    peer_identity_len: usize,
+) -> i32 {
+    if store.is_null() || peer_identity.is_null() {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: preconditions asserted.
+    let s = unsafe { &mut *store };
+    let peer = unsafe { std::slice::from_raw_parts(peer_identity, peer_identity_len) };
+    s.register_peer(peer);
+    PIZZINI_OK
+}
+
+/// Drop a peer: forget the libsignal session and remove it from the
+/// serialize index. After this call, encrypting to or decrypting from the
+/// peer requires re-running PQXDH from a fresh bundle.
+///
+/// # Safety
+/// Same as `pizzini_store_register_peer`.
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_store_forget_peer(
+    store: *mut DeviceStore,
+    peer_identity: *const u8,
+    peer_identity_len: usize,
+) -> i32 {
+    if store.is_null() || peer_identity.is_null() {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: preconditions asserted.
+    let s = unsafe { &mut *store };
+    let peer = unsafe { std::slice::from_raw_parts(peer_identity, peer_identity_len) };
+    s.forget_peer(peer);
+    PIZZINI_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,4 +615,144 @@ mod tests {
         unsafe { pizzini_store_free(s2) };
     }
 
+    #[test]
+    fn store_ffi_serialize_round_trips() {
+        // Build Alice + Bob, talk a bit, snapshot Alice via FFI, rehydrate
+        // via FFI, keep talking. Mirrors the lib-level test but proves the
+        // serialize/from_serialized/forget_peer C ABI symbols work.
+        let alice = unsafe { pizzini_store_new(std::ptr::null(), 0) };
+        let bob = unsafe { pizzini_store_new(std::ptr::null(), 0) };
+
+        let mut bob_id = vec![0u8; 64];
+        let mut bob_id_len = 0usize;
+        unsafe {
+            pizzini_store_identity_public(bob, bob_id.as_mut_ptr(), bob_id.len(), &mut bob_id_len)
+        };
+        let bob_id = bob_id[..bob_id_len].to_vec();
+        let mut alice_id = vec![0u8; 64];
+        let mut alice_id_len = 0usize;
+        unsafe {
+            pizzini_store_identity_public(
+                alice,
+                alice_id.as_mut_ptr(),
+                alice_id.len(),
+                &mut alice_id_len,
+            )
+        };
+        let alice_id = alice_id[..alice_id_len].to_vec();
+
+        let mut bundle = vec![0u8; 4096];
+        let mut blen = 0usize;
+        unsafe {
+            pizzini_store_publish_bundle(bob, bundle.as_mut_ptr(), bundle.len(), &mut blen)
+        };
+        unsafe {
+            pizzini_store_initiate_session(
+                alice,
+                bob_id.as_ptr(), bob_id.len(),
+                bundle.as_ptr(), blen,
+            )
+        };
+
+        let mut ct = vec![0u8; 4096];
+        let mut ctlen = 0usize;
+        let mut mt: u32 = 0;
+        unsafe {
+            pizzini_store_encrypt(
+                alice,
+                bob_id.as_ptr(), bob_id.len(),
+                b"hi".as_ptr(), 2,
+                ct.as_mut_ptr(), ct.len(), &mut ctlen, &mut mt,
+            )
+        };
+        let mut pt = vec![0u8; 256];
+        let mut ptlen = 0usize;
+        unsafe {
+            pizzini_store_decrypt(
+                bob,
+                alice_id.as_ptr(), alice_id.len(),
+                ct.as_ptr(), ctlen, 1,
+                pt.as_mut_ptr(), pt.len(), &mut ptlen,
+            )
+        };
+        let mut bob_ct = vec![0u8; 4096];
+        let mut bob_ctlen = 0usize;
+        unsafe {
+            pizzini_store_encrypt(
+                bob,
+                alice_id.as_ptr(), alice_id.len(),
+                b"yo".as_ptr(), 2,
+                bob_ct.as_mut_ptr(), bob_ct.len(), &mut bob_ctlen, &mut mt,
+            )
+        };
+        let mut bob_pt = vec![0u8; 256];
+        let mut bob_ptlen = 0usize;
+        unsafe {
+            pizzini_store_decrypt(
+                alice,
+                bob_id.as_ptr(), bob_id.len(),
+                bob_ct.as_ptr(), bob_ctlen, 0,
+                bob_pt.as_mut_ptr(), bob_pt.len(), &mut bob_ptlen,
+            )
+        };
+
+        // Snapshot Alice via FFI.
+        let mut snap = vec![0u8; 16384];
+        let mut snaplen = 0usize;
+        let rc = unsafe {
+            pizzini_store_serialize(alice, snap.as_mut_ptr(), snap.len(), &mut snaplen)
+        };
+        assert_eq!(rc, PIZZINI_OK);
+        assert!(snaplen > 0);
+        unsafe { pizzini_store_free(alice) };
+
+        // Rehydrate Alice from the snapshot.
+        let alice2 = unsafe { pizzini_store_new_from_serialized(snap.as_ptr(), snaplen) };
+        assert!(!alice2.is_null());
+
+        // Continue the chat — Whisper, since the session survived.
+        let mut ct3 = vec![0u8; 4096];
+        let mut ct3len = 0usize;
+        unsafe {
+            pizzini_store_encrypt(
+                alice2,
+                bob_id.as_ptr(), bob_id.len(),
+                b"still here".as_ptr(), 10,
+                ct3.as_mut_ptr(), ct3.len(), &mut ct3len, &mut mt,
+            )
+        };
+        assert_eq!(mt, PIZZINI_MSG_TYPE_WHISPER);
+        let mut pt3 = vec![0u8; 256];
+        let mut pt3len = 0usize;
+        let rc = unsafe {
+            pizzini_store_decrypt(
+                bob,
+                alice_id.as_ptr(), alice_id.len(),
+                ct3.as_ptr(), ct3len, 0,
+                pt3.as_mut_ptr(), pt3.len(), &mut pt3len,
+            )
+        };
+        assert_eq!(rc, PIZZINI_OK);
+        assert_eq!(&pt3[..pt3len], b"still here");
+
+        // Forget the peer — encrypting to them must now fail.
+        let rc = unsafe {
+            pizzini_store_forget_peer(alice2, bob_id.as_ptr(), bob_id.len())
+        };
+        assert_eq!(rc, PIZZINI_OK);
+        let mut ct4 = vec![0u8; 4096];
+        let mut ct4len = 0usize;
+        let rc = unsafe {
+            pizzini_store_encrypt(
+                alice2,
+                bob_id.as_ptr(), bob_id.len(),
+                b"ghost".as_ptr(), 5,
+                ct4.as_mut_ptr(), ct4.len(), &mut ct4len, &mut mt,
+            )
+        };
+        assert_eq!(rc, PIZZINI_ERR_INTERNAL);
+
+        unsafe { pizzini_store_free(alice2) };
+        unsafe { pizzini_store_free(bob) };
+    }
 }

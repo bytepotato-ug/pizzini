@@ -49,7 +49,9 @@ int32_t pizzini_identity_keypair_generate(uint8_t *out_buf,
  * If `seed_ptr` is null, a fresh identity keypair is generated. Otherwise
  * `(seed_ptr, seed_len)` must be the bytes returned by a prior
  * `pizzini_store_identity_keypair` call (libsignal's serialized
- * IdentityKeyPair) — used to rehydrate an identity from Keychain.
+ * IdentityKeyPair) — used to rehydrate an identity from Keychain. This
+ * path keeps the identity but loses session/prekey state. For full
+ * continuity (sessions, ratchet) use `pizzini_store_new_from_serialized`.
  *
  * Returns a non-null opaque handle on success, null on failure.
  *
@@ -57,6 +59,18 @@ int32_t pizzini_identity_keypair_generate(uint8_t *out_buf,
  * `seed_ptr` must either be null or point to `seed_len` readable bytes.
  */
 struct DeviceStore *pizzini_store_new(const uint8_t *seed_ptr, uintptr_t seed_len);
+
+/**
+ * Creates a device store from a full serialized snapshot (the bytes
+ * returned by `pizzini_store_serialize`). Restores identity, registration
+ * id, prekeys, signed prekeys, kyber prekeys, and per-peer session state.
+ *
+ * Returns null if the blob is malformed.
+ *
+ * # Safety
+ * `bytes` must point to `len` readable bytes.
+ */
+struct DeviceStore *pizzini_store_new_from_serialized(const uint8_t *bytes, uintptr_t len);
 
 /**
  * Releases a device-store handle. Safe to call with null.
@@ -154,5 +168,44 @@ int32_t pizzini_store_decrypt(struct DeviceStore *store,
                               uint8_t *out_plaintext,
                               uintptr_t out_plaintext_cap,
                               uintptr_t *out_plaintext_len);
+
+/**
+ * Snapshot the entire store (identity + prekeys + sessions) to a versioned
+ * binary blob. Persist this in Keychain or SQLCipher; pass it back to
+ * `pizzini_store_new_from_serialized` on the next launch.
+ *
+ * # Safety
+ * `store` must be a live handle. `out_buf`/`out_len` as for the other
+ * blob-returning calls.
+ */
+int32_t pizzini_store_serialize(struct DeviceStore *store,
+                                uint8_t *out_buf,
+                                uintptr_t out_buf_cap,
+                                uintptr_t *out_len);
+
+/**
+ * Idempotently track an identity_pub. Called by the host right after
+ * scanning a peer's QR — pre-seeds the peer so it survives serialize even
+ * before the actual session handshake completes.
+ *
+ * # Safety
+ * `store` must be a live handle. `peer_identity` must point to
+ * `peer_identity_len` readable bytes.
+ */
+int32_t pizzini_store_register_peer(struct DeviceStore *store,
+                                    const uint8_t *peer_identity,
+                                    uintptr_t peer_identity_len);
+
+/**
+ * Drop a peer: forget the libsignal session and remove it from the
+ * serialize index. After this call, encrypting to or decrypting from the
+ * peer requires re-running PQXDH from a fresh bundle.
+ *
+ * # Safety
+ * Same as `pizzini_store_register_peer`.
+ */
+int32_t pizzini_store_forget_peer(struct DeviceStore *store,
+                                  const uint8_t *peer_identity,
+                                  uintptr_t peer_identity_len);
 
 #endif  /* PIZZINI_CRYPTO_CORE_H */

@@ -31,12 +31,14 @@ use libsignal_protocol::{
     CiphertextMessage, CiphertextMessageType, DeviceId, GenericSignedPreKey, IdentityKey,
     IdentityKeyPair, IdentityKeyStore, InMemSignalProtocolStore, KeyPair, KyberPreKeyRecord,
     KyberPreKeyStore, PreKeyBundle, PreKeyRecord, PreKeySignalMessage, PreKeyStore,
-    ProtocolAddress, PublicKey, SignalMessage, SignalProtocolError, SignedPreKeyRecord,
-    SignedPreKeyStore, Timestamp, kem, message_decrypt, message_encrypt, process_prekey_bundle,
+    ProtocolAddress, PublicKey, SessionRecord, SessionStore, SignalMessage, SignalProtocolError,
+    SignedPreKeyRecord, SignedPreKeyStore, Timestamp, kem, message_decrypt, message_encrypt,
+    process_prekey_bundle,
 };
 use rand::{Rng, TryRngCore as _, rngs::OsRng};
 
 const BUNDLE_VERSION: u8 = 1;
+const STORE_VERSION: u8 = 1;
 const DEVICE_ID: u8 = 1;
 
 pub struct DeviceStore {
@@ -44,6 +46,11 @@ pub struct DeviceStore {
     next_pre_key_id: u32,
     next_signed_pre_key_id: u32,
     next_kyber_pre_key_id: u32,
+    /// Identity-public bytes for every peer we've ever set up an outbound
+    /// session with (initiate_session) or accepted an inbound PreKey from
+    /// (decrypt). The list is the index used during `serialize` to enumerate
+    /// libsignal session records — InMemSessionStore exposes no iterator.
+    peers: Vec<Vec<u8>>,
 }
 
 pub struct EncryptResult {
@@ -61,12 +68,14 @@ impl DeviceStore {
             next_pre_key_id: 1,
             next_signed_pre_key_id: 1,
             next_kyber_pre_key_id: 1,
+            peers: Vec::new(),
         })
     }
 
     /// Rehydrate from a previously-saved IdentityKeyPair (i.e. the bytes from
-    /// `identity_keypair_bytes`). Registration id is freshly drawn — it does
-    /// not need to be stable across reinstalls in our model.
+    /// `identity_keypair_bytes`). Registration id is freshly drawn and any
+    /// prior session/prekey state is lost — for full continuity use
+    /// `from_serialized` instead.
     pub fn from_identity(seed_bytes: &[u8]) -> Result<Self, SignalProtocolError> {
         let id = IdentityKeyPair::try_from(seed_bytes)?;
         let mut rng = OsRng.unwrap_err();
@@ -76,6 +85,7 @@ impl DeviceStore {
             next_pre_key_id: 1,
             next_signed_pre_key_id: 1,
             next_kyber_pre_key_id: 1,
+            peers: Vec::new(),
         })
     }
 
@@ -197,7 +207,32 @@ impl DeviceStore {
             &mut rng,
         )
         .now_or_never()
-        .expect("in-mem store is sync")
+        .expect("in-mem store is sync")?;
+        self.register_peer(peer_identity);
+        Ok(())
+    }
+
+    /// Idempotently track an identity_pub. Used both internally (whenever a
+    /// session lands in libsignal's session store) and from the FFI when the
+    /// host wants to pre-seed a peer (e.g. right after a QR scan, before the
+    /// actual handshake — so the peer survives `serialize`/`from_serialized`
+    /// even if the session never completed).
+    pub fn register_peer(&mut self, peer_identity: &[u8]) {
+        if !self.peers.iter().any(|p| p.as_slice() == peer_identity) {
+            self.peers.push(peer_identity.to_vec());
+        }
+    }
+
+    pub fn forget_peer(&mut self, peer_identity: &[u8]) {
+        self.peers.retain(|p| p.as_slice() != peer_identity);
+        // Also drop the libsignal session and known-identity entry so a
+        // future inbound message can't silently resume the chat.
+        let addr = address_for(peer_identity);
+        let _ = self
+            .inner
+            .session_store
+            .store_session(&addr, &SessionRecord::new_fresh())
+            .now_or_never();
     }
 
     pub fn encrypt(
@@ -240,7 +275,7 @@ impl DeviceStore {
         } else {
             CiphertextMessage::SignalMessage(SignalMessage::try_from(ciphertext)?)
         };
-        message_decrypt(
+        let pt = message_decrypt(
             &parsed,
             &peer_addr,
             &local_addr,
@@ -252,7 +287,185 @@ impl DeviceStore {
             &mut rng,
         )
         .now_or_never()
-        .expect("in-mem store is sync")
+        .expect("in-mem store is sync")?;
+        self.register_peer(peer_identity);
+        Ok(pt)
+    }
+
+    /// Snapshot the entire libsignal store + ratchet state to a versioned
+    /// binary blob. Pair with `from_serialized` for full session continuity
+    /// across launches. Format documented at the top of this module.
+    pub fn serialize(&self) -> Result<Vec<u8>, SignalProtocolError> {
+        let mut out = Vec::with_capacity(8192);
+        out.push(STORE_VERSION);
+        let id_kp = self.local_identity_keypair();
+        write_u32_blob(&mut out, &id_kp.serialize());
+        out.extend_from_slice(&self.registration_id().to_be_bytes());
+        out.extend_from_slice(&self.next_pre_key_id.to_be_bytes());
+        out.extend_from_slice(&self.next_signed_pre_key_id.to_be_bytes());
+        out.extend_from_slice(&self.next_kyber_pre_key_id.to_be_bytes());
+
+        out.extend_from_slice(&(self.peers.len() as u32).to_be_bytes());
+        for peer in &self.peers {
+            write_u16_blob(&mut out, peer);
+        }
+
+        let pre_key_ids: Vec<u32> = self
+            .inner
+            .pre_key_store
+            .all_pre_key_ids()
+            .map(|id| (*id).into())
+            .collect();
+        out.extend_from_slice(&(pre_key_ids.len() as u32).to_be_bytes());
+        for id in pre_key_ids {
+            let record = self
+                .inner
+                .pre_key_store
+                .get_pre_key(id.into())
+                .now_or_never()
+                .expect("in-mem store is sync")?;
+            out.extend_from_slice(&id.to_be_bytes());
+            write_u32_blob(&mut out, &record.serialize()?);
+        }
+
+        let spk_ids: Vec<u32> = self
+            .inner
+            .signed_pre_key_store
+            .all_signed_pre_key_ids()
+            .map(|id| (*id).into())
+            .collect();
+        out.extend_from_slice(&(spk_ids.len() as u32).to_be_bytes());
+        for id in spk_ids {
+            let record = self
+                .inner
+                .signed_pre_key_store
+                .get_signed_pre_key(id.into())
+                .now_or_never()
+                .expect("in-mem store is sync")?;
+            out.extend_from_slice(&id.to_be_bytes());
+            write_u32_blob(&mut out, &record.serialize()?);
+        }
+
+        let kpk_ids: Vec<u32> = self
+            .inner
+            .kyber_pre_key_store
+            .all_kyber_pre_key_ids()
+            .map(|id| (*id).into())
+            .collect();
+        out.extend_from_slice(&(kpk_ids.len() as u32).to_be_bytes());
+        for id in kpk_ids {
+            let record = self
+                .inner
+                .kyber_pre_key_store
+                .get_kyber_pre_key(id.into())
+                .now_or_never()
+                .expect("in-mem store is sync")?;
+            out.extend_from_slice(&id.to_be_bytes());
+            write_u32_blob(&mut out, &record.serialize()?);
+        }
+
+        let mut session_entries = Vec::new();
+        for peer in &self.peers {
+            let addr = address_for(peer);
+            if let Some(session) = self
+                .inner
+                .session_store
+                .load_session(&addr)
+                .now_or_never()
+                .expect("in-mem store is sync")?
+            {
+                let bytes = session.serialize()?;
+                if !bytes.is_empty() {
+                    session_entries.push((peer.clone(), bytes));
+                }
+            }
+        }
+        out.extend_from_slice(&(session_entries.len() as u32).to_be_bytes());
+        for (peer, bytes) in &session_entries {
+            write_u16_blob(&mut out, peer);
+            write_u32_blob(&mut out, bytes);
+        }
+
+        Ok(out)
+    }
+
+    pub fn from_serialized(bytes: &[u8]) -> Result<Self, SignalProtocolError> {
+        let mut r = Cursor::new(bytes);
+        let version = r.u8()?;
+        if version != STORE_VERSION {
+            return Err(SignalProtocolError::InvalidArgument(format!(
+                "unknown store version {version}"
+            )));
+        }
+        let id_kp_bytes = r.u32_blob()?;
+        let id_kp = IdentityKeyPair::try_from(id_kp_bytes)?;
+        let registration_id = r.u32()?;
+        let next_pre_key_id = r.u32()?;
+        let next_signed_pre_key_id = r.u32()?;
+        let next_kyber_pre_key_id = r.u32()?;
+
+        let mut store = InMemSignalProtocolStore::new(id_kp, registration_id)?;
+        let mut peers: Vec<Vec<u8>> = Vec::new();
+        let peer_count = r.u32()? as usize;
+        for _ in 0..peer_count {
+            peers.push(r.u16_blob()?.to_vec());
+        }
+
+        let pre_count = r.u32()? as usize;
+        for _ in 0..pre_count {
+            let id = r.u32()?;
+            let record = PreKeyRecord::deserialize(r.u32_blob()?)?;
+            store
+                .save_pre_key(id.into(), &record)
+                .now_or_never()
+                .expect("in-mem store is sync")?;
+        }
+        let spk_count = r.u32()? as usize;
+        for _ in 0..spk_count {
+            let id = r.u32()?;
+            let record = SignedPreKeyRecord::deserialize(r.u32_blob()?)?;
+            store
+                .save_signed_pre_key(id.into(), &record)
+                .now_or_never()
+                .expect("in-mem store is sync")?;
+        }
+        let kpk_count = r.u32()? as usize;
+        for _ in 0..kpk_count {
+            let id = r.u32()?;
+            let record = KyberPreKeyRecord::deserialize(r.u32_blob()?)?;
+            store
+                .save_kyber_pre_key(id.into(), &record)
+                .now_or_never()
+                .expect("in-mem store is sync")?;
+        }
+        let session_count = r.u32()? as usize;
+        for _ in 0..session_count {
+            let peer = r.u16_blob()?;
+            let session_bytes = r.u32_blob()?;
+            let record = SessionRecord::deserialize(session_bytes)?;
+            let addr = address_for(peer);
+            store
+                .session_store
+                .store_session(&addr, &record)
+                .now_or_never()
+                .expect("in-mem store is sync")?;
+            // Re-pin the peer's identity in the identity store so future
+            // is_trusted_identity checks compare against what we already know.
+            let identity = IdentityKey::decode(peer)?;
+            store
+                .identity_store
+                .save_identity(&addr, &identity)
+                .now_or_never()
+                .expect("in-mem store is sync")?;
+        }
+
+        Ok(Self {
+            inner: store,
+            next_pre_key_id,
+            next_signed_pre_key_id,
+            next_kyber_pre_key_id,
+            peers,
+        })
     }
 }
 
@@ -478,5 +691,59 @@ mod tests {
             bundle.identity_key().unwrap().serialize().as_ref(),
             s.identity_public_bytes().as_slice()
         );
+    }
+
+    #[test]
+    fn serialize_round_trips_full_session() {
+        // Establish Alice ↔ Bob, send a couple of messages, snapshot Alice's
+        // store, rehydrate, and prove the ratchet picks up where it left off.
+        let mut alice = DeviceStore::fresh().unwrap();
+        let mut bob = DeviceStore::fresh().unwrap();
+        let bob_id = bob.identity_public_bytes();
+        let alice_id = alice.identity_public_bytes();
+
+        let bundle = bob.publish_bundle().unwrap();
+        alice.initiate_session(&bob_id, &bundle).unwrap();
+
+        let m1 = alice.encrypt(&bob_id, b"hello").unwrap();
+        let _ = bob.decrypt(&alice_id, &m1.ciphertext, true).unwrap();
+        let m2 = bob.encrypt(&alice_id, b"hi back").unwrap();
+        let _ = alice.decrypt(&bob_id, &m2.ciphertext, false).unwrap();
+
+        let snapshot = alice.serialize().unwrap();
+        let mut alice2 = DeviceStore::from_serialized(&snapshot).unwrap();
+        assert_eq!(alice2.identity_public_bytes(), alice_id);
+
+        // Continue the conversation across the rehydrate boundary.
+        let m3 = alice2.encrypt(&bob_id, b"and again").unwrap();
+        assert!(!m3.is_prekey, "session continued — must be Whisper");
+        let pt3 = bob.decrypt(&alice_id, &m3.ciphertext, false).unwrap();
+        assert_eq!(pt3, b"and again");
+    }
+
+    #[test]
+    fn fresh_store_serializes_to_a_minimal_blob() {
+        let s = DeviceStore::fresh().unwrap();
+        let blob = s.serialize().unwrap();
+        let s2 = DeviceStore::from_serialized(&blob).unwrap();
+        assert_eq!(s.identity_keypair_bytes(), s2.identity_keypair_bytes());
+        assert_eq!(s.registration_id(), s2.registration_id());
+    }
+
+    #[test]
+    fn forget_peer_drops_session() {
+        let mut alice = DeviceStore::fresh().unwrap();
+        let mut bob = DeviceStore::fresh().unwrap();
+        let bob_id = bob.identity_public_bytes();
+        let bundle = bob.publish_bundle().unwrap();
+        alice.initiate_session(&bob_id, &bundle).unwrap();
+        let _ = alice.encrypt(&bob_id, b"hi").unwrap();
+        alice.forget_peer(&bob_id);
+        // Encrypting again must now fail — session was dropped.
+        match alice.encrypt(&bob_id, b"again") {
+            Err(SignalProtocolError::SessionNotFound(_)) => {}
+            Ok(_) => panic!("expected SessionNotFound; encrypt succeeded"),
+            Err(e) => panic!("expected SessionNotFound, got {e:?}"),
+        }
     }
 }

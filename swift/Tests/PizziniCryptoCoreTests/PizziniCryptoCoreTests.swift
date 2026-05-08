@@ -57,4 +57,39 @@ struct PizziniCryptoCoreTests {
         let pubB = try s2.identityPublic()
         #expect(pubA == pubB)
     }
+
+    @Test("Session serialize/init(serialized:) keeps the ratchet alive")
+    func sessionSerializeContinuesRatchet() throws {
+        let alice = try Session()
+        let bob = try Session()
+        let bobBundle = try bob.publishBundle()
+        let bobId = try bob.identityPublic()
+        let aliceId = try alice.identityPublic()
+
+        try alice.initiateSession(peerIdentity: bobId, bundle: bobBundle)
+        let m1 = try alice.encrypt(peerIdentity: bobId, plaintext: Data("hi".utf8))
+        _ = try bob.decrypt(peerIdentity: aliceId, ciphertext: m1.ciphertext, isPreKey: true)
+        let m2 = try bob.encrypt(peerIdentity: aliceId, plaintext: Data("yo".utf8))
+        _ = try alice.decrypt(peerIdentity: bobId, ciphertext: m2.ciphertext, isPreKey: false)
+
+        let snapshot = try alice.serialize()
+        let alice2 = try Session(serialized: snapshot)
+        let m3 = try alice2.encrypt(peerIdentity: bobId, plaintext: Data("still here".utf8))
+        #expect(m3.messageType == .whisper)
+        let pt = try bob.decrypt(peerIdentity: aliceId, ciphertext: m3.ciphertext, isPreKey: false)
+        #expect(String(data: pt, encoding: .utf8) == "still here")
+    }
+
+    @Test("forgetPeer drops the session — encrypt fails afterwards")
+    func sessionForgetPeer() throws {
+        let alice = try Session()
+        let bob = try Session()
+        let bobId = try bob.identityPublic()
+        try alice.initiateSession(peerIdentity: bobId, bundle: try bob.publishBundle())
+        _ = try alice.encrypt(peerIdentity: bobId, plaintext: Data("hi".utf8))
+        try alice.forgetPeer(peerIdentity: bobId)
+        #expect(throws: (any Error).self) {
+            _ = try alice.encrypt(peerIdentity: bobId, plaintext: Data("again".utf8))
+        }
+    }
 }
