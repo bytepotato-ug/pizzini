@@ -80,14 +80,14 @@ final class ChatStore: NSObject {
     /// same QR twice is a no-op. Eagerly requests the peer's bundle if the
     /// relay is up — if both peers have already added each other, the
     /// session goes live within a round-trip.
+    ///
+    /// Note: `card.host` is *informational* — it's the address the peer
+    /// uses to reach the relay. We never adopt it as our own relay host;
+    /// scanning a sim's `127.0.0.1` QR from a real iPhone would otherwise
+    /// silently break our connection.
     func acceptScannedCard(_ raw: String) {
         guard let card = ContactCard.decode(raw) else { return }
         guard let session else { return }
-        if card.host != state.relayHost {
-            // Adopt the peer's relay host — for our dev model (single Mac
-            // running the relay) this should already match.
-            setRelayHost(card.host)
-        }
         if state.contacts.contains(where: { $0.identityPub == card.peerId }) {
             // Already added; just retry the bundle request.
             relay?.requestBundle(fromPeer: card.peerId)
