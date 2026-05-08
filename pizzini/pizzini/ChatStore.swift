@@ -2,194 +2,204 @@ import Foundation
 import PizziniCryptoCore
 import SwiftUI
 
-enum ChatBubbleSide: Sendable {
-    case me, peer
-}
-
-enum ChatMessageKind: Sendable {
-    case preKey
-    case whisper
-    case system
-}
-
-struct ChatLogEntry: Identifiable, Sendable {
-    let id = UUID()
-    let side: ChatBubbleSide
-    let text: String
-    let kind: ChatMessageKind
-    let bytes: Int
-    let timestamp = Date()
-}
-
-/// One coordinator: owns the libsignal Session, the relay connection, and
-/// the per-peer message log. The UI binds to its `@Observable` state.
+/// Coordinator: owns the libsignal `Session`, the `RelayClient`, the
+/// `AppState` (relay host + contacts), and the rules for who's allowed to
+/// talk to us.
+///
+/// Trust model: messages are only accepted from peers whose QR has been
+/// scanned (i.e. identity_pub is in `state.contacts`). Inbound frames from
+/// unknown identities are dropped before reaching libsignal. The Rust
+/// store mirrors the peers list via `registerPeer` / `forgetPeer` so the
+/// trusted set survives `serialize`/`init(serialized:)`.
 @MainActor
 @Observable
 final class ChatStore: NSObject {
-    // Persisted (Keychain) — survives launches.
-    private static let identityAccount = "long-term-identity"
-    private static let relayAccount = "relay-host"
-    private static let defaultRelayHost = "127.0.0.1"
     private static let relayPort: UInt16 = 7777
 
+    // Public, observable.
     var relayState: RelayClient.State = .idle
-    var relayHost: String = ""
-    private(set) var myCard: ContactCard?
-    private(set) var peer: Data?
-    private(set) var sessionEstablished = false
-    private(set) var log: [ChatLogEntry] = []
+    private(set) var state: AppState
     private(set) var initError: String?
+    var myCard: ContactCard? {
+        guard let myId = myIdentityPublicCached else { return nil }
+        return ContactCard(peerId: myId, host: state.relayHost, port: Self.relayPort)
+    }
 
+    // Internal.
     private var session: Session?
     private var relay: RelayClient?
+    private var myIdentityPublicCached: Data?
 
     override init() {
+        self.state = Storage.loadAppState()
         super.init()
         do {
-            let session = try resumeOrCreateSession()
-            self.session = session
-            let id = try session.identityPublic()
-            let host = loadRelayHost() ?? Self.defaultRelayHost
-            self.relayHost = host
-            self.myCard = ContactCard(peerId: id, host: host, port: Self.relayPort)
+            let s = try Storage.loadOrCreateSession()
+            self.session = s
+            self.myIdentityPublicCached = try s.identityPublic()
             connectRelay()
         } catch {
             self.initError = String(describing: error)
         }
     }
 
-    // MARK: - Identity / setup
-
-    private func resumeOrCreateSession() throws -> Session {
-        if let seed = Keychain.read(account: Self.identityAccount) {
-            return try Session(identitySeed: seed)
-        }
-        let s = try Session()
-        let bytes = try s.identityKeypairBytes()
-        _ = Keychain.write(bytes, account: Self.identityAccount)
-        return s
-    }
-
-    private func loadRelayHost() -> String? {
-        guard let data = Keychain.read(account: Self.relayAccount) else { return nil }
-        return String(data: data, encoding: .utf8)
-    }
-
-    func setRelayHost(_ host: String) {
-        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        relayHost = trimmed
-        if let bytes = trimmed.data(using: .utf8) {
-            _ = Keychain.write(bytes, account: Self.relayAccount)
-        }
-        if let myId = try? session?.identityPublic() {
-            myCard = ContactCard(peerId: myId, host: trimmed, port: Self.relayPort)
-        }
-        connectRelay()
-    }
-
-    func resetIdentity() {
-        Keychain.delete(account: Self.identityAccount)
-        log.removeAll()
-        peer = nil
-        sessionEstablished = false
-        do {
-            session = try resumeOrCreateSession()
-            if let id = try session?.identityPublic() {
-                myCard = ContactCard(peerId: id, host: relayHost, port: Self.relayPort)
-            }
-            relay?.disconnect()
-            connectRelay()
-        } catch {
-            initError = String(describing: error)
-        }
-    }
-
     // MARK: - Relay
 
     private func connectRelay() {
-        guard let session, let myCard else {
-            NSLog("[pizzini] connectRelay: skipped (no session or card)")
-            return
-        }
+        guard let session else { return }
         relay?.disconnect()
-        let myId: Data
-        do { myId = try session.identityPublic() } catch {
-            NSLog("[pizzini] connectRelay: identityPublic failed: \(error)")
+        guard let myId = myIdentityPublicCached ?? (try? session.identityPublic()) else {
             return
         }
         let client = RelayClient(myIdentity: myId)
         client.delegate = self
         self.relay = client
-        NSLog("[pizzini] connecting to \(myCard.host):\(Self.relayPort)")
-        client.connect(to: myCard.host, port: Self.relayPort)
+        NSLog("[pizzini] connecting to \(state.relayHost):\(Self.relayPort)")
+        client.connect(to: state.relayHost, port: Self.relayPort)
     }
 
-    // MARK: - Contact pairing
+    func setRelayHost(_ host: String) {
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != state.relayHost else { return }
+        state.relayHost = trimmed
+        Storage.persist(appState: state)
+        connectRelay()
+    }
 
+    // MARK: - Contacts
+
+    func contact(forIdentity peerId: Data) -> Contact? {
+        state.contacts.first { $0.identityPub == peerId }
+    }
+
+    private func contactIndex(forIdentity peerId: Data) -> Int? {
+        state.contacts.firstIndex { $0.identityPub == peerId }
+    }
+
+    /// Add a freshly-scanned (or pasted) contact. Idempotent: scanning the
+    /// same QR twice is a no-op. Eagerly requests the peer's bundle if the
+    /// relay is up — if both peers have already added each other, the
+    /// session goes live within a round-trip.
     func acceptScannedCard(_ raw: String) {
-        guard let card = ContactCard.decode(raw) else {
-            appendSystem("Could not decode QR: \(raw)")
-            return
-        }
+        guard let card = ContactCard.decode(raw) else { return }
         guard let session else { return }
-        // Treat the scanned card's host as authoritative — it points at
-        // whichever relay the peer is on. For dev, both peers connect to
-        // the same Mac, so this should already match relayHost.
-        if card.host != relayHost {
-            appendSystem("Switching relay to \(card.host) (from peer card)")
+        if card.host != state.relayHost {
+            // Adopt the peer's relay host — for our dev model (single Mac
+            // running the relay) this should already match.
             setRelayHost(card.host)
         }
-        peer = card.peerId
-        sessionEstablished = false
-        appendSystem("Scanned peer \(short(card.peerId)). Requesting bundle…")
-        guard relayState == .connected else {
-            appendSystem("Relay not connected yet. Will retry once HELLO completes.")
+        if state.contacts.contains(where: { $0.identityPub == card.peerId }) {
+            // Already added; just retry the bundle request.
+            relay?.requestBundle(fromPeer: card.peerId)
             return
         }
-        relay?.requestBundle(fromPeer: card.peerId)
-        _ = session
+        let contact = Contact(
+            identityPub: card.peerId,
+            displayName: Contact.defaultName(for: card.peerId)
+        )
+        state.contacts.append(contact)
+        try? session.registerPeer(peerIdentity: card.peerId)
+        persistAll()
+        if relayState == .connected {
+            relay?.requestBundle(fromPeer: card.peerId)
+        }
     }
 
-    func send(_ text: String) {
+    func send(_ text: String, to contact: Contact) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let session, let peer, let relay else { return }
-        guard sessionEstablished else {
-            appendSystem("Session not established yet.")
+        guard !trimmed.isEmpty,
+              let session,
+              let relay,
+              let idx = contactIndex(forIdentity: contact.identityPub)
+        else { return }
+        guard contact.sessionEstablished else {
+            appendSystem("Session not established yet — waiting for the other side to scan you.", to: idx)
             return
         }
         do {
             let result = try session.encrypt(
-                peerIdentity: peer,
+                peerIdentity: contact.identityPub,
                 plaintext: Data(trimmed.utf8)
             )
             relay.send(
-                toPeer: peer,
+                toPeer: contact.identityPub,
                 ciphertext: result.ciphertext,
                 isPreKey: result.messageType == .preKey
             )
-            log.append(
-                ChatLogEntry(
-                    side: .me,
-                    text: trimmed,
-                    kind: result.messageType == .preKey ? .preKey : .whisper,
-                    bytes: result.ciphertext.count
-                )
+            let entry = PersistedMessage(
+                side: .me,
+                text: trimmed,
+                kind: result.messageType == .preKey ? .preKey : .whisper,
+                bytes: result.ciphertext.count
             )
+            state.contacts[idx].log.append(entry)
+            state.contacts[idx].lastMessageAt = entry.timestamp
+            persistAll()
         } catch {
-            appendSystem("Encrypt failed: \(error)")
+            appendSystem("Encrypt failed: \(error)", to: idx)
+        }
+    }
+
+    func deleteChat(_ contact: Contact) {
+        guard let idx = contactIndex(forIdentity: contact.identityPub) else { return }
+        state.contacts[idx].log.removeAll()
+        state.contacts[idx].lastMessageAt = nil
+        Storage.persist(appState: state)
+    }
+
+    func deleteContact(_ contact: Contact) {
+        guard let idx = contactIndex(forIdentity: contact.identityPub) else { return }
+        state.contacts.remove(at: idx)
+        try? session?.forgetPeer(peerIdentity: contact.identityPub)
+        persistAll()
+    }
+
+    func deleteAllChats() {
+        for i in state.contacts.indices {
+            state.contacts[i].log.removeAll()
+            state.contacts[i].lastMessageAt = nil
+        }
+        Storage.persist(appState: state)
+    }
+
+    func rename(_ contact: Contact, to newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let idx = contactIndex(forIdentity: contact.identityPub)
+        else { return }
+        state.contacts[idx].displayName = trimmed
+        Storage.persist(appState: state)
+    }
+
+    func resetIdentity() {
+        relay?.disconnect()
+        Storage.resetEverything()
+        state = AppState()
+        do {
+            let s = try Storage.loadOrCreateSession()
+            session = s
+            myIdentityPublicCached = try s.identityPublic()
+            connectRelay()
+            initError = nil
+        } catch {
+            initError = String(describing: error)
         }
     }
 
     // MARK: - Helpers
 
-    private func appendSystem(_ text: String) {
-        log.append(ChatLogEntry(side: .me, text: text, kind: .system, bytes: 0))
+    private func persistAll() {
+        Storage.persist(appState: state)
+        if let session {
+            try? Storage.persist(session: session)
+        }
     }
 
-    private func short(_ data: Data) -> String {
-        let head = data.prefix(4).map { String(format: "%02x", $0) }.joined()
-        return head + "…"
+    private func appendSystem(_ text: String, to idx: Int) {
+        state.contacts[idx].log.append(
+            PersistedMessage(side: .me, text: text, kind: .system, bytes: 0)
+        )
+        Storage.persist(appState: state)
     }
 }
 
@@ -197,9 +207,13 @@ extension ChatStore: RelayClientDelegate {
     nonisolated func relayClient(_ client: RelayClient, didChange state: RelayClient.State) {
         Task { @MainActor in
             self.relayState = state
-            if state == .connected, let peer = self.peer, !self.sessionEstablished {
-                self.appendSystem("Relay reconnected. Re-requesting bundle.")
-                client.requestBundle(fromPeer: peer)
+            if state == .connected {
+                // Retry bundle requests for any contact that hasn't yet
+                // completed the handshake — the typical reason is "the
+                // other side hadn't scanned us when we last asked".
+                for c in self.state.contacts where !c.sessionEstablished {
+                    client.requestBundle(fromPeer: c.identityPub)
+                }
             }
         }
     }
@@ -211,12 +225,11 @@ extension ChatStore: RelayClientDelegate {
         isPreKey: Bool
     ) {
         Task { @MainActor in
-            guard let session = self.session else { return }
-            // First contact via incoming PreKey: the peer initiated, so we
-            // adopt them as our peer and store the contact.
-            if self.peer == nil {
-                self.peer = fromPeer
-                self.appendSystem("Incoming PreKey from \(self.short(fromPeer)) — adopting as peer.")
+            guard let session = self.session,
+                  let idx = self.contactIndex(forIdentity: fromPeer)
+            else {
+                NSLog("[pizzini] dropped SEND from unknown peer \(self.short(fromPeer))")
+                return
             }
             do {
                 let pt = try session.decrypt(
@@ -224,31 +237,37 @@ extension ChatStore: RelayClientDelegate {
                     ciphertext: ciphertext,
                     isPreKey: isPreKey
                 )
-                self.sessionEstablished = true
                 let text = String(data: pt, encoding: .utf8) ?? "<\(pt.count) non-utf8 bytes>"
-                self.log.append(
-                    ChatLogEntry(
-                        side: .peer,
-                        text: text,
-                        kind: isPreKey ? .preKey : .whisper,
-                        bytes: ciphertext.count
-                    )
+                let entry = PersistedMessage(
+                    side: .peer,
+                    text: text,
+                    kind: isPreKey ? .preKey : .whisper,
+                    bytes: ciphertext.count
                 )
+                self.state.contacts[idx].log.append(entry)
+                self.state.contacts[idx].lastMessageAt = entry.timestamp
+                self.state.contacts[idx].sessionEstablished = true
+                self.persistAll()
             } catch {
-                self.appendSystem("Decrypt failed: \(error)")
+                NSLog("[pizzini] decrypt failed for \(self.short(fromPeer)): \(error)")
             }
         }
     }
 
     nonisolated func relayClient(_ client: RelayClient, didReceiveBundleRequestFrom fromPeer: Data) {
         Task { @MainActor in
-            guard let session = self.session else { return }
+            guard self.contactIndex(forIdentity: fromPeer) != nil,
+                  let session = self.session
+            else {
+                NSLog("[pizzini] dropped BUNDLE_REQUEST from unknown peer \(self.short(fromPeer))")
+                return
+            }
             do {
                 let bundle = try session.publishBundle()
                 client.sendBundle(toPeer: fromPeer, bundle: bundle)
-                self.appendSystem("Sent bundle to \(self.short(fromPeer)).")
+                self.persistAll()
             } catch {
-                self.appendSystem("Bundle generation failed: \(error)")
+                NSLog("[pizzini] publishBundle failed: \(error)")
             }
         }
     }
@@ -259,15 +278,24 @@ extension ChatStore: RelayClientDelegate {
         bundle: Data
     ) {
         Task { @MainActor in
-            guard let session = self.session else { return }
+            guard let session = self.session,
+                  let idx = self.contactIndex(forIdentity: fromPeer)
+            else {
+                NSLog("[pizzini] dropped BUNDLE_RESPONSE from unknown peer \(self.short(fromPeer))")
+                return
+            }
             do {
                 try session.initiateSession(peerIdentity: fromPeer, bundle: bundle)
-                if self.peer == nil { self.peer = fromPeer }
-                self.sessionEstablished = true
-                self.appendSystem("PQXDH complete with \(self.short(fromPeer)). You can chat.")
+                self.state.contacts[idx].sessionEstablished = true
+                self.persistAll()
             } catch {
-                self.appendSystem("initiateSession failed: \(error)")
+                NSLog("[pizzini] initiateSession failed: \(error)")
             }
         }
+    }
+
+    private func short(_ data: Data) -> String {
+        let head = data.prefix(4).map { String(format: "%02x", $0) }.joined()
+        return head + "…"
     }
 }
