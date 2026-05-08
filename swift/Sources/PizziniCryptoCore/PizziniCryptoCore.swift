@@ -20,6 +20,10 @@ public enum PizziniCryptoCore {
 public struct IdentityKeyPair: Sendable {
     public let bytes: Data
 
+    public init(bytes: Data) {
+        self.bytes = bytes
+    }
+
     /// Generate a fresh identity keypair using the OS CSPRNG.
     public static func generate() throws -> IdentityKeyPair {
         var buffer = [UInt8](repeating: 0, count: 256)

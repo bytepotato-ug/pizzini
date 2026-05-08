@@ -13,6 +13,9 @@ struct ContentView: View {
     @State private var initError: String?
     @State private var draft: String = ""
     @State private var sender: Sender = .alice
+    @State private var identity: IdentityKeyPair?
+
+    private static let identityAccount = "long-term-identity"
 
     var body: some View {
         VStack(spacing: 0) {
@@ -30,6 +33,7 @@ struct ContentView: View {
             }
         }
         .task {
+            loadOrCreateIdentity()
             do {
                 model = try ChatModel()
             } catch {
@@ -38,18 +42,72 @@ struct ContentView: View {
         }
     }
 
+    private func loadOrCreateIdentity() {
+        if let existing = Keychain.read(account: Self.identityAccount) {
+            self.identity = IdentityKeyPair(bytes: existing)
+            return
+        }
+        do {
+            let kp = try IdentityKeyPair.generate()
+            _ = Keychain.write(kp.bytes, account: Self.identityAccount)
+            self.identity = kp
+        } catch {
+            // Identity is informational for the loopback demo; if generation
+            // fails the chat still works.
+        }
+    }
+
+    private func resetIdentity() {
+        Keychain.delete(account: Self.identityAccount)
+        self.identity = nil
+        loadOrCreateIdentity()
+    }
+
     private var header: some View {
-        HStack {
-            Image(systemName: "lock.shield")
-                .foregroundStyle(.tint)
-            Text("Pizzini")
-                .font(.headline)
-            Spacer()
-            Text(PizziniCryptoCore.version)
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Image(systemName: "lock.shield")
+                    .foregroundStyle(.tint)
+                Text("Pizzini")
+                    .font(.headline)
+                Spacer()
+                Text(PizziniCryptoCore.version)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 8) {
+                Text("identity")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(fingerprint)
+                    .font(.caption2.monospaced())
+                Spacer()
+                Menu {
+                    Button(role: .destructive) {
+                        resetIdentity()
+                    } label: {
+                        Label("Reset identity", systemImage: "arrow.counterclockwise")
+                    }
+                    Button {
+                        if let model = model { try? model.reset() }
+                    } label: {
+                        Label("Reset session", systemImage: "bubble.left.and.bubble.right")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.caption)
+                }
+            }
         }
         .padding()
+    }
+
+    private var fingerprint: String {
+        guard let id = identity else { return "—" }
+        let bytes = Array(id.bytes)
+        let hexHead = bytes.prefix(4).map { String(format: "%02x", $0) }.joined()
+        let hexTail = bytes.suffix(4).map { String(format: "%02x", $0) }.joined()
+        return "\(hexHead)…\(hexTail)  (\(bytes.count) B)"
     }
 
     private func messages(model: ChatModel) -> some View {
@@ -156,10 +214,15 @@ struct ChatMessage: Identifiable, Sendable {
 @Observable
 final class ChatModel {
     var messages: [ChatMessage] = []
-    private let session: LoopbackSession
+    private var session: LoopbackSession
 
     init() throws {
         self.session = try LoopbackSession()
+    }
+
+    func reset() throws {
+        self.session = try LoopbackSession()
+        self.messages.removeAll()
     }
 
     func send(_ text: String, from sender: Sender) {
