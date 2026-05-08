@@ -1,6 +1,7 @@
 import Foundation
 import PizziniCryptoCore
 import SwiftUI
+import UserNotifications
 
 /// Coordinator: owns the libsignal `Session`, the `RelayClient`, the
 /// `AppState` (relay host + contacts), and the rules for who's allowed to
@@ -47,6 +48,14 @@ final class ChatStore: NSObject {
         } catch {
             self.initError = String(describing: error)
         }
+        requestBadgeAuthorization()
+        refreshAppBadge()
+    }
+
+    /// First-launch ask for the badge bit only. Sound/alert come later
+    /// when push notifications land.
+    private func requestBadgeAuthorization() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.badge]) { _, _ in }
     }
 
     // MARK: - Relay
@@ -157,7 +166,9 @@ final class ChatStore: NSObject {
         guard let idx = contactIndex(forIdentity: contact.identityPub) else { return }
         state.contacts[idx].log.removeAll()
         state.contacts[idx].lastMessageAt = nil
+        state.contacts[idx].lastSeenAt = Date()
         Storage.persist(appState: state)
+        refreshAppBadge()
     }
 
     func deleteContact(_ contact: Contact) {
@@ -168,11 +179,22 @@ final class ChatStore: NSObject {
     }
 
     func deleteAllChats() {
+        let now = Date()
         for i in state.contacts.indices {
             state.contacts[i].log.removeAll()
             state.contacts[i].lastMessageAt = nil
+            state.contacts[i].lastSeenAt = now
         }
         Storage.persist(appState: state)
+        refreshAppBadge()
+    }
+
+    /// Called when the user enters a chat — clears its unread count.
+    func markRead(contactID: UUID) {
+        guard let idx = state.contacts.firstIndex(where: { $0.id == contactID }) else { return }
+        state.contacts[idx].lastSeenAt = Date()
+        Storage.persist(appState: state)
+        refreshAppBadge()
     }
 
     func rename(_ contact: Contact, to newName: String) {
@@ -197,6 +219,7 @@ final class ChatStore: NSObject {
         } catch {
             initError = String(describing: error)
         }
+        refreshAppBadge()
     }
 
     // MARK: - Helpers
@@ -206,6 +229,15 @@ final class ChatStore: NSObject {
         if let session {
             try? Storage.persist(session: session)
         }
+        refreshAppBadge()
+    }
+
+    /// Total unread → app icon. Uses the modern API (the
+    /// `UIApplication.shared.applicationIconBadgeNumber` setter is
+    /// deprecated in iOS 17 and we target ≥ 17).
+    private func refreshAppBadge() {
+        let count = state.totalUnread
+        UNUserNotificationCenter.current().setBadgeCount(count) { _ in }
     }
 
     private func appendSystem(_ text: String, to idx: Int) {

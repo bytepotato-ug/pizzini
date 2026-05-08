@@ -29,6 +29,11 @@ struct ChatView: View {
             }
             .navigationTitle(contact.displayName)
             .navigationBarTitleDisplayMode(.inline)
+            .onAppear { store.markRead(contactID: contactID) }
+            .onDisappear { store.markRead(contactID: contactID) }
+            .onChange(of: contact.log.count) { _, _ in
+                store.markRead(contactID: contactID)
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {

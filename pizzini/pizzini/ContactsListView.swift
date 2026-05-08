@@ -124,7 +124,7 @@ private struct ContactRow: View {
             statusDot
             VStack(alignment: .leading, spacing: 2) {
                 Text(contact.displayName)
-                    .font(.body)
+                    .font(unread > 0 ? .body.weight(.semibold) : .body)
                 if let last = contact.log.last {
                     Text(preview(last))
                         .font(.caption)
@@ -136,8 +136,24 @@ private struct ContactRow: View {
                         .foregroundStyle(.orange)
                 }
             }
+            Spacer(minLength: 8)
+            if unread > 0 {
+                unreadBadge
+            }
         }
         .padding(.vertical, 4)
+    }
+
+    private var unread: Int { contact.unreadCount }
+
+    private var unreadBadge: some View {
+        Text("\(unread)")
+            .font(.caption2.bold().monospacedDigit())
+            .foregroundStyle(.white)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(Color.accentColor))
+            .accessibilityLabel("\(unread) unread")
     }
 
     private var statusDot: some View {

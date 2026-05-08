@@ -47,6 +47,10 @@ struct Contact: Codable, Identifiable, Sendable {
     var sessionEstablished: Bool
     var log: [PersistedMessage]
     var lastMessageAt: Date?
+    /// Wall-clock the user last opened this chat. Inbound messages
+    /// (`side == .peer`) with `timestamp > lastSeenAt` are unread. Nil
+    /// means "never opened" — every received message is unread.
+    var lastSeenAt: Date?
     let addedAt: Date
 
     init(
@@ -56,6 +60,7 @@ struct Contact: Codable, Identifiable, Sendable {
         sessionEstablished: Bool = false,
         log: [PersistedMessage] = [],
         lastMessageAt: Date? = nil,
+        lastSeenAt: Date? = nil,
         addedAt: Date = Date()
     ) {
         self.id = id
@@ -64,7 +69,15 @@ struct Contact: Codable, Identifiable, Sendable {
         self.sessionEstablished = sessionEstablished
         self.log = log
         self.lastMessageAt = lastMessageAt
+        self.lastSeenAt = lastSeenAt
         self.addedAt = addedAt
+    }
+
+    var unreadCount: Int {
+        let cutoff = lastSeenAt ?? .distantPast
+        return log.reduce(0) { acc, msg in
+            (msg.side == .peer && msg.timestamp > cutoff) ? acc + 1 : acc
+        }
     }
 
     /// Default name for newly-scanned contacts: short fingerprint of the
@@ -74,6 +87,10 @@ struct Contact: Codable, Identifiable, Sendable {
         let tail = identityPub.suffix(2).map { String(format: "%02x", $0) }.joined()
         return "peer \(head)…\(tail)"
     }
+}
+
+extension AppState {
+    var totalUnread: Int { contacts.reduce(0) { $0 + $1.unreadCount } }
 }
 
 /// Everything the UI needs that lives outside the libsignal store. Encoded
