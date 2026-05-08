@@ -115,7 +115,7 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(spacing: 12) {
                     if model.messages.isEmpty {
-                        emptyState
+                        emptyStateView(model: model)
                     } else {
                         ForEach(model.messages) { m in
                             MessageRow(message: m).id(m.id)
@@ -133,8 +133,8 @@ struct ContentView: View {
         }
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 8) {
+    private func emptyStateView(model: ChatModel) -> some View {
+        VStack(spacing: 12) {
             Text("session ready")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -142,8 +142,27 @@ struct ContentView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+            Button("Run a demo exchange") {
+                Task { await runDemo(model: model) }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .padding(.top, 4)
         }
         .padding(.top, 48)
+    }
+
+    private func runDemo(model: ChatModel) async {
+        let script: [(Sender, String)] = [
+            (.alice, "hi bob"),
+            (.bob,   "hey alice"),
+            (.alice, "look at this PQ ratchet flip"),
+            (.bob,   "wild — Whisper now"),
+        ]
+        for (sender, text) in script {
+            try? await Task.sleep(for: .milliseconds(450))
+            model.send(text, from: sender)
+        }
     }
 
     private func composer(model: ChatModel) -> some View {
