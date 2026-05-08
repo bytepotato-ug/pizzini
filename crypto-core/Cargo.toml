@@ -20,5 +20,10 @@ rand = "0.9"
 [build-dependencies]
 cbindgen = "0.29"
 
+[dev-dependencies]
+# now_or_never() — the in-mem libsignal stores resolve futures synchronously,
+# so we don't need a runtime in tests/examples.
+futures-util = "0.3"
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

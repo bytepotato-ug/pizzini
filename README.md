@@ -64,7 +64,7 @@ pizzini/
 - [x] Repo skeleton
 - [x] Rust crypto core (libsignal wrapper, FFI) — minimal: identity keypair gen + cbindgen
 - [ ] iOS app skeleton (SwiftUI, Tor.framework, Keychain integration)
-- [ ] PQXDH handshake working end-to-end (CLI test client)
+- [x] PQXDH handshake working end-to-end (CLI test client) — `cargo run --example pqxdh_roundtrip`
 - [ ] Triple Ratchet messaging working
 - [ ] Stateless relay server
 - [ ] Contact establishment (QR / invite link)
@@ -84,3 +84,4 @@ AGPL-3.0-or-later. See [LICENSE](LICENSE).
 
 - 2026-05-08 — repo skeleton, Cargo workspace, iOS project renamed pizzini.app→pizzini — next: libsignal wrapper in crypto-core
 - 2026-05-08 — libsignal-protocol pinned at v0.93.2; FFI surface for IdentityKeyPair generation; cbindgen header generation wired via build.rs; 5 tests pass — next: PreKey bundle generation + session establishment in crypto-core, then iOS bridging
+- 2026-05-08 — full PQXDH handshake roundtrip working in-process (Alice ↔ Bob via InMemSignalProtocolStore), including bidirectional ratchet step (PreKey→Whisper transition); 7 tests pass — next: iOS bridging (XCFramework build phase + Swift wrappers)
