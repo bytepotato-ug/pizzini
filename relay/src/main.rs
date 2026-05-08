@@ -40,6 +40,10 @@
 //!   u16 from_len + from_id_bytes
 //!   bundle bytes (consume to end-of-payload)
 //!
+//! REGISTER_PUSH  (type = 5) — client publishes its APNs device token so
+//!                              we can wake it on offline SEND:
+//!   u16 token_len + token_bytes
+//!
 //! Bundle exchange exists because Kyber1024 (~1568 B) does not fit a
 //! comfortably-scannable QR. Discovery QRs carry only `peer_id +
 //! lan_address`; the actual bundle hops through the relay on first contact.
@@ -47,9 +51,13 @@
 //! For our stateless relay, both peers must be online for first contact.
 //! ```
 //!
-//! Stateless: if the recipient is not currently connected, the SEND is
-//! dropped on the floor. There is no queue, no ack, no retry. Senders that
-//! care should reattempt at the application layer once the peer reconnects.
+//! Stateless: if the recipient is not currently connected, the SEND
+//! payload is dropped (no queue, no ack, no retry). If the recipient
+//! has previously REGISTER_PUSH'd, we additionally fire a payload-opaque
+//! "New message" push via APNs as a wake-up. The push carries no peer
+//! information — see `apns.rs` for the threat-model rationale.
+
+mod apns;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -60,16 +68,26 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
+use crate::apns::{ApnsClient, ApnsConfig};
+
 const PORT: u16 = 7777;
 const FRAME_TYPE_HELLO: u8 = 1;
 const FRAME_TYPE_SEND: u8 = 2;
 const FRAME_TYPE_BUNDLE_REQUEST: u8 = 3;
 const FRAME_TYPE_BUNDLE_RESPONSE: u8 = 4;
+const FRAME_TYPE_REGISTER_PUSH: u8 = 5;
 const MAX_FRAME_BYTES: u32 = 1024 * 1024;
+/// Hard ceiling on a single client's APNs device token. Real tokens are
+/// 32 bytes today; Apple has hinted they may grow. Reject anything above
+/// this so we don't memo absurd buffers per peer.
+const MAX_PUSH_TOKEN_BYTES: usize = 256;
 
 type PeerId = Vec<u8>;
 type Outbox = mpsc::UnboundedSender<Vec<u8>>;
 type Routes = Arc<Mutex<HashMap<PeerId, Outbox>>>;
+/// Lives across reconnects — that's the whole point: we look up the
+/// token when the recipient is *not* currently connected.
+type PushTokens = Arc<Mutex<HashMap<PeerId, Vec<u8>>>>;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -90,13 +108,41 @@ async fn main() -> std::io::Result<()> {
     }
     println!("  DEV BUILD — clearnet, no queueing, no auth. Tor-only in prod.");
 
+    let apns = match ApnsConfig::from_env() {
+        Ok(Some(cfg)) => match ApnsClient::new(cfg) {
+            Ok(c) => {
+                println!("  apns: enabled ({:?})", c.endpoint());
+                Some(Arc::new(c))
+            }
+            Err(e) => {
+                eprintln!("  apns: failed to initialise — push disabled: {e}");
+                None
+            }
+        },
+        Ok(None) => {
+            println!(
+                "  apns: disabled (set APNS_AUTH_KEY_PATH, APNS_TEAM_ID, APNS_KEY_ID to enable)"
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("  apns: misconfigured — push disabled: {e}");
+            None
+        }
+    };
+
     let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+    let push_tokens: PushTokens = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         let routes = routes.clone();
+        let push_tokens = push_tokens.clone();
+        let apns = apns.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, routes, peer_addr).await {
+            if let Err(e) =
+                handle_connection(stream, routes, push_tokens, apns, peer_addr).await
+            {
                 eprintln!("[{peer_addr}] connection closed: {e}");
             }
         });
@@ -106,6 +152,8 @@ async fn main() -> std::io::Result<()> {
 async fn handle_connection(
     stream: TcpStream,
     routes: Routes,
+    push_tokens: PushTokens,
+    apns: Option<Arc<ApnsClient>>,
     peer_addr: SocketAddr,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
@@ -146,7 +194,8 @@ async fn handle_connection(
         }
     });
 
-    let read_result = read_loop(&mut reader, &routes, &peer_id).await;
+    let read_result =
+        read_loop(&mut reader, &routes, &push_tokens, apns.clone(), &peer_id).await;
 
     {
         let mut map = routes.lock().await;
@@ -164,6 +213,8 @@ async fn handle_connection(
 async fn read_loop(
     reader: &mut (impl AsyncReadExt + Unpin),
     routes: &Routes,
+    push_tokens: &PushTokens,
+    apns: Option<Arc<ApnsClient>>,
     self_id: &[u8],
 ) -> std::io::Result<()> {
     loop {
@@ -177,6 +228,29 @@ async fn read_loop(
         }
         match frame[0] {
             FRAME_TYPE_HELLO => return Err(invalid("duplicate HELLO")),
+            FRAME_TYPE_REGISTER_PUSH => {
+                let token = match parse_register_push(&frame[1..]) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("malformed REGISTER_PUSH: {e}");
+                        continue;
+                    }
+                };
+                push_tokens
+                    .lock()
+                    .await
+                    .insert(self_id.to_vec(), token);
+                println!(
+                    "REGISTER_PUSH from {}: token recorded ({} byte token)",
+                    short_hex(self_id),
+                    push_tokens
+                        .lock()
+                        .await
+                        .get(self_id)
+                        .map(|v| v.len())
+                        .unwrap_or(0),
+                );
+            }
             FRAME_TYPE_SEND
             | FRAME_TYPE_BUNDLE_REQUEST
             | FRAME_TYPE_BUNDLE_RESPONSE => {
@@ -196,19 +270,46 @@ async fn read_loop(
                     continue;
                 }
                 let map = routes.lock().await;
-                let Some(target) = map.get(&parsed.to_id) else {
+                if let Some(target) = map.get(&parsed.to_id) {
+                    let _ = target.send(frame);
+                } else {
+                    drop(map);
                     println!(
                         "drop frame {} → {}: recipient offline",
                         short_hex(&parsed.from_id),
                         short_hex(&parsed.to_id),
                     );
-                    continue;
-                };
-                let _ = target.send(frame);
+                    if frame[0] == FRAME_TYPE_SEND {
+                        maybe_send_push(&parsed.to_id, push_tokens, apns.as_ref()).await;
+                    }
+                }
             }
             other => return Err(invalid(&format!("unknown frame type {other}"))),
         }
     }
+}
+
+/// Look up the recipient's push token; if present and APNs is configured,
+/// fire a payload-opaque "New message" wake-up. Errors are logged only —
+/// push is best-effort and must never break relay forwarding.
+async fn maybe_send_push(
+    recipient: &[u8],
+    push_tokens: &PushTokens,
+    apns: Option<&Arc<ApnsClient>>,
+) {
+    let Some(client) = apns else { return };
+    let token = match push_tokens.lock().await.get(recipient).cloned() {
+        Some(t) => t,
+        None => return,
+    };
+    let recipient_dbg = short_hex(recipient);
+    let client = client.clone();
+    tokio::spawn(async move {
+        match client.send_wakeup(&token).await {
+            Ok(_) => println!("push: sent wake-up to {recipient_dbg}"),
+            Err(e) => eprintln!("push: failed for {recipient_dbg}: {e}"),
+        }
+    });
 }
 
 struct ParsedRouted {
@@ -231,6 +332,24 @@ fn parse_routed(body: &[u8]) -> std::io::Result<ParsedRouted> {
     let from_id = c.u16_blob()?.to_vec();
     // Anything after the routing prefix is opaque to the relay.
     Ok(ParsedRouted { to_id, from_id })
+}
+
+fn parse_register_push(body: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut c = Cursor::new(body);
+    let token = c.u16_blob()?.to_vec();
+    if !c.is_empty() {
+        return Err(invalid("trailing bytes after REGISTER_PUSH"));
+    }
+    if token.is_empty() {
+        return Err(invalid("REGISTER_PUSH with empty token"));
+    }
+    if token.len() > MAX_PUSH_TOKEN_BYTES {
+        return Err(invalid(&format!(
+            "REGISTER_PUSH token too large: {} bytes",
+            token.len()
+        )));
+    }
+    Ok(token)
 }
 
 async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> std::io::Result<Vec<u8>> {

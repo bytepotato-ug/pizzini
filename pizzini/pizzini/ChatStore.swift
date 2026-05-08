@@ -36,6 +36,9 @@ final class ChatStore: NSObject {
     private var session: Session?
     private var relay: RelayClient?
     private var myIdentityPublicCached: Data?
+    /// Latest APNs token. Stashed so a relay-host change (which builds
+    /// a fresh `RelayClient`) re-publishes the token automatically.
+    private var pushTokenCached: Data?
 
     override init() {
         self.state = Storage.loadAppState()
@@ -48,14 +51,15 @@ final class ChatStore: NSObject {
         } catch {
             self.initError = String(describing: error)
         }
-        requestBadgeAuthorization()
         refreshAppBadge()
     }
 
-    /// First-launch ask for the badge bit only. Sound/alert come later
-    /// when push notifications land.
-    private func requestBadgeAuthorization() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.badge]) { _, _ in }
+    /// Forwards the APNs device token to the relay so it can wake us
+    /// when a SEND lands while we're disconnected. Called by
+    /// `AppDelegate` once iOS has issued a token.
+    func publishPushToken(_ token: Data) {
+        pushTokenCached = token
+        relay?.registerPush(token: token)
     }
 
     // MARK: - Relay
@@ -75,6 +79,9 @@ final class ChatStore: NSObject {
         }
         let client = RelayClient(myIdentity: myId)
         client.delegate = self
+        if let token = pushTokenCached {
+            client.registerPush(token: token)
+        }
         self.relay = client
         NSLog("[pizzini] connecting to \(state.relayHost):\(Self.relayPort)")
         client.connect(to: state.relayHost, port: Self.relayPort)

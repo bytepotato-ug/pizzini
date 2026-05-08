@@ -42,6 +42,7 @@ public final class RelayClient: @unchecked Sendable {
     private static let frameTypeSend: UInt8 = 2
     private static let frameTypeBundleRequest: UInt8 = 3
     private static let frameTypeBundleResponse: UInt8 = 4
+    private static let frameTypeRegisterPush: UInt8 = 5
     private static let maxFrameBytes: UInt32 = 1024 * 1024
 
     public weak var delegate: RelayClientDelegate?
@@ -61,6 +62,10 @@ public final class RelayClient: @unchecked Sendable {
     private let myIdentity: Data
     private var connection: NWConnection?
     private var readBuffer = Data()
+    /// Latest APNs device token. Cached so we automatically re-register
+    /// after a reconnect (the relay's push-token map is in-memory; a
+    /// relay restart wipes it).
+    private var pushToken: Data?
 
     public init(myIdentity: Data) {
         self.myIdentity = myIdentity
@@ -83,6 +88,9 @@ public final class RelayClient: @unchecked Sendable {
             switch s {
             case .ready:
                 self.sendHello()
+                if let token = self.pushToken {
+                    self.sendRegisterPush(token: token)
+                }
                 self.state = .connected
                 self.scheduleRead()
             case .failed(let err):
@@ -129,6 +137,24 @@ public final class RelayClient: @unchecked Sendable {
         appendU16Blob(&payload, to)
         appendU16Blob(&payload, myIdentity)
         payload.append(bundle)
+        writeFrame(payload, on: connection)
+    }
+
+    /// Publishes our APNs device token so the relay can wake us when a
+    /// SEND lands while we're disconnected. Token is cached and
+    /// re-sent automatically after a reconnect.
+    public func registerPush(token: Data) {
+        pushToken = token
+        if state == .connected {
+            sendRegisterPush(token: token)
+        }
+    }
+
+    private func sendRegisterPush(token: Data) {
+        guard let connection else { return }
+        var payload = Data()
+        payload.append(Self.frameTypeRegisterPush)
+        appendU16Blob(&payload, token)
         writeFrame(payload, on: connection)
     }
 
