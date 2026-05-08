@@ -1,0 +1,19 @@
+[package]
+name = "pizzini-relay"
+description = "Pizzini stateless Tor relay. Deployed in CH/IS/PA initially."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "pizzini-relay"
+path = "src/main.rs"
+
+[dependencies]
+# tokio + actual relay deps land when we implement the wire protocol.
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

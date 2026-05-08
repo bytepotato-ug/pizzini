@@ -1,0 +1,21 @@
+[workspace]
+members = ["crypto-core", "relay"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/bytepotato-ug/pizzini"
+authors = ["bytepotato"]
+rust-version = "1.80"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+overflow-checks = true
+
+[profile.release.package."*"]
+opt-level = 3

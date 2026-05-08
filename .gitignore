@@ -1,0 +1,40 @@
+# macOS
+.DS_Store
+
+# Xcode — user-specific state
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+DerivedData/
+build/
+*.ipa
+*.dSYM
+*.dSYM.zip
+
+# Swift Package Manager
+.swiftpm/
+.build/
+Package.resolved
+
+# Rust
+target/
+*.rs.bk
+*.pdb
+
+# Generated FFI artifacts
+crypto-core/include/
+*.xcframework/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets — never commit
+*.p12
+*.mobileprovision
+*.cer
+.env
+.env.*
+!.env.example
