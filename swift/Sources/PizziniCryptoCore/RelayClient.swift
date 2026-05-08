@@ -174,8 +174,9 @@ public final class RelayClient: @unchecked Sendable {
     private func drainFrames() {
         while readBuffer.count >= 4 {
             let lenBytes = readBuffer.prefix(4)
+            // loadUnaligned: Data slices may not honour 4-byte alignment.
             let len = lenBytes.withUnsafeBytes { ptr -> UInt32 in
-                let raw = ptr.load(as: UInt32.self)
+                let raw = ptr.loadUnaligned(as: UInt32.self)
                 return UInt32(bigEndian: raw)
             }
             if len > Self.maxFrameBytes {
@@ -246,8 +247,9 @@ private struct Cursor {
     }
     mutating func u16() -> UInt16? {
         guard buf.count >= 2 else { return nil }
+        // loadUnaligned: Data slice offsets are arbitrary — `load` would trap.
         let v = buf.prefix(2).withUnsafeBytes { ptr in
-            UInt16(bigEndian: ptr.load(as: UInt16.self))
+            UInt16(bigEndian: ptr.loadUnaligned(as: UInt16.self))
         }
         buf = buf.dropFirst(2)
         return v
