@@ -1358,15 +1358,18 @@ mod tests {
         unsafe { pizzini_store_free(bob) };
     }
 
-    // ───── Audit PoCs (S7) ─────────────────────────────────────────────
+    // ───── Audit PoCs (Surfaces 1, 7) ──────────────────────────────────
+    // Names previously labelled F-701/F-702/F-703 didn't match the audit's
+    // finding numbering — fix-review N-004. Renamed so a future maintainer
+    // grepping for the F-XX they care about lands on the right test.
 
-    /// PoC for F-701: `pizzini_blake3_hash` skips the input-null check when
-    /// `input_len == 0`. With a real `out_hash_32` buffer, NULL input is
-    /// supposed to be rejected with `INVALID_ARG`; today it returns OK.
-    /// Independent — also confirms the contract is "input MUST be non-null"
-    /// per the doc comment on the symbol.
+    /// `pizzini_blake3_hash` MUST reject a NULL input pointer with
+    /// `INVALID_ARG`, even when `input_len == 0`. The doc comment on the
+    /// symbol promises this; this test pins the contract so a future
+    /// refactor that "treats len=0 as a valid empty slice" doesn't slip
+    /// in. Surface 7 (FFI), independent of the audit's specific findings.
     #[test]
-    fn poc_f701_blake3_null_input_with_real_output() {
+    fn pizzini_blake3_hash_rejects_null_input_pointer() {
         let mut out = [0u8; 32];
         let rc = unsafe {
             pizzini_blake3_hash(std::ptr::null(), 0, out.as_mut_ptr())
@@ -1382,7 +1385,7 @@ mod tests {
     /// back, NOT a `is_duplicate=1, pt_len=0` ghost. Was the F-101 bug
     /// reproducer; now the fix verifier.
     #[test]
-    fn poc_f702_seal_receive_advances_session_before_buffer_check() {
+    fn poc_f101_seal_receive_no_advance_on_buffer_too_small() {
         // Set up Alice and Bob, pre-trust on Bob, ship a single sealed
         // message, then on the receive side call with `out_plaintext_cap = 0`.
         let alice = unsafe { pizzini_store_new(std::ptr::null(), 0) };
@@ -1500,7 +1503,7 @@ mod tests {
     /// caller cannot wedge the host thread. Was the F-702 bug
     /// reproducer; now the fix verifier.
     #[test]
-    fn poc_f703_hashcash_compute_accepts_unbounded_bits() {
+    fn poc_f702_hashcash_bits_capped_at_max() {
         let challenge = b"x";
 
         // bits within the ceiling: succeeds.
