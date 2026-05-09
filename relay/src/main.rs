@@ -1401,4 +1401,276 @@ mod tests {
         bad.extend_from_slice(&[0u8; 8]); // declared 64, gives 8
         assert!(parse_sealed(&bad).is_err());
     }
+
+    // ─── F-203 fix-review attack vectors ──────────────────────────────────
+    // The audit prompt enumerates six attacks the HELLO possession proof
+    // must defeat. These tests exercise verify_hello_possession_proof
+    // directly with crafted ParsedHello structs.
+
+    use rand::TryRngCore as _;
+
+    /// Helper: mint a libsignal IdentityKeyPair, return (peer_id_bytes,
+    /// keypair). peer_id_bytes is the 33-byte wire form (1-byte type
+    /// prefix + 32-byte point) — same encoding parse_hello expects.
+    fn fresh_identity() -> (Vec<u8>, libsignal_protocol::IdentityKeyPair) {
+        let mut rng = rand::rngs::OsRng.unwrap_err();
+        let kp = libsignal_protocol::IdentityKeyPair::generate(&mut rng);
+        let peer_id = kp.identity_key().serialize().to_vec();
+        (peer_id, kp)
+    }
+
+    /// Helper: produce a fully-signed HELLO for `kp` claiming `peer_id`.
+    /// `now_offset_secs` lets a test forge a future or past timestamp.
+    fn signed_hello(
+        peer_id: &[u8],
+        verify_key: &[u8],
+        kp: &libsignal_protocol::IdentityKeyPair,
+        now_offset_secs: i64,
+        nonce: [u8; HELLO_NONCE_LEN],
+    ) -> ParsedHello {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let ts = (now_secs + now_offset_secs).max(0) as u64;
+        let payload = build_hello_signing_payload(peer_id, verify_key, ts, &nonce);
+        let mut rng = rand::rngs::OsRng.unwrap_err();
+        let sig = kp
+            .private_key()
+            .calculate_signature(&payload, &mut rng)
+            .expect("sign");
+        ParsedHello {
+            peer_id: peer_id.to_vec(),
+            verify_key: verify_key.to_vec(),
+            timestamp_secs: ts,
+            nonce,
+            signature: sig.to_vec(),
+        }
+    }
+
+    /// F-203 attack 1: captured HELLO replayed within timestamp window.
+    /// First call: accept. Second call (same peer_id, same nonce):
+    /// reject via the (peer_id, nonce) replay set.
+    #[tokio::test]
+    async fn f203_captured_hello_replay_within_timestamp_window_rejected() {
+        let (peer_id, kp) = fresh_identity();
+        let vk = vec![7u8; VERIFY_KEY_LEN];
+        let nonce = [0xAAu8; HELLO_NONCE_LEN];
+        let h = signed_hello(&peer_id, &vk, &kp, 0, nonce);
+        let replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
+        // First HELLO: accepted.
+        verify_hello_possession_proof(&h, &replays).await.unwrap();
+        // Re-submit same bytes: replay-set hit.
+        let err = verify_hello_possession_proof(&h, &replays).await.unwrap_err();
+        assert!(err.contains("replay"), "expected replay error, got: {err}");
+    }
+
+    /// F-203 attack 2: captured HELLO replayed PAST the timestamp window.
+    /// Even before the (peer_id, nonce) entry would be GC'd, the
+    /// timestamp gate fires first.
+    #[tokio::test]
+    async fn f203_hello_outside_clock_skew_window_rejected() {
+        let (peer_id, kp) = fresh_identity();
+        let vk = vec![7u8; VERIFY_KEY_LEN];
+        // Sign 5 minutes in the past — well outside the 60s window.
+        let h = signed_hello(&peer_id, &vk, &kp, -300, [0xBBu8; HELLO_NONCE_LEN]);
+        let replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
+        let err = verify_hello_possession_proof(&h, &replays).await.unwrap_err();
+        assert!(
+            err.contains("timestamp"),
+            "expected timestamp error, got: {err}"
+        );
+    }
+
+    /// F-203 attack 3: forged HELLO with attacker's IdentityKey but
+    /// peer_id = victim's. Verifier extracts IdentityKey from peer_id
+    /// (victim's), so the attacker's signature will not validate
+    /// against it.
+    #[tokio::test]
+    async fn f203_squat_victim_peer_id_with_attacker_signature_rejected() {
+        let (victim_pid, _victim_kp) = fresh_identity();
+        let (_attacker_pid, attacker_kp) = fresh_identity();
+        let vk = vec![7u8; VERIFY_KEY_LEN];
+        // Sign with the ATTACKER's key but claim VICTIM's peer_id.
+        let h = signed_hello(&victim_pid, &vk, &attacker_kp, 0, [0xCCu8; HELLO_NONCE_LEN]);
+        let replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
+        let err = verify_hello_possession_proof(&h, &replays).await.unwrap_err();
+        assert!(err.contains("signature"), "expected sig error, got: {err}");
+    }
+
+    /// F-203 attack 4: forged HELLO with peer_id = victim and a sig
+    /// signed by some other key (not the IdentityKey associated with
+    /// peer_id). Verifier MUST extract the IdentityKey from peer_id,
+    /// not from the wire — checking the sig against any wire-supplied
+    /// key would be the bug.
+    ///
+    /// Same shape as attack 3 in this code (the relay only has one
+    /// place a key could come from), but separated to flag the intent
+    /// in case someone refactors verify_hello_possession_proof.
+    #[tokio::test]
+    async fn f203_signature_from_unrelated_key_rejected() {
+        let (victim_pid, _victim_kp) = fresh_identity();
+        let (_, other_kp) = fresh_identity();
+        let vk = vec![7u8; VERIFY_KEY_LEN];
+        let h = signed_hello(&victim_pid, &vk, &other_kp, 0, [0xDDu8; HELLO_NONCE_LEN]);
+        let replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
+        let err = verify_hello_possession_proof(&h, &replays).await.unwrap_err();
+        assert!(err.contains("signature"), "expected sig error, got: {err}");
+    }
+
+    /// F-203 attack 5: malformed peer_id (32 bytes instead of 33). The
+    /// verifier MUST return Err, not panic.
+    #[tokio::test]
+    async fn f203_malformed_peer_id_returns_err_not_panic() {
+        let bad_peer = vec![0u8; 32]; // wrong length
+        let vk = vec![7u8; VERIFY_KEY_LEN];
+        let h = ParsedHello {
+            peer_id: bad_peer,
+            verify_key: vk,
+            timestamp_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            nonce: [0xEEu8; HELLO_NONCE_LEN],
+            signature: vec![0u8; HELLO_SIG_LEN],
+        };
+        let replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
+        let err = verify_hello_possession_proof(&h, &replays).await.unwrap_err();
+        assert!(
+            err.contains("peer_id") || err.contains("IdentityKey"),
+            "expected peer_id error, got: {err}"
+        );
+    }
+
+    /// F-203 attack 5b: peer_id has the right length (33 bytes) but the
+    /// type prefix is bogus (e.g. 0xff instead of the DJB type). Should
+    /// fail decode without panicking.
+    #[tokio::test]
+    async fn f203_peer_id_with_bad_type_prefix_returns_err() {
+        let mut bad_peer = vec![0u8; 33];
+        bad_peer[0] = 0xff; // not a valid IdentityKey type prefix
+        let vk = vec![7u8; VERIFY_KEY_LEN];
+        let h = ParsedHello {
+            peer_id: bad_peer,
+            verify_key: vk,
+            timestamp_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            nonce: [0xEFu8; HELLO_NONCE_LEN],
+            signature: vec![0u8; HELLO_SIG_LEN],
+        };
+        let replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
+        // We don't strictly require the prefix to be rejected; either
+        // peer_id-decode-fail or signature-fail is acceptable. What we
+        // require is no panic.
+        let _ = verify_hello_possession_proof(&h, &replays).await;
+    }
+
+    /// F-203 attack 6: signed timestamp 1000s in the future. The
+    /// verifier uses delta.abs() so positive AND negative drift get
+    /// caught.
+    #[tokio::test]
+    async fn f203_future_timestamp_rejected() {
+        let (peer_id, kp) = fresh_identity();
+        let vk = vec![7u8; VERIFY_KEY_LEN];
+        let h = signed_hello(&peer_id, &vk, &kp, 1000, [0xF0u8; HELLO_NONCE_LEN]);
+        let replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
+        let err = verify_hello_possession_proof(&h, &replays).await.unwrap_err();
+        assert!(err.contains("timestamp"), "expected ts error, got: {err}");
+    }
+
+    /// F-203 fresh-honest path: a properly-signed HELLO with the
+    /// matching peer_id is accepted on first sight.
+    #[tokio::test]
+    async fn f203_honest_hello_accepted() {
+        let (peer_id, kp) = fresh_identity();
+        let vk = vec![7u8; VERIFY_KEY_LEN];
+        let h = signed_hello(&peer_id, &vk, &kp, 0, [0x10u8; HELLO_NONCE_LEN]);
+        let replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
+        verify_hello_possession_proof(&h, &replays).await.unwrap();
+    }
+
+    // ─── F-301 challenge byte-shape ───────────────────────────────────────
+
+    /// F-301: the relay's `build_hashcash_challenge` MUST produce the
+    /// same 32-byte digest that iOS's hashcashChallenge produces. We
+    /// hand-construct the iOS-side computation here and compare. Mirrors
+    /// the byte sequence in pizzini/ChatStore.swift::hashcashChallenge.
+    #[test]
+    fn f301_challenge_bytes_match_ios_encoder() {
+        let peer_id: [u8; 33] = [0x05; 33];
+        let hour: u64 = 0x1234567890abcdef;
+        let server_chal = build_hashcash_challenge(&peer_id, hour);
+        // iOS-equivalent:
+        // input = HASHCASH_CHALLENGE_TAG || u16_be(33) || peer_id || hour_be
+        let mut ios_input = Vec::new();
+        ios_input.extend_from_slice(b"pizzini.hashcash.bundle.v1");
+        ios_input.extend_from_slice(&33u16.to_be_bytes());
+        ios_input.extend_from_slice(&peer_id);
+        ios_input.extend_from_slice(&hour.to_be_bytes());
+        let ios_chal = blake3::hash(&ios_input);
+        assert_eq!(
+            server_chal,
+            *ios_chal.as_bytes(),
+            "iOS and relay challenge digests must match byte-for-byte"
+        );
+    }
+
+    /// F-301 negative: bit-flipping the tag changes the digest. (Sanity
+    /// — domain separation actually separates.)
+    #[test]
+    fn f301_tag_bitflip_changes_digest() {
+        let peer_id: [u8; 33] = [0x05; 33];
+        let hour: u64 = 42;
+        let good = build_hashcash_challenge(&peer_id, hour);
+        // Same shape but flip one byte of the tag.
+        let mut bad_input = Vec::new();
+        bad_input.extend_from_slice(b"Pizzini.hashcash.bundle.v1"); // capital P
+        bad_input.extend_from_slice(&33u16.to_be_bytes());
+        bad_input.extend_from_slice(&peer_id);
+        bad_input.extend_from_slice(&hour.to_be_bytes());
+        let bad = blake3::hash(&bad_input);
+        assert_ne!(good, *bad.as_bytes());
+    }
+
+    // ─── F-205 expiry-cap ─────────────────────────────────────────────────
+
+    /// F-205: a token with `expiry = u32::MAX` should be rejected for
+    /// being too far in the future. The cap is
+    /// TOKEN_MAX_FUTURE_EXPIRY_SECS ≈ 30d + 5min from now.
+    #[tokio::test]
+    async fn f205_token_with_max_expiry_rejected_as_too_far_future() {
+        // Build a valid recipient verify_key by deriving from a fresh
+        // libsignal IdentityKey, mirroring crypto-core's pattern.
+        let (recipient_pid, _kp) = fresh_identity();
+        let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
+        // Use a placeholder verify_key (signature won't match anyway,
+        // but we want to reach the expiry-cap branch first). Insert
+        // *something* so the verify_keys lookup succeeds.
+        verify_keys
+            .lock()
+            .await
+            .insert(recipient_pid.clone(), vec![0u8; VERIFY_KEY_LEN]);
+        let replays: Replays = Arc::new(Mutex::new(HashMap::new()));
+        let mut token = vec![0u8; TOKEN_LEN];
+        // Nonce: arbitrary.
+        token[..TOKEN_NONCE_LEN].copy_from_slice(&[0xABu8; TOKEN_NONCE_LEN]);
+        // Expiry = u32::MAX (year 2106).
+        token[TOKEN_NONCE_LEN..TOKEN_NONCE_LEN + 4]
+            .copy_from_slice(&u32::MAX.to_be_bytes());
+        // Sig: bogus.
+        let parsed = ParsedSealed {
+            to_id: recipient_pid.clone(),
+            ttl_seconds: 3600,
+            token,
+        };
+        let err = check_delivery_token(&parsed, &verify_keys, &replays)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("future"),
+            "expected expiry-cap error, got: {err}"
+        );
+    }
 }

@@ -1437,6 +1437,7 @@ dependencies = [
  "blake3",
  "jsonwebtoken",
  "libsignal-protocol",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",

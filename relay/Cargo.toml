@@ -25,5 +25,10 @@ libsignal-protocol = { git = "https://github.com/signalapp/libsignal.git", tag =
 # per request, sub-microsecond.
 blake3 = { version = "1", default-features = false }
 
+[dev-dependencies]
+# Used only by F-203 fix-review unit tests to construct signed HELLO
+# possession proofs — needs an Rng to mint IdentityKeyPairs.
+rand = "0.9"
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
