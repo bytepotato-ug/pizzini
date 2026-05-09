@@ -69,9 +69,17 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: UIScene.didEnterBackgroundNotification)) { _ in
             lockManager.handleDidEnterBackground()
+            // Close the relay socket cleanly. Apple's networking layer
+            // doesn't keep TCP alive across iOS suspension; if we
+            // leave the connection open, the queued `.failed` callback
+            // surfaces only on the *next* foreground and produces a
+            // red→green→red flap. Closing here, reconnecting on
+            // foreground, eliminates the race.
+            store.disconnectForBackground()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIScene.willEnterForegroundNotification)) { _ in
             lockManager.handleWillEnterForeground()
+            store.reconnectAfterBackground()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIScene.didActivateNotification)) { _ in
             lockManager.handleDidActivate()

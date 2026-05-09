@@ -95,6 +95,30 @@ final class ChatStore: NSObject {
         connectRelay()
     }
 
+    /// Cleanly tear down the relay socket as the app moves to
+    /// background. iOS suspends networking shortly after background;
+    /// keeping a half-dead NWConnection across suspension produces
+    /// stale `.failed` callbacks that surface only on the *next*
+    /// foreground (red → green → red flapping). Closing here avoids
+    /// the race entirely.
+    func disconnectForBackground() {
+        guard let relay else { return }
+        NSLog("[pizzini] relay disconnect for background")
+        relay.delegate = nil
+        relay.disconnect()
+        self.relay = nil
+        relayState = .idle
+    }
+
+    /// Build a fresh relay connection on every foreground entry. We
+    /// don't inspect the prior state — see `disconnectForBackground`
+    /// for why trusting `relayState` across a suspension cycle is a
+    /// bug.
+    func reconnectAfterBackground() {
+        NSLog("[pizzini] relay reconnect on foreground")
+        connectRelay()
+    }
+
     // MARK: - Contacts
 
     func contact(forIdentity peerId: Data) -> Contact? {
