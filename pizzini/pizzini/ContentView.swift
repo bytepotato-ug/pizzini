@@ -187,39 +187,168 @@ struct ContentView: View {
     }
 }
 
+/// Pairing-QR sheet. The QR encodes the user's long-term peer-id +
+/// relay endpoint — both technically public, but a photograph of this
+/// code is enough to deanonymize the user on the relay (link "real
+/// face" → "peer-id observable in traffic"). The strict-scan +
+/// hashcash + contact-gate stack already prevents a stolen QR from
+/// being used to *pair* without consent, so the residual risk is
+/// purely deanonymization. We surface that explicitly: blur by
+/// default, plain-language warning, tap-to-reveal, tap-again-to-hide.
 private struct MyQRSheet: View {
     let card: ContactCard?
     let onDone: () -> Void
 
+    /// Hidden by default. The user has to make an explicit reveal
+    /// gesture, after reading the warning above the surface. Re-tap
+    /// rehides; backgrounding the app rehides via the privacy shield.
+    @State private var revealed = false
+    @State private var showDetails = false
+    @State private var copyConfirmation = false
+
     var body: some View {
         NavigationStack {
-            VStack(spacing: 18) {
-                if let card {
-                    ContactCardView(card: card)
-                    Button {
-                        UIPasteboard.general.string = card.encoded
-                    } label: {
-                        Label("Copy contact string", systemImage: "doc.on.doc")
+            ScrollView {
+                VStack(spacing: 24) {
+                    privacyWarning
+                    qrSurface
+                    if revealed {
+                        usageHint
+                        actions
                     }
-                    .buttonStyle(.bordered)
-                } else {
-                    ProgressView("preparing identity…")
                 }
-                Text("Show this to a peer in person and have them scan it. They show theirs back to you. After both scans, chat unlocks.")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 24)
-                Spacer()
+                .padding(.horizontal, 24)
+                .padding(.top, 8)
+                .padding(.bottom, 32)
             }
-            .padding(.top, 24)
-            .navigationTitle("Your QR")
+            .navigationTitle("Your QR code")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done", action: onDone)
                 }
             }
+        }
+    }
+
+    private var privacyWarning: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "exclamationmark.shield.fill")
+                .font(.title3)
+                .foregroundStyle(.orange)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Show this only to the person you want to chat with.")
+                    .font(.callout.weight(.semibold))
+                Text("A photo of this code — even from a window, a security camera, or someone behind you — identifies you on Pizzini's network. Make sure no one else can see your screen before you reveal it.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.orange.opacity(0.10))
+        )
+    }
+
+    @ViewBuilder
+    private var qrSurface: some View {
+        if let card {
+            ZStack {
+                if revealed {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) { revealed = false }
+                    } label: {
+                        ContactQRImage(card: card)
+                    }
+                    .buttonStyle(.plain)
+                } else {
+                    hiddenPlaceholder
+                }
+            }
+            .frame(maxWidth: .infinity)
+        } else {
+            ProgressView("preparing identity…")
+                .frame(minHeight: 304)
+        }
+    }
+
+    private var hiddenPlaceholder: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.15)) { revealed = true }
+        } label: {
+            VStack(spacing: 14) {
+                Image(systemName: "eye.slash.fill")
+                    .font(.system(size: 44))
+                    .foregroundStyle(.secondary)
+                Text("Code hidden for privacy")
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                Text("Tap to reveal")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.tint)
+            }
+            .frame(maxWidth: .infinity, minHeight: 304)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Color(uiColor: .secondarySystemBackground))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .strokeBorder(Color.secondary.opacity(0.20), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("QR code hidden. Tap to reveal.")
+    }
+
+    private var usageHint: some View {
+        VStack(spacing: 6) {
+            Text("Tap the code to hide it again.")
+                .font(.footnote)
+                .foregroundStyle(.tertiary)
+            Text("They scan this with Pizzini, then show you theirs. Both scans unlock the chat.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+    }
+
+    @ViewBuilder
+    private var actions: some View {
+        // Copy is gated behind reveal: the user has already accepted
+        // the warning by tapping reveal. Without this gating, a careful
+        // user could be tripped up by accidentally tapping "Copy" and
+        // pushing their identity to the system pasteboard before
+        // realising it's the same risk surface.
+        if let card {
+            VStack(spacing: 8) {
+                Button {
+                    UIPasteboard.general.string = card.encoded
+                    copyConfirmation = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        copyConfirmation = false
+                    }
+                } label: {
+                    Label(copyConfirmation ? "Copied" : "Copy as text", systemImage: copyConfirmation ? "checkmark" : "doc.on.doc")
+                }
+                .buttonStyle(.bordered)
+                Text("Pasting it into another app exposes your identity the same way a photo does. Use only with someone you'd hand the QR to.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 16)
+            }
+
+            DisclosureGroup("Show technical details", isExpanded: $showDetails) {
+                ContactCardDetails(card: card)
+                    .padding(.top, 8)
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .padding(.top, 4)
         }
     }
 }

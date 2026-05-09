@@ -52,31 +52,27 @@ struct ContactCard: Equatable, Identifiable {
     }
 }
 
-struct ContactCardView: View {
+/// Pure QR-image renderer. Used by `MyQRSheet`'s reveal/hide states —
+/// the surrounding chrome (warning, hide-toggle, details disclosure)
+/// lives in `MyQRSheet` so this stays reusable.
+struct ContactQRImage: View {
     let card: ContactCard
+    var sideLength: CGFloat = 280
 
     var body: some View {
-        VStack(spacing: 12) {
-            if let image = qrImage(for: card.encoded) {
-                Image(uiImage: image)
-                    .interpolation(.none)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: 280, maxHeight: 280)
-                    .padding(8)
-                    .background(Color.white)
-                    .cornerRadius(12)
-                    .accessibilityLabel("Pizzini contact QR")
-            } else {
-                Text("(could not render QR)")
-                    .foregroundStyle(.red)
-            }
-            Text(card.host + ":" + String(card.port))
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-            Text(fingerprint(card.peerId))
-                .font(.caption2.monospaced())
-                .foregroundStyle(.tertiary)
+        if let image = qrImage(for: card.encoded) {
+            Image(uiImage: image)
+                .interpolation(.none)
+                .resizable()
+                .scaledToFit()
+                .frame(maxWidth: sideLength, maxHeight: sideLength)
+                .padding(12)
+                .background(Color.white)
+                .cornerRadius(16)
+                .accessibilityLabel("Pizzini contact QR")
+        } else {
+            Text("(could not render QR)")
+                .foregroundStyle(.red)
         }
     }
 
@@ -90,11 +86,29 @@ struct ContactCardView: View {
         guard let cg = context.createCGImage(scaled, from: scaled.extent) else { return nil }
         return UIImage(cgImage: cg)
     }
+}
 
-    private func fingerprint(_ data: Data) -> String {
-        let bytes = Array(data)
-        let head = bytes.prefix(4).map { String(format: "%02x", $0) }.joined()
-        let tail = bytes.suffix(4).map { String(format: "%02x", $0) }.joined()
-        return "\(head)…\(tail)  (\(bytes.count) B)"
+/// Compact "host:port · fingerprint" line for power-users who want to
+/// double-check what's encoded in the QR. Hidden behind a disclosure in
+/// `MyQRSheet`; non-technical users never see it.
+struct ContactCardDetails: View {
+    let card: ContactCard
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            row(label: "Relay", value: "\(card.host):\(card.port)")
+            row(label: "Fingerprint", value: card.fingerprintShort)
+        }
+        .font(.caption.monospaced())
+    }
+
+    private func row(label: String, value: String) -> some View {
+        HStack {
+            Text(label)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text(value)
+                .foregroundStyle(.primary)
+        }
     }
 }
