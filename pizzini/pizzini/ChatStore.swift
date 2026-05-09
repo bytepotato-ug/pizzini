@@ -530,9 +530,26 @@ final class ChatStore: NSObject {
 
     func resetIdentity() {
         relay?.disconnect()
+        // Preserve non-identity configuration across the wipe. The relay
+        // host is a network endpoint (typically a LAN IP for a physical
+        // iPhone, loopback for the sim); resetting it to the
+        // 127.0.0.1 default would leave a real device unable to find
+        // the relay until the user re-edited it. Same reasoning for
+        // the UX prefs (auto-lock, biometric, onboarding-seen):
+        // they're not identity-derived.
+        let preservedHost = state.relayHost
+        let preservedAutoLock = state.autoLockTimeout
+        let preservedBiometric = state.biometricLockEnabled
+        let preservedOnboarding = state.onboardingCompleted
         Storage.resetEverything()
-        state = AppState()
+        state = AppState(
+            relayHost: preservedHost,
+            onboardingCompleted: preservedOnboarding,
+            biometricLockEnabled: preservedBiometric,
+            autoLockTimeout: preservedAutoLock,
+        )
         outbox = .empty
+        Storage.persist(appState: state)
         do {
             let s = try Storage.loadOrCreateSession()
             session = s
