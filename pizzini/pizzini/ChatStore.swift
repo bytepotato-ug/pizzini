@@ -953,6 +953,17 @@ final class ChatStore: NSObject {
         Storage.persist(appState: state)
     }
 
+    /// Toggle in-app QuickLook previews for received attachments.
+    /// Default is OFF — strict mode keeps the parser surface fully
+    /// out-of-process. ON lets users tap a "Preview" button on inbound
+    /// attachment rows and view the file via `QLPreviewController`,
+    /// whose actual rendering still runs in Apple's QuickLook XPC.
+    func setQuickLookPreviewEnabled(_ enabled: Bool) {
+        guard state.quickLookPreviewEnabled != enabled else { return }
+        state.quickLookPreviewEnabled = enabled
+        Storage.persist(appState: state)
+    }
+
     func resetIdentity() {
         // F-704: full teardown — null self.relay, invalidate retry
         // timer, clear delegate. Mirrors disconnectForBackground so
@@ -970,11 +981,13 @@ final class ChatStore: NSObject {
         let preservedAutoLock = state.autoLockTimeout
         let preservedBiometric = state.biometricLockEnabled
         let preservedOnboarding = state.onboardingCompleted
+        let preservedQuickLook = state.quickLookPreviewEnabled
         let resetState = AppState(
             relayHost: preservedHost,
             onboardingCompleted: preservedOnboarding,
             biometricLockEnabled: preservedBiometric,
             autoLockTimeout: preservedAutoLock,
+            quickLookPreviewEnabled: preservedQuickLook,
         )
         // F-703: write the post-reset AppState to Keychain BEFORE wiping
         // the device-store / outbox / legacy slots. The previous order

@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import QuickLook
 
 struct ChatView: View {
     @Bindable var store: ChatStore
@@ -177,6 +178,7 @@ struct ChatView: View {
                             entry: entry,
                             status: rowStatus(forEntry: entry),
                             resolveURL: { info in store.attachmentURL(for: info) },
+                            quickLookEnabled: store.state.quickLookPreviewEnabled,
                         ).id(entry.id)
                     }
                 }
@@ -359,15 +361,21 @@ struct ChatRow: View {
     /// concrete URL. Closure rather than direct ChatStore access so the
     /// row stays cheap to construct in tests / previews.
     let resolveURL: (AttachmentInfo) -> URL?
+    /// Honours the user's `quickLookPreviewEnabled` setting — when true
+    /// AND the row is an inbound attachment, we render a Preview button
+    /// that opens QLPreviewController in addition to Save to Files.
+    let quickLookEnabled: Bool
 
     init(
         entry: PersistedMessage,
         status: OutboxEntry.Status? = nil,
-        resolveURL: @escaping (AttachmentInfo) -> URL? = { _ in nil }
+        resolveURL: @escaping (AttachmentInfo) -> URL? = { _ in nil },
+        quickLookEnabled: Bool = false
     ) {
         self.entry = entry
         self.status = status
         self.resolveURL = resolveURL
+        self.quickLookEnabled = quickLookEnabled
     }
 
     var body: some View {
@@ -381,6 +389,7 @@ struct ChatRow: View {
                         bubbleColor: bubbleColor,
                         resolveURL: resolveURL,
                         captionText: entry.text,
+                        quickLookEnabled: quickLookEnabled,
                     )
                 } else {
                     Text(entry.text)
@@ -458,8 +467,29 @@ struct AttachmentRowCard: View {
     let bubbleColor: Color
     let resolveURL: (AttachmentInfo) -> URL?
     let captionText: String
+    /// User's `quickLookPreviewEnabled` setting — when true AND this is
+    /// an inbound row, we render a Preview button that pops
+    /// QLPreviewController. Default false (strict mode).
+    let quickLookEnabled: Bool
 
     @State private var presentingShare = false
+    @State private var presentingPreview = false
+
+    init(
+        info: AttachmentInfo,
+        side: ChatBubbleSide,
+        bubbleColor: Color,
+        resolveURL: @escaping (AttachmentInfo) -> URL?,
+        captionText: String,
+        quickLookEnabled: Bool = false
+    ) {
+        self.info = info
+        self.side = side
+        self.bubbleColor = bubbleColor
+        self.resolveURL = resolveURL
+        self.captionText = captionText
+        self.quickLookEnabled = quickLookEnabled
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -485,13 +515,37 @@ struct AttachmentRowCard: View {
                 bannerView(banner)
             }
             if info.isInbound {
-                saveToFilesButton
+                HStack(spacing: 8) {
+                    saveToFilesButton
+                    if quickLookEnabled {
+                        previewButton
+                    }
+                }
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .background(bubbleColor)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .quickLookPreview(
+            $presentingPreview,
+            url: resolveURL(info),
+        )
+    }
+
+    /// In-app preview via `QLPreviewController`. The actual rendering
+    /// runs in QuickLook's XPC service, NOT in Pizzini's process —
+    /// same as Save-to-Files-then-tap. The integration surface here
+    /// is wider than strict mode (we hand QuickLook a file URL), but
+    /// the bytes still aren't parsed by us.
+    private var previewButton: some View {
+        Button {
+            presentingPreview = true
+        } label: {
+            Label("Preview", systemImage: "eye")
+                .font(.callout)
+        }
+        .buttonStyle(.bordered)
     }
 
     private var icon: String {
@@ -567,6 +621,65 @@ struct AttachmentRowCard: View {
                 url: resolveURL(info),
             )
         )
+    }
+}
+
+/// SwiftUI modifier that presents `QLPreviewController` for an
+/// optional URL, gated on a binding. `View.quickLookPreview(_:url:)`
+/// is shipped by Apple but takes a non-optional `URL` (or expects you
+/// to use the `[URL]` form) — and our resolver may legitimately return
+/// nil if the sandbox copy was already GC'd post-TTL. Wrap with our
+/// own modifier so a nil URL is a no-op rather than a crash.
+extension View {
+    fileprivate func quickLookPreview(
+        _ isPresented: Binding<Bool>,
+        url: URL?
+    ) -> some View {
+        sheet(isPresented: isPresented) {
+            if let url {
+                QLPreviewWrapper(url: url) {
+                    isPresented.wrappedValue = false
+                }
+                .ignoresSafeArea()
+            } else {
+                Text("Attachment is no longer available on this device.")
+                    .padding()
+            }
+        }
+    }
+}
+
+private struct QLPreviewWrapper: UIViewControllerRepresentable {
+    let url: URL
+    let onDismiss: () -> Void
+
+    func makeUIViewController(context: Context) -> UINavigationController {
+        let preview = QLPreviewController()
+        preview.dataSource = context.coordinator
+        preview.delegate = context.coordinator
+        let nav = UINavigationController(rootViewController: preview)
+        return nav
+    }
+
+    func updateUIViewController(_ uiViewController: UINavigationController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator { Coordinator(url: url, onDismiss: onDismiss) }
+
+    final class Coordinator: NSObject, QLPreviewControllerDataSource, QLPreviewControllerDelegate {
+        let url: URL
+        let onDismiss: () -> Void
+        init(url: URL, onDismiss: @escaping () -> Void) {
+            self.url = url
+            self.onDismiss = onDismiss
+        }
+
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
+            url as NSURL
+        }
+        func previewControllerDidDismiss(_ controller: QLPreviewController) {
+            onDismiss()
+        }
     }
 }
 

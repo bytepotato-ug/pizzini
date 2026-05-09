@@ -48,6 +48,19 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Toggle(isOn: Binding(
+                        get: { store.state.quickLookPreviewEnabled },
+                        set: { store.setQuickLookPreviewEnabled($0) }
+                    )) {
+                        Label("In-app preview", systemImage: "eye")
+                    }
+                } header: {
+                    Text("Attachments")
+                } footer: {
+                    Text("Off (default): received files show only the filename, with a Save-to-Files button. On: also shows a Preview button that opens the file in iOS QuickLook. The file is parsed by Apple's QuickLook service either way once you tap; off keeps Pizzini's process out of the loop entirely. Recommended off for journalists and anyone targeted by sophisticated adversaries.")
+                }
+
+                Section {
                     NavigationLink {
                         AdvancedScreen(store: store, onResetClose: onClose)
                     } label: {

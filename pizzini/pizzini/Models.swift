@@ -291,6 +291,15 @@ struct AppState: Codable, Sendable {
     var onboardingCompleted: Bool
     var biometricLockEnabled: Bool
     var autoLockTimeout: AutoLockTimeout
+    /// When true, received attachments get an extra "Preview" button
+    /// that opens `QLPreviewController` in-app. Default OFF — the
+    /// strict-mode UX (filename + Save to Files only) keeps the parser
+    /// surface fully out-of-process for the highest-risk users.
+    /// Turning it on doesn't expose us to zero-click attacks (the user
+    /// still has to tap explicitly) and the actual rendering happens
+    /// in QuickLook's XPC, but it does widen the in-process integration
+    /// surface a hair vs the strict default.
+    var quickLookPreviewEnabled: Bool
 
     static let currentVersion = 1
     static let defaultRelayHost = "127.0.0.1"
@@ -301,7 +310,8 @@ struct AppState: Codable, Sendable {
         contacts: [Contact] = [],
         onboardingCompleted: Bool = false,
         biometricLockEnabled: Bool = false,
-        autoLockTimeout: AutoLockTimeout = .immediately
+        autoLockTimeout: AutoLockTimeout = .immediately,
+        quickLookPreviewEnabled: Bool = false
     ) {
         self.version = version
         self.relayHost = relayHost
@@ -309,6 +319,7 @@ struct AppState: Codable, Sendable {
         self.onboardingCompleted = onboardingCompleted
         self.biometricLockEnabled = biometricLockEnabled
         self.autoLockTimeout = autoLockTimeout
+        self.quickLookPreviewEnabled = quickLookPreviewEnabled
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -318,6 +329,7 @@ struct AppState: Codable, Sendable {
         case onboardingCompleted
         case biometricLockEnabled
         case autoLockTimeout
+        case quickLookPreviewEnabled
     }
 
     init(from decoder: Decoder) throws {
@@ -328,5 +340,6 @@ struct AppState: Codable, Sendable {
         onboardingCompleted = try c.decodeIfPresent(Bool.self, forKey: .onboardingCompleted) ?? false
         biometricLockEnabled = try c.decodeIfPresent(Bool.self, forKey: .biometricLockEnabled) ?? false
         autoLockTimeout = try c.decodeIfPresent(AutoLockTimeout.self, forKey: .autoLockTimeout) ?? .immediately
+        quickLookPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .quickLookPreviewEnabled) ?? false
     }
 }
