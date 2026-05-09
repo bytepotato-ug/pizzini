@@ -14,10 +14,7 @@ struct ContentView: View {
     @State private var lockManager = LockManager.shared
     @State private var showScanner = false
     @State private var showMyQR = false
-    @State private var showRelaySheet = false
-    @State private var showSecuritySheet = false
-    @State private var confirmDeleteAllChats = false
-    @State private var confirmReset = false
+    @State private var showSettings = false
     @State private var pendingCard: ContactCard?
     @State private var pendingName: String = ""
 
@@ -39,10 +36,7 @@ struct ContentView: View {
                             store: store,
                             showScanner: $showScanner,
                             showMyQR: $showMyQR,
-                            showRelaySheet: $showRelaySheet,
-                            showSecuritySheet: $showSecuritySheet,
-                            confirmDeleteAllChats: $confirmDeleteAllChats,
-                            confirmReset: $confirmReset,
+                            showSettings: $showSettings,
                             onPasteContact: promptForName(decoding:)
                         )
                     }
@@ -135,38 +129,8 @@ struct ContentView: View {
         .sheet(isPresented: $showMyQR) {
             MyQRSheet(card: store.myCard, onDone: { showMyQR = false })
         }
-        .sheet(isPresented: $showRelaySheet) {
-            RelaySettingsSheet(
-                host: store.state.relayHost,
-                onSave: { newHost in
-                    store.setRelayHost(newHost)
-                    showRelaySheet = false
-                },
-                onCancel: { showRelaySheet = false }
-            )
-        }
-        .sheet(isPresented: $showSecuritySheet) {
-            SecuritySettingsView(store: store, onClose: { showSecuritySheet = false })
-        }
-        .confirmationDialog(
-            "Delete all chats? Contacts and sessions stay; only message logs are wiped.",
-            isPresented: $confirmDeleteAllChats,
-            titleVisibility: .visible
-        ) {
-            Button("Delete all chats", role: .destructive) {
-                store.deleteAllChats()
-            }
-            Button("Cancel", role: .cancel) {}
-        }
-        .confirmationDialog(
-            "Reset identity? This wipes contacts, sessions, and your keypair. Peers will need to rescan you.",
-            isPresented: $confirmReset,
-            titleVisibility: .visible
-        ) {
-            Button("Reset identity", role: .destructive) {
-                store.resetIdentity()
-            }
-            Button("Cancel", role: .cancel) {}
+        .sheet(isPresented: $showSettings) {
+            SettingsView(store: store, onClose: { showSettings = false })
         }
     }
 
@@ -404,39 +368,6 @@ private struct MyQRSheet: View {
             .font(.callout)
             .foregroundStyle(.secondary)
             .padding(.top, 4)
-        }
-    }
-}
-
-private struct RelaySettingsSheet: View {
-    @State var host: String
-    let onSave: (String) -> Void
-    let onCancel: () -> Void
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    TextField("host (e.g. 192.168.x.x)", text: $host)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.URL)
-                } header: {
-                    Text("relay host")
-                } footer: {
-                    Text("Both peers connect to the same relay. Sim → 127.0.0.1; phone → the Mac's LAN IP. Port is fixed at 7777.")
-                }
-            }
-            .navigationTitle("Relay")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel", action: onCancel)
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") { onSave(host) }
-                }
-            }
         }
     }
 }

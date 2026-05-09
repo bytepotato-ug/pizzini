@@ -1,73 +1,68 @@
 import SwiftUI
 
-/// User-facing controls for the biometric lock. Reached from the
-/// contacts-list ⋯ menu. Toggling biometric lock OFF requires a
-/// successful auth — defends against "I have your unlocked phone for
-/// 10 seconds, let me kill the lock so I can read everything later".
-/// Toggling ON also requires auth so we never persist `enabled = true`
-/// without first confirming the user can actually pass the prompt.
+/// User-facing controls for the biometric lock. Pushed via NavigationLink
+/// from the parent `SettingsView`, so it owns its Form rows but NOT
+/// the NavigationStack or the trailing "Done" button — the parent
+/// settings screen handles dismissal. Toggling biometric lock OFF
+/// requires a successful auth — defends against "I have your unlocked
+/// phone for 10 seconds, let me kill the lock so I can read everything
+/// later". Toggling ON also requires auth so we never persist
+/// `enabled = true` without first confirming the user can pass the
+/// prompt.
 struct SecuritySettingsView: View {
     @Bindable var store: ChatStore
-    let onClose: () -> Void
 
     @State private var error: String?
     @State private var inFlight = false
 
     var body: some View {
-        NavigationStack {
-            Form {
+        Form {
+            Section {
+                Toggle(isOn: Binding(
+                    get: { store.state.biometricLockEnabled },
+                    set: { newValue in handleToggle(target: newValue) }
+                )) {
+                    Label("Require Face ID", systemImage: "faceid")
+                }
+                .disabled(inFlight)
+            } header: {
+                Text("App lock")
+            } footer: {
+                Text("Pizzini will require Face ID (or your device passcode) to open the app and to read messages.")
+            }
+
+            if store.state.biometricLockEnabled {
                 Section {
-                    Toggle(isOn: Binding(
-                        get: { store.state.biometricLockEnabled },
-                        set: { newValue in handleToggle(target: newValue) }
-                    )) {
-                        Label("Require Face ID", systemImage: "faceid")
-                    }
-                    .disabled(inFlight)
-                } header: {
-                    Text("App lock")
-                } footer: {
-                    Text("Pizzini will require Face ID (or your device passcode) to open the app and to read messages.")
-                }
-
-                if store.state.biometricLockEnabled {
-                    Section {
-                        Picker(
-                            "Lock when backgrounded",
-                            selection: Binding(
-                                get: { store.state.autoLockTimeout },
-                                set: { store.setAutoLockTimeout($0) }
-                            )
-                        ) {
-                            ForEach(AutoLockTimeout.allCases, id: \.self) { option in
-                                Text(option.label).tag(option)
-                            }
+                    Picker(
+                        "Lock when backgrounded",
+                        selection: Binding(
+                            get: { store.state.autoLockTimeout },
+                            set: { store.setAutoLockTimeout($0) }
+                        )
+                    ) {
+                        ForEach(AutoLockTimeout.allCases, id: \.self) { option in
+                            Text(option.label).tag(option)
                         }
-                        .pickerStyle(.inline)
-                        .labelsHidden()
-                    } header: {
-                        Text("Auto-lock")
-                    } footer: {
-                        Text("How long Pizzini stays unlocked after you switch away from it.")
                     }
-                }
-
-                if let error {
-                    Section {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                    }
+                    .pickerStyle(.inline)
+                    .labelsHidden()
+                } header: {
+                    Text("Auto-lock")
+                } footer: {
+                    Text("How long Pizzini stays unlocked after you switch away from it.")
                 }
             }
-            .navigationTitle("Security")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done", action: onClose)
+
+            if let error {
+                Section {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
             }
         }
+        .navigationTitle("App lock")
+        .navigationBarTitleDisplayMode(.inline)
     }
 
     private func handleToggle(target enable: Bool) {

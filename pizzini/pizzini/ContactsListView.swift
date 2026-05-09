@@ -6,11 +6,12 @@ struct ContactsListView: View {
     @Bindable var store: ChatStore
     @Binding var showScanner: Bool
     @Binding var showMyQR: Bool
-    @Binding var showRelaySheet: Bool
-    @Binding var showSecuritySheet: Bool
-    @Binding var confirmDeleteAllChats: Bool
-    @Binding var confirmReset: Bool
+    @Binding var showSettings: Bool
     let onPasteContact: (String) -> Void
+
+    /// Confirmation-dialog state for the `+` add-contact action sheet.
+    /// Local to the toolbar — no need to plumb up to ContentView.
+    @State private var showAddContactDialog = false
 
     var body: some View {
         ZStack {
@@ -20,7 +21,7 @@ struct ContactsListView: View {
                 list
             }
         }
-        .navigationTitle("Pizzini Contacts")
+        .navigationTitle("Pizzini")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
@@ -29,60 +30,99 @@ struct ContactsListView: View {
                 } label: {
                     Image(systemName: "qrcode")
                 }
+                .accessibilityLabel("Show my QR")
             }
             ToolbarItem(placement: .principal) {
                 relayBadge
             }
             ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Button {
-                        showScanner = true
-                    } label: { Label("Scan a contact's QR", systemImage: "qrcode.viewfinder") }
-                    Button {
-                        if let s = UIPasteboard.general.string {
-                            onPasteContact(s)
-                        }
-                    } label: { Label("Paste contact", systemImage: "doc.on.clipboard") }
-                    Divider()
-                    Button {
-                        showSecuritySheet = true
-                    } label: {
-                        Label(
-                            store.state.biometricLockEnabled ? "Security (Face ID on)" : "Security",
-                            systemImage: "lock.shield"
-                        )
-                    }
-                    Button {
-                        showRelaySheet = true
-                    } label: {
-                        Label("Relay host (\(store.state.relayHost))", systemImage: "antenna.radiowaves.left.and.right")
-                    }
-                    Divider()
-                    Button(role: .destructive) {
-                        confirmDeleteAllChats = true
-                    } label: { Label("Delete all chats", systemImage: "trash") }
-                    Button(role: .destructive) {
-                        confirmReset = true
-                    } label: { Label("Reset identity", systemImage: "arrow.counterclockwise") }
+                Button {
+                    showSettings = true
                 } label: {
-                    Image(systemName: "ellipsis.circle")
+                    Image(systemName: "gearshape")
                 }
+                .accessibilityLabel("Settings")
             }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showAddContactDialog = true
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .accessibilityLabel("Add contact")
+            }
+        }
+        .confirmationDialog(
+            "Add a contact",
+            isPresented: $showAddContactDialog,
+            titleVisibility: .visible,
+        ) {
+            Button {
+                showScanner = true
+            } label: { Text("Scan their QR") }
+            Button {
+                if let s = UIPasteboard.general.string {
+                    onPasteContact(s)
+                }
+            } label: { Text("Paste from clipboard") }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Pair by scanning the other person's QR. They need to scan you back too.")
         }
     }
 
+    // ─── Empty state ───────────────────────────────────────────────────
+    // Two big primary actions stacked, plus a smaller paste fallback.
+    // Replaces the previous "tap the ⋯ menu to scan" instruction
+    // (forcing first-run users to discover an overflow menu before they
+    // could do anything).
     private var emptyState: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "qrcode")
-                .font(.system(size: 56))
-                .foregroundStyle(.tint)
-            Text("No contacts yet")
-                .font(.headline)
-            Text("Both you and the other person scan each other's QR.\nTap the QR icon to share yours, or the ⋯ menu to scan.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
+        VStack(spacing: 28) {
+            Spacer()
+            VStack(spacing: 14) {
+                Image(systemName: "qrcode.viewfinder")
+                    .font(.system(size: 64))
+                    .foregroundStyle(.tint)
+                Text("No contacts yet")
+                    .font(.title3.weight(.semibold))
+                Text("Pair by scanning each other's QR. Both of you have to scan; one-way scans don't unlock chat.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
+            }
+            VStack(spacing: 10) {
+                Button {
+                    showScanner = true
+                } label: {
+                    Label("Scan a QR", systemImage: "qrcode.viewfinder")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+
+                Button {
+                    showMyQR = true
+                } label: {
+                    Label("Show my QR", systemImage: "qrcode")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+
+                Button {
+                    if let s = UIPasteboard.general.string {
+                        onPasteContact(s)
+                    }
+                } label: {
+                    Text("Paste contact from clipboard")
+                        .font(.footnote)
+                }
+                .padding(.top, 4)
+            }
+            .padding(.horizontal, 32)
+            Spacer()
+            Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
