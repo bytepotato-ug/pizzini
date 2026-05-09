@@ -55,9 +55,19 @@ struct ContactCard: Equatable, Identifiable {
 /// Pure QR-image renderer. Used by `MyQRSheet`'s reveal/hide states —
 /// the surrounding chrome (warning, hide-toggle, details disclosure)
 /// lives in `MyQRSheet` so this stays reusable.
+///
+/// Default `sideLength = 180pt` is deliberately conservative: pairing
+/// happens hand-to-hand (≈30 cm apart), and at that range a 180pt QR
+/// is comfortably scannable. A photographer 2 m+ away — security
+/// camera, someone behind a window, a shoulder surfer with their own
+/// phone — gets a postage-stamp image whose modules don't resolve
+/// cleanly. The previous 280pt code was scannable from across the
+/// room, which is exactly the threat the warning above the QR is
+/// asking the user to defend against. Smaller code, smaller blast
+/// radius if a stray photo gets taken.
 struct ContactQRImage: View {
     let card: ContactCard
-    var sideLength: CGFloat = 280
+    var sideLength: CGFloat = 180
 
     var body: some View {
         if let image = qrImage(for: card.encoded) {
@@ -66,9 +76,9 @@ struct ContactQRImage: View {
                 .resizable()
                 .scaledToFit()
                 .frame(maxWidth: sideLength, maxHeight: sideLength)
-                .padding(12)
+                .padding(8)
                 .background(Color.white)
-                .cornerRadius(16)
+                .cornerRadius(12)
                 .accessibilityLabel("Pizzini contact QR")
         } else {
             Text("(could not render QR)")
