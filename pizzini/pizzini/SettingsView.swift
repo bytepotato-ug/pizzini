@@ -60,6 +60,16 @@ struct SettingsView: View {
                     Text("Off (default): received files show only the filename, with a Save-to-Files button. On: also shows a Preview button that opens the file in iOS QuickLook. The file is parsed by Apple's QuickLook service either way once you tap; off keeps Pizzini's process out of the loop entirely. Recommended off for journalists and anyone targeted by sophisticated adversaries.")
                 }
 
+                Section("Help") {
+                    NavigationLink {
+                        FAQContent(initialSection: nil)
+                            .navigationTitle("FAQ")
+                            .navigationBarTitleDisplayMode(.inline)
+                    } label: {
+                        SettingsRow(icon: "questionmark.circle", title: "FAQ")
+                    }
+                }
+
                 Section {
                     NavigationLink {
                         AdvancedScreen(store: store, onResetClose: onClose)

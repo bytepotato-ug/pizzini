@@ -15,6 +15,10 @@ struct ChatView: View {
     @State private var showPhotoPicker = false
     @State private var showDocumentPicker = false
     @State private var attachmentDraft: AttachmentDraft?
+    /// Set to a non-nil section when the user taps an (i) info button
+    /// on a tier banner — both pre-send and post-receive surfaces use
+    /// this to deep-link into FAQView at the right anchor.
+    @State private var faqAnchor: FAQSection?
     @Environment(\.dismiss) private var dismiss
 
     private var contact: Contact? {
@@ -47,6 +51,9 @@ struct ChatView: View {
             // the button as the popover anchor. Attaching it here at
             // the body level made the popover float at the top of the
             // screen with the arrow pointing nowhere.
+            .sheet(item: $faqAnchor) { anchor in
+                FAQView(initialSection: anchor) { faqAnchor = nil }
+            }
             .sheet(isPresented: $showPhotoPicker) {
                 PhotoVideoPicker(
                     onPick: { url, name in
@@ -175,6 +182,7 @@ struct ChatView: View {
                             status: rowStatus(forEntry: entry),
                             resolveURL: { info in store.attachmentURL(for: info) },
                             quickLookEnabled: store.state.quickLookPreviewEnabled,
+                            onInfoTap: { section in faqAnchor = section },
                         ).id(entry.id)
                     }
                 }
@@ -275,16 +283,28 @@ struct ChatView: View {
                 .accessibilityLabel("Remove attachment")
             }
             if let warning = AttachmentCopy.attachWarning(forTier: draft.tier) {
-                Text(warning)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(Color.yellow.opacity(0.15))
-                    )
+                HStack(alignment: .top, spacing: 6) {
+                    Text(warning)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if let anchor = AttachmentCopy.attachFaqAnchor(forTier: draft.tier) {
+                        Button {
+                            faqAnchor = anchor
+                        } label: {
+                            Image(systemName: "info.circle")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("More info")
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.yellow.opacity(0.15))
+                )
             }
         }
         .padding(.horizontal)
@@ -370,17 +390,22 @@ struct ChatRow: View {
     /// AND the row is an inbound attachment, we render a Preview button
     /// that opens QLPreviewController in addition to Save to Files.
     let quickLookEnabled: Bool
+    /// Bubble (i) info-button taps up to the parent ChatView so it
+    /// can present the FAQ sheet at the right anchor.
+    let onInfoTap: ((FAQSection) -> Void)?
 
     init(
         entry: PersistedMessage,
         status: OutboxEntry.Status? = nil,
         resolveURL: @escaping (AttachmentInfo) -> URL? = { _ in nil },
-        quickLookEnabled: Bool = false
+        quickLookEnabled: Bool = false,
+        onInfoTap: ((FAQSection) -> Void)? = nil
     ) {
         self.entry = entry
         self.status = status
         self.resolveURL = resolveURL
         self.quickLookEnabled = quickLookEnabled
+        self.onInfoTap = onInfoTap
     }
 
     var body: some View {
@@ -399,6 +424,7 @@ struct ChatRow: View {
                         resolveURL: resolveURL,
                         captionText: entry.text,
                         quickLookEnabled: quickLookEnabled,
+                        onInfoTap: onInfoTap,
                     )
                 } else {
                     Text(entry.text)
@@ -480,6 +506,11 @@ struct AttachmentRowCard: View {
     /// an inbound row, we render a Preview button that pops
     /// QLPreviewController. Default false (strict mode).
     let quickLookEnabled: Bool
+    /// Bubble taps on the (i) info button up to the parent ChatView
+    /// so the FAQ sheet is presented from a single place. Nil means
+    /// "no info button" (e.g. a row in a context where deep-linking
+    /// to FAQ doesn't make sense).
+    let onInfoTap: ((FAQSection) -> Void)?
 
     @State private var presentingShare = false
     @State private var presentingPreview = false
@@ -490,7 +521,8 @@ struct AttachmentRowCard: View {
         bubbleColor: Color,
         resolveURL: @escaping (AttachmentInfo) -> URL?,
         captionText: String,
-        quickLookEnabled: Bool = false
+        quickLookEnabled: Bool = false,
+        onInfoTap: ((FAQSection) -> Void)? = nil
     ) {
         self.info = info
         self.side = side
@@ -498,6 +530,7 @@ struct AttachmentRowCard: View {
         self.resolveURL = resolveURL
         self.captionText = captionText
         self.quickLookEnabled = quickLookEnabled
+        self.onInfoTap = onInfoTap
     }
 
     var body: some View {
@@ -608,7 +641,22 @@ struct AttachmentRowCard: View {
         let fg: Color = banner.tone == .danger ? .red : .orange
         HStack(alignment: .top, spacing: 6) {
             Image(systemName: icon).foregroundStyle(fg)
-            Text(banner.text).font(.caption2)
+            Text(banner.text)
+                .font(.caption2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            // (i) button deep-links into FAQ for the curious user.
+            // Hidden when the parent didn't pass an onInfoTap (e.g.
+            // tests or previews) or the banner has no FAQ section.
+            if let faq = banner.faqSection, let onInfoTap {
+                Button {
+                    onInfoTap(faq)
+                } label: {
+                    Image(systemName: "info.circle")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("More info")
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
