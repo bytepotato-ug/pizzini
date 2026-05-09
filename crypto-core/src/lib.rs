@@ -15,7 +15,7 @@ use rand::TryRngCore;
 use rand::rngs::OsRng;
 
 mod store;
-pub use store::{DeviceStore, EncryptResult};
+pub use store::{DeviceStore, EncryptResult, SealReceived, DELIVERY_TOKEN_VERIFY_KEY_LEN};
 
 // ───── Error codes ─────────────────────────────────────────────────────
 //
@@ -451,6 +451,187 @@ pub unsafe extern "C" fn pizzini_store_forget_peer(
     PIZZINI_OK
 }
 
+/// Writes the recipient's published delivery-token verify key (33 bytes:
+/// libsignal PublicKey serialize() — 1-byte type prefix + 32-byte point).
+/// Used by the relay-side token check; deterministic per IdentityKeyPair.
+///
+/// # Safety
+/// Same as `pizzini_store_identity_keypair`.
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_store_delivery_token_verify_key(
+    store: *mut DeviceStore,
+    out_buf: *mut u8,
+    out_buf_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if store.is_null() || out_buf.is_null() || out_len.is_null() {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted store is live.
+    let s = unsafe { &*store };
+    let bytes = match s.delivery_token_verify_key_bytes() {
+        Ok(b) => b,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    // SAFETY: out_buf/out_len asserted valid.
+    unsafe { copy_or_size_out(&bytes, out_buf, out_buf_cap, out_len) }
+}
+
+/// Mints (or refreshes) the cached SenderCertificate and writes its wire
+/// bytes. Production callers reach `pizzini_store_seal_send` directly
+/// which calls this internally; this entry point is exposed mostly for
+/// debug/logging in Swift.
+///
+/// # Safety
+/// Same as `pizzini_store_publish_bundle`.
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_store_ensure_sender_certificate(
+    store: *mut DeviceStore,
+    out_buf: *mut u8,
+    out_buf_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if store.is_null() || out_buf.is_null() || out_len.is_null() {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted store is live.
+    let s = unsafe { &mut *store };
+    let bytes = match s.ensure_sender_certificate() {
+        Ok(b) => b,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    // SAFETY: out_buf/out_len asserted valid.
+    unsafe { copy_or_size_out(&bytes, out_buf, out_buf_cap, out_len) }
+}
+
+/// Sealed-sender SEND. Wraps `plaintext` in a libsignal ratchet
+/// ciphertext, prefixes the 16-byte `message_id` and 1-byte `is_prekey`
+/// at the USMC layer, seals to `peer_identity_pub`, and writes the wire
+/// bytes the relay forwards verbatim. Mints the SenderCertificate
+/// internally if absent.
+///
+/// # Safety
+/// All non-null pointers must describe valid slices of the declared sizes.
+/// `message_id` must point to exactly 16 readable bytes.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_store_seal_send(
+    store: *mut DeviceStore,
+    peer_identity: *const u8,
+    peer_identity_len: usize,
+    message_id_16: *const u8,
+    plaintext: *const u8,
+    plaintext_len: usize,
+    out_sealed: *mut u8,
+    out_sealed_cap: usize,
+    out_sealed_len: *mut usize,
+) -> i32 {
+    if store.is_null()
+        || peer_identity.is_null()
+        || message_id_16.is_null()
+        || plaintext.is_null()
+        || out_sealed.is_null()
+        || out_sealed_len.is_null()
+    {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: preconditions asserted.
+    let s = unsafe { &mut *store };
+    let peer = unsafe { std::slice::from_raw_parts(peer_identity, peer_identity_len) };
+    let pt = unsafe { std::slice::from_raw_parts(plaintext, plaintext_len) };
+    let msg_id_slice = unsafe { std::slice::from_raw_parts(message_id_16, 16) };
+    let mut msg_id = [0u8; 16];
+    msg_id.copy_from_slice(msg_id_slice);
+    let bytes = match s.seal_send(peer, &msg_id, pt) {
+        Ok(b) => b,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    // SAFETY: out_sealed/out_sealed_len asserted valid.
+    unsafe { copy_or_size_out(&bytes, out_sealed, out_sealed_cap, out_sealed_len) }
+}
+
+/// Sealed-sender RECEIVE. Validates the embedded cert against the
+/// claimed sender's identity_pub (looked up in the store's peers list),
+/// decrypts the inner ratchet ciphertext, and writes three outputs:
+///
+/// - `out_sender` — the sender's 33-byte identity_pub.
+/// - `out_message_id_16` — the 16-byte message_id from the USMC header.
+/// - `out_plaintext` — the inner plaintext bytes.
+///
+/// Returns `PIZZINI_ERR_BUFFER_TOO_SMALL` when EITHER `out_sender` or
+/// `out_plaintext` is too small to receive its payload, with the
+/// corresponding `*_len` filled in. Caller retries with both buffers
+/// sized appropriately. (We don't surface partial success — the
+/// alternative is "decrypted, then refused to copy", which leaves the
+/// ratchet advanced but the caller empty-handed.)
+///
+/// # Safety
+/// All non-null pointers must describe valid slices of the declared sizes.
+/// `out_message_id_16` must point to 16 writable bytes.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_store_seal_receive(
+    store: *mut DeviceStore,
+    sealed: *const u8,
+    sealed_len: usize,
+    out_sender: *mut u8,
+    out_sender_cap: usize,
+    out_sender_len: *mut usize,
+    out_message_id_16: *mut u8,
+    out_plaintext: *mut u8,
+    out_plaintext_cap: usize,
+    out_plaintext_len: *mut usize,
+) -> i32 {
+    if store.is_null()
+        || sealed.is_null()
+        || out_sender.is_null()
+        || out_sender_len.is_null()
+        || out_message_id_16.is_null()
+        || out_plaintext.is_null()
+        || out_plaintext_len.is_null()
+    {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: preconditions asserted.
+    let s = unsafe { &mut *store };
+    let sealed_bytes = unsafe { std::slice::from_raw_parts(sealed, sealed_len) };
+    let received = match s.seal_receive(sealed_bytes) {
+        Ok(r) => r,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+
+    // Two-buffer copy. If either is too small we report the maximum
+    // required size for that buffer, untouched, so the caller can grow
+    // both and retry with one round-trip.
+    let sender_len = received.sender_identity_pub.len();
+    let plaintext_len = received.plaintext.len();
+    if sender_len > out_sender_cap || plaintext_len > out_plaintext_cap {
+        // SAFETY: lengths pointers asserted valid.
+        unsafe {
+            *out_sender_len = sender_len;
+            *out_plaintext_len = plaintext_len;
+        }
+        return PIZZINI_ERR_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: caps verified above; pointers asserted valid.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            received.sender_identity_pub.as_ptr(),
+            out_sender,
+            sender_len,
+        );
+        *out_sender_len = sender_len;
+        std::ptr::copy_nonoverlapping(received.message_id.as_ptr(), out_message_id_16, 16);
+        std::ptr::copy_nonoverlapping(
+            received.plaintext.as_ptr(),
+            out_plaintext,
+            plaintext_len,
+        );
+        *out_plaintext_len = plaintext_len;
+    }
+    PIZZINI_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +934,116 @@ mod tests {
         assert_eq!(rc, PIZZINI_ERR_INTERNAL);
 
         unsafe { pizzini_store_free(alice2) };
+        unsafe { pizzini_store_free(bob) };
+    }
+
+    #[test]
+    fn store_ffi_seal_send_receive_round_trips() {
+        // Mirror seal_round_trips from store.rs but via the FFI surface
+        // exclusively — these are the symbols Swift calls.
+        let alice = unsafe { pizzini_store_new(std::ptr::null(), 0) };
+        let bob = unsafe { pizzini_store_new(std::ptr::null(), 0) };
+
+        // Pull both identity_pubs.
+        let mut alice_id = vec![0u8; 64];
+        let mut alice_id_len = 0usize;
+        unsafe {
+            pizzini_store_identity_public(
+                alice,
+                alice_id.as_mut_ptr(), alice_id.len(), &mut alice_id_len,
+            )
+        };
+        let alice_id = alice_id[..alice_id_len].to_vec();
+        let mut bob_id = vec![0u8; 64];
+        let mut bob_id_len = 0usize;
+        unsafe {
+            pizzini_store_identity_public(
+                bob,
+                bob_id.as_mut_ptr(), bob_id.len(), &mut bob_id_len,
+            )
+        };
+        let bob_id = bob_id[..bob_id_len].to_vec();
+
+        // Bundle exchange: Alice initiates against Bob; pre-trust Alice
+        // on Bob's side so the seal_receive contact-gate accepts her.
+        let mut bundle = vec![0u8; 4096];
+        let mut bundle_len = 0usize;
+        unsafe {
+            pizzini_store_publish_bundle(
+                bob,
+                bundle.as_mut_ptr(), bundle.len(), &mut bundle_len,
+            )
+        };
+        unsafe {
+            pizzini_store_initiate_session(
+                alice,
+                bob_id.as_ptr(), bob_id.len(),
+                bundle.as_ptr(), bundle_len,
+            )
+        };
+        unsafe {
+            pizzini_store_register_peer(bob, alice_id.as_ptr(), alice_id.len())
+        };
+
+        // Verify-key getter works and returns the documented size.
+        let mut vk = vec![0u8; 64];
+        let mut vk_len = 0usize;
+        let rc = unsafe {
+            pizzini_store_delivery_token_verify_key(
+                alice, vk.as_mut_ptr(), vk.len(), &mut vk_len,
+            )
+        };
+        assert_eq!(rc, PIZZINI_OK);
+        assert_eq!(vk_len, DELIVERY_TOKEN_VERIFY_KEY_LEN);
+
+        // Round-trip a message.
+        let plaintext = b"hello via sealed FFI";
+        let msg_id = [0xAAu8; 16];
+        let mut sealed = vec![0u8; 4096];
+        let mut sealed_len = 0usize;
+        let rc = unsafe {
+            pizzini_store_seal_send(
+                alice,
+                bob_id.as_ptr(), bob_id.len(),
+                msg_id.as_ptr(),
+                plaintext.as_ptr(), plaintext.len(),
+                sealed.as_mut_ptr(), sealed.len(), &mut sealed_len,
+            )
+        };
+        assert_eq!(rc, PIZZINI_OK);
+        assert!(sealed_len > 0);
+
+        let mut sender = vec![0u8; 64];
+        let mut sender_len = 0usize;
+        let mut got_msg_id = [0u8; 16];
+        let mut pt = vec![0u8; 1024];
+        let mut pt_len = 0usize;
+        let rc = unsafe {
+            pizzini_store_seal_receive(
+                bob,
+                sealed.as_ptr(), sealed_len,
+                sender.as_mut_ptr(), sender.len(), &mut sender_len,
+                got_msg_id.as_mut_ptr(),
+                pt.as_mut_ptr(), pt.len(), &mut pt_len,
+            )
+        };
+        assert_eq!(rc, PIZZINI_OK);
+        assert_eq!(&sender[..sender_len], alice_id.as_slice());
+        assert_eq!(got_msg_id, msg_id);
+        assert_eq!(&pt[..pt_len], plaintext);
+
+        // ensure_sender_certificate is idempotent.
+        let mut cert = vec![0u8; 4096];
+        let mut cert_len = 0usize;
+        let rc = unsafe {
+            pizzini_store_ensure_sender_certificate(
+                alice, cert.as_mut_ptr(), cert.len(), &mut cert_len,
+            )
+        };
+        assert_eq!(rc, PIZZINI_OK);
+        assert!(cert_len > 0);
+
+        unsafe { pizzini_store_free(alice) };
         unsafe { pizzini_store_free(bob) };
     }
 }

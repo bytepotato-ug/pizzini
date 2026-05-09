@@ -92,4 +92,53 @@ struct PizziniCryptoCoreTests {
             _ = try alice.encrypt(peerIdentity: bobId, plaintext: Data("again".utf8))
         }
     }
+
+    @Test("encryptSealed/decryptSealed round-trip a sealed-sender SEND")
+    func sealedSenderRoundTrip() throws {
+        let alice = try Session()
+        let bob = try Session()
+        let aliceId = try alice.identityPublic()
+        let bobId = try bob.identityPublic()
+        try alice.initiateSession(peerIdentity: bobId, bundle: try bob.publishBundle())
+        // Pre-trust Alice on Bob's side (mirrors what addContact does
+        // after a QR scan).
+        try bob.registerPeer(peerIdentity: aliceId)
+
+        let messageId = Data((0..<16).map { UInt8($0) })
+        let payload = Data("first sealed".utf8)
+        let sealed = try alice.encryptSealed(
+            peer: bobId, messageId: messageId, plaintext: payload
+        )
+        let received = try bob.decryptSealed(sealed)
+        #expect(received.peer == aliceId)
+        #expect(received.messageId == messageId)
+        #expect(received.plaintext == payload)
+    }
+
+    @Test("decryptSealed throws for a sender we don't trust yet")
+    func sealedSenderUnknownSender() throws {
+        let alice = try Session()
+        let bob = try Session()
+        let bobId = try bob.identityPublic()
+        try alice.initiateSession(peerIdentity: bobId, bundle: try bob.publishBundle())
+        // Note: do NOT pre-register Alice on Bob's side.
+        let sealed = try alice.encryptSealed(
+            peer: bobId,
+            messageId: Data(repeating: 0, count: 16),
+            plaintext: Data("surprise".utf8),
+        )
+        #expect(throws: (any Error).self) {
+            _ = try bob.decryptSealed(sealed)
+        }
+    }
+
+    @Test("delivery-token verify key is deterministic per identity")
+    func deliveryTokenVerifyKey() throws {
+        let s = try Session()
+        let key1 = try s.deliveryTokenVerifyKey()
+        let seed = try s.identityKeypairBytes()
+        let s2 = try Session(identitySeed: seed)
+        #expect(try s2.deliveryTokenVerifyKey() == key1)
+        #expect(key1.count == 33)
+    }
 }

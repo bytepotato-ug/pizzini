@@ -19,6 +19,15 @@
 
 #define PIZZINI_MSG_TYPE_WHISPER 1
 
+/**
+ * libsignal-native public-key wire size: 1-byte DJB type prefix + 32-byte
+ * Curve25519 point. The bundle field carries exactly this many bytes;
+ * rejecting other sizes keeps the relay's per-recipient verify-key table
+ * predictable, and any future migration to a different curve flavour
+ * will trip the size check loudly instead of silently mis-verifying.
+ */
+#define DELIVERY_TOKEN_VERIFY_KEY_LEN 33
+
 typedef struct DeviceStore DeviceStore;
 
 /**
@@ -207,5 +216,84 @@ int32_t pizzini_store_register_peer(struct DeviceStore *store,
 int32_t pizzini_store_forget_peer(struct DeviceStore *store,
                                   const uint8_t *peer_identity,
                                   uintptr_t peer_identity_len);
+
+/**
+ * Writes the recipient's published delivery-token verify key (33 bytes:
+ * libsignal PublicKey serialize() — 1-byte type prefix + 32-byte point).
+ * Used by the relay-side token check; deterministic per IdentityKeyPair.
+ *
+ * # Safety
+ * Same as `pizzini_store_identity_keypair`.
+ */
+int32_t pizzini_store_delivery_token_verify_key(struct DeviceStore *store,
+                                                uint8_t *out_buf,
+                                                uintptr_t out_buf_cap,
+                                                uintptr_t *out_len);
+
+/**
+ * Mints (or refreshes) the cached SenderCertificate and writes its wire
+ * bytes. Production callers reach `pizzini_store_seal_send` directly
+ * which calls this internally; this entry point is exposed mostly for
+ * debug/logging in Swift.
+ *
+ * # Safety
+ * Same as `pizzini_store_publish_bundle`.
+ */
+int32_t pizzini_store_ensure_sender_certificate(struct DeviceStore *store,
+                                                uint8_t *out_buf,
+                                                uintptr_t out_buf_cap,
+                                                uintptr_t *out_len);
+
+/**
+ * Sealed-sender SEND. Wraps `plaintext` in a libsignal ratchet
+ * ciphertext, prefixes the 16-byte `message_id` and 1-byte `is_prekey`
+ * at the USMC layer, seals to `peer_identity_pub`, and writes the wire
+ * bytes the relay forwards verbatim. Mints the SenderCertificate
+ * internally if absent.
+ *
+ * # Safety
+ * All non-null pointers must describe valid slices of the declared sizes.
+ * `message_id` must point to exactly 16 readable bytes.
+ */
+int32_t pizzini_store_seal_send(struct DeviceStore *store,
+                                const uint8_t *peer_identity,
+                                uintptr_t peer_identity_len,
+                                const uint8_t *message_id_16,
+                                const uint8_t *plaintext,
+                                uintptr_t plaintext_len,
+                                uint8_t *out_sealed,
+                                uintptr_t out_sealed_cap,
+                                uintptr_t *out_sealed_len);
+
+/**
+ * Sealed-sender RECEIVE. Validates the embedded cert against the
+ * claimed sender's identity_pub (looked up in the store's peers list),
+ * decrypts the inner ratchet ciphertext, and writes three outputs:
+ *
+ * - `out_sender` — the sender's 33-byte identity_pub.
+ * - `out_message_id_16` — the 16-byte message_id from the USMC header.
+ * - `out_plaintext` — the inner plaintext bytes.
+ *
+ * Returns `PIZZINI_ERR_BUFFER_TOO_SMALL` when EITHER `out_sender` or
+ * `out_plaintext` is too small to receive its payload, with the
+ * corresponding `*_len` filled in. Caller retries with both buffers
+ * sized appropriately. (We don't surface partial success — the
+ * alternative is "decrypted, then refused to copy", which leaves the
+ * ratchet advanced but the caller empty-handed.)
+ *
+ * # Safety
+ * All non-null pointers must describe valid slices of the declared sizes.
+ * `out_message_id_16` must point to 16 writable bytes.
+ */
+int32_t pizzini_store_seal_receive(struct DeviceStore *store,
+                                   const uint8_t *sealed,
+                                   uintptr_t sealed_len,
+                                   uint8_t *out_sender,
+                                   uintptr_t out_sender_cap,
+                                   uintptr_t *out_sender_len,
+                                   uint8_t *out_message_id_16,
+                                   uint8_t *out_plaintext,
+                                   uintptr_t out_plaintext_cap,
+                                   uintptr_t *out_plaintext_len);
 
 #endif  /* PIZZINI_CRYPTO_CORE_H */

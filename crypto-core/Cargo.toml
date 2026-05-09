@@ -20,6 +20,12 @@ rand = "0.9"
 # so we don't need a real runtime. Promoted from dev-dep when LoopbackState
 # moved into the library proper.
 futures-util = { version = "0.3", default-features = false }
+# HKDF-SHA512 derives the per-peer delivery-token signing key from the
+# IdentityKeyPair, so a peer's verify-key is reconstructible from a
+# Keychain-backed identity backup with no separate secret. Both crates
+# are already in libsignal's transitive tree — no supply-chain delta.
+hkdf = "0.12"
+sha2 = "0.10"
 
 [build-dependencies]
 cbindgen = "0.29"

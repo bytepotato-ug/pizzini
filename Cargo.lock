@@ -1382,8 +1382,10 @@ version = "0.0.0"
 dependencies = [
  "cbindgen",
  "futures-util",
+ "hkdf",
  "libsignal-protocol",
  "rand",
+ "sha2",
 ]
 
 [[package]]
