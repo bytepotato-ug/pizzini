@@ -216,9 +216,30 @@ type Routes = Arc<Mutex<HashMap<PeerId, Outbox>>>;
 /// token when the recipient is *not* currently connected.
 type PushTokens = Arc<Mutex<HashMap<PeerId, Vec<u8>>>>;
 /// Per-recipient delivery-token verify key. Populated by the
-/// recipient's HELLO; persists across reconnects so a sender can ship
-/// a SEND while the recipient is briefly offline (queued).
-type VerifyKeys = Arc<Mutex<HashMap<PeerId, Vec<u8>>>>;
+/// recipient's HELLO and refreshed on every successful
+/// `check_delivery_token` lookup. The value's `Instant` is the last
+/// time we touched the entry; the periodic GC prunes anything older
+/// than `VERIFY_KEY_TTL`.
+///
+/// Why time-based instead of remove-on-disconnect (the F-204 fix
+/// before fix-review): a SEND aimed at a recently-disconnected peer
+/// still needs the recipient's verify_key to pass `check_delivery_token`
+/// — otherwise the frame is dropped before reaching `enqueue_pending`,
+/// breaking the offline-message-delivery feature. Time-based GC
+/// preserves the verify_key for the full token TTL window AND bounds
+/// memory + linkability the same way: an attacker padding peer_ids
+/// gets entries that age out in `VERIFY_KEY_TTL`. N-002.
+type VerifyKeys = Arc<Mutex<HashMap<PeerId, (Vec<u8>, Instant)>>>;
+/// How long a verify_key entry lives without being touched. Must be
+/// ≥ `DELIVERY_TOKEN_TTL_SECS` so a token from the longest possible
+/// holdout sender still finds its issuer's key. The token TTL itself
+/// guarantees that pruned entries never correspond to a still-valid
+/// token.
+const VERIFY_KEY_TTL: Duration = TOKEN_REPLAY_WINDOW;
+/// How often the GC walks the verify_keys table. 1h is well below
+/// `VERIFY_KEY_TTL` (30d) — coarse enough to keep lock contention
+/// negligible, fine enough that "drift past TTL" stays bounded.
+const VERIFY_KEY_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Replay-set entry: (recipient_peer_id, token_nonce). Each token is
 /// one-use against a given recipient; the same nonce against a
 /// different recipient is a logically different token (different
@@ -323,6 +344,7 @@ async fn main() -> std::io::Result<()> {
     spawn_pending_gc(pending.clone());
     spawn_replay_gc(replays.clone());
     spawn_hello_replay_gc(hello_replays.clone());
+    spawn_verify_keys_gc(verify_keys.clone());
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
@@ -427,10 +449,13 @@ async fn handle_connection(
     // Register / overwrite the recipient's verify key. Token-bearing
     // SENDs/ACKs to this peer get verified against the latest entry,
     // so a peer rotating its identity wipes any older stash without a
-    // separate revocation flow.
+    // separate revocation flow. The `Instant` is the GC's last-touched
+    // marker; refreshed on every successful check_delivery_token
+    // lookup so a peer with active inbound traffic stays cached even
+    // when offline themselves.
     {
         let mut vk = verify_keys.lock().await;
-        vk.insert(peer_id.clone(), verify_key);
+        vk.insert(peer_id.clone(), (verify_key, Instant::now()));
     }
     println!("[{peer_addr}] HELLO from peer {} (proof verified, verify key registered)", short_hex(&peer_id));
 
@@ -489,21 +514,16 @@ async fn handle_connection(
         }
         was_ours
     };
-    // F-204: drop verify_keys[peer_id] alongside the route IFF we're the
-    // owning connection AND no queued mail still needs the verify_key
-    // for incoming-token verification. Older verify_keys would otherwise
-    // accumulate forever.
-    if was_ours {
-        let pending_present = pending
-            .lock()
-            .await
-            .get(&peer_id)
-            .map(|q| !q.is_empty())
-            .unwrap_or(false);
-        if !pending_present {
-            verify_keys.lock().await.remove(&peer_id);
-        }
-    }
+    // N-002: previously this code eagerly removed verify_keys[peer_id]
+    // on disconnect when pending was empty. That broke offline-message
+    // delivery — incoming SENDs to a recently-disconnected peer rely
+    // on `check_delivery_token` finding the recipient's verify_key,
+    // and a missing key dropped the frame BEFORE `enqueue_pending`
+    // could queue it. Verify_keys lifetime is now governed by
+    // `spawn_verify_keys_gc` instead, which prunes entries unused for
+    // `VERIFY_KEY_TTL` (= token TTL = 30d). This bounds memory and
+    // post-mortem linkability the same way (entries age out) without
+    // breaking delivery to peers in their first 30d of disconnect.
     drop(our_tx);
     writer_task.abort();
     dev_peer_log!("[{peer_addr}] disconnected ({peer_hex})");
@@ -796,9 +816,19 @@ async fn check_delivery_token(
         ));
     }
 
+    // N-002: touch last_used on every successful lookup so an active
+    // recipient's verify_key stays cached even when they're disconnected
+    // (third parties keep sending them mail; each verified frame
+    // refreshes the GC marker).
     let verify_key_bytes = {
-        let table = verify_keys.lock().await;
-        table.get(&parsed.to_id).cloned()
+        let mut table = verify_keys.lock().await;
+        match table.get_mut(&parsed.to_id) {
+            Some(entry) => {
+                entry.1 = Instant::now();
+                Some(entry.0.clone())
+            }
+            None => None,
+        }
     };
     let verify_key_bytes = match verify_key_bytes {
         Some(b) => b,
@@ -839,6 +869,28 @@ fn spawn_replay_gc(replays: Replays) {
             let after = set.len();
             if before != after {
                 println!("token-replay GC: pruned {} → {after}", before - after);
+            }
+        }
+    });
+}
+
+/// N-002: prune verify_keys entries unused for `VERIFY_KEY_TTL`. Bounds
+/// memory growth (the F-204 concern) and post-mortem linkability (a
+/// memory dump reveals only peers active in the last `VERIFY_KEY_TTL`)
+/// without breaking offline-message delivery for recently-disconnected
+/// recipients.
+fn spawn_verify_keys_gc(verify_keys: VerifyKeys) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(VERIFY_KEY_GC_INTERVAL);
+        loop {
+            tick.tick().await;
+            let cutoff = Instant::now() - VERIFY_KEY_TTL;
+            let mut table = verify_keys.lock().await;
+            let before = table.len();
+            table.retain(|_, (_, last_touched)| *last_touched > cutoff);
+            let after = table.len();
+            if before != after {
+                println!("verify-keys GC: pruned {} → {after}", before - after);
             }
         }
     });
@@ -1634,6 +1686,103 @@ mod tests {
         assert_ne!(good, *bad.as_bytes());
     }
 
+    // ─── N-002 verify_keys lifetime ───────────────────────────────────────
+
+    /// N-002: Bob has been registered (HELLO completed) and is now
+    /// disconnected. A SEND aimed at Bob with a token signed by Bob's
+    /// verify_key MUST still verify — otherwise offline-message
+    /// delivery breaks for any peer whose connection just dropped.
+    /// This was the regression introduced by the original F-204 fix.
+    #[tokio::test]
+    async fn n002_verify_key_survives_disconnect_and_check_succeeds() {
+        // Mint Bob's IdentityKey and derive his recipient verify_key
+        // the same way crypto-core does (HKDF-SHA512 from the
+        // IdentityKeyPair's private bytes is the production path; for
+        // this test we just need ANY valid (verify_key, signature) pair
+        // that goes through the same `PublicKey::verify_signature` path
+        // the relay uses).
+        let (bob_pid, bob_kp) = fresh_identity();
+        let bob_verify_pub = *bob_kp.identity_key().public_key();
+        let bob_verify_key_bytes = bob_verify_pub.serialize().to_vec();
+        // Sign a token (nonce16 || expiry_be_u32) with Bob's private key.
+        let mut rng = rand::rngs::OsRng.unwrap_err();
+        let nonce = [0xCDu8; TOKEN_NONCE_LEN];
+        let expiry = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            + 3600) as u32;
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&nonce);
+        payload.extend_from_slice(&expiry.to_be_bytes());
+        let sig = bob_kp
+            .private_key()
+            .calculate_signature(&payload, &mut rng)
+            .expect("sign");
+        let mut token = Vec::with_capacity(TOKEN_LEN);
+        token.extend_from_slice(&payload);
+        token.extend_from_slice(&sig);
+        assert_eq!(token.len(), TOKEN_LEN);
+
+        // Register Bob via HELLO-equivalent insert into verify_keys.
+        let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
+        verify_keys
+            .lock()
+            .await
+            .insert(bob_pid.clone(), (bob_verify_key_bytes, Instant::now()));
+
+        // Bob "disconnects" — under N-002's fix, no removal happens.
+        // (Pre-fix, the F-204 eager-remove block ran here and dropped
+        // verify_keys[bob].)
+
+        // Alice's SEND to Bob arrives at the relay — check_delivery_token
+        // looks up verify_keys[bob] and verifies the signature.
+        let parsed = ParsedSealed {
+            to_id: bob_pid.clone(),
+            ttl_seconds: 3600,
+            token,
+        };
+        let replays: Replays = Arc::new(Mutex::new(HashMap::new()));
+        check_delivery_token(&parsed, &verify_keys, &replays)
+            .await
+            .expect("verify must succeed for recently-disconnected recipient");
+    }
+
+    /// N-002: the periodic GC prunes verify_keys entries unused for
+    /// `VERIFY_KEY_TTL`. Simulates an old entry by inserting with
+    /// last_touched = `now - VERIFY_KEY_TTL - 1s`.
+    #[tokio::test]
+    async fn n002_verify_keys_gc_prunes_stale_entries() {
+        let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
+        let stale_pid = vec![0xAAu8; 33];
+        let fresh_pid = vec![0xBBu8; 33];
+        // Stale entry: simulate "30d + 1s ago".
+        let stale_ts = Instant::now()
+            .checked_sub(VERIFY_KEY_TTL + Duration::from_secs(1))
+            .expect("clock arithmetic");
+        verify_keys
+            .lock()
+            .await
+            .insert(stale_pid.clone(), (vec![1u8; 33], stale_ts));
+        verify_keys
+            .lock()
+            .await
+            .insert(fresh_pid.clone(), (vec![2u8; 33], Instant::now()));
+        // Run the GC loop body inline (the real spawn is on a 1h
+        // tick; we just want to test the retain logic).
+        {
+            let cutoff = Instant::now() - VERIFY_KEY_TTL;
+            let mut table = verify_keys.lock().await;
+            table.retain(|_, (_, last_touched)| *last_touched > cutoff);
+        }
+        let table = verify_keys.lock().await;
+        assert!(!table.contains_key(&stale_pid), "stale entry must be GC'd");
+        assert!(
+            table.contains_key(&fresh_pid),
+            "fresh entry must survive GC"
+        );
+    }
+
     // ─── F-205 expiry-cap ─────────────────────────────────────────────────
 
     /// F-205: a token with `expiry = u32::MAX` should be rejected for
@@ -1651,7 +1800,10 @@ mod tests {
         verify_keys
             .lock()
             .await
-            .insert(recipient_pid.clone(), vec![0u8; VERIFY_KEY_LEN]);
+            .insert(
+                recipient_pid.clone(),
+                (vec![0u8; VERIFY_KEY_LEN], Instant::now()),
+            );
         let replays: Replays = Arc::new(Mutex::new(HashMap::new()));
         let mut token = vec![0u8; TOKEN_LEN];
         // Nonce: arbitrary.
