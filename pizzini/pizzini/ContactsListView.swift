@@ -20,7 +20,7 @@ struct ContactsListView: View {
                 list
             }
         }
-        .navigationTitle("Pizzini")
+        .navigationTitle("Pizzini Contacts")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
