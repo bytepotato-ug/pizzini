@@ -201,7 +201,7 @@ private struct MyQRSheet: View {
 
     /// Hidden by default. The user has to make an explicit reveal
     /// gesture, after reading the warning above the surface. Re-tap
-    /// rehides; backgrounding the app rehides via the privacy shield.
+    /// rehides; backgrounding the app re-hides too — F-802 fix below.
     @State private var revealed = false
     @State private var showDetails = false
     @State private var copyConfirmation = false
@@ -227,6 +227,21 @@ private struct MyQRSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done", action: onDone)
                 }
+            }
+            // F-802: re-hide the QR whenever the scene deactivates
+            // (background, Control Centre pull-down, incoming call,
+            // app-switcher peek). The privacy shield masks the
+            // multitasking SNAPSHOT but the sheet itself remains
+            // presented across foreground transitions, so without this
+            // a bystander grabbing the unlocked phone seconds after
+            // the user resumes captures the deanonymising QR. Matches
+            // the verbal promise the privacy-warning copy makes.
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: UIScene.willDeactivateNotification,
+                ),
+            ) { _ in
+                revealed = false
             }
         }
     }

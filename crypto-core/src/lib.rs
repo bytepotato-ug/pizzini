@@ -10,7 +10,7 @@
 
 use core::ffi::c_char;
 
-use libsignal_protocol::IdentityKeyPair;
+use libsignal_protocol::{IdentityKeyPair, PublicKey};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 
@@ -18,8 +18,9 @@ mod hashcash;
 mod store;
 pub use hashcash::{hashcash_compute, hashcash_verify, HASHCASH_DEFAULT_BITS};
 pub use store::{
-    DeviceStore, EncryptResult, SealReceived, DELIVERY_TOKEN_LEN, DELIVERY_TOKEN_NONCE_LEN,
-    DELIVERY_TOKEN_SIG_LEN, DELIVERY_TOKEN_TTL_SECS, DELIVERY_TOKEN_VERIFY_KEY_LEN,
+    extract_bundle_verify_key, DeviceStore, EncryptResult, SealReceived, DELIVERY_TOKEN_LEN,
+    DELIVERY_TOKEN_NONCE_LEN, DELIVERY_TOKEN_SIG_LEN, DELIVERY_TOKEN_TTL_SECS,
+    DELIVERY_TOKEN_VERIFY_KEY_LEN,
 };
 
 // ───── Error codes ─────────────────────────────────────────────────────
@@ -31,6 +32,11 @@ pub const PIZZINI_OK: i32 = 0;
 pub const PIZZINI_ERR_INVALID_ARG: i32 = -1;
 pub const PIZZINI_ERR_BUFFER_TOO_SMALL: i32 = -2;
 pub const PIZZINI_ERR_INTERNAL: i32 = -3;
+/// Cryptographic verification failed (e.g. delivery-token signature does
+/// not match the supplied verify_key). Distinct from `INTERNAL` so the
+/// caller can attribute the failure to "untrustworthy bytes" rather than
+/// "library misbehaved".
+pub const PIZZINI_ERR_BAD_SIGNATURE: i32 = -4;
 
 // ───── Message type tags exposed across FFI ────────────────────────────
 
@@ -612,16 +618,23 @@ pub unsafe extern "C" fn pizzini_blake3_hash(
     PIZZINI_OK
 }
 
+/// FFI ceiling on `bits` to prevent an untrusted caller from wedging
+/// the host thread. 26 is well above the protocol's
+/// `HASHCASH_DEFAULT_BITS = 18` (which costs ~1s on a modern phone),
+/// well below the wall-clock-infinite region. At 26 the expected runtime
+/// is ~64x default → ~1 minute on a phone, ~3 seconds on a desktop.
+/// Anything stricter the caller wants must come from a separate API
+/// that takes a wall-clock budget. F-702.
+pub const HASHCASH_FFI_MAX_BITS: u32 = 26;
+
 /// BLAKE3 hashcash prover. Brute-forces a u64 nonce such that
 /// `BLAKE3(challenge || nonce_be) has at least `bits` leading zero
 /// bits`. Used by iOS to compute the proof attached to a
 /// BUNDLE_REQUEST; the relay verifies with a single hash.
 ///
 /// Returns 0 on success and writes the nonce to `*out_nonce`. Returns
-/// `PIZZINI_ERR_INVALID_ARG` on null pointers. There is no upper-bound
-/// guard on `bits` here — the caller is responsible for picking a
-/// reasonable difficulty (the relay accepts the protocol-defined
-/// `HASHCASH_DEFAULT_BITS = 18`).
+/// `PIZZINI_ERR_INVALID_ARG` on null pointers OR when `bits` exceeds
+/// `HASHCASH_FFI_MAX_BITS` (untrusted-caller DoS guard).
 ///
 /// # Safety
 /// `challenge` must point to `challenge_len` readable bytes.
@@ -636,10 +649,157 @@ pub unsafe extern "C" fn pizzini_hashcash_compute(
     if challenge.is_null() || out_nonce.is_null() {
         return PIZZINI_ERR_INVALID_ARG;
     }
+    if bits > HASHCASH_FFI_MAX_BITS {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
     // SAFETY: caller asserted challenge slice + nonce pointer valid.
     let chal = unsafe { std::slice::from_raw_parts(challenge, challenge_len) };
     let nonce = hashcash_compute(chal, bits);
     unsafe { *out_nonce = nonce };
+    PIZZINI_OK
+}
+
+/// Verify a delivery-token signature against a publish-bundle verify
+/// key. F-202 / F-401: the iOS receiver of a TOKEN_ISSUE batch needs to
+/// authenticate each token against the issuer's bundle-published
+/// verify_key, otherwise a malicious relay can swap legitimate batches
+/// for relay-forged bytes that fail at SEND-time and DoS the user.
+///
+/// Wire format mirrors `crypto-core::store::DeliveryToken`:
+/// `nonce16 || expiry_be_u32 || sig64`. The signature is over the first
+/// 20 bytes (nonce + expiry).
+///
+/// Returns `PIZZINI_OK` on valid signature, `PIZZINI_ERR_INVALID_ARG`
+/// on null pointers or wrong lengths, `PIZZINI_ERR_INTERNAL` if the
+/// verify_key fails to deserialize, and `PIZZINI_ERR_BAD_SIGNATURE` if
+/// the signature does not validate.
+///
+/// # Safety
+/// `verify_key` must point to `verify_key_len` readable bytes (must be
+/// `DELIVERY_TOKEN_VERIFY_KEY_LEN` = 33).
+/// `token` must point to `token_len` readable bytes (must be
+/// `DELIVERY_TOKEN_LEN` = 84).
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_verify_delivery_token(
+    verify_key: *const u8,
+    verify_key_len: usize,
+    token: *const u8,
+    token_len: usize,
+) -> i32 {
+    if verify_key.is_null() || token.is_null() {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    if verify_key_len != DELIVERY_TOKEN_VERIFY_KEY_LEN {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    if token_len != DELIVERY_TOKEN_LEN {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted slice validity above.
+    let vk_bytes = unsafe { std::slice::from_raw_parts(verify_key, verify_key_len) };
+    let tok_bytes = unsafe { std::slice::from_raw_parts(token, token_len) };
+
+    let key = match PublicKey::deserialize(vk_bytes) {
+        Ok(k) => k,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    let payload = &tok_bytes[..DELIVERY_TOKEN_NONCE_LEN + 4];
+    let sig = &tok_bytes[DELIVERY_TOKEN_NONCE_LEN + 4..];
+    if key.verify_signature(payload, sig) {
+        PIZZINI_OK
+    } else {
+        PIZZINI_ERR_BAD_SIGNATURE
+    }
+}
+
+/// Sign `payload` with the local IdentityKey's private half. F-203:
+/// used by the iOS client to attach a possession proof to its HELLO
+/// frame so a network-positioned attacker can't squat someone else's
+/// peer_id and drain that peer's queued mail. The relay verifies the
+/// returned 64-byte Ed25519 signature against the IdentityKey extracted
+/// from the HELLO's `peer_id` field.
+///
+/// The store is borrowed immutably — signing doesn't mutate any
+/// libsignal state.
+///
+/// # Safety
+/// `store` must point to a live `DeviceStore`.
+/// `payload` must point to `payload_len` readable bytes.
+/// `out_sig` must point to `out_cap` writable bytes.
+/// `out_len` must point to a valid `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_store_identity_sign(
+    store: *mut DeviceStore,
+    payload: *const u8,
+    payload_len: usize,
+    out_sig: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if store.is_null() || payload.is_null() || out_sig.is_null() || out_len.is_null() {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted slice + pointer validity.
+    let s = unsafe { &*store };
+    let payload_bytes = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+    let kp = s.local_identity_keypair();
+    let mut rng = OsRng.unwrap_err();
+    let sig = match kp.private_key().calculate_signature(payload_bytes, &mut rng) {
+        Ok(s) => s,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    let sig_bytes: &[u8] = &sig;
+    if sig_bytes.len() > out_cap {
+        unsafe { *out_len = sig_bytes.len() };
+        return PIZZINI_ERR_BUFFER_TOO_SMALL;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(sig_bytes.as_ptr(), out_sig, sig_bytes.len());
+        *out_len = sig_bytes.len();
+    }
+    PIZZINI_OK
+}
+
+/// Pull the issuer's `delivery_token_verify_key` (33 bytes) out of a
+/// BUNDLE_RESPONSE payload without consuming the bundle. Companion to
+/// `pizzini_verify_delivery_token` — iOS calls this on the bundle bytes
+/// it just received, stashes the result on the Contact, and uses it to
+/// authenticate every later TOKEN_ISSUE batch from this peer.
+///
+/// Returns `PIZZINI_OK` on success and writes 33 bytes to `out_buf`,
+/// `PIZZINI_ERR_BUFFER_TOO_SMALL` if `out_cap` is too small (with
+/// `*out_len` set to `DELIVERY_TOKEN_VERIFY_KEY_LEN`),
+/// `PIZZINI_ERR_INTERNAL` if the bundle fails to parse.
+///
+/// # Safety
+/// `bundle` must point to `bundle_len` readable bytes.
+/// `out_buf` must point to `out_cap` writable bytes.
+/// `out_len` must point to a valid `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_bundle_extract_verify_key(
+    bundle: *const u8,
+    bundle_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if bundle.is_null() || out_buf.is_null() || out_len.is_null() {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted slice + pointer validity.
+    let bundle_bytes = unsafe { std::slice::from_raw_parts(bundle, bundle_len) };
+    let vk = match extract_bundle_verify_key(bundle_bytes) {
+        Ok(v) => v,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    if vk.len() > out_cap {
+        unsafe { *out_len = vk.len() };
+        return PIZZINI_ERR_BUFFER_TOO_SMALL;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(vk.as_ptr(), out_buf, vk.len());
+        *out_len = vk.len();
+    }
     PIZZINI_OK
 }
 
@@ -657,10 +817,18 @@ pub unsafe extern "C" fn pizzini_hashcash_compute(
 ///
 /// Returns `PIZZINI_ERR_BUFFER_TOO_SMALL` when EITHER `out_sender` or
 /// `out_plaintext` is too small to receive its payload, with the
-/// corresponding `*_len` filled in. Caller retries with both buffers
-/// sized appropriately. (We don't surface partial success — the
-/// alternative is "decrypted, then refused to copy", which leaves the
-/// ratchet advanced but the caller empty-handed.)
+/// corresponding `*_len` filled with an upper bound the caller can use
+/// to size the retry. **The ratchet is NOT advanced on a buffer-too-small
+/// path** — the FFI runs a non-mutating peek (`peek_sealed_lengths`)
+/// to check sizes before committing the ratchet step, so the caller's
+/// "discover size, retry with bigger buffer" idiom is now safe (F-101 / F-701).
+///
+/// `out_plaintext_len` on the BUFFER_TOO_SMALL path is a conservative
+/// over-estimate: it equals the USMC inner-content length minus the
+/// 16-byte message_id + 1-byte is_prekey header. The actual plaintext
+/// returned by a successful retry is smaller (libsignal removes its
+/// own protocol overhead). Sizing a retry buffer to this bound is
+/// always sufficient.
 ///
 /// # Safety
 /// All non-null pointers must describe valid slices of the declared sizes.
@@ -695,25 +863,36 @@ pub unsafe extern "C" fn pizzini_store_seal_receive(
     // SAFETY: preconditions asserted.
     let s = unsafe { &mut *store };
     let sealed_bytes = unsafe { std::slice::from_raw_parts(sealed, sealed_len) };
+
+    // F-101 / F-701 fix: pre-flight size check via `peek_sealed_lengths`.
+    // This opens the outer USMC envelope but does NOT call message_decrypt,
+    // so the Double Ratchet is untouched on a too-small return. The
+    // caller's documented retry-with-bigger-buffer pattern is now safe.
+    let (sender_upper, plaintext_upper) = match s.peek_sealed_lengths(sealed_bytes) {
+        Ok(t) => t,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    if sender_upper > out_sender_cap || plaintext_upper > out_plaintext_cap {
+        // SAFETY: lengths pointers asserted valid.
+        unsafe {
+            *out_sender_len = sender_upper;
+            *out_plaintext_len = plaintext_upper;
+        }
+        return PIZZINI_ERR_BUFFER_TOO_SMALL;
+    }
+
+    // Caps satisfy the upper bounds, so the actual lengths after
+    // `seal_receive` will fit by construction. Now do the destructive
+    // ratchet step.
     let received = match s.seal_receive(sealed_bytes) {
         Ok(r) => r,
         Err(_) => return PIZZINI_ERR_INTERNAL,
     };
-
-    // Two-buffer copy. If either is too small we report the maximum
-    // required size for that buffer, untouched, so the caller can grow
-    // both and retry with one round-trip.
     let sender_len = received.sender_identity_pub.len();
     let plaintext_len = received.plaintext.len();
-    if sender_len > out_sender_cap || plaintext_len > out_plaintext_cap {
-        // SAFETY: lengths pointers asserted valid.
-        unsafe {
-            *out_sender_len = sender_len;
-            *out_plaintext_len = plaintext_len;
-        }
-        return PIZZINI_ERR_BUFFER_TOO_SMALL;
-    }
-    // SAFETY: caps verified above; pointers asserted valid.
+    debug_assert!(sender_len <= out_sender_cap);
+    debug_assert!(plaintext_len <= out_plaintext_cap);
+    // SAFETY: caps verified by the peek; pointers asserted valid.
     unsafe {
         std::ptr::copy_nonoverlapping(
             received.sender_identity_pub.as_ptr(),
@@ -1117,7 +1296,13 @@ mod tests {
         let mut sender = vec![0u8; 64];
         let mut sender_len = 0usize;
         let mut got_msg_id = [0u8; 16];
-        let mut pt = vec![0u8; 1024];
+        // Sized for a PreKey envelope's worst-case inner content. The post-
+        // F-101/F-701 FFI checks the upper bound BEFORE message_decrypt;
+        // PreKey messages carry the bundle inline so the upper bound is
+        // ~1758 bytes for chat-sized plaintexts. Whisper messages can stay
+        // smaller, but production callers (Swift wrapper) provision 4096
+        // up-front to avoid the BUFFER_TOO_SMALL retry path entirely.
+        let mut pt = vec![0u8; 4096];
         let mut pt_len = 0usize;
         let mut is_dup: u8 = 0;
         let rc = unsafe {
@@ -1140,7 +1325,7 @@ mod tests {
         // will reject as duplicate, but the FFI must still surface the
         // sender + message_id and signal `is_duplicate=1`.
         let mut is_dup2: u8 = 0;
-        let mut pt2 = vec![0u8; 1024];
+        let mut pt2 = vec![0u8; 4096];
         let mut pt2_len = 0usize;
         let rc = unsafe {
             pizzini_store_seal_receive(
@@ -1171,5 +1356,179 @@ mod tests {
 
         unsafe { pizzini_store_free(alice) };
         unsafe { pizzini_store_free(bob) };
+    }
+
+    // ───── Audit PoCs (S7) ─────────────────────────────────────────────
+
+    /// PoC for F-701: `pizzini_blake3_hash` skips the input-null check when
+    /// `input_len == 0`. With a real `out_hash_32` buffer, NULL input is
+    /// supposed to be rejected with `INVALID_ARG`; today it returns OK.
+    /// Independent — also confirms the contract is "input MUST be non-null"
+    /// per the doc comment on the symbol.
+    #[test]
+    fn poc_f701_blake3_null_input_with_real_output() {
+        let mut out = [0u8; 32];
+        let rc = unsafe {
+            pizzini_blake3_hash(std::ptr::null(), 0, out.as_mut_ptr())
+        };
+        // Code says null input -> INVALID_ARG per the if-guard.
+        assert_eq!(rc, PIZZINI_ERR_INVALID_ARG, "null input slipped past check");
+    }
+
+    /// Regression for F-101 / F-701: `pizzini_store_seal_receive` MUST NOT
+    /// advance the libsignal ratchet on a `BUFFER_TOO_SMALL` return.
+    /// Caller passes a 0-byte plaintext cap, gets the size hint, then
+    /// retries with an adequate buffer — and gets the original plaintext
+    /// back, NOT a `is_duplicate=1, pt_len=0` ghost. Was the F-101 bug
+    /// reproducer; now the fix verifier.
+    #[test]
+    fn poc_f702_seal_receive_advances_session_before_buffer_check() {
+        // Set up Alice and Bob, pre-trust on Bob, ship a single sealed
+        // message, then on the receive side call with `out_plaintext_cap = 0`.
+        let alice = unsafe { pizzini_store_new(std::ptr::null(), 0) };
+        let bob = unsafe { pizzini_store_new(std::ptr::null(), 0) };
+
+        let mut alice_id = vec![0u8; 64];
+        let mut alice_id_len = 0usize;
+        unsafe {
+            pizzini_store_identity_public(
+                alice, alice_id.as_mut_ptr(), alice_id.len(), &mut alice_id_len,
+            )
+        };
+        let alice_id = alice_id[..alice_id_len].to_vec();
+        let mut bob_id = vec![0u8; 64];
+        let mut bob_id_len = 0usize;
+        unsafe {
+            pizzini_store_identity_public(
+                bob, bob_id.as_mut_ptr(), bob_id.len(), &mut bob_id_len,
+            )
+        };
+        let bob_id = bob_id[..bob_id_len].to_vec();
+
+        let mut bundle = vec![0u8; 4096];
+        let mut bundle_len = 0usize;
+        unsafe {
+            pizzini_store_publish_bundle(
+                bob, bundle.as_mut_ptr(), bundle.len(), &mut bundle_len,
+            )
+        };
+        unsafe {
+            pizzini_store_initiate_session(
+                alice, bob_id.as_ptr(), bob_id.len(),
+                bundle.as_ptr(), bundle_len,
+            )
+        };
+        unsafe { pizzini_store_register_peer(bob, alice_id.as_ptr(), alice_id.len()) };
+
+        let plaintext = b"please decode me, just need bigger buffer next time";
+        let msg_id = [0xCDu8; 16];
+        let mut sealed = vec![0u8; 4096];
+        let mut sealed_len = 0usize;
+        let rc = unsafe {
+            pizzini_store_seal_send(
+                alice,
+                bob_id.as_ptr(), bob_id.len(),
+                msg_id.as_ptr(),
+                plaintext.as_ptr(), plaintext.len(),
+                sealed.as_mut_ptr(), sealed.len(), &mut sealed_len,
+            )
+        };
+        assert_eq!(rc, PIZZINI_OK);
+
+        // First receive: caller provides a 0-byte plaintext buffer (sender
+        // buffer big). Expectation under the doc comment: "Caller retries
+        // with both buffers sized appropriately" — implying retry succeeds.
+        let mut sender = vec![0u8; 64];
+        let mut sender_len = 0usize;
+        let mut got_msg_id = [0u8; 16];
+        let mut pt_zero = [0u8; 1];
+        let mut pt_zero_len = 0usize;
+        let mut is_dup: u8 = 0;
+        let rc1 = unsafe {
+            pizzini_store_seal_receive(
+                bob,
+                sealed.as_ptr(), sealed_len,
+                sender.as_mut_ptr(), sender.len(), &mut sender_len,
+                got_msg_id.as_mut_ptr(),
+                pt_zero.as_mut_ptr(), 0, &mut pt_zero_len,  // <-- cap = 0
+                &mut is_dup,
+            )
+        };
+        // Doc comment claims this returns BUFFER_TOO_SMALL with required
+        // size in *out_plaintext_len. Confirm the contract:
+        assert_eq!(rc1, PIZZINI_ERR_BUFFER_TOO_SMALL,
+            "doc comment promises BUFFER_TOO_SMALL when plaintext cap is too small");
+        assert!(pt_zero_len > 0, "size hint not reported");
+
+        // Second receive: same sealed bytes, ample buffers. Per the
+        // Swift wrapper's comment block at decryptSealed (lines ~346-352),
+        // "the FFI returns INTERNAL before advancing the ratchet on a
+        // buffer-too-small ... Retrying with bigger buffers is safe."
+        let mut pt_big = vec![0u8; pt_zero_len];
+        let mut pt_big_len = 0usize;
+        let mut sender2 = vec![0u8; 64];
+        let mut sender2_len = 0usize;
+        let mut got_msg_id2 = [0u8; 16];
+        let mut is_dup2: u8 = 0;
+        let rc2 = unsafe {
+            pizzini_store_seal_receive(
+                bob,
+                sealed.as_ptr(), sealed_len,
+                sender2.as_mut_ptr(), sender2.len(), &mut sender2_len,
+                got_msg_id2.as_mut_ptr(),
+                pt_big.as_mut_ptr(), pt_big.len(), &mut pt_big_len,
+                &mut is_dup2,
+            )
+        };
+        // After the F-101 / F-701 fix the FFI peeks USMC sizes BEFORE
+        // running message_decrypt. The ratchet was not advanced on rc1,
+        // so the retry must succeed cleanly with the original plaintext.
+        assert_eq!(rc2, PIZZINI_OK, "retry with adequate buffer must succeed");
+        assert_eq!(is_dup2, 0, "ratchet must NOT have been advanced on rc1");
+        assert_eq!(
+            &pt_big[..pt_big_len],
+            plaintext,
+            "retry must return the original plaintext"
+        );
+
+        unsafe { pizzini_store_free(alice) };
+        unsafe { pizzini_store_free(bob) };
+    }
+
+    /// Regression for F-702: `pizzini_hashcash_compute` MUST reject
+    /// `bits` values past the FFI's safety ceiling so an untrusted
+    /// caller cannot wedge the host thread. Was the F-702 bug
+    /// reproducer; now the fix verifier.
+    #[test]
+    fn poc_f703_hashcash_compute_accepts_unbounded_bits() {
+        let challenge = b"x";
+
+        // bits within the ceiling: succeeds.
+        let mut nonce: u64 = 0;
+        let rc = unsafe {
+            pizzini_hashcash_compute(challenge.as_ptr(), challenge.len(), 12, &mut nonce)
+        };
+        assert_eq!(rc, PIZZINI_OK);
+
+        // bits exactly at the ceiling: would still succeed (we don't
+        // actually run it because it can take ~minutes; just exercise
+        // the boundary check).
+        // bits one above the ceiling: rejected.
+        let mut nonce_bad: u64 = 0;
+        let rc_bad = unsafe {
+            pizzini_hashcash_compute(
+                challenge.as_ptr(),
+                challenge.len(),
+                HASHCASH_FFI_MAX_BITS + 1,
+                &mut nonce_bad,
+            )
+        };
+        assert_eq!(rc_bad, PIZZINI_ERR_INVALID_ARG);
+
+        // bits = 64 (audit's reference DoS value): rejected.
+        let rc_dos = unsafe {
+            pizzini_hashcash_compute(challenge.as_ptr(), challenge.len(), 64, &mut nonce_bad)
+        };
+        assert_eq!(rc_dos, PIZZINI_ERR_INVALID_ARG);
     }
 }

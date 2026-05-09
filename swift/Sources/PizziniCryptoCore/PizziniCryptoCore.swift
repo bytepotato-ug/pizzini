@@ -240,6 +240,120 @@ public final class Session: @unchecked Sendable {
         }
     }
 
+    /// Sign `payload` with the local IdentityKey's private half. F-203:
+    /// the iOS RelayClient calls this to attach a possession proof to
+    /// every HELLO so a network-positioned attacker can't squat someone
+    /// else's peer_id (peer_id IS the IdentityKey wire form, so the
+    /// relay can verify against it without a separate key registry).
+    /// Returns the 64-byte Ed25519 signature.
+    public func identitySign(_ payload: Data) throws -> Data {
+        guard let handle else { throw CryptoCoreError.invalidArgument }
+        var buf = [UInt8](repeating: 0, count: 128)
+        var len: UInt = 0
+        var rc = payload.withUnsafeBytes { pPtr -> Int32 in
+            buf.withUnsafeMutableBufferPointer { outPtr in
+                pizzini_store_identity_sign(
+                    handle,
+                    pPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    UInt(payload.count),
+                    outPtr.baseAddress,
+                    UInt(outPtr.count),
+                    &len,
+                )
+            }
+        }
+        if rc == PIZZINI_ERR_BUFFER_TOO_SMALL {
+            buf = [UInt8](repeating: 0, count: Int(len))
+            rc = payload.withUnsafeBytes { pPtr -> Int32 in
+                buf.withUnsafeMutableBufferPointer { outPtr in
+                    pizzini_store_identity_sign(
+                        handle,
+                        pPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        UInt(payload.count),
+                        outPtr.baseAddress,
+                        UInt(outPtr.count),
+                        &len,
+                    )
+                }
+            }
+        }
+        guard rc == PIZZINI_OK else {
+            if rc == PIZZINI_ERR_INVALID_ARG { throw CryptoCoreError.invalidArgument }
+            throw CryptoCoreError.internalError
+        }
+        return Data(buf.prefix(Int(len)))
+    }
+
+    /// Pull the issuer's `delivery_token_verify_key` (33 bytes) out of a
+    /// BUNDLE_RESPONSE payload without consuming the bundle. Used by iOS
+    /// to stash the peer's key on the Contact at pair time so subsequent
+    /// TOKEN_ISSUE batches can be authenticated end-to-end via
+    /// `verifyDeliveryToken`. F-202/F-401.
+    public static func extractBundleVerifyKey(_ bundle: Data) throws -> Data {
+        let initialCap = 64
+        var buf = [UInt8](repeating: 0, count: initialCap)
+        var len: UInt = 0
+        var rc = bundle.withUnsafeBytes { bPtr -> Int32 in
+            buf.withUnsafeMutableBufferPointer { outPtr in
+                pizzini_bundle_extract_verify_key(
+                    bPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    UInt(bundle.count),
+                    outPtr.baseAddress,
+                    UInt(outPtr.count),
+                    &len,
+                )
+            }
+        }
+        if rc == PIZZINI_ERR_BUFFER_TOO_SMALL {
+            buf = [UInt8](repeating: 0, count: Int(len))
+            rc = bundle.withUnsafeBytes { bPtr -> Int32 in
+                buf.withUnsafeMutableBufferPointer { outPtr in
+                    pizzini_bundle_extract_verify_key(
+                        bPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        UInt(bundle.count),
+                        outPtr.baseAddress,
+                        UInt(outPtr.count),
+                        &len,
+                    )
+                }
+            }
+        }
+        guard rc == PIZZINI_OK else { throw CryptoCoreError.internalError }
+        return Data(buf.prefix(Int(len)))
+    }
+
+    /// Verify a delivery token's XEd25519 signature against an issuer's
+    /// bundle-published verify key. F-202/F-401: the iOS receiver of a
+    /// TOKEN_ISSUE batch authenticates each token end-to-end before
+    /// adding it to the per-contact stash, defeating relay swap.
+    ///
+    /// `verifyKey` is the 33-byte bundle field; `token` is the 84-byte
+    /// `nonce16 || expiry_be_u32 || sig64`. Returns `true` on a valid
+    /// signature, `false` if the signature does not match. Throws
+    /// `CryptoCoreError.invalidArgument` for length/null mismatches.
+    public static func verifyDeliveryToken(verifyKey: Data, token: Data) throws -> Bool {
+        let rc = verifyKey.withUnsafeBytes { vkPtr -> Int32 in
+            token.withUnsafeBytes { tokPtr -> Int32 in
+                pizzini_verify_delivery_token(
+                    vkPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    UInt(verifyKey.count),
+                    tokPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                    UInt(token.count),
+                )
+            }
+        }
+        switch rc {
+        case PIZZINI_OK:
+            return true
+        case PIZZINI_ERR_BAD_SIGNATURE:
+            return false
+        case PIZZINI_ERR_INVALID_ARG:
+            throw CryptoCoreError.invalidArgument
+        default:
+            throw CryptoCoreError.internalError
+        }
+    }
+
     /// Mints (or refreshes) the cached SenderCertificate. Production
     /// callers don't need this — `encryptSealed` calls it implicitly —
     /// but it's handy for diagnostics ("can my store actually issue a

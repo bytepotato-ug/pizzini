@@ -49,7 +49,17 @@ public final class RelayClient: @unchecked Sendable {
 
     /// On-the-wire protocol version negotiated in HELLO. Bumped from 1
     /// when sealed-sender SEND/ACK landed; v1 relays/clients reject.
-    public static let protocolVersion: UInt8 = 2
+    /// Protocol v3 added the F-203 HELLO possession proof — every HELLO
+    /// frame now carries `timestamp_be_u64 || u16 nonce_len + nonce16
+    /// || u16 sig_len + sig64`, where `sig` is the IdentityKey's Ed25519
+    /// signature over `b"pizzini.hello.v1" || peer_id || verify_key ||
+    /// timestamp_be || nonce`. Relay verifies against the IdentityKey
+    /// extracted from `peer_id`.
+    public static let protocolVersion: UInt8 = 3
+    /// Domain-separation tag for the HELLO signing payload. MUST match
+    /// `HELLO_SIGNING_TAG` in `relay/src/main.rs`.
+    private static let helloSigningTag = Data("pizzini.hello.v1".utf8)
+    private static let helloNonceLen = 16
 
     /// Inner-plaintext type byte. Sealed envelope contents always start
     /// with one of these so the receiver can dispatch without parsing
@@ -87,9 +97,17 @@ public final class RelayClient: @unchecked Sendable {
         }
     }
 
+    /// Closure that signs an arbitrary payload with the local
+    /// IdentityKey's private half. F-203: provided at construction time
+    /// so RelayClient stays unaware of `Session` internals (cleaner test
+    /// substitution + keeps `Sendable` inference simple). In production
+    /// it's `{ try? session.identitySign($0) }`.
+    public typealias HelloSigner = @Sendable (Data) -> Data?
+
     private let queue = DispatchQueue(label: "app.pizzini.relay")
     private let myIdentity: Data
     private let myDeliveryTokenVerifyKey: Data
+    private let signer: HelloSigner
     private var connection: NWConnection?
     private var readBuffer = Data()
     /// Latest APNs device token. Cached so we automatically re-register
@@ -97,9 +115,14 @@ public final class RelayClient: @unchecked Sendable {
     /// relay restart wipes it).
     private var pushToken: Data?
 
-    public init(myIdentity: Data, myDeliveryTokenVerifyKey: Data) {
+    public init(
+        myIdentity: Data,
+        myDeliveryTokenVerifyKey: Data,
+        signer: @escaping HelloSigner
+    ) {
         self.myIdentity = myIdentity
         self.myDeliveryTokenVerifyKey = myDeliveryTokenVerifyKey
+        self.signer = signer
     }
 
     public func connect(to host: String, port: UInt16) {
@@ -260,11 +283,36 @@ public final class RelayClient: @unchecked Sendable {
 
     private func sendHello() {
         guard let connection else { return }
+        // F-203: build the possession-proof payload and sign with the
+        // IdentityKey private half before assembling the wire frame.
+        let timestampSecs = UInt64(Date().timeIntervalSince1970)
+        var nonce = Data(count: Self.helloNonceLen)
+        _ = nonce.withUnsafeMutableBytes { buf in
+            SecRandomCopyBytes(kSecRandomDefault, buf.count, buf.baseAddress!)
+        }
+        var signingPayload = Data()
+        signingPayload.append(Self.helloSigningTag)
+        signingPayload.append(myIdentity)
+        signingPayload.append(myDeliveryTokenVerifyKey)
+        var tsBE = timestampSecs.bigEndian
+        withUnsafeBytes(of: &tsBE) { signingPayload.append(contentsOf: $0) }
+        signingPayload.append(nonce)
+        guard let signature = signer(signingPayload), signature.count == 64 else {
+            // Without a valid signature the relay will drop the HELLO,
+            // and a half-open TCP connection is worse than a clean
+            // failure. Mark .failed so the UI surfaces the error.
+            state = .failed("HELLO signing failed (identity key unavailable)")
+            return
+        }
+
         var payload = Data()
         payload.append(Self.frameTypeHello)
         payload.append(Self.protocolVersion)
         appendU16Blob(&payload, myIdentity)
         appendU16Blob(&payload, myDeliveryTokenVerifyKey)
+        withUnsafeBytes(of: &tsBE) { payload.append(contentsOf: $0) }
+        appendU16Blob(&payload, nonce)
+        appendU16Blob(&payload, signature)
         writeFrame(payload, on: connection)
     }
 

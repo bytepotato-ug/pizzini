@@ -86,9 +86,13 @@ const DEVICE_ID: u8 = 1;
 /// goes offline for a few weeks can still send without a refresh round
 /// trip; short enough that a forgotten device's certs lapse on their own.
 const SENDER_CERT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
-/// Mint a fresh cert if the cached one is within this window of expiry,
-/// so we never sign an envelope with a cert about to lapse mid-flight.
-const SENDER_CERT_REFRESH_MARGIN_MS: u64 = 24 * 60 * 60 * 1000;
+/// Mint a fresh cert if the cached one is within this window of expiry.
+/// 7 days closes the F-102 asymmetric-clock-skew DoS: with a 24h margin a
+/// recipient whose clock was ahead by 24h–30d would reject every cert
+/// while the sender's refresh trigger never fired. 7 days leaves only a
+/// 23-day skew window where the same condition could apply, and bounds
+/// it tighter under the same RFC-1305-typical clock-skew expectations.
+const SENDER_CERT_REFRESH_MARGIN_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// HKDF info string for the long-term delivery-token signing key. Stable
 /// across versions: rotating it is equivalent to rotating every peer's
 /// stash in lock-step, which we don't want as a side effect of an
@@ -566,6 +570,34 @@ impl DeviceStore {
         .expect("in-mem store is sync")
     }
 
+    /// Pre-flight size discovery for `seal_receive`. Opens the outer
+    /// USMC envelope (read-only — does NOT advance the Double Ratchet),
+    /// returns conservative upper bounds for `(sender_len, plaintext_len)`
+    /// the FFI can use to gate buffer-too-small without committing the
+    /// ratchet step. F-101 / F-701.
+    ///
+    /// `plaintext_len` is an over-estimate: it equals
+    /// `usmc.contents().len() - 17` (USMC inner minus the 16-byte
+    /// `message_id` + 1-byte `is_prekey` header). The actual plaintext
+    /// emitted by `message_decrypt` is smaller — libsignal strips its
+    /// own protocol overhead — so a buffer sized to this bound is always
+    /// big enough for the real plaintext.
+    ///
+    /// Cost: one symmetric `sealed_sender_decrypt_to_usmc` open. ~µs.
+    /// Cheap enough to call before every `seal_receive`.
+    pub fn peek_sealed_lengths(
+        &self,
+        sealed: &[u8],
+    ) -> Result<(usize, usize), SignalProtocolError> {
+        let usmc = sealed_sender_decrypt_to_usmc(sealed, &self.inner.identity_store)
+            .now_or_never()
+            .expect("in-mem store is sync")?;
+        let claimed_pub = usmc.sender()?.key()?;
+        let sender_len = IdentityKey::new(claimed_pub).serialize().len();
+        let plaintext_upper = usmc.contents()?.len().saturating_sub(17);
+        Ok((sender_len, plaintext_upper))
+    }
+
     /// Sealed-sender RECEIVE. Opens the envelope, looks the claimed
     /// sender's identity_pub up in our trusted peers list, validates the
     /// embedded cert against THAT identity (so a forged cert claiming a
@@ -621,20 +653,43 @@ impl DeviceStore {
         }
 
         let inner_bytes = usmc.contents()?;
-        if inner_bytes.len() < 17 {
+        // Tightened from `< 17` (header alone) to `< 18` (header + at least
+        // one byte of ratchet ciphertext). At exactly 17 bytes the ratchet
+        // body would be empty and libsignal's parser fails with
+        // CiphertextMessageTooShort anyway — rejecting one byte earlier
+        // means a fuzzer probing the boundary doesn't even reach
+        // `*SignalMessage::try_from`. F-104.
+        if inner_bytes.len() < 18 {
             eprintln!(
                 "seal_receive: inner content too short ({} bytes) for {}",
                 inner_bytes.len(),
                 hex_lower(&claimed_bytes)
             );
             return Err(SignalProtocolError::InvalidArgument(
-                "sealed sender inner content shorter than message_id||is_prekey header".into(),
+                "sealed sender inner content shorter than message_id||is_prekey||ratchet[1+]".into(),
             ));
         }
         let mut message_id = [0u8; 16];
         message_id.copy_from_slice(&inner_bytes[..16]);
         let is_prekey = inner_bytes[16] != 0;
         let ratchet = &inner_bytes[17..];
+
+        // F-103: cross-check the inner is_prekey byte against the outer
+        // USMC.msg_type. The send path stores the same boolean twice
+        // (lines 553, 548); a paired peer can craft a USMC where the two
+        // disagree. libsignal's parser fails closed on the disagreement
+        // today, but relying on that is brittle — make the redundancy
+        // checked rather than ambient.
+        let usmc_is_prekey = matches!(usmc.msg_type()?, CiphertextMessageType::PreKey);
+        if usmc_is_prekey != is_prekey {
+            eprintln!(
+                "seal_receive: USMC msg_type / is_prekey byte disagreement from {} (usmc={usmc_is_prekey}, byte={is_prekey})",
+                hex_lower(&claimed_bytes)
+            );
+            return Err(SignalProtocolError::InvalidArgument(
+                "sealed sender USMC msg_type disagrees with inner is_prekey byte".into(),
+            ));
+        }
 
         let parsed = if is_prekey {
             CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::try_from(ratchet)?)
@@ -971,6 +1026,16 @@ fn encode_bundle(
 pub struct DecodedBundle {
     pub bundle: PreKeyBundle,
     pub delivery_token_verify_key: Vec<u8>,
+}
+
+/// F-202/F-401: parse a peer's published `delivery_token_verify_key`
+/// from their BUNDLE_RESPONSE bytes without consuming the bundle. Used
+/// by the iOS receiver to verify each token in a TOKEN_ISSUE batch
+/// end-to-end before stashing it (a malicious relay could otherwise
+/// swap legitimate batches for relay-forged bytes that fail at SEND).
+pub fn extract_bundle_verify_key(bundle_bytes: &[u8]) -> Result<Vec<u8>, SignalProtocolError> {
+    let decoded = decode_bundle(bundle_bytes)?;
+    Ok(decoded.delivery_token_verify_key)
 }
 
 fn decode_bundle(bytes: &[u8]) -> Result<DecodedBundle, SignalProtocolError> {

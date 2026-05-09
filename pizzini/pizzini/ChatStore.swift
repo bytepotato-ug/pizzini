@@ -91,7 +91,19 @@ final class ChatStore: NSObject {
         else {
             return
         }
-        let client = RelayClient(myIdentity: myId, myDeliveryTokenVerifyKey: verifyKey)
+        // F-203: capture the session for HELLO signing. Using a strong
+        // capture here is fine because RelayClient lifetime is bounded
+        // by ChatStore (we own it as `self.relay`). If the user resets
+        // identity, `teardownRelay` nils self.relay, and the closure's
+        // captured session is harmless.
+        let signingSession = session
+        let client = RelayClient(
+            myIdentity: myId,
+            myDeliveryTokenVerifyKey: verifyKey,
+            signer: { payload in
+                try? signingSession.identitySign(payload)
+            },
+        )
         client.delegate = self
         if let token = pushTokenCached {
             client.registerPush(token: token)
@@ -132,10 +144,24 @@ final class ChatStore: NSObject {
     /// foreground (red → green → red flapping). Closing here avoids
     /// the race entirely.
     func disconnectForBackground() {
-        guard let relay else { return }
+        guard relay != nil else { return }
         NSLog("[pizzini] relay disconnect for background")
-        relay.delegate = nil
-        relay.disconnect()
+        teardownRelay()
+    }
+
+    /// F-704: shared disconnect path used by `disconnectForBackground`
+    /// AND `resetIdentity`. The earlier asymmetry — where `resetIdentity`
+    /// only called `relay?.disconnect()` and relied on the next
+    /// `connectRelay()` to clear delegate / timer / `self.relay` — was
+    /// not exploitable but was a refactor trip-wire: any future `await`
+    /// inserted between disconnect and reconnect could let a queued
+    /// retry tick fire on the OLD client with the new outbox state. Make
+    /// the cleanup symmetric and explicit.
+    private func teardownRelay() {
+        if let relay {
+            relay.delegate = nil
+            relay.disconnect()
+        }
         self.relay = nil
         relayState = .idle
         retryTimer?.invalidate()
@@ -194,14 +220,31 @@ final class ChatStore: NSObject {
     /// modern phone) and ship the BUNDLE_REQUEST. Async — bundle exchange
     /// is rare so the latency is acceptable; the alternative would be a
     /// pre-warmed nonce cache, which would freeze on first launch instead.
+    ///
+    /// F-303 fix: re-derive the hour bucket INSIDE the dispatch closure
+    /// right before computing the proof, in case iOS suspended the queue
+    /// (e.g. user backgrounded the app mid-PoW) and the originally
+    /// captured hour is stale by the time we resume. Capture `relay`
+    /// weakly via `self.relay` so an instance swap (relay-host change /
+    /// reconnect) doesn't ship the proof to a torn-down client.
     private func requestBundleWithHashcash(fromPeer peer: Data) {
-        guard let relay else { return }
-        let challenge = Self.hashcashChallenge(for: peer, hour: Self.currentHourBucket())
+        guard relay != nil else { return }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // Re-derive hour bucket here. If suspended for ≥1h between
+            // request scheduling and PoW completion, the bucket would
+            // otherwise be stale and the relay would reject.
+            let challenge = Self.hashcashChallenge(
+                for: peer,
+                hour: Self.currentHourBucket(),
+            )
             let nonce = Hashcash.compute(challenge: challenge)
             DispatchQueue.main.async {
-                guard self != nil else { return }
-                relay.requestBundle(fromPeer: peer, hashcashNonce: nonce)
+                // Look up the CURRENT relay instance via self — capturing
+                // the local `relay` strongly would target the pre-swap
+                // client. Drop on the floor if the chat-store or relay
+                // are gone (e.g. identity reset mid-PoW).
+                guard let liveRelay = self?.relay else { return }
+                liveRelay.requestBundle(fromPeer: peer, hashcashNonce: nonce)
             }
         }
     }
@@ -210,13 +253,85 @@ final class ChatStore: NSObject {
         UInt64(Date().timeIntervalSince1970) / 3600
     }
 
-    /// Hashcash challenge layout, mirroring `relay::verify_hashcash`:
-    /// `BLAKE3(recipient_peer_id || hour_bucket_be_u64)`. CryptoKit
-    /// doesn't expose BLAKE3, so the iOS side reaches into the
+    /// Domain-separation tag baked into the hashcash challenge digest.
+    /// MUST match `HASHCASH_CHALLENGE_TAG` in `relay/src/main.rs` byte
+    /// for byte. F-301.
+    private static let hashcashChallengeTag = Data("pizzini.hashcash.bundle.v1".utf8)
+
+    /// F-402: BUNDLE_RESPONSE wire size for the decoy path. A real
+    /// Pizzini bundle is 1858 bytes (kyber1024 PK 1568 + 4× signatures
+    /// 64 each + 4× public keys 33 each + headers/IDs); we round up to
+    /// 1860 to absorb future tweaks below detection. Token batch size
+    /// is `Contact.initialIssuance × 84` = 86016 bytes.
+    private static let decoyBundleSize = 1860
+    /// Pacing budget for the real BUNDLE_RESPONSE + TOKEN_ISSUE path on
+    /// a modern phone — kyber1024 keygen + 1024 XEd25519 signatures
+    /// runs ~1s. Decoy waits within this window before emitting so the
+    /// relay can't time-distinguish "Y is in Alice's contacts" from
+    /// "Y is not". 50ms jitter prevents a learned-fixed-1s signature.
+    private static let decoyEmitDelay: ClosedRange<Duration> = .milliseconds(900) ... .milliseconds(1100)
+
+    @MainActor
+    private func emitBundleResponseDecoy(toFakePeer fromPeer: Data, via client: RelayClient) {
+        // Capture the client and target before we go async — the iOS
+        // app may reset identity / swap the relay before our delay
+        // fires; if so, drop silently rather than ship to a stale
+        // client.
+        let target = fromPeer
+        Task { @MainActor [weak self, weak client] in
+            // Random sleep within the budget so the decoy doesn't have
+            // a fixed-latency fingerprint. Even if iOS suspends mid-
+            // sleep, we still want to ship on resume to keep the
+            // wire-shape consistent — the leak is the asymmetry, not
+            // the precise timing.
+            let nanos = UInt64.random(in: 900_000_000 ... 1_100_000_000)
+            try? await Task.sleep(nanoseconds: nanos)
+            guard let self else { return }
+            guard let client else { return }
+            // After the await we may also have lost the connection or
+            // had identity reset. emitDecoyOnSocket guards on those.
+            self.emitDecoyOnSocket(toPeer: target, via: client)
+            _ = ChatStore.decoyEmitDelay  // silence unused range
+        }
+    }
+
+    @MainActor
+    private func emitDecoyOnSocket(toPeer: Data, via client: RelayClient) {
+        // Random bytes shaped to match a real BUNDLE_RESPONSE payload.
+        // The recipient (the malicious relay or its colluding client)
+        // can't decrypt — bundle decoder rejects on the version byte
+        // mismatch — but the relay's outbound observation is identical
+        // to the real-contact path.
+        var decoyBundle = Data(count: ChatStore.decoyBundleSize)
+        _ = decoyBundle.withUnsafeMutableBytes { buf in
+            SecRandomCopyBytes(kSecRandomDefault, buf.count, buf.baseAddress!)
+        }
+        client.sendBundle(toPeer: toPeer, bundle: decoyBundle)
+
+        // Same-shape decoy TOKEN_ISSUE: 1024 random 84-byte "tokens".
+        var decoyTokens: [Data] = []
+        decoyTokens.reserveCapacity(Contact.initialIssuance)
+        for _ in 0 ..< Contact.initialIssuance {
+            var tok = Data(count: 84)
+            _ = tok.withUnsafeMutableBytes { buf in
+                SecRandomCopyBytes(kSecRandomDefault, buf.count, buf.baseAddress!)
+            }
+            decoyTokens.append(tok)
+        }
+        client.sendTokenIssue(toPeer: toPeer, tokens: decoyTokens)
+    }
+
+    /// Hashcash challenge layout, mirroring `relay::build_hashcash_challenge`:
+    /// `BLAKE3(tag || u16_be(peer_id_len) || peer_id || hour_bucket_be_u64)`.
+    /// F-301: domain-separated and length-prefixed. CryptoKit doesn't
+    /// expose BLAKE3, so the iOS side reaches into the
     /// `pizzini_blake3_hash` FFI rather than maintaining a parallel
     /// pure-Swift hasher.
     private static func hashcashChallenge(for peer: Data, hour: UInt64) -> Data {
         var input = Data()
+        input.append(hashcashChallengeTag)
+        var peerLenBE = UInt16(peer.count).bigEndian
+        withUnsafeBytes(of: &peerLenBE) { input.append(contentsOf: $0) }
         input.append(peer)
         var hourBE = hour.bigEndian
         withUnsafeBytes(of: &hourBE) { input.append(contentsOf: $0) }
@@ -293,6 +408,13 @@ final class ChatStore: NSObject {
                 token: token,
             )
             entry.relayedAt = now
+            // F-505: scrub the token field once the relay accepts the
+            // bytes. The signed token is no longer needed (further
+            // retries on a relayed entry are capped by F-501 and
+            // wouldn't burn a token even if they fired). Keeping it on
+            // disk widens the post-Keychain-extraction replay surface
+            // for the token's 30-day TTL.
+            entry.token = Data()
             outbox.entries[messageId] = entry
             Storage.persist(outbox: outbox)
 
@@ -356,14 +478,22 @@ final class ChatStore: NSObject {
                 messageId: Self.makeMessageId(),
                 plaintext: inner,
             )
+            // F-601: persist the advanced ratchet state BEFORE handing
+            // off to the relay. A force-quit between encryptSealed and
+            // persistAll otherwise rolls the on-disk session back one
+            // step and the next outbound encrypt reuses an already-
+            // consumed counter; the peer rejects with DuplicatedMessage
+            // and the user sees ✓✓ on a message that never arrived.
+            // Mirrors the invariant the other encrypt sites uphold (see
+            // emitAck and emitReadReceiptIfEnabled).
+            state.contacts[idx].lastRefillRequestSentAt = Date()
+            persistAll()
             relay.sendSealed(
                 toPeer: contact.identityPub,
                 sealedCiphertext: sealed,
                 ttlSeconds: Self.defaultTTLSeconds,
                 token: token,
             )
-            state.contacts[idx].lastRefillRequestSentAt = Date()
-            persistAll()
         } catch {
             appendSystem("Refill request failed: \(error)", to: idx)
         }
@@ -529,7 +659,11 @@ final class ChatStore: NSObject {
     }
 
     func resetIdentity() {
-        relay?.disconnect()
+        // F-704: full teardown — null self.relay, invalidate retry
+        // timer, clear delegate. Mirrors disconnectForBackground so
+        // any queued retry tick that fires before connectRelay runs
+        // again can't observe a half-reset state.
+        teardownRelay()
         // Preserve non-identity configuration across the wipe. The relay
         // host is a network endpoint (typically a LAN IP for a physical
         // iPhone, loopback for the sim); resetting it to the
@@ -541,15 +675,23 @@ final class ChatStore: NSObject {
         let preservedAutoLock = state.autoLockTimeout
         let preservedBiometric = state.biometricLockEnabled
         let preservedOnboarding = state.onboardingCompleted
-        Storage.resetEverything()
-        state = AppState(
+        let resetState = AppState(
             relayHost: preservedHost,
             onboardingCompleted: preservedOnboarding,
             biometricLockEnabled: preservedBiometric,
             autoLockTimeout: preservedAutoLock,
         )
+        // F-703: write the post-reset AppState to Keychain BEFORE wiping
+        // the device-store / outbox / legacy slots. The previous order
+        // (wipe, then re-create-and-persist) had a process-kill window
+        // between the two where on next launch `loadAppState()` returned
+        // `AppState()` defaults — silently dropping the user's biometric
+        // lock posture among the preserved fields. Now the new value is
+        // durable across the wipe call's sequence of Keychain ops.
+        Storage.persist(appState: resetState)
+        Storage.resetEverything(preserveAppState: true)
+        state = resetState
         outbox = .empty
-        Storage.persist(appState: state)
         do {
             let s = try Storage.loadOrCreateSession()
             session = s
@@ -619,6 +761,11 @@ extension ChatStore: RelayClientDelegate {
                 for c in self.state.contacts where !c.sessionEstablished {
                     self.requestBundleWithHashcash(fromPeer: c.identityPub)
                 }
+                // F-502: also kick the outbox retry walk immediately on
+                // reconnect rather than waiting up to 30s for the next
+                // timer tick. `runRetryWalk` is idempotent — if no
+                // entries are due, it's a no-op.
+                self.runRetryWalk()
             }
         }
     }
@@ -648,19 +795,50 @@ extension ChatStore: RelayClientDelegate {
                 NSLog("[pizzini] dropped TOKEN_ISSUE from unknown peer \(self.short(fromPeer))")
                 return
             }
-            // Append rather than replace — refills layer on top of any
-            // unspent tokens. Cap stash size so a malicious peer can't
-            // balloon Keychain by spamming refills.
+            // F-202/F-401: authenticate the batch end-to-end against the
+            // peer's bundle-published verify_key before any token enters
+            // the stash. A malicious relay could otherwise swap legitimate
+            // tokens for relay-forged ones and wedge our send path.
+            guard let verifyKey = self.state.contacts[idx].peerVerifyKey else {
+                NSLog(
+                    "[pizzini] dropped TOKEN_ISSUE from \(self.short(fromPeer)): no peerVerifyKey on contact (re-pair to refresh)"
+                )
+                return
+            }
+            var verified: [Data] = []
+            verified.reserveCapacity(tokens.count)
+            for token in tokens {
+                do {
+                    if try Session.verifyDeliveryToken(verifyKey: verifyKey, token: token) {
+                        verified.append(token)
+                    } else {
+                        NSLog(
+                            "[pizzini] dropping batch from \(self.short(fromPeer)): token signature did not verify against bundle-published verify_key"
+                        )
+                        return
+                    }
+                } catch {
+                    NSLog(
+                        "[pizzini] dropping batch from \(self.short(fromPeer)): verify error \(error)"
+                    )
+                    return
+                }
+            }
+            // F-206: cap stash size, but trim from the BACK (newest first)
+            // rather than the front. Combined with verify above this is
+            // belt-and-suspenders — fabricated tokens never enter — but a
+            // peer that legitimately issues lots of refills shouldn't be
+            // able to push older trusted tokens off the queue either.
             let cap = 2 * Contact.initialIssuance
             var stash = self.state.contacts[idx].deliveryTokensForPeer
-            stash.append(contentsOf: tokens)
+            stash.append(contentsOf: verified)
             if stash.count > cap {
-                stash.removeFirst(stash.count - cap)
+                stash.removeLast(stash.count - cap)
             }
             self.state.contacts[idx].deliveryTokensForPeer = stash
             self.persistAll()
             NSLog(
-                "[pizzini] received \(tokens.count) tokens from \(self.short(fromPeer)); stash now \(stash.count)"
+                "[pizzini] received \(verified.count) verified tokens from \(self.short(fromPeer)); stash now \(stash.count)"
             )
         }
     }
@@ -701,7 +879,16 @@ extension ChatStore: RelayClientDelegate {
         }
         guard let kindByte = received.plaintext.first,
               let kind = RelayClient.InnerEnvelopeKind(rawValue: kindByte) else {
-            NSLog("[pizzini] dropped sealed frame: unknown inner-envelope kind")
+            // F-403: surface as a visible system row so a malicious paired
+            // peer can't silently advance our chain key (the ratchet step
+            // already happened above; we keep the persisted advance) — the
+            // user sees something arrived from this contact and can act
+            // (e.g. re-pair) even though we couldn't decode the envelope.
+            let kindHex = received.plaintext.first.map { String(format: "0x%02x", $0) } ?? "(empty)"
+            self.appendSystem(
+                "Received an unknown envelope (\(kindHex)) — possible client mismatch.",
+                to: idx,
+            )
             return
         }
         let payload = received.plaintext.dropFirst()
@@ -743,13 +930,33 @@ extension ChatStore: RelayClientDelegate {
     @MainActor
     private func handleReadReceiptPayload(_ payload: Data, contactIdx idx: Int) {
         guard payload.count == 16 else { return }
+        // F-405: honour `readReceiptsEnabled` symmetrically. If the user
+        // disabled emission of their own read receipts to this contact,
+        // also drop incoming claims that we read — otherwise a paired
+        // peer could spoof "Read" stamps onto our own messages
+        // unilaterally regardless of our setting.
+        guard state.contacts[idx].readReceiptsEnabled else {
+            return
+        }
         let highest = Data(payload)
-        // Stamp every outbox entry to this peer ≤ highest with a
-        // readAt timestamp by mutating their corresponding log row.
-        // Cheap because per-contact log size is small for chat use.
-        guard let highestEntry = outbox.entries[highest] else { return }
-        let cutoff = highestEntry.sentAt
         let now = Date()
+        // Locate the cutoff timestamp for the message_id the peer claims
+        // to have read up to. Prefer the outbox entry's `sentAt`; fall
+        // back to the chat log's own `timestamp` if the outbox entry has
+        // already been GC'd (terminal entries are dropped 24h after
+        // delivery, so reads more than a day late would otherwise be
+        // silently dropped — F-503).
+        let cutoff: Date
+        if let highestEntry = outbox.entries[highest] {
+            cutoff = highestEntry.sentAt
+        } else if let logEntry = state.contacts[idx]
+            .log
+            .last(where: { $0.side == .me && $0.messageId == highest })
+        {
+            cutoff = logEntry.timestamp
+        } else {
+            return
+        }
         var changed = false
         for i in state.contacts[idx].log.indices {
             let m = state.contacts[idx].log[i]
@@ -880,12 +1087,36 @@ extension ChatStore: RelayClientDelegate {
             guard let idx = self.contactIndex(forIdentity: fromPeer),
                   let session = self.session
             else {
-                NSLog("[pizzini] dropped BUNDLE_REQUEST from unknown peer \(self.short(fromPeer))")
+                // F-402: a malicious relay can fabricate BUNDLE_REQUEST
+                // frames with arbitrary `from_id` to probe our contact
+                // set — silence-vs-(BUNDLE_RESPONSE+TOKEN_ISSUE) on the
+                // wire is the oracle. Mask by emitting a same-shape,
+                // same-timing decoy when the requester isn't in our
+                // contacts, so the relay sees identical outbound
+                // bandwidth + latency for known-vs-unknown.
+                NSLog("[pizzini] BUNDLE_REQUEST from unknown peer \(self.short(fromPeer)) — emitting decoy")
+                self.emitBundleResponseDecoy(toFakePeer: fromPeer, via: client)
+                return
+            }
+            // F-404: cooldown publishBundle the same way we cooldown
+            // issueTokens. A paired peer can otherwise loop BUNDLE_REQUEST
+            // (the per-recipient hashcash bound is per-hour and they have
+            // our peer_id, so they can grind one proof per hour) and
+            // burn one one-time prekey + one kyber1024 keygen per
+            // request — a CPU/battery DoS amplified by the existing
+            // F-402 ability for a malicious relay to inject requests.
+            if let last = self.state.contacts[idx].lastBundleServedAt,
+               Date().timeIntervalSince(last) < Contact.refillCooldown
+            {
+                NSLog(
+                    "[pizzini] BUNDLE_REQUEST from \(self.short(fromPeer)) rate-limited; last served \(last)"
+                )
                 return
             }
             do {
                 let bundle = try session.publishBundle()
                 client.sendBundle(toPeer: fromPeer, bundle: bundle)
+                self.state.contacts[idx].lastBundleServedAt = Date()
                 // Right after the bundle, mint and ship a fresh stash
                 // of delivery tokens for the requester. They'll need
                 // these for every subsequent SEND/ACK to clear our
@@ -919,7 +1150,15 @@ extension ChatStore: RelayClientDelegate {
                 return
             }
             do {
+                // F-202/F-401: stash the peer's delivery-token verify key
+                // BEFORE consuming the bundle in initiateSession. Used to
+                // authenticate every later TOKEN_ISSUE batch from this
+                // peer end-to-end. Failing to extract is fatal for the
+                // bundle exchange — better to refuse the pair than accept
+                // a malformed bundle whose token batches we can't verify.
+                let verifyKey = try Session.extractBundleVerifyKey(bundle)
                 try session.initiateSession(peerIdentity: fromPeer, bundle: bundle)
+                self.state.contacts[idx].peerVerifyKey = verifyKey
                 self.state.contacts[idx].sessionEstablished = true
                 self.persistAll()
             } catch {

@@ -15,9 +15,28 @@
 
 #define PIZZINI_ERR_INTERNAL -3
 
+/**
+ * Cryptographic verification failed (e.g. delivery-token signature does
+ * not match the supplied verify_key). Distinct from `INTERNAL` so the
+ * caller can attribute the failure to "untrustworthy bytes" rather than
+ * "library misbehaved".
+ */
+#define PIZZINI_ERR_BAD_SIGNATURE -4
+
 #define PIZZINI_MSG_TYPE_PREKEY 0
 
 #define PIZZINI_MSG_TYPE_WHISPER 1
+
+/**
+ * FFI ceiling on `bits` to prevent an untrusted caller from wedging
+ * the host thread. 26 is well above the protocol's
+ * `HASHCASH_DEFAULT_BITS = 18` (which costs ~1s on a modern phone),
+ * well below the wall-clock-infinite region. At 26 the expected runtime
+ * is ~64x default → ~1 minute on a phone, ~3 seconds on a desktop.
+ * Anything stricter the caller wants must come from a separate API
+ * that takes a wall-clock budget. F-702.
+ */
+#define HASHCASH_FFI_MAX_BITS 26
 
 /**
  * Default difficulty: 18 leading zero bits. ~250k expected attempts.
@@ -325,10 +344,8 @@ int32_t pizzini_blake3_hash(const uint8_t *input, uintptr_t input_len, uint8_t *
  * BUNDLE_REQUEST; the relay verifies with a single hash.
  *
  * Returns 0 on success and writes the nonce to `*out_nonce`. Returns
- * `PIZZINI_ERR_INVALID_ARG` on null pointers. There is no upper-bound
- * guard on `bits` here — the caller is responsible for picking a
- * reasonable difficulty (the relay accepts the protocol-defined
- * `HASHCASH_DEFAULT_BITS = 18`).
+ * `PIZZINI_ERR_INVALID_ARG` on null pointers OR when `bits` exceeds
+ * `HASHCASH_FFI_MAX_BITS` (untrusted-caller DoS guard).
  *
  * # Safety
  * `challenge` must point to `challenge_len` readable bytes.
@@ -338,6 +355,80 @@ int32_t pizzini_hashcash_compute(const uint8_t *challenge,
                                  uintptr_t challenge_len,
                                  uint32_t bits,
                                  uint64_t *out_nonce);
+
+/**
+ * Verify a delivery-token signature against a publish-bundle verify
+ * key. F-202 / F-401: the iOS receiver of a TOKEN_ISSUE batch needs to
+ * authenticate each token against the issuer's bundle-published
+ * verify_key, otherwise a malicious relay can swap legitimate batches
+ * for relay-forged bytes that fail at SEND-time and DoS the user.
+ *
+ * Wire format mirrors `crypto-core::store::DeliveryToken`:
+ * `nonce16 || expiry_be_u32 || sig64`. The signature is over the first
+ * 20 bytes (nonce + expiry).
+ *
+ * Returns `PIZZINI_OK` on valid signature, `PIZZINI_ERR_INVALID_ARG`
+ * on null pointers or wrong lengths, `PIZZINI_ERR_INTERNAL` if the
+ * verify_key fails to deserialize, and `PIZZINI_ERR_BAD_SIGNATURE` if
+ * the signature does not validate.
+ *
+ * # Safety
+ * `verify_key` must point to `verify_key_len` readable bytes (must be
+ * `DELIVERY_TOKEN_VERIFY_KEY_LEN` = 33).
+ * `token` must point to `token_len` readable bytes (must be
+ * `DELIVERY_TOKEN_LEN` = 84).
+ */
+int32_t pizzini_verify_delivery_token(const uint8_t *verify_key,
+                                      uintptr_t verify_key_len,
+                                      const uint8_t *token,
+                                      uintptr_t token_len);
+
+/**
+ * Sign `payload` with the local IdentityKey's private half. F-203:
+ * used by the iOS client to attach a possession proof to its HELLO
+ * frame so a network-positioned attacker can't squat someone else's
+ * peer_id and drain that peer's queued mail. The relay verifies the
+ * returned 64-byte Ed25519 signature against the IdentityKey extracted
+ * from the HELLO's `peer_id` field.
+ *
+ * The store is borrowed immutably — signing doesn't mutate any
+ * libsignal state.
+ *
+ * # Safety
+ * `store` must point to a live `DeviceStore`.
+ * `payload` must point to `payload_len` readable bytes.
+ * `out_sig` must point to `out_cap` writable bytes.
+ * `out_len` must point to a valid `usize`.
+ */
+int32_t pizzini_store_identity_sign(struct DeviceStore *store,
+                                    const uint8_t *payload,
+                                    uintptr_t payload_len,
+                                    uint8_t *out_sig,
+                                    uintptr_t out_cap,
+                                    uintptr_t *out_len);
+
+/**
+ * Pull the issuer's `delivery_token_verify_key` (33 bytes) out of a
+ * BUNDLE_RESPONSE payload without consuming the bundle. Companion to
+ * `pizzini_verify_delivery_token` — iOS calls this on the bundle bytes
+ * it just received, stashes the result on the Contact, and uses it to
+ * authenticate every later TOKEN_ISSUE batch from this peer.
+ *
+ * Returns `PIZZINI_OK` on success and writes 33 bytes to `out_buf`,
+ * `PIZZINI_ERR_BUFFER_TOO_SMALL` if `out_cap` is too small (with
+ * `*out_len` set to `DELIVERY_TOKEN_VERIFY_KEY_LEN`),
+ * `PIZZINI_ERR_INTERNAL` if the bundle fails to parse.
+ *
+ * # Safety
+ * `bundle` must point to `bundle_len` readable bytes.
+ * `out_buf` must point to `out_cap` writable bytes.
+ * `out_len` must point to a valid `usize`.
+ */
+int32_t pizzini_bundle_extract_verify_key(const uint8_t *bundle,
+                                          uintptr_t bundle_len,
+                                          uint8_t *out_buf,
+                                          uintptr_t out_cap,
+                                          uintptr_t *out_len);
 
 /**
  * Sealed-sender RECEIVE. Validates the embedded cert against the
@@ -354,10 +445,18 @@ int32_t pizzini_hashcash_compute(const uint8_t *challenge,
  *
  * Returns `PIZZINI_ERR_BUFFER_TOO_SMALL` when EITHER `out_sender` or
  * `out_plaintext` is too small to receive its payload, with the
- * corresponding `*_len` filled in. Caller retries with both buffers
- * sized appropriately. (We don't surface partial success — the
- * alternative is "decrypted, then refused to copy", which leaves the
- * ratchet advanced but the caller empty-handed.)
+ * corresponding `*_len` filled with an upper bound the caller can use
+ * to size the retry. **The ratchet is NOT advanced on a buffer-too-small
+ * path** — the FFI runs a non-mutating peek (`peek_sealed_lengths`)
+ * to check sizes before committing the ratchet step, so the caller's
+ * "discover size, retry with bigger buffer" idiom is now safe (F-101 / F-701).
+ *
+ * `out_plaintext_len` on the BUFFER_TOO_SMALL path is a conservative
+ * over-estimate: it equals the USMC inner-content length minus the
+ * 16-byte message_id + 1-byte is_prekey header. The actual plaintext
+ * returned by a successful retry is smaller (libsignal removes its
+ * own protocol overhead). Sizing a retry buffer to this bound is
+ * always sufficient.
  *
  * # Safety
  * All non-null pointers must describe valid slices of the declared sizes.

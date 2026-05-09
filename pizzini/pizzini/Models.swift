@@ -103,6 +103,20 @@ struct Contact: Codable, Identifiable, Sendable {
     /// open a message just because they happened to enable it once at
     /// onboarding. ✓✓ (delivered) is independent and always emitted.
     var readReceiptsEnabled: Bool
+    /// Peer's published `delivery_token_verify_key` (33 bytes) extracted
+    /// from their BUNDLE_RESPONSE. F-202/F-401: every TOKEN_ISSUE batch
+    /// from this peer is verified against this key before any token is
+    /// added to `deliveryTokensForPeer`, so a malicious relay cannot
+    /// swap legitimate batches for relay-forged bytes. Optional because
+    /// pre-Phase-3 contact rows on disk won't have this — the next
+    /// successful BUNDLE_RESPONSE re-populates it.
+    var peerVerifyKey: Data?
+    /// Last time we *served* a BUNDLE_RESPONSE to this peer. F-404: a
+    /// paired peer can otherwise loop BUNDLE_REQUEST and burn one
+    /// kyber1024 + one one-time prekey per request; we cap at one fresh
+    /// publish per `Contact.refillCooldown`. The same gate already
+    /// applies to `issueTokens` via `lastRefillRequestHandledAt`.
+    var lastBundleServedAt: Date?
 
     init(
         id: UUID = UUID(),
@@ -117,7 +131,9 @@ struct Contact: Codable, Identifiable, Sendable {
         lastRefillRequestSentAt: Date? = nil,
         lastRefillRequestHandledAt: Date? = nil,
         ttlSeconds: UInt32 = Contact.defaultTTLSeconds,
-        readReceiptsEnabled: Bool = false
+        readReceiptsEnabled: Bool = false,
+        peerVerifyKey: Data? = nil,
+        lastBundleServedAt: Date? = nil
     ) {
         self.id = id
         self.identityPub = identityPub
@@ -132,6 +148,8 @@ struct Contact: Codable, Identifiable, Sendable {
         self.lastRefillRequestHandledAt = lastRefillRequestHandledAt
         self.ttlSeconds = ttlSeconds
         self.readReceiptsEnabled = readReceiptsEnabled
+        self.peerVerifyKey = peerVerifyKey
+        self.lastBundleServedAt = lastBundleServedAt
     }
 
     /// Default per-message TTL: 1 day. Picker offers 1h / 1 day / 3d / 7d.
@@ -156,6 +174,7 @@ struct Contact: Codable, Identifiable, Sendable {
         case lastSeenAt, addedAt
         case deliveryTokensForPeer, lastRefillRequestSentAt, lastRefillRequestHandledAt
         case ttlSeconds, readReceiptsEnabled
+        case peerVerifyKey, lastBundleServedAt
     }
 
     init(from decoder: Decoder) throws {
@@ -173,6 +192,8 @@ struct Contact: Codable, Identifiable, Sendable {
         self.lastRefillRequestHandledAt = try c.decodeIfPresent(Date.self, forKey: .lastRefillRequestHandledAt)
         self.ttlSeconds = try c.decodeIfPresent(UInt32.self, forKey: .ttlSeconds) ?? Contact.defaultTTLSeconds
         self.readReceiptsEnabled = try c.decodeIfPresent(Bool.self, forKey: .readReceiptsEnabled) ?? false
+        self.peerVerifyKey = try c.decodeIfPresent(Data.self, forKey: .peerVerifyKey)
+        self.lastBundleServedAt = try c.decodeIfPresent(Date.self, forKey: .lastBundleServedAt)
     }
 
     var unreadCount: Int {

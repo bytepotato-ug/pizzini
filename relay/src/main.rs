@@ -125,7 +125,34 @@ use tokio::sync::mpsc;
 use crate::apns::{ApnsClient, ApnsConfig};
 
 const PORT: u16 = 7777;
-const PROTOCOL_VERSION: u8 = 2;
+/// Protocol v3 adds the F-203 HELLO possession proof. The added fields
+/// (timestamp, nonce, signature) prevent a network-positioned attacker
+/// from squatting another peer's `peer_id` to drain that peer's queued
+/// mail or DoS third-party token-bearing SENDs by registering a wrong
+/// verify_key.
+const PROTOCOL_VERSION: u8 = 3;
+/// Domain-separation tag baked into the HELLO signing payload. F-203:
+/// peer's IdentityKey signs `tag || peer_id || verify_key || ts_be ||
+/// nonce16`; relay verifies with the IdentityKey extracted from
+/// `peer_id` (which IS the libsignal IdentityKey wire form, 1-byte
+/// type prefix + 32-byte point). MUST match the iOS encoder byte-for-
+/// byte.
+const HELLO_SIGNING_TAG: &[u8] = b"pizzini.hello.v1";
+/// Maximum clock skew between client and relay accepted on a HELLO.
+/// Keeps the replay set bounded — a fresh HELLO past this window won't
+/// verify, so an attacker can't accumulate replay nonces forever.
+const HELLO_MAX_CLOCK_SKEW_SECS: i64 = 60;
+/// Length of the HELLO nonce. 16 random bytes — collision space large
+/// enough that the relay's per-peer (peer_id, nonce) replay set won't
+/// false-positive on legitimate reconnects.
+const HELLO_NONCE_LEN: usize = 16;
+/// How long a HELLO (peer_id, nonce) stays in the replay set. Two
+/// minutes covers the timestamp window plus comfortable slack; longer
+/// retention gains nothing because the timestamp would itself reject
+/// any older HELLO.
+const HELLO_REPLAY_WINDOW: Duration = Duration::from_secs(120);
+/// HELLO signature length — Ed25519/XEd25519 fixed.
+const HELLO_SIG_LEN: usize = 64;
 const FRAME_TYPE_HELLO: u8 = 1;
 const FRAME_TYPE_SEND: u8 = 2;
 const FRAME_TYPE_BUNDLE_REQUEST: u8 = 3;
@@ -159,14 +186,28 @@ const TOKEN_SIG_LEN: usize = 64;
 const TOKEN_LEN: usize = TOKEN_NONCE_LEN + 4 + TOKEN_SIG_LEN;
 /// First-contact PoW difficulty. Verifier rejects anything weaker.
 const HASHCASH_BITS: u32 = 18;
+/// Domain-separation tag baked into the hashcash challenge digest. F-301:
+/// without a tag + length prefix, two distinct (peer_id, hour) pairs can
+/// theoretically map to the same 32-byte challenge. Bumping this string
+/// invalidates every in-flight precomputed proof — coordinate with iOS.
+const HASHCASH_CHALLENGE_TAG: &[u8] = b"pizzini.hashcash.bundle.v1";
 /// How long a SEND/ACK token's nonce stays in the replay set after we
-/// see it. Tokens expire after 30d of issuance — we'd need at least
-/// that to fully prevent replays of an as-yet-unused token, but the
-/// brief specifies a 24h sliding window: replays within 24h are caught
-/// (the 99% case), and the 30d expiry caps the leak past that.
-const TOKEN_REPLAY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+/// see it. F-201: must be ≥ token TTL (30d) so we never forget a nonce
+/// while its token is still verifiable; otherwise a captured frame can be
+/// replayed during the (TTL − replay-window) gap. RAM cost is bounded by
+/// the per-peer issuance rate × number of active peers; the 5-minute GC
+/// task drops expired entries, so steady-state size tracks active load
+/// rather than peak.
+const TOKEN_REPLAY_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// How often we GC the token replay set.
 const TOKEN_REPLAY_GC_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// Hard ceiling on accepted token expiry (relative to now). Mirrors
+/// crypto-core's DELIVERY_TOKEN_TTL_SECS plus a 5-minute clock-skew
+/// margin. F-205: a malicious recipient who minted tokens with
+/// `expiry = u32::MAX` would otherwise pin the token replayable for the
+/// life of the verify_key — the relay rejects such tokens client-side
+/// rather than relying on the recipient's good behaviour.
+const TOKEN_MAX_FUTURE_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60 + 5 * 60;
 
 type PeerId = Vec<u8>;
 type Outbox = mpsc::UnboundedSender<Vec<u8>>;
@@ -184,6 +225,12 @@ type VerifyKeys = Arc<Mutex<HashMap<PeerId, Vec<u8>>>>;
 /// signing key, would fail verification anyway).
 type ReplayKey = (PeerId, [u8; TOKEN_NONCE_LEN]);
 type Replays = Arc<Mutex<HashMap<ReplayKey, Instant>>>;
+/// HELLO replay set: (peer_id, nonce) keys. Separate from the SEND/ACK
+/// `Replays` table because (a) the lifetime is much shorter (matches
+/// the timestamp window, not the token TTL) and (b) the lookup happens
+/// on every HELLO not every SEND. F-203.
+type HelloReplayKey = (PeerId, [u8; HELLO_NONCE_LEN]);
+type HelloReplays = Arc<Mutex<HashMap<HelloReplayKey, Instant>>>;
 
 /// One queued routing frame. The body is the entire frame as it would
 /// have been forwarded — including the leading frame_type byte and the
@@ -196,6 +243,29 @@ struct PendingFrame {
 }
 
 type Pending = Arc<Mutex<HashMap<PeerId, VecDeque<PendingFrame>>>>;
+
+/// Per-peer activity log. F-903: gated on `debug_assertions` so a
+/// `--release` relay never prints peer_id metadata to stdout, closing
+/// the production-drift path the module's "no logging that survives a
+/// process restart" rule warns about. Dev builds (default `cargo run`)
+/// keep the diagnostics; release builds (production Tor onion target)
+/// no-op.
+#[cfg(debug_assertions)]
+macro_rules! dev_peer_log {
+    ($($arg:tt)*) => { println!($($arg)*) };
+}
+#[cfg(not(debug_assertions))]
+macro_rules! dev_peer_log {
+    ($($arg:tt)*) => { () };
+}
+#[cfg(debug_assertions)]
+macro_rules! dev_peer_elog {
+    ($($arg:tt)*) => { eprintln!($($arg)*) };
+}
+#[cfg(not(debug_assertions))]
+macro_rules! dev_peer_elog {
+    ($($arg:tt)*) => { () };
+}
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -248,9 +318,11 @@ async fn main() -> std::io::Result<()> {
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
     let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
     let replays: Replays = Arc::new(Mutex::new(HashMap::new()));
+    let hello_replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
 
     spawn_pending_gc(pending.clone());
     spawn_replay_gc(replays.clone());
+    spawn_hello_replay_gc(hello_replays.clone());
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
@@ -259,10 +331,19 @@ async fn main() -> std::io::Result<()> {
         let pending = pending.clone();
         let verify_keys = verify_keys.clone();
         let replays = replays.clone();
+        let hello_replays = hello_replays.clone();
         let apns = apns.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
-                stream, routes, push_tokens, pending, verify_keys, replays, apns, peer_addr,
+                stream,
+                routes,
+                push_tokens,
+                pending,
+                verify_keys,
+                replays,
+                hello_replays,
+                apns,
+                peer_addr,
             )
             .await
             {
@@ -289,7 +370,7 @@ fn spawn_pending_gc(pending: Pending) {
                 let before = queue.len();
                 queue.retain(|f| f.expires_at > now);
                 if queue.is_empty() {
-                    println!(
+                    dev_peer_log!(
                         "pending: GC dropped {before} expired entries for {}",
                         short_hex(peer_id)
                     );
@@ -310,6 +391,7 @@ async fn handle_connection(
     pending: Pending,
     verify_keys: VerifyKeys,
     replays: Replays,
+    hello_replays: HelloReplays,
     apns: Option<Arc<ApnsClient>>,
     peer_addr: SocketAddr,
 ) -> std::io::Result<()> {
@@ -321,13 +403,26 @@ async fn handle_connection(
         return Err(invalid("first frame must be HELLO"));
     }
     let parsed_hello = parse_hello(&first[1..]).map_err(|e| {
-        // Refuse v1 clients loudly so a stale build can't silently
-        // corrupt v2 routing state. Connection is closed by the caller
+        // Refuse v1/v2 clients loudly so a stale build can't silently
+        // corrupt v3 routing state. Connection is closed by the caller
         // on Err return.
         eprintln!("[{peer_addr}] HELLO rejected: {e}");
         e
     })?;
+    // F-203: verify the possession proof BEFORE writing anything to the
+    // global routes / verify_keys tables. A failure here means the
+    // HELLO came from someone who doesn't hold the IdentityKey private
+    // half — typically a network attacker squatting another peer's
+    // peer_id to drain queued mail or DoS token verification.
+    if let Err(e) = verify_hello_possession_proof(&parsed_hello, &hello_replays).await {
+        eprintln!(
+            "[{peer_addr}] HELLO possession proof rejected for {}: {e}",
+            short_hex(&parsed_hello.peer_id),
+        );
+        return Err(invalid(&format!("HELLO possession proof failed: {e}")));
+    }
     let peer_id = parsed_hello.peer_id;
+    let verify_key = parsed_hello.verify_key;
     let peer_hex = hex(&peer_id);
     // Register / overwrite the recipient's verify key. Token-bearing
     // SENDs/ACKs to this peer get verified against the latest entry,
@@ -335,9 +430,9 @@ async fn handle_connection(
     // separate revocation flow.
     {
         let mut vk = verify_keys.lock().await;
-        vk.insert(peer_id.clone(), parsed_hello.verify_key);
+        vk.insert(peer_id.clone(), verify_key);
     }
-    println!("[{peer_addr}] HELLO from peer {} (verify key registered)", short_hex(&peer_id));
+    println!("[{peer_addr}] HELLO from peer {} (proof verified, verify key registered)", short_hex(&peer_id));
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     // Hold a clone so we can identify "is the entry in the map still ours?"
@@ -383,17 +478,35 @@ async fn handle_connection(
     // *if* it still belongs to us (a newer HELLO from the same peer would
     // have replaced it). Then cancel the writer task. After both Senders
     // drop, the writer's `out_rx` returns None and it exits cleanly.
-    {
+    let was_ours = {
         let mut map = routes.lock().await;
-        if let Some(existing) = map.get(&peer_id) {
-            if existing.same_channel(&our_tx) {
-                map.remove(&peer_id);
-            }
+        let was_ours = map
+            .get(&peer_id)
+            .map(|e| e.same_channel(&our_tx))
+            .unwrap_or(false);
+        if was_ours {
+            map.remove(&peer_id);
+        }
+        was_ours
+    };
+    // F-204: drop verify_keys[peer_id] alongside the route IFF we're the
+    // owning connection AND no queued mail still needs the verify_key
+    // for incoming-token verification. Older verify_keys would otherwise
+    // accumulate forever.
+    if was_ours {
+        let pending_present = pending
+            .lock()
+            .await
+            .get(&peer_id)
+            .map(|q| !q.is_empty())
+            .unwrap_or(false);
+        if !pending_present {
+            verify_keys.lock().await.remove(&peer_id);
         }
     }
     drop(our_tx);
     writer_task.abort();
-    println!("[{peer_addr}] disconnected ({peer_hex})");
+    dev_peer_log!("[{peer_addr}] disconnected ({peer_hex})");
     read_result
 }
 
@@ -453,7 +566,7 @@ async fn read_loop(
                 if let Err(reason) =
                     check_delivery_token(&parsed, verify_keys, replays).await
                 {
-                    eprintln!(
+                    dev_peer_elog!(
                         "rejecting {} → {}: {reason}",
                         match frame[0] {
                             FRAME_TYPE_SEND => "SEND",
@@ -468,7 +581,7 @@ async fn read_loop(
                 let map = routes.lock().await;
                 if let Some(target) = map.get(&parsed.to_id) {
                     let _ = target.send(frame);
-                    println!(
+                    dev_peer_log!(
                         "forward type={frame_type} → {} ({frame_len} bytes, ttl={}s)",
                         short_hex(&parsed.to_id),
                         parsed.ttl_seconds,
@@ -476,7 +589,7 @@ async fn read_loop(
                 } else {
                     drop(map);
                     enqueue_pending(&parsed.to_id, frame, parsed.ttl_seconds, pending).await;
-                    println!(
+                    dev_peer_log!(
                         "queued type={frame_type} → {}: recipient offline (ttl={}s)",
                         short_hex(&parsed.to_id),
                         parsed.ttl_seconds,
@@ -494,7 +607,7 @@ async fn read_loop(
                     }
                 };
                 if parsed.from_id != self_id {
-                    eprintln!(
+                    dev_peer_elog!(
                         "rejecting bundle request with spoofed from_id {} (connection is {})",
                         short_hex(&parsed.from_id),
                         short_hex(self_id),
@@ -502,7 +615,7 @@ async fn read_loop(
                     continue;
                 }
                 if !verify_hashcash(&parsed.to_id, parsed.hashcash_nonce) {
-                    eprintln!(
+                    dev_peer_elog!(
                         "rejecting bundle request {} → {}: invalid hashcash (need {HASHCASH_BITS} zero bits)",
                         short_hex(&parsed.from_id),
                         short_hex(&parsed.to_id),
@@ -513,13 +626,13 @@ async fn read_loop(
                 if let Some(target) = map.get(&parsed.to_id) {
                     let frame_len = frame.len();
                     let _ = target.send(frame);
-                    println!(
+                    dev_peer_log!(
                         "forward bundle req {} → {} ({frame_len} bytes, pow ok)",
                         short_hex(&parsed.from_id),
                         short_hex(&parsed.to_id),
                     );
                 } else {
-                    println!(
+                    dev_peer_log!(
                         "drop bundle req {} → {}: recipient offline",
                         short_hex(&parsed.from_id),
                         short_hex(&parsed.to_id),
@@ -540,7 +653,7 @@ async fn read_loop(
                     }
                 };
                 if parsed.from_id != self_id {
-                    eprintln!(
+                    dev_peer_elog!(
                         "rejecting bundle frame with spoofed from_id {} (connection is {})",
                         short_hex(&parsed.from_id),
                         short_hex(self_id),
@@ -552,13 +665,13 @@ async fn read_loop(
                     let frame_type = frame[0];
                     let frame_len = frame.len();
                     let _ = target.send(frame);
-                    println!(
+                    dev_peer_log!(
                         "forward bundle type={frame_type} {} → {} ({frame_len} bytes)",
                         short_hex(&parsed.from_id),
                         short_hex(&parsed.to_id),
                     );
                 } else {
-                    println!(
+                    dev_peer_log!(
                         "drop bundle type={} {} → {}: recipient offline (bundle exchange requires both online)",
                         frame[0],
                         short_hex(&parsed.from_id),
@@ -635,7 +748,7 @@ async fn drain_pending(peer_id: &[u8], pending: &Pending, routes: &Routes) {
         }
         forwarded += 1;
     }
-    println!(
+    dev_peer_log!(
         "drained pending for {}: forwarded={forwarded} expired={expired}",
         short_hex(peer_id),
     );
@@ -665,12 +778,22 @@ async fn check_delivery_token(
     );
     let sig = &parsed.token[TOKEN_NONCE_LEN + 4..];
 
-    let now_secs = SystemTime::now()
+    let now_secs_u64 = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0) as u32;
+        .unwrap_or(0);
+    let now_secs = now_secs_u64 as u32;
     if expiry < now_secs {
         return Err(format!("token expired (expiry={expiry}, now={now_secs})"));
+    }
+    // F-205: cap accepted future-expiry. A malicious or buggy recipient
+    // could otherwise mint tokens with `expiry = u32::MAX` and pin them
+    // replayable for the life of their verify_key.
+    let future_secs = u64::from(expiry).saturating_sub(now_secs_u64);
+    if future_secs > TOKEN_MAX_FUTURE_EXPIRY_SECS {
+        return Err(format!(
+            "token expiry too far in the future ({future_secs}s; cap {TOKEN_MAX_FUTURE_EXPIRY_SECS}s)"
+        ));
     }
 
     let verify_key_bytes = {
@@ -721,6 +844,22 @@ fn spawn_replay_gc(replays: Replays) {
     });
 }
 
+/// Build the per-recipient/per-hour hashcash challenge. F-301: input is
+/// domain-separated by `HASHCASH_CHALLENGE_TAG` and the peer_id is
+/// length-prefixed so two distinct `(peer_id, hour)` pairs can never
+/// hash to the same 32-byte digest. Same shape on iOS (must match
+/// byte-for-byte).
+fn build_hashcash_challenge(recipient_peer_id: &[u8], hour: u64) -> [u8; 32] {
+    let peer_len = u16::try_from(recipient_peer_id.len())
+        .expect("peer_id length fits in u16 (parser caps at u16::MAX)");
+    let mut chal = blake3::Hasher::new();
+    chal.update(HASHCASH_CHALLENGE_TAG);
+    chal.update(&peer_len.to_be_bytes());
+    chal.update(recipient_peer_id);
+    chal.update(&hour.to_be_bytes());
+    *chal.finalize().as_bytes()
+}
+
 /// Verify hashcash on a BUNDLE_REQUEST. Accepts the current and
 /// previous hour to absorb clock skew across the relay/sender pair.
 fn verify_hashcash(recipient_peer_id: &[u8], nonce: u64) -> bool {
@@ -729,12 +868,9 @@ fn verify_hashcash(recipient_peer_id: &[u8], nonce: u64) -> bool {
         .map(|d| d.as_secs() / 3600)
         .unwrap_or(0);
     let try_bucket = |hour: u64| -> bool {
-        let mut chal = blake3::Hasher::new();
-        chal.update(recipient_peer_id);
-        chal.update(&hour.to_be_bytes());
-        let challenge = chal.finalize();
+        let challenge = build_hashcash_challenge(recipient_peer_id, hour);
         let mut hasher = blake3::Hasher::new();
-        hasher.update(challenge.as_bytes());
+        hasher.update(&challenge);
         hasher.update(&nonce.to_be_bytes());
         let hash = hasher.finalize();
         leading_zero_bits(hash.as_bytes()) >= HASHCASH_BITS
@@ -772,8 +908,8 @@ async fn maybe_send_push(
     let client = client.clone();
     tokio::spawn(async move {
         match client.send_wakeup(&token).await {
-            Ok(_) => println!("push: sent wake-up to {recipient_dbg}"),
-            Err(e) => eprintln!("push: failed for {recipient_dbg}: {e}"),
+            Ok(_) => dev_peer_log!("push: sent wake-up to {recipient_dbg}"),
+            Err(e) => dev_peer_elog!("push: failed for {recipient_dbg}: {e}"),
         }
     });
 }
@@ -782,6 +918,19 @@ async fn maybe_send_push(
 struct ParsedHello {
     peer_id: Vec<u8>,
     verify_key: Vec<u8>,
+    /// F-203: unix-time seconds at the moment the client signed the
+    /// HELLO. Relay enforces ±`HELLO_MAX_CLOCK_SKEW_SECS` against its
+    /// own clock to bound the replay window.
+    timestamp_secs: u64,
+    /// F-203: 16 random bytes; (peer_id, nonce) lookup against the
+    /// HELLO replay set rejects a captured-and-replayed HELLO frame
+    /// within the timestamp window.
+    nonce: [u8; HELLO_NONCE_LEN],
+    /// F-203: Ed25519/XEd25519 signature over
+    /// `HELLO_SIGNING_TAG || peer_id || verify_key || timestamp_be ||
+    /// nonce`, computed by the client's IdentityKey private half.
+    /// Relay verifies against the IdentityKey extracted from `peer_id`.
+    signature: Vec<u8>,
 }
 
 struct ParsedRouted {
@@ -817,10 +966,112 @@ fn parse_hello(body: &[u8]) -> std::io::Result<ParsedHello> {
             verify_key.len()
         )));
     }
+    // F-203: HELLO possession-proof fields. timestamp + nonce + sig.
+    let timestamp_secs = c.u64()?;
+    let nonce_blob = c.u16_blob()?;
+    if nonce_blob.len() != HELLO_NONCE_LEN {
+        return Err(invalid(&format!(
+            "HELLO nonce must be {HELLO_NONCE_LEN} bytes, got {}",
+            nonce_blob.len()
+        )));
+    }
+    let mut nonce = [0u8; HELLO_NONCE_LEN];
+    nonce.copy_from_slice(nonce_blob);
+    let signature = c.u16_blob()?.to_vec();
+    if signature.len() != HELLO_SIG_LEN {
+        return Err(invalid(&format!(
+            "HELLO signature must be {HELLO_SIG_LEN} bytes, got {}",
+            signature.len()
+        )));
+    }
     if !c.is_empty() {
         return Err(invalid("trailing bytes after HELLO"));
     }
-    Ok(ParsedHello { peer_id, verify_key })
+    Ok(ParsedHello {
+        peer_id,
+        verify_key,
+        timestamp_secs,
+        nonce,
+        signature,
+    })
+}
+
+/// Build the byte string the iOS client signs and the relay verifies.
+/// MUST stay in sync with the Swift encoder. F-203.
+fn build_hello_signing_payload(
+    peer_id: &[u8],
+    verify_key: &[u8],
+    timestamp_secs: u64,
+    nonce: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        HELLO_SIGNING_TAG.len() + peer_id.len() + verify_key.len() + 8 + nonce.len(),
+    );
+    out.extend_from_slice(HELLO_SIGNING_TAG);
+    out.extend_from_slice(peer_id);
+    out.extend_from_slice(verify_key);
+    out.extend_from_slice(&timestamp_secs.to_be_bytes());
+    out.extend_from_slice(nonce);
+    out
+}
+
+/// F-203: validate the possession proof on a freshly-parsed HELLO.
+/// Returns Ok on accept, Err(reason) on any failure.
+async fn verify_hello_possession_proof(
+    h: &ParsedHello,
+    hello_replays: &HelloReplays,
+) -> Result<(), String> {
+    // Clock window. Allow ±skew so a phone whose NTP is briefly off
+    // can still HELLO; reject stale captures past that window so a
+    // replay must (also) fail the (peer_id, nonce) check.
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let delta = (h.timestamp_secs as i64) - (now_secs as i64);
+    if delta.abs() > HELLO_MAX_CLOCK_SKEW_SECS {
+        return Err(format!(
+            "timestamp out of range (Δ={delta}s, |max|={HELLO_MAX_CLOCK_SKEW_SECS}s)"
+        ));
+    }
+    // peer_id IS the libsignal IdentityKey wire form (1-byte type
+    // prefix + 32-byte point). Decode and verify.
+    let identity_pub = libsignal_protocol::IdentityKey::decode(&h.peer_id)
+        .map_err(|e| format!("peer_id is not a valid IdentityKey: {e}"))?;
+    let payload =
+        build_hello_signing_payload(&h.peer_id, &h.verify_key, h.timestamp_secs, &h.nonce);
+    if !identity_pub
+        .public_key()
+        .verify_signature(&payload, &h.signature)
+    {
+        return Err("signature does not validate against peer_id's IdentityKey".into());
+    }
+    // (peer_id, nonce) replay check, AFTER signature verify so a
+    // failing signature doesn't burn a nonce slot.
+    let mut set = hello_replays.lock().await;
+    let key = (h.peer_id.clone(), h.nonce);
+    if set.contains_key(&key) {
+        return Err("HELLO replay (peer_id, nonce) already seen".into());
+    }
+    set.insert(key, Instant::now());
+    Ok(())
+}
+
+fn spawn_hello_replay_gc(hello_replays: HelloReplays) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(TOKEN_REPLAY_GC_INTERVAL);
+        loop {
+            tick.tick().await;
+            let cutoff = Instant::now() - HELLO_REPLAY_WINDOW;
+            let mut set = hello_replays.lock().await;
+            let before = set.len();
+            set.retain(|_, t| *t > cutoff);
+            let after = set.len();
+            if before != after {
+                println!("hello-replay GC: pruned {} → {after}", before - after);
+            }
+        }
+    });
 }
 
 fn parse_routed(body: &[u8]) -> std::io::Result<ParsedRouted> {
@@ -1020,39 +1271,83 @@ mod tests {
         assert_eq!(clamp_ttl(24 * 3600), Duration::from_secs(24 * 3600));
     }
 
+    /// Build a structurally-valid v3 HELLO body. Signature is dummy
+    /// bytes — for parse-side tests only; verification happens
+    /// separately via `verify_hello_possession_proof`.
+    fn build_v3_hello_body(peer_id: &[u8], verify_key: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(PROTOCOL_VERSION);
+        body.extend_from_slice(&(peer_id.len() as u16).to_be_bytes());
+        body.extend_from_slice(peer_id);
+        body.extend_from_slice(&(verify_key.len() as u16).to_be_bytes());
+        body.extend_from_slice(verify_key);
+        // Phase 3 added: timestamp + nonce + sig.
+        body.extend_from_slice(&0u64.to_be_bytes()); // timestamp
+        body.extend_from_slice(&(HELLO_NONCE_LEN as u16).to_be_bytes());
+        body.extend_from_slice(&[0u8; HELLO_NONCE_LEN]); // nonce
+        body.extend_from_slice(&(HELLO_SIG_LEN as u16).to_be_bytes());
+        body.extend_from_slice(&[0u8; HELLO_SIG_LEN]); // sig (dummy)
+        body
+    }
+
     #[test]
     fn rejects_protocol_v1() {
         // v1 HELLO body had no version byte; it started straight with the
         // u16 peer_id length. Re-encoding such a body and parsing it
-        // against v2 must fail with a clear "unsupported version" error.
+        // against v3 must fail with a clear "unsupported version" error.
         let mut v1_body = Vec::new();
         v1_body.extend_from_slice(&(4u16.to_be_bytes())); // peer_id_len = 4
-        v1_body.extend_from_slice(&[1, 2, 3, 4]);          // peer_id bytes
+        v1_body.extend_from_slice(&[1, 2, 3, 4]); // peer_id bytes
         let err = parse_hello(&v1_body).unwrap_err();
         assert!(format!("{err}").contains("protocol version"));
     }
 
     #[test]
-    fn parse_hello_accepts_protocol_v2() {
+    fn parse_hello_accepts_protocol_v3() {
+        let body = build_v3_hello_body(&[1u8; 33], &[2u8; VERIFY_KEY_LEN]);
+        let parsed = parse_hello(&body).unwrap();
+        assert_eq!(parsed.peer_id, vec![1u8; 33]);
+        assert_eq!(parsed.verify_key, vec![2u8; VERIFY_KEY_LEN]);
+        assert_eq!(parsed.timestamp_secs, 0);
+        assert_eq!(parsed.nonce, [0u8; HELLO_NONCE_LEN]);
+        assert_eq!(parsed.signature.len(), HELLO_SIG_LEN);
+    }
+
+    #[test]
+    fn parse_hello_rejects_wrong_verify_key_length() {
+        let body = build_v3_hello_body(&[1, 2, 3, 4], &[0u8; 16]);
+        assert!(parse_hello(&body).is_err());
+    }
+
+    #[test]
+    fn parse_hello_rejects_wrong_nonce_length() {
         let mut body = Vec::new();
         body.push(PROTOCOL_VERSION);
         body.extend_from_slice(&(33u16.to_be_bytes()));
         body.extend_from_slice(&[1u8; 33]);
         body.extend_from_slice(&(VERIFY_KEY_LEN as u16).to_be_bytes());
         body.extend_from_slice(&[2u8; VERIFY_KEY_LEN]);
-        let parsed = parse_hello(&body).unwrap();
-        assert_eq!(parsed.peer_id, vec![1u8; 33]);
-        assert_eq!(parsed.verify_key, vec![2u8; VERIFY_KEY_LEN]);
+        body.extend_from_slice(&0u64.to_be_bytes());
+        body.extend_from_slice(&8u16.to_be_bytes()); // nonce len = 8 (wrong)
+        body.extend_from_slice(&[0u8; 8]);
+        body.extend_from_slice(&(HELLO_SIG_LEN as u16).to_be_bytes());
+        body.extend_from_slice(&[0u8; HELLO_SIG_LEN]);
+        assert!(parse_hello(&body).is_err());
     }
 
     #[test]
-    fn parse_hello_rejects_wrong_verify_key_length() {
+    fn parse_hello_rejects_wrong_sig_length() {
         let mut body = Vec::new();
         body.push(PROTOCOL_VERSION);
-        body.extend_from_slice(&(4u16.to_be_bytes()));
-        body.extend_from_slice(&[1, 2, 3, 4]);
-        body.extend_from_slice(&(16u16.to_be_bytes()));
-        body.extend_from_slice(&[0u8; 16]);
+        body.extend_from_slice(&(33u16.to_be_bytes()));
+        body.extend_from_slice(&[1u8; 33]);
+        body.extend_from_slice(&(VERIFY_KEY_LEN as u16).to_be_bytes());
+        body.extend_from_slice(&[2u8; VERIFY_KEY_LEN]);
+        body.extend_from_slice(&0u64.to_be_bytes());
+        body.extend_from_slice(&(HELLO_NONCE_LEN as u16).to_be_bytes());
+        body.extend_from_slice(&[0u8; HELLO_NONCE_LEN]);
+        body.extend_from_slice(&32u16.to_be_bytes()); // sig len = 32 (wrong, must be 64)
+        body.extend_from_slice(&[0u8; 32]);
         assert!(parse_hello(&body).is_err());
     }
 
