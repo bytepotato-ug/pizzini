@@ -168,44 +168,48 @@ async fn handle_connection(
     println!("[{peer_addr}] HELLO from peer {}", short_hex(&peer_id));
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // Hold a clone so we can identify "is the entry in the map still ours?"
+    // on cleanup via `same_channel`. The map gets the original; the clone
+    // is dropped at the end of `handle_connection`.
+    let our_tx = out_tx.clone();
     {
         let mut map = routes.lock().await;
         if let Some(prev) = map.insert(peer_id.clone(), out_tx) {
-            // Older connection for the same peer — drop it.
+            // Older connection for the same peer — drop it. The old
+            // writer_task's `out_rx.recv()` will return None on the next
+            // poll and the task will exit on its own.
             drop(prev);
         }
     }
 
-    let writer_routes = routes.clone();
-    let writer_peer = peer_id.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(payload) = out_rx.recv().await {
             if write_frame(&mut writer, &payload).await.is_err() {
                 break;
             }
         }
-        // Receiver dropped or write failed — clean up our route entry, but
-        // only if the entry still belongs to this connection.
-        let mut map = writer_routes.lock().await;
-        if let Some(existing) = map.get(&writer_peer) {
-            if existing.is_closed() {
-                map.remove(&writer_peer);
-            }
-        }
+        // We exit on either Receiver returning None (all Senders dropped)
+        // or write_frame failing. Either way, leave map cleanup to the
+        // owning `handle_connection` — it knows which entry was ours.
     });
 
     let read_result =
         read_loop(&mut reader, &routes, &push_tokens, apns.clone(), &peer_id).await;
 
+    // Read side closed → this connection is done. Remove our route entry
+    // *if* it still belongs to us (a newer HELLO from the same peer would
+    // have replaced it). Then cancel the writer task. After both Senders
+    // drop, the writer's `out_rx` returns None and it exits cleanly.
     {
         let mut map = routes.lock().await;
         if let Some(existing) = map.get(&peer_id) {
-            if existing.is_closed() {
+            if existing.same_channel(&our_tx) {
                 map.remove(&peer_id);
             }
         }
     }
-    drop(writer_task);
+    drop(our_tx);
+    writer_task.abort();
     println!("[{peer_addr}] disconnected ({peer_hex})");
     read_result
 }
@@ -271,7 +275,14 @@ async fn read_loop(
                 }
                 let map = routes.lock().await;
                 if let Some(target) = map.get(&parsed.to_id) {
+                    let frame_type = frame[0];
+                    let frame_len = frame.len();
                     let _ = target.send(frame);
+                    println!(
+                        "forward type={frame_type} {} → {} ({frame_len} bytes)",
+                        short_hex(&parsed.from_id),
+                        short_hex(&parsed.to_id),
+                    );
                 } else {
                     drop(map);
                     println!(

@@ -242,9 +242,16 @@ final class ChatStore: NSObject {
     /// Total unread → app icon. Uses the modern API (the
     /// `UIApplication.shared.applicationIconBadgeNumber` setter is
     /// deprecated in iOS 17 and we target ≥ 17).
+    ///
+    /// Also publishes the count into the shared App Group container so
+    /// the Notification Service Extension can pick up an authoritative
+    /// baseline whenever a push arrives while the app is dead. The
+    /// extension reads, increments, writes back; the main app then
+    /// re-syncs from `state.totalUnread` on next launch.
     private func refreshAppBadge() {
         let count = state.totalUnread
         UNUserNotificationCenter.current().setBadgeCount(count) { _ in }
+        SharedAppGroup.defaults?.set(count, forKey: SharedAppGroup.unreadCountKey)
     }
 
     private func appendSystem(_ text: String, to idx: Int) {

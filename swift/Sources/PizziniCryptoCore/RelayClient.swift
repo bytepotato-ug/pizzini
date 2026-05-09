@@ -93,6 +93,14 @@ public final class RelayClient: @unchecked Sendable {
                 }
                 self.state = .connected
                 self.scheduleRead()
+            case .waiting:
+                // Transient (route flap, brief unreachable). NWConnection
+                // will resolve back to `.ready` on its own; until then,
+                // bytes won't flow, so don't lie to the UI by leaving
+                // state at `.connected`. Surface as `.connecting`, not
+                // `.failed` — `.failed` would imply the user should
+                // intervene, which is wrong for a recoverable hiccup.
+                self.state = .connecting
             case .failed(let err):
                 self.state = .failed("\(err)")
             case .cancelled:

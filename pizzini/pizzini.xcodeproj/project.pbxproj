@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		3DD827FC2FAE791900977B79 /* PizziniCryptoCore in Frameworks */ = {isa = PBXBuildFile; productRef = 3DD827FB2FAE791900977B79 /* PizziniCryptoCore */; };
+		7E5E000000000002C0000001 /* pizziniNotificationService.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 7E5E000000000001D0000001 /* pizziniNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -25,12 +26,34 @@
 			remoteGlobalIDString = 3DA1C5E12FAE69AA00B75E2A;
 			remoteInfo = pizzini;
 		};
+		7E5E000000000002A0000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 3DA1C5DA2FAE69AA00B75E2A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 7E5E000000000001A0000001;
+			remoteInfo = pizziniNotificationService;
+		};
 /* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		7E5E000000000001B0000004 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				7E5E000000000002C0000001 /* pizziniNotificationService.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		3DA1C5E22FAE69AA00B75E2A /* pizzini.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = pizzini.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		3DA1C5EF2FAE69AB00B75E2A /* pizziniTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = pizziniTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		3DA1C5F92FAE69AB00B75E2A /* pizziniUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = pizziniUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		7E5E000000000001D0000001 /* pizziniNotificationService.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = pizziniNotificationService.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -49,7 +72,26 @@
 			path = pizziniUITests;
 			sourceTree = "<group>";
 		};
+		7E5E000000000001C0000001 /* pizziniNotificationService */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				7E5E000000000001C0000002 /* Exceptions for "pizziniNotificationService" folder in "pizziniNotificationService" target */,
+			);
+			path = pizziniNotificationService;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		7E5E000000000001C0000002 /* Exceptions for "pizziniNotificationService" folder in "pizziniNotificationService" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+				pizziniNotificationService.entitlements,
+			);
+			target = 7E5E000000000001A0000001 /* pizziniNotificationService */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		3DA1C5DF2FAE69AA00B75E2A /* Frameworks */ = {
@@ -74,6 +116,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		7E5E000000000001B0000002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -81,6 +130,7 @@
 			isa = PBXGroup;
 			children = (
 				3DA1C5E42FAE69AA00B75E2A /* pizzini */,
+				7E5E000000000001C0000001 /* pizziniNotificationService */,
 				3DA1C5F22FAE69AB00B75E2A /* pizziniTests */,
 				3DA1C5FC2FAE69AB00B75E2A /* pizziniUITests */,
 				3DD827FA2FAE791900977B79 /* Frameworks */,
@@ -92,6 +142,7 @@
 			isa = PBXGroup;
 			children = (
 				3DA1C5E22FAE69AA00B75E2A /* pizzini.app */,
+				7E5E000000000001D0000001 /* pizziniNotificationService.appex */,
 				3DA1C5EF2FAE69AB00B75E2A /* pizziniTests.xctest */,
 				3DA1C5F92FAE69AB00B75E2A /* pizziniUITests.xctest */,
 			);
@@ -115,10 +166,12 @@
 				3DA1C5DE2FAE69AA00B75E2A /* Sources */,
 				3DA1C5DF2FAE69AA00B75E2A /* Frameworks */,
 				3DA1C5E02FAE69AA00B75E2A /* Resources */,
+				7E5E000000000001B0000004 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				7E5E000000000002B0000001 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				3DA1C5E42FAE69AA00B75E2A /* pizzini */,
@@ -130,6 +183,28 @@
 			productName = pizzini;
 			productReference = 3DA1C5E22FAE69AA00B75E2A /* pizzini.app */;
 			productType = "com.apple.product-type.application";
+		};
+		7E5E000000000001A0000001 /* pizziniNotificationService */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 7E5E000000000001F0000001 /* Build configuration list for PBXNativeTarget "pizziniNotificationService" */;
+			buildPhases = (
+				7E5E000000000001B0000001 /* Sources */,
+				7E5E000000000001B0000002 /* Frameworks */,
+				7E5E000000000001B0000003 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				7E5E000000000001C0000001 /* pizziniNotificationService */,
+			);
+			name = pizziniNotificationService;
+			packageProductDependencies = (
+			);
+			productName = pizziniNotificationService;
+			productReference = 7E5E000000000001D0000001 /* pizziniNotificationService.appex */;
+			productType = "com.apple.product-type.app-extension";
 		};
 		3DA1C5EE2FAE69AB00B75E2A /* pizziniTests */ = {
 			isa = PBXNativeTarget;
@@ -198,6 +273,9 @@
 						CreatedOnToolsVersion = 26.0.1;
 						TestTargetID = 3DA1C5E12FAE69AA00B75E2A;
 					};
+					7E5E000000000001A0000001 = {
+						CreatedOnToolsVersion = 26.0.1;
+					};
 				};
 			};
 			buildConfigurationList = 3DA1C5DD2FAE69AA00B75E2A /* Build configuration list for PBXProject "pizzini" */;
@@ -218,6 +296,7 @@
 			projectRoot = "";
 			targets = (
 				3DA1C5E12FAE69AA00B75E2A /* pizzini */,
+				7E5E000000000001A0000001 /* pizziniNotificationService */,
 				3DA1C5EE2FAE69AB00B75E2A /* pizziniTests */,
 				3DA1C5F82FAE69AB00B75E2A /* pizziniUITests */,
 			);
@@ -240,6 +319,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		3DA1C5F72FAE69AB00B75E2A /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		7E5E000000000001B0000003 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -270,6 +356,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		7E5E000000000001B0000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -282,6 +375,11 @@
 			isa = PBXTargetDependency;
 			target = 3DA1C5E12FAE69AA00B75E2A /* pizzini */;
 			targetProxy = 3DA1C5FA2FAE69AB00B75E2A /* PBXContainerItemProxy */;
+		};
+		7E5E000000000002B0000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 7E5E000000000001A0000001 /* pizziniNotificationService */;
+			targetProxy = 7E5E000000000002A0000001 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -559,6 +657,62 @@
 			};
 			name = Release;
 		};
+		7E5E000000000001E0000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = pizziniNotificationService/pizziniNotificationService.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = N3WYDR67GB;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = pizziniNotificationService/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.bytepotato.pizzini.NotificationService;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		7E5E000000000001E0000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = pizziniNotificationService/pizziniNotificationService.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = N3WYDR67GB;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = pizziniNotificationService/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.bytepotato.pizzini.NotificationService;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -594,6 +748,15 @@
 			buildConfigurations = (
 				3DA1C60A2FAE69AB00B75E2A /* Debug */,
 				3DA1C60B2FAE69AB00B75E2A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		7E5E000000000001F0000001 /* Build configuration list for PBXNativeTarget "pizziniNotificationService" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7E5E000000000001E0000001 /* Debug */,
+				7E5E000000000001E0000002 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

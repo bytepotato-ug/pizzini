@@ -140,10 +140,20 @@ impl ApnsClient {
         let jwt = self.current_jwt().await?;
         let token_hex = hex_encode(device_token);
         let url = format!("{}/3/device/{token_hex}", self.cfg.endpoint.host());
+        // `mutable-content: 1` makes iOS invoke our Notification Service
+        // Extension before displaying. The extension reads the locally
+        // stored unread count from the shared App Group container,
+        // increments it, and stamps the right `badge` on the
+        // notification. We deliberately do NOT send a `badge` field
+        // here — the relay doesn't know (and shouldn't know) the
+        // recipient's per-peer unread count, and APNs only accepts
+        // absolute values. Letting the device do the math keeps the
+        // count out of Apple's logs.
         let body = serde_json::json!({
             "aps": {
                 "alert": "New message",
-                "sound": "default"
+                "sound": "default",
+                "mutable-content": 1
             }
         });
         let resp = self
