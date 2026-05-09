@@ -18,6 +18,14 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
     let kind: ChatMessageKind
     let bytes: Int
     let timestamp: Date
+    /// 16-byte sealed-sender message id. Set for every `.me` chat
+    /// message so we can match an incoming ACK back to the right
+    /// outbox entry; nil for `.peer` and `.system` rows.
+    let messageId: Data?
+    /// Set on `.me` rows when the recipient sends a read receipt
+    /// covering this message. Drives the "Read" indicator in the chat
+    /// row. Nil unless the recipient has read receipts on for us.
+    var readAt: Date?
 
     init(
         id: UUID = UUID(),
@@ -25,7 +33,9 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
         text: String,
         kind: ChatMessageKind,
         bytes: Int,
-        timestamp: Date = Date()
+        timestamp: Date = Date(),
+        messageId: Data? = nil,
+        readAt: Date? = nil
     ) {
         self.id = id
         self.side = side
@@ -33,6 +43,24 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
         self.kind = kind
         self.bytes = bytes
         self.timestamp = timestamp
+        self.messageId = messageId
+        self.readAt = readAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, side, text, kind, bytes, timestamp, messageId, readAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(UUID.self, forKey: .id)
+        self.side = try c.decode(ChatBubbleSide.self, forKey: .side)
+        self.text = try c.decode(String.self, forKey: .text)
+        self.kind = try c.decode(ChatMessageKind.self, forKey: .kind)
+        self.bytes = try c.decode(Int.self, forKey: .bytes)
+        self.timestamp = try c.decode(Date.self, forKey: .timestamp)
+        self.messageId = try c.decodeIfPresent(Data.self, forKey: .messageId)
+        self.readAt = try c.decodeIfPresent(Date.self, forKey: .readAt)
     }
 }
 
@@ -65,6 +93,16 @@ struct Contact: Codable, Identifiable, Sendable {
     /// rate-limit applied to incoming requests so we don't pay for
     /// 1024 fresh signatures more than once per cooldown window.
     var lastRefillRequestHandledAt: Date?
+    /// Per-contact default per-message TTL (seconds). Phase 4 picker.
+    /// Default is `Contact.defaultTTLSeconds`; user-adjustable via the
+    /// chat ⋯ menu. A reduction here doesn't shrink in-flight messages
+    /// — only future SENDs pick up the new value.
+    var ttlSeconds: UInt32
+    /// Per-contact read-receipts toggle. Default OFF — most journalists
+    /// keep this off, and we won't surprise them by leaking when they
+    /// open a message just because they happened to enable it once at
+    /// onboarding. ✓✓ (delivered) is independent and always emitted.
+    var readReceiptsEnabled: Bool
 
     init(
         id: UUID = UUID(),
@@ -77,7 +115,9 @@ struct Contact: Codable, Identifiable, Sendable {
         addedAt: Date = Date(),
         deliveryTokensForPeer: [Data] = [],
         lastRefillRequestSentAt: Date? = nil,
-        lastRefillRequestHandledAt: Date? = nil
+        lastRefillRequestHandledAt: Date? = nil,
+        ttlSeconds: UInt32 = Contact.defaultTTLSeconds,
+        readReceiptsEnabled: Bool = false
     ) {
         self.id = id
         self.identityPub = identityPub
@@ -90,7 +130,18 @@ struct Contact: Codable, Identifiable, Sendable {
         self.deliveryTokensForPeer = deliveryTokensForPeer
         self.lastRefillRequestSentAt = lastRefillRequestSentAt
         self.lastRefillRequestHandledAt = lastRefillRequestHandledAt
+        self.ttlSeconds = ttlSeconds
+        self.readReceiptsEnabled = readReceiptsEnabled
     }
+
+    /// Default per-message TTL: 1 day. Picker offers 1h / 1 day / 3d / 7d.
+    static let defaultTTLSeconds: UInt32 = 24 * 60 * 60
+    static let ttlOptions: [(label: String, seconds: UInt32)] = [
+        ("1 hour",  60 * 60),
+        ("1 day (recommended)", 24 * 60 * 60),
+        ("3 days",  3 * 24 * 60 * 60),
+        ("7 days",  7 * 24 * 60 * 60),
+    ]
 
     /// Restock target. Each fresh issuance refills the stash to this
     /// many tokens. Brief specifies 1024.
@@ -104,6 +155,7 @@ struct Contact: Codable, Identifiable, Sendable {
         case id, identityPub, displayName, sessionEstablished, log, lastMessageAt
         case lastSeenAt, addedAt
         case deliveryTokensForPeer, lastRefillRequestSentAt, lastRefillRequestHandledAt
+        case ttlSeconds, readReceiptsEnabled
     }
 
     init(from decoder: Decoder) throws {
@@ -119,6 +171,8 @@ struct Contact: Codable, Identifiable, Sendable {
         self.deliveryTokensForPeer = try c.decodeIfPresent([Data].self, forKey: .deliveryTokensForPeer) ?? []
         self.lastRefillRequestSentAt = try c.decodeIfPresent(Date.self, forKey: .lastRefillRequestSentAt)
         self.lastRefillRequestHandledAt = try c.decodeIfPresent(Date.self, forKey: .lastRefillRequestHandledAt)
+        self.ttlSeconds = try c.decodeIfPresent(UInt32.self, forKey: .ttlSeconds) ?? Contact.defaultTTLSeconds
+        self.readReceiptsEnabled = try c.decodeIfPresent(Bool.self, forKey: .readReceiptsEnabled) ?? false
     }
 
     var unreadCount: Int {

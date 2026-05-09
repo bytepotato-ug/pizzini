@@ -56,6 +56,16 @@
 		7E5E000000000001D0000001 /* pizziniNotificationService.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = pizziniNotificationService.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		7E5E000000000001C0000002 /* Exceptions for "pizziniNotificationService" folder in "pizziniNotificationService" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 7E5E000000000001A0000001 /* pizziniNotificationService */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		3DA1C5E42FAE69AA00B75E2A /* pizzini */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
@@ -81,17 +91,6 @@
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
-
-/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		7E5E000000000001C0000002 /* Exceptions for "pizziniNotificationService" folder in "pizziniNotificationService" target */ = {
-			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = (
-				Info.plist,
-				pizziniNotificationService.entitlements,
-			);
-			target = 7E5E000000000001A0000001 /* pizziniNotificationService */;
-		};
-/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		3DA1C5DF2FAE69AA00B75E2A /* Frameworks */ = {
@@ -184,28 +183,6 @@
 			productReference = 3DA1C5E22FAE69AA00B75E2A /* pizzini.app */;
 			productType = "com.apple.product-type.application";
 		};
-		7E5E000000000001A0000001 /* pizziniNotificationService */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 7E5E000000000001F0000001 /* Build configuration list for PBXNativeTarget "pizziniNotificationService" */;
-			buildPhases = (
-				7E5E000000000001B0000001 /* Sources */,
-				7E5E000000000001B0000002 /* Frameworks */,
-				7E5E000000000001B0000003 /* Resources */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-			);
-			fileSystemSynchronizedGroups = (
-				7E5E000000000001C0000001 /* pizziniNotificationService */,
-			);
-			name = pizziniNotificationService;
-			packageProductDependencies = (
-			);
-			productName = pizziniNotificationService;
-			productReference = 7E5E000000000001D0000001 /* pizziniNotificationService.appex */;
-			productType = "com.apple.product-type.app-extension";
-		};
 		3DA1C5EE2FAE69AB00B75E2A /* pizziniTests */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 3DA1C6062FAE69AB00B75E2A /* Build configuration list for PBXNativeTarget "pizziniTests" */;
@@ -251,6 +228,28 @@
 			productName = pizziniUITests;
 			productReference = 3DA1C5F92FAE69AB00B75E2A /* pizziniUITests.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+		7E5E000000000001A0000001 /* pizziniNotificationService */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 7E5E000000000001F0000001 /* Build configuration list for PBXNativeTarget "pizziniNotificationService" */;
+			buildPhases = (
+				7E5E000000000001B0000001 /* Sources */,
+				7E5E000000000001B0000002 /* Frameworks */,
+				7E5E000000000001B0000003 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				7E5E000000000001C0000001 /* pizziniNotificationService */,
+			);
+			name = pizziniNotificationService;
+			packageProductDependencies = (
+			);
+			productName = pizziniNotificationService;
+			productReference = 7E5E000000000001D0000001 /* pizziniNotificationService.appex */;
+			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
 

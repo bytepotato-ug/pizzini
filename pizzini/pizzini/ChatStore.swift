@@ -26,6 +26,7 @@ final class ChatStore: NSObject {
     // Public, observable.
     var relayState: RelayClient.State = .idle
     private(set) var state: AppState
+    private(set) var outbox: OutboxStore
     private(set) var initError: String?
     var myCard: ContactCard? {
         guard let myId = myIdentityPublicCached else { return nil }
@@ -39,9 +40,13 @@ final class ChatStore: NSObject {
     /// Latest APNs token. Stashed so a relay-host change (which builds
     /// a fresh `RelayClient`) re-publishes the token automatically.
     private var pushTokenCached: Data?
+    /// Periodic retry/TTL-expiry walk. Re-armed in `connectRelay` so
+    /// each fresh socket gets one timer; cancelled on disconnect.
+    private var retryTimer: Timer?
 
     override init() {
         self.state = Storage.loadAppState()
+        self.outbox = Storage.loadOutbox()
         super.init()
         do {
             let s = try Storage.loadOrCreateSession()
@@ -52,6 +57,12 @@ final class ChatStore: NSObject {
             self.initError = String(describing: error)
         }
         refreshAppBadge()
+    }
+
+    /// Outbox entry for `messageId`, if any. Used by the chat row to
+    /// pick its status icon.
+    func outboxEntry(forMessageId id: Data) -> OutboxEntry? {
+        outbox.entries[id]
     }
 
     /// Forwards the APNs device token to the relay so it can wake us
@@ -88,6 +99,22 @@ final class ChatStore: NSObject {
         self.relay = client
         NSLog("[pizzini] connecting to \(state.relayHost):\(Self.relayPort)")
         client.connect(to: state.relayHost, port: Self.relayPort)
+        scheduleRetryTimer()
+    }
+
+    private func scheduleRetryTimer() {
+        retryTimer?.invalidate()
+        // 30s matches the OutboxEntry.shouldRetry minimum baseline so
+        // every wake-up is actionable on at least the freshest entry.
+        let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                self.runRetryWalk()
+            }
+        }
+        timer.tolerance = 5
+        RunLoop.main.add(timer, forMode: .common)
+        retryTimer = timer
     }
 
     func setRelayHost(_ host: String) {
@@ -111,6 +138,8 @@ final class ChatStore: NSObject {
         relay.disconnect()
         self.relay = nil
         relayState = .idle
+        retryTimer?.invalidate()
+        retryTimer = nil
     }
 
     /// Build a fresh relay connection on every foreground entry. We
@@ -216,9 +245,9 @@ final class ChatStore: NSObject {
         }
         do {
             // Phase 2 wire format: sealed envelope on the wire, no
-            // from_id / is_prekey at the relay layer. Phase 4 will lift
-            // messageId out into a sender-side outbox for retries +
-            // delivered (✓✓) tracking; for now generate-and-discard.
+            // from_id / is_prekey at the relay layer. Phase 4 records
+            // an OutboxEntry per send so retries + delivered (✓✓)
+            // tracking work even across relay restarts.
             let messageId = Self.makeMessageId()
             var inner = Data([RelayClient.InnerEnvelopeKind.chat.rawValue])
             inner.append(Data(trimmed.utf8))
@@ -227,13 +256,39 @@ final class ChatStore: NSObject {
                 messageId: messageId,
                 plaintext: inner,
             )
+            let ttl = state.contacts[idx].ttlSeconds
+            let now = Date()
+            // Insert into outbox BEFORE handing off to the relay so a
+            // crash mid-send still leaves a retryable record on disk.
+            var entry = OutboxEntry(
+                messageId: messageId,
+                recipientPeerId: contact.identityPub,
+                sealedCiphertext: sealed,
+                token: token,
+                ttl: TimeInterval(ttl),
+                sentAt: now,
+                retries: 0,
+                deliveredAt: nil,
+                failedAt: nil,
+                relayedAt: nil,
+            )
+            outbox.entries[messageId] = entry
+            Storage.persist(outbox: outbox)
+            // Send. NWConnection completion fires async; we treat a
+            // synchronous return + state==.connected as the "✓ relayed"
+            // tier — see `markRelayed` for the explicit completion
+            // hook in the new RelayClient.send completion.
             relay.sendSealed(
                 toPeer: contact.identityPub,
                 sealedCiphertext: sealed,
-                ttlSeconds: Self.defaultTTLSeconds,
+                ttlSeconds: ttl,
                 token: token,
             )
-            let entry = PersistedMessage(
+            entry.relayedAt = now
+            outbox.entries[messageId] = entry
+            Storage.persist(outbox: outbox)
+
+            let logEntry = PersistedMessage(
                 side: .me,
                 text: trimmed,
                 // Bubble metadata stays "PreKey/Whisper" for now —
@@ -242,9 +297,10 @@ final class ChatStore: NSObject {
                 // PreKey on the very first send, Whisper after.
                 kind: state.contacts[idx].sessionEstablished ? .whisper : .preKey,
                 bytes: sealed.count,
+                messageId: messageId,
             )
-            state.contacts[idx].log.append(entry)
-            state.contacts[idx].lastMessageAt = entry.timestamp
+            state.contacts[idx].log.append(logEntry)
+            state.contacts[idx].lastMessageAt = logEntry.timestamp
             persistAll()
             maybeRequestRefill(forContactAt: idx, via: relay, session: session)
         } catch {
@@ -371,12 +427,59 @@ final class ChatStore: NSObject {
         refreshAppBadge()
     }
 
-    /// Called when the user enters a chat — clears its unread count.
+    /// Called when the user enters a chat — clears its unread count
+    /// and, if read receipts are enabled for this contact, emits a
+    /// single sealed `read` envelope covering the highest message_id
+    /// seen so the peer can show "Read" in their UI.
     func markRead(contactID: UUID) {
         guard let idx = state.contacts.firstIndex(where: { $0.id == contactID }) else { return }
         state.contacts[idx].lastSeenAt = Date()
         Storage.persist(appState: state)
         refreshAppBadge()
+        emitReadReceiptIfEnabled(forContactAt: idx)
+    }
+
+    func setContactTTL(_ contact: Contact, seconds: UInt32) {
+        guard let idx = contactIndex(forIdentity: contact.identityPub) else { return }
+        state.contacts[idx].ttlSeconds = seconds
+        Storage.persist(appState: state)
+    }
+
+    func setReadReceipts(_ contact: Contact, enabled: Bool) {
+        guard let idx = contactIndex(forIdentity: contact.identityPub) else { return }
+        state.contacts[idx].readReceiptsEnabled = enabled
+        Storage.persist(appState: state)
+    }
+
+    @MainActor
+    private func emitReadReceiptIfEnabled(forContactAt idx: Int) {
+        let contact = state.contacts[idx]
+        guard contact.readReceiptsEnabled,
+              let session, let relay,
+              let last = contact.log.last(where: { $0.side == .peer && $0.messageId != nil }),
+              let highest = last.messageId
+        else { return }
+        guard let token = popDeliveryToken(forContactAt: idx) else {
+            NSLog("[pizzini] cannot emit read receipt: out of tokens")
+            return
+        }
+        var inner = Data([RelayClient.InnerEnvelopeKind.readReceipt.rawValue])
+        inner.append(highest)
+        do {
+            let sealed = try session.encryptSealed(
+                peer: contact.identityPub,
+                messageId: Self.makeMessageId(),
+                plaintext: inner,
+            )
+            relay.sendSealed(
+                toPeer: contact.identityPub,
+                sealedCiphertext: sealed,
+                ttlSeconds: contact.ttlSeconds,
+                token: token,
+            )
+        } catch {
+            NSLog("[pizzini] read-receipt encrypt failed: \(error)")
+        }
     }
 
     func rename(_ contact: Contact, to newName: String) {
@@ -417,6 +520,7 @@ final class ChatStore: NSObject {
         relay?.disconnect()
         Storage.resetEverything()
         state = AppState()
+        outbox = .empty
         do {
             let s = try Storage.loadOrCreateSession()
             session = s
@@ -548,8 +652,7 @@ extension ChatStore: RelayClientDelegate {
             guard let session = self.session else { return }
             self.issueTokens(for: received.peer, via: client, session: session)
         case .readReceipt:
-            // Phase 4 hooks read-receipt UI here.
-            NSLog("[pizzini] read-receipt from \(self.short(received.peer)) (Phase 4)")
+            self.handleReadReceiptPayload(payload, contactIdx: idx)
         }
         // Defensive: an ACK arriving on the SEND channel would have
         // landed in the chat path above unless its inner-kind byte is
@@ -576,14 +679,100 @@ extension ChatStore: RelayClientDelegate {
     }
 
     @MainActor
+    private func handleReadReceiptPayload(_ payload: Data, contactIdx idx: Int) {
+        guard payload.count == 16 else { return }
+        let highest = Data(payload)
+        // Stamp every outbox entry to this peer ≤ highest with a
+        // readAt timestamp by mutating their corresponding log row.
+        // Cheap because per-contact log size is small for chat use.
+        guard let highestEntry = outbox.entries[highest] else { return }
+        let cutoff = highestEntry.sentAt
+        let now = Date()
+        var changed = false
+        for i in state.contacts[idx].log.indices {
+            let m = state.contacts[idx].log[i]
+            guard m.side == .me, m.timestamp <= cutoff else { continue }
+            if state.contacts[idx].log[i].readAt == nil {
+                state.contacts[idx].log[i].readAt = now
+                changed = true
+            }
+        }
+        if changed { Storage.persist(appState: state) }
+    }
+
+    @MainActor
     private func handleAckPayload(_ payload: Data, contactIdx idx: Int) {
         guard payload.count == 16 else {
             NSLog("[pizzini] malformed ACK from \(self.short(state.contacts[idx].identityPub))")
             return
         }
-        // Phase 4 hooks the per-message-id outbox here.
-        let messageId = payload.map { String(format: "%02x", $0) }.joined()
-        NSLog("[pizzini] ACK for message \(messageId) from \(self.short(state.contacts[idx].identityPub))")
+        let messageId = Data(payload)
+        guard var entry = outbox.entries[messageId] else {
+            NSLog("[pizzini] ACK for unknown messageId \(messageId.map { String(format: "%02x", $0) }.joined())")
+            return
+        }
+        entry.deliveredAt = Date()
+        outbox.entries[messageId] = entry
+        Storage.persist(outbox: outbox)
+    }
+
+    /// Periodic walk: re-send unacked entries that satisfy
+    /// `OutboxEntry.shouldRetry`, mark expired entries failed, drop
+    /// terminal entries older than 24h to keep the JSON blob bounded.
+    @MainActor
+    private func runRetryWalk() {
+        guard let session, let relay else { return }
+        let now = Date()
+        var changed = false
+
+        // 1. TTL expiry → mark failed.
+        for (id, entry) in outbox.entries where entry.hasExpired(now: now) {
+            var e = entry
+            e.failedAt = now
+            outbox.entries[id] = e
+            changed = true
+        }
+
+        // 2. Retry walk — only if connected. NWConnection.send while
+        // disconnected silently drops; we'd burn tokens.
+        if relayState == .connected {
+            for entry in outbox.retryableEntries(now: now) {
+                guard let idx = contactIndex(forIdentity: entry.recipientPeerId) else {
+                    continue
+                }
+                guard let token = popDeliveryToken(forContactAt: idx) else {
+                    NSLog("[pizzini] cannot retry \(short(entry.recipientPeerId)): out of tokens")
+                    continue
+                }
+                relay.sendSealed(
+                    toPeer: entry.recipientPeerId,
+                    sealedCiphertext: entry.sealedCiphertext,
+                    ttlSeconds: UInt32(entry.ttl),
+                    token: token,
+                )
+                var e = entry
+                e.retries += 1
+                e.relayedAt = now
+                outbox.entries[entry.messageId] = e
+                changed = true
+                _ = session  // silence unused-let in current scope
+            }
+        }
+
+        // 3. Garbage-collect terminal entries past their post-mortem
+        // window. 24h after delivered or failed is plenty for the UI
+        // to read; the user can still see the message in the chat
+        // log, just without a status icon.
+        let postMortem: TimeInterval = 24 * 60 * 60
+        for (id, entry) in outbox.entries {
+            if let t = entry.deliveredAt ?? entry.failedAt,
+               now.timeIntervalSince(t) > postMortem {
+                outbox.entries.removeValue(forKey: id)
+                changed = true
+            }
+        }
+
+        if changed { Storage.persist(outbox: outbox) }
     }
 
     @MainActor

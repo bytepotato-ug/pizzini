@@ -40,6 +40,30 @@ struct ChatView: View {
                             renameDraft = contact.displayName
                             renaming = true
                         } label: { Label("Rename", systemImage: "pencil") }
+                        Menu("Expires after") {
+                            ForEach(Contact.ttlOptions, id: \.seconds) { opt in
+                                Button {
+                                    store.setContactTTL(contact, seconds: opt.seconds)
+                                } label: {
+                                    if contact.ttlSeconds == opt.seconds {
+                                        Label(opt.label, systemImage: "checkmark")
+                                    } else {
+                                        Text(opt.label)
+                                    }
+                                }
+                            }
+                        }
+                        Toggle(isOn: Binding(
+                            get: { contact.readReceiptsEnabled },
+                            set: { store.setReadReceipts(contact, enabled: $0) }
+                        )) {
+                            VStack(alignment: .leading) {
+                                Text("Tell \(contact.displayName) when I read their messages")
+                                Text("Off by default. Most journalists keep this off. \(contact.displayName) will see ✓✓ when their messages arrive on your phone either way.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                         Button(role: .destructive) {
                             confirmDeleteChat = true
                         } label: { Label("Delete chat", systemImage: "trash") }
@@ -110,7 +134,10 @@ struct ChatView: View {
                             .padding(.top, 48)
                     }
                     ForEach(contact.log) { entry in
-                        ChatRow(entry: entry).id(entry.id)
+                        ChatRow(
+                            entry: entry,
+                            status: entry.messageId.flatMap { store.outboxEntry(forMessageId: $0)?.status }
+                        ).id(entry.id)
                     }
                 }
                 .padding(.horizontal)
@@ -161,6 +188,12 @@ struct ChatView: View {
 
 struct ChatRow: View {
     let entry: PersistedMessage
+    let status: OutboxEntry.Status?
+
+    init(entry: PersistedMessage, status: OutboxEntry.Status? = nil) {
+        self.entry = entry
+        self.status = status
+    }
 
     var body: some View {
         HStack(alignment: .bottom) {
@@ -199,7 +232,29 @@ struct ChatRow: View {
                 Text("·").foregroundStyle(.tertiary)
                 Text("\(entry.bytes) B").foregroundStyle(.secondary)
             }
+            if entry.side == .me, let status, entry.kind != .system {
+                Text("·").foregroundStyle(.tertiary)
+                statusIcon(status)
+                if entry.readAt != nil, status == .delivered {
+                    Text("·").foregroundStyle(.tertiary)
+                    Text("Read").foregroundStyle(.blue)
+                }
+            }
         }
         .font(.caption2.monospaced())
+    }
+
+    @ViewBuilder
+    private func statusIcon(_ status: OutboxEntry.Status) -> some View {
+        switch status {
+        case .pending:
+            Text("⏳").help("Queued — waiting for the relay")
+        case .relayed:
+            Text("✓").foregroundStyle(.secondary).help("Sent to the relay")
+        case .delivered:
+            Text("✓✓").foregroundStyle(.blue).help("Your contact's phone got it")
+        case .failed:
+            Text("✗").foregroundStyle(.red).help("Expired before reaching them")
+        }
     }
 }

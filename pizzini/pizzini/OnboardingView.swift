@@ -15,19 +15,61 @@ struct OnboardingView: View {
     @State private var authError: String?
     @State private var authInFlight = false
 
-    private enum Step { case welcome, biometric }
+    private enum Step { case welcome, icons, biometric }
 
     var body: some View {
         NavigationStack {
             VStack {
                 switch step {
                 case .welcome:    welcomeStep
+                case .icons:      iconsStep
                 case .biometric:  biometricStep
                 }
             }
             .padding(.horizontal, 24)
         }
         .interactiveDismissDisabled(true)
+    }
+
+    private var iconsStep: some View {
+        VStack(spacing: 18) {
+            Spacer()
+            Image(systemName: "checkmark.seal.fill")
+                .font(.system(size: 72))
+                .foregroundStyle(.tint)
+            Text("What the ticks mean")
+                .font(.title.bold())
+                .multilineTextAlignment(.center)
+            VStack(alignment: .leading, spacing: 14) {
+                iconRow("✓", color: .secondary, label: "Sent to the relay.")
+                iconRow("✓✓", color: .blue, label: "Your contact's phone got it.")
+                iconRow("⏳", color: .secondary, label: "Waiting — your phone or the relay was offline.")
+                iconRow("✗", color: .red, label: "Expired before reaching them. Try again.")
+            }
+            .font(.body)
+            .padding(.top, 8)
+            Spacer()
+            Button {
+                step = .biometric
+            } label: {
+                Text("Continue")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+                    .padding()
+            }
+            .buttonStyle(.borderedProminent)
+            .padding(.bottom, 24)
+        }
+    }
+
+    private func iconRow(_ glyph: String, color: Color, label: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(glyph)
+                .font(.title2.monospaced())
+                .foregroundStyle(color)
+                .frame(minWidth: 36, alignment: .leading)
+            Text(label)
+        }
     }
 
     private var welcomeStep: some View {
@@ -49,7 +91,7 @@ struct OnboardingView: View {
             .padding(.top, 8)
             Spacer()
             Button {
-                step = .biometric
+                step = .icons
             } label: {
                 Text("Continue")
                     .font(.headline)

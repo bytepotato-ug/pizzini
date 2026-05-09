@@ -15,6 +15,7 @@ import PizziniCryptoCore
 enum Storage {
     static let deviceStoreAccount = "device-store"
     static let appStateAccount = "app-state"
+    static let outboxAccount = "outbox"
     static let legacyIdentityAccount = "long-term-identity"
 
     /// Load the libsignal session, migrating an old identity-only blob if
@@ -57,11 +58,24 @@ enum Storage {
         _ = Keychain.write(data, account: appStateAccount)
     }
 
+    static func loadOutbox() -> OutboxStore {
+        guard let data = Keychain.read(account: outboxAccount),
+              let store = try? JSONDecoder().decode(OutboxStore.self, from: data)
+        else { return .empty }
+        return store
+    }
+
+    static func persist(outbox: OutboxStore) {
+        guard let data = try? JSONEncoder().encode(outbox) else { return }
+        _ = Keychain.write(data, account: outboxAccount)
+    }
+
     /// Wipes everything Pizzini owns in Keychain. Used by "Reset identity"
     /// — different from "delete all chats" (which only clears logs).
     static func resetEverything() {
         Keychain.delete(account: deviceStoreAccount)
         Keychain.delete(account: appStateAccount)
+        Keychain.delete(account: outboxAccount)
         Keychain.delete(account: legacyIdentityAccount)
     }
 }
