@@ -485,8 +485,12 @@ final class ChatStore: NSObject {
     /// sharing the attachmentId for UI rollup via
     /// `OutboxStore.attachmentStatus(forId:)`.
     func sendFile(_ url: URL, to contact: Contact, caption: String?) {
-        guard let session,
-              let relay,
+        // Existence guards — the actual session/relay handles are
+        // re-fetched on the MainActor hop in `shipPreparedAttachment`,
+        // so we only need to know they exist before kicking off the
+        // off-main read + strip pass.
+        guard session != nil,
+              relay != nil,
               let idx = contactIndex(forIdentity: contact.identityPub)
         else { return }
         guard contact.sessionEstablished else {
@@ -562,13 +566,18 @@ final class ChatStore: NSObject {
                 }
                 return
             }
-            var chunks: [Data] = []
-            chunks.reserveCapacity(chunkCount)
+            var working: [Data] = []
+            working.reserveCapacity(chunkCount)
             for i in 0..<chunkCount {
                 let start = i * chunkSize
                 let end = min(start + chunkSize, totalSize)
-                chunks.append(bytes.subdata(in: start..<end))
+                working.append(bytes.subdata(in: start..<end))
             }
+            // Swift 6 strict-concurrency: a `Task { @MainActor in ... }`
+            // closure runs on a different executor and can't capture a
+            // `var`. Bind the prepared chunks to an immutable `let`
+            // first so the capture is a deep-copy of a Sendable [Data].
+            let preparedChunks = working
             Task { @MainActor [weak self] in
                 self?.shipPreparedAttachment(
                     contactId: peerId,
@@ -576,7 +585,7 @@ final class ChatStore: NSObject {
                     sanitizedFilename: safeName,
                     mime: mime,
                     tier: tier,
-                    chunks: chunks,
+                    chunks: preparedChunks,
                     totalSize: UInt64(totalSize),
                     ttl: ttlForChunks,
                     captionText: captionText,
@@ -712,8 +721,12 @@ final class ChatStore: NSObject {
 
     /// Map a sanitized filename to the best-guess MIME / UTI string.
     /// Recipient treats this as informational only; classification is
-    /// re-derived from the filename extension on receive.
-    private nonisolated func mimeTypeForFilename(_ name: String) -> String {
+    /// re-derived from the filename extension on receive. Stays on
+    /// the MainActor (no `nonisolated`) because the only call site
+    /// is from `sendFile` *before* the off-main hop, and
+    /// `FilenameSanitizer` is MainActor-isolated under the iOS
+    /// app's default isolation rules.
+    private func mimeTypeForFilename(_ name: String) -> String {
         guard let ext = FilenameSanitizer.trailingExtension(of: name)?.lowercased(),
               let type = UTType(filenameExtension: ext)
         else { return "application/octet-stream" }
