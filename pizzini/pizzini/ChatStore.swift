@@ -758,7 +758,20 @@ extension ChatStore: RelayClientDelegate {
                 // Retry bundle requests for any contact that hasn't yet
                 // completed the handshake — the typical reason is "the
                 // other side hadn't scanned us when we last asked".
-                for c in self.state.contacts where !c.sessionEstablished {
+                //
+                // Also re-request for paired contacts whose `peerVerifyKey`
+                // is nil. This catches the F-202 upgrade-path strand: a
+                // user upgrading from pre-Phase-3 has every Contact row
+                // with `peerVerifyKey == nil` (the field didn't exist on
+                // disk). Without this, every TOKEN_ISSUE batch from those
+                // peers gets dropped at didReceiveTokenIssueFrom and the
+                // user silently drains their stash. The next BUNDLE_RESPONSE
+                // re-populates the key via Session.extractBundleVerifyKey.
+                // F-404's lastBundleServedAt cooldown (peer-side) keeps
+                // this from amplifying into a flood.
+                for c in self.state.contacts
+                    where !c.sessionEstablished || c.peerVerifyKey == nil
+                {
                     self.requestBundleWithHashcash(fromPeer: c.identityPub)
                 }
                 // F-502: also kick the outbox retry walk immediately on
