@@ -175,7 +175,8 @@ struct ChatView: View {
                     ForEach(contact.log) { entry in
                         ChatRow(
                             entry: entry,
-                            status: entry.messageId.flatMap { store.outboxEntry(forMessageId: $0)?.status }
+                            status: rowStatus(forEntry: entry),
+                            resolveURL: { info in store.attachmentURL(for: info) },
                         ).id(entry.id)
                     }
                 }
@@ -319,6 +320,16 @@ struct ChatView: View {
         attachmentDraft = nil
     }
 
+    /// Resolve the right OutboxEntry.Status for a chat row. Plain chat
+    /// rows look up by their own messageId; attachment rows roll up
+    /// across all chunks via OutboxStore.attachmentStatus(forId:).
+    private func rowStatus(forEntry entry: PersistedMessage) -> OutboxEntry.Status? {
+        if entry.kind == .attachment, let aid = entry.attachment?.attachmentId {
+            return store.outbox.attachmentStatus(forId: aid)
+        }
+        return entry.messageId.flatMap { store.outboxEntry(forMessageId: $0)?.status }
+    }
+
     private func sendDraft(contact: Contact) {
         // Two paths share this entrypoint: bare-text and attachment+
         // optional-caption. The latter sends one chunked attachment
@@ -344,22 +355,41 @@ struct ChatView: View {
 struct ChatRow: View {
     let entry: PersistedMessage
     let status: OutboxEntry.Status?
+    /// Resolves an inbound attachment's sandbox-relative path back to a
+    /// concrete URL. Closure rather than direct ChatStore access so the
+    /// row stays cheap to construct in tests / previews.
+    let resolveURL: (AttachmentInfo) -> URL?
 
-    init(entry: PersistedMessage, status: OutboxEntry.Status? = nil) {
+    init(
+        entry: PersistedMessage,
+        status: OutboxEntry.Status? = nil,
+        resolveURL: @escaping (AttachmentInfo) -> URL? = { _ in nil }
+    ) {
         self.entry = entry
         self.status = status
+        self.resolveURL = resolveURL
     }
 
     var body: some View {
         HStack(alignment: .bottom) {
             if entry.side == .peer { Spacer(minLength: 32) }
             VStack(alignment: entry.side == .me ? .leading : .trailing, spacing: 4) {
-                Text(entry.text)
-                    .font(.body)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(bubbleColor)
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                if entry.kind == .attachment, let info = entry.attachment {
+                    AttachmentRowCard(
+                        info: info,
+                        side: entry.side,
+                        bubbleColor: bubbleColor,
+                        resolveURL: resolveURL,
+                        captionText: entry.text,
+                    )
+                } else {
+                    Text(entry.text)
+                        .font(.body)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(bubbleColor)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                }
                 metadata
             }
             if entry.side == .me { Spacer(minLength: 32) }
@@ -413,6 +443,183 @@ struct ChatRow: View {
             Text("✓✓").foregroundStyle(.blue).help("Delivered to their phone")
         case .failed:
             Text("✗").foregroundStyle(.red).help("Expired before reaching them")
+        }
+    }
+}
+
+/// Card view for an attachment chat row. Renders filename + size + an
+/// icon (NEVER a thumbnail — see Pegasus 2021 / "no in-app preview"
+/// hard rule), tier-appropriate warning banner, and either a Save-to-
+/// Files button (inbound) or a status hint (outbound — the file came
+/// from the user's own picker, no need to save it again).
+struct AttachmentRowCard: View {
+    let info: AttachmentInfo
+    let side: ChatBubbleSide
+    let bubbleColor: Color
+    let resolveURL: (AttachmentInfo) -> URL?
+    let captionText: String
+
+    @State private var presentingShare = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.title2)
+                    .foregroundStyle(iconColor)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(info.filename)
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(sizeText)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if !captionText.isEmpty {
+                Text(captionText)
+                    .font(.callout)
+            }
+            if info.isInbound, let banner = receiveBanner {
+                bannerView(banner)
+            }
+            if info.isInbound {
+                saveToFilesButton
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(bubbleColor)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private var icon: String {
+        switch info.tier {
+        case .textFamily: return "doc.text"
+        case .archive: return "doc.zipper"
+        case .mediaStripAndWarn: return "photo"
+        case .authorLeakingDoc: return "doc.richtext"
+        case .codeOnTap: return "exclamationmark.triangle.fill"
+        }
+    }
+    private var iconColor: Color {
+        if AttachmentTierClassifier.isDesktopExecutable(filename: info.filename) {
+            return .red
+        }
+        switch info.tier {
+        case .codeOnTap: return .red
+        case .mediaStripAndWarn, .authorLeakingDoc: return .orange
+        default: return .secondary
+        }
+    }
+
+    private var sizeText: String {
+        let bcf = ByteCountFormatter()
+        bcf.allowedUnits = [.useKB, .useMB, .useGB]
+        bcf.countStyle = .file
+        return bcf.string(fromByteCount: Int64(info.byteSize))
+    }
+
+    private var receiveBanner: AttachmentCopy.ReceiveBanner? {
+        AttachmentCopy.receiveWarning(
+            forTier: info.tier,
+            isDesktopExecutable: AttachmentTierClassifier
+                .isDesktopExecutable(filename: info.filename),
+        )
+    }
+
+    @ViewBuilder
+    private func bannerView(_ banner: AttachmentCopy.ReceiveBanner) -> some View {
+        let bg: Color = banner.tone == .danger
+            ? Color.red.opacity(0.18) : Color.yellow.opacity(0.18)
+        let icon = banner.tone == .danger ? "exclamationmark.octagon.fill" : "exclamationmark.triangle.fill"
+        let fg: Color = banner.tone == .danger ? .red : .orange
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: icon).foregroundStyle(fg)
+            Text(banner.text).font(.caption2)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous).fill(bg)
+        )
+    }
+
+    /// Save-to-Files button. Resolves the sandbox URL on tap and
+    /// presents `UIDocumentInteractionController.presentOptionsMenu`
+    /// — that's the standard iOS surface that includes "Save to
+    /// Files" and "Open in…" without opening the bytes in-app. We
+    /// deliberately do NOT use Quick Look (in-app preview = parser
+    /// surface) and do NOT auto-open.
+    private var saveToFilesButton: some View {
+        Button {
+            presentingShare = true
+        } label: {
+            Label("Save to Files", systemImage: "square.and.arrow.down")
+                .font(.callout)
+        }
+        .buttonStyle(.bordered)
+        .background(
+            DocumentInteractionPresenter(
+                isPresented: $presentingShare,
+                url: resolveURL(info),
+            )
+        )
+    }
+}
+
+/// Bridges `UIDocumentInteractionController` into SwiftUI. Triggered by
+/// flipping `isPresented` to true; the controller calls back to clear
+/// the binding when dismissed. The brief specifies this controller
+/// rather than ShareLink/UIActivityViewController so the user surface
+/// is the focused "Save to Files / Open in…" menu rather than a
+/// full share sheet.
+struct DocumentInteractionPresenter: UIViewControllerRepresentable {
+    @Binding var isPresented: Bool
+    let url: URL?
+
+    func makeUIViewController(context: Context) -> UIViewController {
+        UIViewController()
+    }
+
+    func updateUIViewController(_ uiViewController: UIViewController, context: Context) {
+        guard isPresented, let url, uiViewController.view.window != nil else { return }
+        let controller = UIDocumentInteractionController(url: url)
+        controller.delegate = context.coordinator
+        context.coordinator.controller = controller
+        let presented = controller.presentOptionsMenu(
+            from: uiViewController.view.bounds,
+            in: uiViewController.view,
+            animated: true,
+        )
+        // If iOS refused the menu (no apps registered for this UTI),
+        // fall back to the standard preview-options sheet so the user
+        // can still pick "Save to Files".
+        if !presented {
+            _ = controller.presentPreview(animated: true)
+        }
+        DispatchQueue.main.async {
+            isPresented = false
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator: NSObject, UIDocumentInteractionControllerDelegate {
+        var controller: UIDocumentInteractionController?
+        func documentInteractionControllerViewControllerForPreview(
+            _ controller: UIDocumentInteractionController
+        ) -> UIViewController {
+            // Walk up to the key window's root — UIDocumentInteractionController
+            // needs a presenting VC for its preview path even though we
+            // primarily use presentOptionsMenu.
+            let scene = UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .first(where: { $0.activationState == .foregroundActive })
+            return scene?.windows.first(where: { $0.isKeyWindow })?
+                .rootViewController ?? UIViewController()
         }
     }
 }

@@ -46,6 +46,9 @@ If you need anything else, stop and ask.
 - No clearnet transport. Tor-only.
 - No analytics, no telemetry, no third-party SDKs.
 - No automatic media loading (Pegasus 2021 was an iMessage zero-click via image parsing).
+- No in-app preview of any attachment, ever — text, image, archive, all the same. Same Pegasus-class reasoning. Recipient taps "Save to Files" and the OS owns what's inside.
+- No auto-download of attachments. Recipient explicitly chooses to receive (the chunked-attachment flow only fires once both peers are paired and the user is in the chat); no thumbnail generation; no in-app archive extraction; no in-app PDF rendering.
+- Attachment bytes go ONLY into the app's `Application Support/attachments/` sandbox with `FileProtectionType.completeUntilFirstUserAuthentication`, excluded from iCloud backup. Never `PHPhotoLibrary` (would back up to iCloud Photos), never `Documents/` (iCloud-Documents-backed by default).
 - iOS Lockdown Mode must work. Test it.
 
 ## Repo layout
