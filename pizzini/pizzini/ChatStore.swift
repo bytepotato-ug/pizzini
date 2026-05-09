@@ -259,14 +259,20 @@ final class ChatStore: NSObject {
         }
     }
 
-    private static func currentHourBucket() -> UInt64 {
+    /// Pure deterministic helper — `nonisolated` so the F-303 dispatch
+    /// closure (which runs on `DispatchQueue.global`) can call it
+    /// without a MainActor hop. Strict concurrency would otherwise
+    /// reject the call site.
+    nonisolated private static func currentHourBucket() -> UInt64 {
         UInt64(Date().timeIntervalSince1970) / 3600
     }
 
     /// Domain-separation tag baked into the hashcash challenge digest.
     /// MUST match `HASHCASH_CHALLENGE_TAG` in `relay/src/main.rs` byte
-    /// for byte. F-301.
-    private static let hashcashChallengeTag = Data("pizzini.hashcash.bundle.v1".utf8)
+    /// for byte. F-301. `nonisolated` so the F-303 background dispatch
+    /// can read it without a MainActor hop — it's an immutable Sendable
+    /// constant.
+    nonisolated private static let hashcashChallengeTag = Data("pizzini.hashcash.bundle.v1".utf8)
 
     /// F-402: BUNDLE_RESPONSE wire size for the decoy path. A real
     /// Pizzini bundle is 1858 bytes (kyber1024 PK 1568 + 4× signatures
@@ -337,7 +343,11 @@ final class ChatStore: NSObject {
     /// expose BLAKE3, so the iOS side reaches into the
     /// `pizzini_blake3_hash` FFI rather than maintaining a parallel
     /// pure-Swift hasher.
-    private static func hashcashChallenge(for peer: Data, hour: UInt64) -> Data {
+    ///
+    /// `nonisolated` so the F-303 dispatch closure (background queue,
+    /// not MainActor) can call it directly — pure function of its
+    /// arguments, no MainActor state touched.
+    nonisolated private static func hashcashChallenge(for peer: Data, hour: UInt64) -> Data {
         var input = Data()
         input.append(hashcashChallengeTag)
         var peerLenBE = UInt16(peer.count).bigEndian
@@ -348,7 +358,10 @@ final class ChatStore: NSObject {
         return blake3(input)
     }
 
-    private static func blake3(_ input: Data) -> Data {
+    /// Pure FFI wrapper — `nonisolated` for the same reason as
+    /// `hashcashChallenge`: called from `hashcashChallenge` which is
+    /// itself reachable from the F-303 background dispatch closure.
+    nonisolated private static func blake3(_ input: Data) -> Data {
         Blake3.hash(input)
     }
 
