@@ -645,11 +645,15 @@ pub unsafe extern "C" fn pizzini_hashcash_compute(
 
 /// Sealed-sender RECEIVE. Validates the embedded cert against the
 /// claimed sender's identity_pub (looked up in the store's peers list),
-/// decrypts the inner ratchet ciphertext, and writes three outputs:
+/// decrypts the inner ratchet ciphertext, and writes four outputs:
 ///
 /// - `out_sender` — the sender's 33-byte identity_pub.
 /// - `out_message_id_16` — the 16-byte message_id from the USMC header.
-/// - `out_plaintext` — the inner plaintext bytes.
+/// - `out_plaintext` — the inner plaintext bytes (empty when duplicate).
+/// - `out_is_duplicate` — set to 1 if libsignal's ratchet rejected the
+///   inner ciphertext as a duplicate (counter already consumed). The
+///   sender + message_id are still written so the host can re-emit a
+///   fresh ACK to flip the sender's outbox; `out_plaintext_len` is 0.
 ///
 /// Returns `PIZZINI_ERR_BUFFER_TOO_SMALL` when EITHER `out_sender` or
 /// `out_plaintext` is too small to receive its payload, with the
@@ -661,6 +665,7 @@ pub unsafe extern "C" fn pizzini_hashcash_compute(
 /// # Safety
 /// All non-null pointers must describe valid slices of the declared sizes.
 /// `out_message_id_16` must point to 16 writable bytes.
+/// `out_is_duplicate` must point to 1 writable byte.
 #[allow(clippy::too_many_arguments)]
 #[no_mangle]
 pub unsafe extern "C" fn pizzini_store_seal_receive(
@@ -674,6 +679,7 @@ pub unsafe extern "C" fn pizzini_store_seal_receive(
     out_plaintext: *mut u8,
     out_plaintext_cap: usize,
     out_plaintext_len: *mut usize,
+    out_is_duplicate: *mut u8,
 ) -> i32 {
     if store.is_null()
         || sealed.is_null()
@@ -682,6 +688,7 @@ pub unsafe extern "C" fn pizzini_store_seal_receive(
         || out_message_id_16.is_null()
         || out_plaintext.is_null()
         || out_plaintext_len.is_null()
+        || out_is_duplicate.is_null()
     {
         return PIZZINI_ERR_INVALID_ARG;
     }
@@ -721,6 +728,7 @@ pub unsafe extern "C" fn pizzini_store_seal_receive(
             plaintext_len,
         );
         *out_plaintext_len = plaintext_len;
+        *out_is_duplicate = if received.is_duplicate { 1 } else { 0 };
     }
     PIZZINI_OK
 }
@@ -1111,6 +1119,7 @@ mod tests {
         let mut got_msg_id = [0u8; 16];
         let mut pt = vec![0u8; 1024];
         let mut pt_len = 0usize;
+        let mut is_dup: u8 = 0;
         let rc = unsafe {
             pizzini_store_seal_receive(
                 bob,
@@ -1118,12 +1127,36 @@ mod tests {
                 sender.as_mut_ptr(), sender.len(), &mut sender_len,
                 got_msg_id.as_mut_ptr(),
                 pt.as_mut_ptr(), pt.len(), &mut pt_len,
+                &mut is_dup,
             )
         };
         assert_eq!(rc, PIZZINI_OK);
         assert_eq!(&sender[..sender_len], alice_id.as_slice());
         assert_eq!(got_msg_id, msg_id);
         assert_eq!(&pt[..pt_len], plaintext);
+        assert_eq!(is_dup, 0);
+
+        // A second receive of the same sealed bytes — the inner ratchet
+        // will reject as duplicate, but the FFI must still surface the
+        // sender + message_id and signal `is_duplicate=1`.
+        let mut is_dup2: u8 = 0;
+        let mut pt2 = vec![0u8; 1024];
+        let mut pt2_len = 0usize;
+        let rc = unsafe {
+            pizzini_store_seal_receive(
+                bob,
+                sealed.as_ptr(), sealed_len,
+                sender.as_mut_ptr(), sender.len(), &mut sender_len,
+                got_msg_id.as_mut_ptr(),
+                pt2.as_mut_ptr(), pt2.len(), &mut pt2_len,
+                &mut is_dup2,
+            )
+        };
+        assert_eq!(rc, PIZZINI_OK);
+        assert_eq!(is_dup2, 1);
+        assert_eq!(pt2_len, 0);
+        assert_eq!(&sender[..sender_len], alice_id.as_slice());
+        assert_eq!(got_msg_id, msg_id);
 
         // ensure_sender_certificate is idempotent.
         let mut cert = vec![0u8; 4096];

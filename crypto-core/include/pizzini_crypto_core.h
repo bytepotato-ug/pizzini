@@ -342,11 +342,15 @@ int32_t pizzini_hashcash_compute(const uint8_t *challenge,
 /**
  * Sealed-sender RECEIVE. Validates the embedded cert against the
  * claimed sender's identity_pub (looked up in the store's peers list),
- * decrypts the inner ratchet ciphertext, and writes three outputs:
+ * decrypts the inner ratchet ciphertext, and writes four outputs:
  *
  * - `out_sender` — the sender's 33-byte identity_pub.
  * - `out_message_id_16` — the 16-byte message_id from the USMC header.
- * - `out_plaintext` — the inner plaintext bytes.
+ * - `out_plaintext` — the inner plaintext bytes (empty when duplicate).
+ * - `out_is_duplicate` — set to 1 if libsignal's ratchet rejected the
+ *   inner ciphertext as a duplicate (counter already consumed). The
+ *   sender + message_id are still written so the host can re-emit a
+ *   fresh ACK to flip the sender's outbox; `out_plaintext_len` is 0.
  *
  * Returns `PIZZINI_ERR_BUFFER_TOO_SMALL` when EITHER `out_sender` or
  * `out_plaintext` is too small to receive its payload, with the
@@ -358,6 +362,7 @@ int32_t pizzini_hashcash_compute(const uint8_t *challenge,
  * # Safety
  * All non-null pointers must describe valid slices of the declared sizes.
  * `out_message_id_16` must point to 16 writable bytes.
+ * `out_is_duplicate` must point to 1 writable byte.
  */
 int32_t pizzini_store_seal_receive(struct DeviceStore *store,
                                    const uint8_t *sealed,
@@ -368,6 +373,7 @@ int32_t pizzini_store_seal_receive(struct DeviceStore *store,
                                    uint8_t *out_message_id_16,
                                    uint8_t *out_plaintext,
                                    uintptr_t out_plaintext_cap,
-                                   uintptr_t *out_plaintext_len);
+                                   uintptr_t *out_plaintext_len,
+                                   uint8_t *out_is_duplicate);
 
 #endif  /* PIZZINI_CRYPTO_CORE_H */

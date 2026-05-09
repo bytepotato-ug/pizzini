@@ -274,6 +274,14 @@ final class ChatStore: NSObject {
             )
             outbox.entries[messageId] = entry
             Storage.persist(outbox: outbox)
+            // CRITICAL: encryptSealed advanced the ratchet; flush that
+            // state to Keychain BEFORE the socket write. The
+            // outbox-then-session-then-send order means a force-quit
+            // mid-send leaves the outbox knowing we tried (so the
+            // retry walk picks it up after restart) AND the libsignal
+            // session pinned at the post-encrypt counter (so the retry
+            // doesn't reuse a chain key the peer has already consumed).
+            persistSession()
             // Send. NWConnection completion fires async; we treat a
             // synchronous return + state==.connected as the "✓ relayed"
             // tier — see `markRelayed` for the explicit completion
@@ -355,7 +363,7 @@ final class ChatStore: NSObject {
                 token: token,
             )
             state.contacts[idx].lastRefillRequestSentAt = Date()
-            Storage.persist(appState: state)
+            persistAll()
         } catch {
             appendSystem("Refill request failed: \(error)", to: idx)
         }
@@ -471,6 +479,10 @@ final class ChatStore: NSObject {
                 messageId: Self.makeMessageId(),
                 plaintext: inner,
             )
+            // Same root-cause guard as `emitAck`: persist before the
+            // socket write so a force-quit between encrypt and the
+            // next chat send can't roll the ratchet back.
+            persistSession()
             relay.sendSealed(
                 toPeer: contact.identityPub,
                 sealedCiphertext: sealed,
@@ -537,10 +549,23 @@ final class ChatStore: NSObject {
 
     private func persistAll() {
         Storage.persist(appState: state)
+        persistSession()
+        refreshAppBadge()
+    }
+
+    /// Persist *only* the libsignal session blob — used after every
+    /// `Session.encryptSealed` / `decryptSealed` whose call-site doesn't
+    /// already trigger a `persistAll()` for unrelated reasons. The
+    /// libsignal ratchet advances on every encrypt and on every decrypt;
+    /// dropping that state on the floor (e.g. after `emitAck` followed
+    /// by a force-quit) rolls the on-disk session back, so the NEXT
+    /// outbound message reuses an already-consumed counter and the peer
+    /// rejects with `DuplicatedMessage`. Cheap to call — the blob is
+    /// kilobytes and Keychain writes are async.
+    private func persistSession() {
         if let session {
             try? Storage.persist(session: session)
         }
-        refreshAppBadge()
     }
 
     /// Total unread → app icon. Uses the modern API (the
@@ -630,11 +655,31 @@ extension ChatStore: RelayClientDelegate {
         do {
             received = try session.decryptSealed(sealedCiphertext)
         } catch {
-            NSLog("[pizzini] sealed decrypt failed: \(error)")
+            NSLog("[pizzini] sealed decrypt failed: \(error) (sealed=\(sealedCiphertext.count) bytes, isAckFrame=\(isAckFrame))")
             return
         }
+        // Persist BEFORE dispatching to per-kind handlers. The libsignal
+        // ratchet has already advanced (decrypt is destructive); if we
+        // crash mid-handler the on-disk session must reflect that step
+        // or the peer's NEXT inbound to us reuses a chain key we've
+        // already consumed and the whole conversation desyncs.
+        persistSession()
         guard let idx = self.contactIndex(forIdentity: received.peer) else {
             NSLog("[pizzini] dropped sealed frame from unknown peer \(self.short(received.peer))")
+            return
+        }
+        if received.isDuplicate {
+            // Sender retried a SEND we already processed (their first
+            // ACK from us probably got lost). Re-emit a fresh ACK
+            // pointing at the same message_id so their outbox can flip
+            // ✓→✓✓; do NOT re-append to the chat log or advance any
+            // app-level state. The ratchet already returned us to
+            // a quiescent state in this case (libsignal's
+            // DuplicatedMessage path doesn't mutate the session).
+            NSLog(
+                "[pizzini] duplicate sealed frame from \(self.short(received.peer)) — re-emitting ACK"
+            )
+            self.emitAck(for: received.messageId, toPeer: received.peer, via: client)
             return
         }
         guard let kindByte = received.plaintext.first,
@@ -752,7 +797,11 @@ extension ChatStore: RelayClientDelegate {
                 )
                 var e = entry
                 e.retries += 1
-                e.relayedAt = now
+                // `relayedAt` records the FIRST time bytes left our
+                // socket — bumping it on retry would lie to the UI
+                // about how long this message has been waiting. The
+                // status icon reads from `relayedAt`/`deliveredAt`/
+                // `failedAt`; only the new retry count is interesting.
                 outbox.entries[entry.messageId] = e
                 changed = true
                 _ = session  // silence unused-let in current scope
@@ -792,6 +841,12 @@ extension ChatStore: RelayClientDelegate {
                 messageId: Self.makeMessageId(),
                 plaintext: inner,
             )
+            // CRITICAL: persist immediately. encryptSealed advanced the
+            // ratchet; if the app is killed before the next persistAll,
+            // the on-disk session rolls back one step and our NEXT
+            // outbound encrypt reuses an already-consumed counter that
+            // the peer will reject as DuplicatedMessage.
+            persistSession()
             client.sendAck(
                 toPeer: toPeer,
                 sealedCiphertext: sealed,

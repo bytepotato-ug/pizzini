@@ -141,11 +141,19 @@ pub struct EncryptResult {
 /// against the embedded cert), the 16-byte message_id (extracted from the
 /// USMC contents header — the relay never sees this), and the inner
 /// plaintext.
+///
+/// `is_duplicate = true` means the libsignal ratchet rejected the inner
+/// ciphertext as a duplicate (counter already consumed). The sender +
+/// message_id are still extracted and returned so the host can re-emit
+/// a fresh ACK — without re-displaying the message — to flip the
+/// sender's outbox if its first ACK got lost. `plaintext` is empty in
+/// this case.
 #[derive(Debug)]
 pub struct SealReceived {
     pub sender_identity_pub: Vec<u8>,
     pub message_id: [u8; 16],
     pub plaintext: Vec<u8>,
+    pub is_duplicate: bool,
 }
 
 impl DeviceStore {
@@ -570,9 +578,16 @@ impl DeviceStore {
         &mut self,
         sealed: &[u8],
     ) -> Result<SealReceived, SignalProtocolError> {
-        let usmc = sealed_sender_decrypt_to_usmc(sealed, &self.inner.identity_store)
+        let usmc = match sealed_sender_decrypt_to_usmc(sealed, &self.inner.identity_store)
             .now_or_never()
-            .expect("in-mem store is sync")?;
+            .expect("in-mem store is sync")
+        {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("seal_receive: sealed_sender_decrypt_to_usmc failed: {e}");
+                return Err(e);
+            }
+        };
 
         let claimed_pub = usmc.sender()?.key()?;
         let claimed_bytes = IdentityKey::new(claimed_pub).serialize().to_vec();
@@ -584,6 +599,10 @@ impl DeviceStore {
         // sealed envelopes from arbitrary identities.
         let trusted = self.peers.iter().any(|p| p.as_slice() == claimed_bytes.as_slice());
         if !trusted {
+            eprintln!(
+                "seal_receive: rejecting unknown sender {}",
+                hex_lower(&claimed_bytes)
+            );
             return Err(SignalProtocolError::InvalidArgument(
                 "sealed sender claim does not match a known contact".into(),
             ));
@@ -592,6 +611,10 @@ impl DeviceStore {
         let trust_root = IdentityKey::decode(&claimed_bytes)?;
         let validation_time = Timestamp::from_epoch_millis(now_millis());
         if !usmc.sender()?.validate(trust_root.public_key(), validation_time)? {
+            eprintln!(
+                "seal_receive: cert validation failed for sender {}",
+                hex_lower(&claimed_bytes)
+            );
             return Err(SignalProtocolError::InvalidArgument(
                 "sealed sender certificate does not validate against the contact's identity".into(),
             ));
@@ -599,6 +622,11 @@ impl DeviceStore {
 
         let inner_bytes = usmc.contents()?;
         if inner_bytes.len() < 17 {
+            eprintln!(
+                "seal_receive: inner content too short ({} bytes) for {}",
+                inner_bytes.len(),
+                hex_lower(&claimed_bytes)
+            );
             return Err(SignalProtocolError::InvalidArgument(
                 "sealed sender inner content shorter than message_id||is_prekey header".into(),
             ));
@@ -616,7 +644,7 @@ impl DeviceStore {
         let mut rng = OsRng.unwrap_err();
         let sender_addr = address_for(&claimed_bytes);
         let local_addr = address_for(&self.identity_public_bytes());
-        let pt = message_decrypt(
+        let pt = match message_decrypt(
             &parsed,
             &sender_addr,
             &local_addr,
@@ -628,12 +656,43 @@ impl DeviceStore {
             &mut rng,
         )
         .now_or_never()
-        .expect("in-mem store is sync")?;
+        .expect("in-mem store is sync")
+        {
+            Ok(pt) => pt,
+            Err(SignalProtocolError::DuplicatedMessage(timestamp, counter)) => {
+                // libsignal's ratchet rejected the inner ciphertext
+                // because its (chain, counter) pair was already
+                // consumed. Session state is unchanged; we still want
+                // to surface sender + message_id so the caller can
+                // re-emit a fresh ACK (the sender's first ACK might
+                // have been lost mid-flight, and they're now retrying
+                // — answering shuts the loop down).
+                eprintln!(
+                    "seal_receive: duplicate ratchet message from {} (timestamp={timestamp}, counter={counter})",
+                    hex_lower(&claimed_bytes)
+                );
+                return Ok(SealReceived {
+                    sender_identity_pub: claimed_bytes,
+                    message_id,
+                    plaintext: Vec::new(),
+                    is_duplicate: true,
+                });
+            }
+            Err(e) => {
+                eprintln!(
+                    "seal_receive: inner message_decrypt failed for {} (is_prekey={is_prekey}, msg_id={}): {e}",
+                    hex_lower(&claimed_bytes),
+                    hex_lower(&message_id),
+                );
+                return Err(e);
+            }
+        };
 
         Ok(SealReceived {
             sender_identity_pub: claimed_bytes,
             message_id,
             plaintext: pt,
+            is_duplicate: false,
         })
     }
 
@@ -1177,6 +1236,42 @@ mod tests {
                 if i % 2 == 0 { alice_id.clone() } else { bob_id.clone() },
             );
         }
+    }
+
+    #[test]
+    fn seal_receive_returns_duplicate_flag_on_replay() {
+        // Replay defence: feeding the same sealed bytes through
+        // seal_receive twice must surface `is_duplicate = true` on the
+        // second call (libsignal's Double Ratchet rejects the second
+        // call as DuplicateMessage; we catch it and report instead of
+        // bubbling internalError to the iOS layer). sender + message_id
+        // are still extracted so the host can re-emit a fresh ACK.
+        let mut alice = DeviceStore::fresh().unwrap();
+        let mut bob = DeviceStore::fresh().unwrap();
+        let alice_id = alice.identity_public_bytes();
+        let bob_id = bob.identity_public_bytes();
+        alice.initiate_session(&bob_id, &bob.publish_bundle().unwrap()).unwrap();
+        bob.register_peer(&alice_id);
+
+        let mut msg_id = [0u8; 16];
+        msg_id[0] = 0xDE;
+        msg_id[1] = 0xAD;
+        let sealed = alice.seal_send(&bob_id, &msg_id, b"hello once").unwrap();
+
+        // First receive: real decrypt.
+        let first = bob.seal_receive(&sealed).unwrap();
+        assert!(!first.is_duplicate);
+        assert_eq!(first.plaintext, b"hello once");
+        assert_eq!(first.sender_identity_pub, alice_id);
+        assert_eq!(first.message_id, msg_id);
+
+        // Second receive of the same sealed bytes: duplicate flag,
+        // empty plaintext, sender + message_id still present.
+        let second = bob.seal_receive(&sealed).unwrap();
+        assert!(second.is_duplicate);
+        assert!(second.plaintext.is_empty());
+        assert_eq!(second.sender_identity_pub, alice_id);
+        assert_eq!(second.message_id, msg_id);
     }
 
     #[test]

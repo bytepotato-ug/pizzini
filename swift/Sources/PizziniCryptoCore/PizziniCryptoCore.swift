@@ -301,10 +301,17 @@ public final class Session: @unchecked Sendable {
 
     /// Sealed-sender RECEIVE result: the verified sender, the 16-byte
     /// message id (caller owns dedup), and the inner plaintext.
+    ///
+    /// `isDuplicate == true` means libsignal's ratchet rejected the
+    /// inner ciphertext as already-consumed (a retry of a SEND we
+    /// already processed). `plaintext` is empty in that case; sender
+    /// + messageId are still populated so the host can re-emit a
+    /// fresh ACK and shut down the sender's retry loop.
     public struct SealedReceived: Sendable {
         public let peer: Data
         public let messageId: Data
         public let plaintext: Data
+        public let isDuplicate: Bool
     }
 
     /// Sealed-sender RECEIVE. Validates the embedded cert against the
@@ -319,6 +326,7 @@ public final class Session: @unchecked Sendable {
         var msgId = [UInt8](repeating: 0, count: 16)
         var plaintext = [UInt8](repeating: 0, count: max(sealed.count + 256, 1024))
         var plaintextLen: UInt = 0
+        var isDuplicate: UInt8 = 0
         var rc = sealed.withUnsafeBytes { sealedPtr -> Int32 in
             sender.withUnsafeMutableBufferPointer { sPtr in
                 msgId.withUnsafeMutableBufferPointer { mPtr in
@@ -328,7 +336,8 @@ public final class Session: @unchecked Sendable {
                             sealedPtr.bindMemory(to: UInt8.self).baseAddress, UInt(sealed.count),
                             sPtr.baseAddress, UInt(sPtr.count), &senderLen,
                             mPtr.baseAddress,
-                            pPtr.baseAddress, UInt(pPtr.count), &plaintextLen
+                            pPtr.baseAddress, UInt(pPtr.count), &plaintextLen,
+                            &isDuplicate
                         )
                     }
                 }
@@ -352,7 +361,8 @@ public final class Session: @unchecked Sendable {
                                 sealedPtr.bindMemory(to: UInt8.self).baseAddress, UInt(sealed.count),
                                 sPtr.baseAddress, UInt(sPtr.count), &senderLen,
                                 mPtr.baseAddress,
-                                pPtr.baseAddress, UInt(pPtr.count), &plaintextLen
+                                pPtr.baseAddress, UInt(pPtr.count), &plaintextLen,
+                                &isDuplicate
                             )
                         }
                     }
@@ -363,7 +373,8 @@ public final class Session: @unchecked Sendable {
         return SealedReceived(
             peer: Data(sender.prefix(Int(senderLen))),
             messageId: Data(msgId),
-            plaintext: Data(plaintext.prefix(Int(plaintextLen)))
+            plaintext: Data(plaintext.prefix(Int(plaintextLen))),
+            isDuplicate: isDuplicate != 0
         )
     }
 

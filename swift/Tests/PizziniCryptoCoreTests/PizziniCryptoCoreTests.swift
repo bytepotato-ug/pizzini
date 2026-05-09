@@ -113,6 +113,29 @@ struct PizziniCryptoCoreTests {
         #expect(received.peer == aliceId)
         #expect(received.messageId == messageId)
         #expect(received.plaintext == payload)
+        #expect(received.isDuplicate == false)
+    }
+
+    @Test("decryptSealed flags a replayed SEND as duplicate without throwing")
+    func sealedSenderDuplicate() throws {
+        let alice = try Session()
+        let bob = try Session()
+        let aliceId = try alice.identityPublic()
+        let bobId = try bob.identityPublic()
+        try alice.initiateSession(peerIdentity: bobId, bundle: try bob.publishBundle())
+        try bob.registerPeer(peerIdentity: aliceId)
+
+        let messageId = Data(repeating: 0xFE, count: 16)
+        let sealed = try alice.encryptSealed(
+            peer: bobId, messageId: messageId, plaintext: Data("once".utf8)
+        )
+        let first = try bob.decryptSealed(sealed)
+        #expect(first.isDuplicate == false)
+        let second = try bob.decryptSealed(sealed)
+        #expect(second.isDuplicate == true)
+        #expect(second.plaintext.isEmpty)
+        #expect(second.peer == aliceId)
+        #expect(second.messageId == messageId)
     }
 
     @Test("decryptSealed throws for a sender we don't trust yet")
