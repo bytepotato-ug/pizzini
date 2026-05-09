@@ -108,13 +108,21 @@ impl DeviceStore {
             .expect("infallible for in-mem identity store")
     }
 
-    fn local_identity_keypair(&self) -> IdentityKeyPair {
+    pub fn local_identity_keypair(&self) -> IdentityKeyPair {
         self.inner
             .identity_store
             .get_identity_key_pair()
             .now_or_never()
             .expect("in-mem store is sync")
             .expect("infallible for in-mem identity store")
+    }
+
+    /// Direct access to the underlying libsignal store. Used by the sealed-
+    /// sender feasibility test (`tests/sealed_sender.rs`) which drives the
+    /// libsignal sealed-sender API directly. Phase 1 wraps this with
+    /// proper `seal_send`/`seal_receive` methods on DeviceStore.
+    pub fn inner_mut(&mut self) -> &mut InMemSignalProtocolStore {
+        &mut self.inner
     }
 
     pub fn publish_bundle(&mut self) -> Result<Vec<u8>, SignalProtocolError> {
