@@ -28,6 +28,16 @@ final class ChatStore: NSObject {
     private(set) var state: AppState
     private(set) var outbox: OutboxStore
     private(set) var initError: String?
+    /// True iff the most recent attempt to persist the libsignal session
+    /// blob to Keychain failed. F-602 fix-review: the audit's deeper
+    /// recommendation was to "block further encrypts behind a 'Keychain
+    /// unavailable; tap to retry' UI guard rather than letting in-memory
+    /// drift further". A flag drives a banner in ContentView that warns
+    /// the user — chronic write failure means a force-quit will roll
+    /// the on-disk session back to the last successful persist, and the
+    /// next outbound encrypt will reuse a counter the peer has already
+    /// consumed. Cleared the next time persistSession succeeds.
+    private(set) var keychainWriteFailing: Bool = false
     var myCard: ContactCard? {
         guard let myId = myIdentityPublicCached else { return nil }
         return ContactCard(peerId: myId, host: state.relayHost, port: Self.relayPort)
@@ -722,8 +732,22 @@ final class ChatStore: NSObject {
     /// rejects with `DuplicatedMessage`. Cheap to call — the blob is
     /// kilobytes and Keychain writes are async.
     private func persistSession() {
-        if let session {
-            try? Storage.persist(session: session)
+        guard let session else { return }
+        do {
+            try Storage.persist(session: session)
+            // Clear the warning the moment a write succeeds. Chronic
+            // failure stays surfaced; transient hiccups self-resolve
+            // on the next persistSession call.
+            if keychainWriteFailing {
+                keychainWriteFailing = false
+            }
+        } catch {
+            // F-602: surface to UI via the published flag. Storage layer
+            // already NSLog'd the underlying errSec status — the banner
+            // tells the user to investigate before they trust further
+            // ✓✓ indicators (which would otherwise be lying about
+            // delivery in the worst case).
+            keychainWriteFailing = true
         }
     }
 

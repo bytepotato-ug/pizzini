@@ -46,6 +46,17 @@ struct ContentView: View {
                             onPasteContact: promptForName(decoding:)
                         )
                     }
+                    // F-602: surface chronic Keychain.write failures the
+                    // user would otherwise never see. The banner sits
+                    // inside the chat-content branch (above the nav bar
+                    // via .safeAreaInset) so it shows during normal use
+                    // but doesn't double up on the initError state. The
+                    // copy mirrors the audit's recommended message.
+                    .safeAreaInset(edge: .top, spacing: 0) {
+                        if store.keychainWriteFailing {
+                            keychainFailureBanner
+                        }
+                    }
                 }
             }
 
@@ -184,6 +195,35 @@ struct ContentView: View {
                 .padding(.horizontal)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// F-602: persistent banner shown above the nav bar when ChatStore
+    /// detects chronic Keychain.write failure. The plain-language copy
+    /// names the consequence (sent messages may not survive a relaunch)
+    /// rather than the underlying errSec status, which the user can't
+    /// act on. NSLog has the technical detail for support.
+    private var keychainFailureBanner: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "lock.trianglebadge.exclamationmark")
+                .foregroundStyle(.white)
+                .imageScale(.large)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Storage unavailable")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                Text(
+                    "Pizzini can't write to the Keychain right now. Sent messages may not survive an app restart. Restart the device or check storage and try again."
+                )
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.95))
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.red)
     }
 }
 
