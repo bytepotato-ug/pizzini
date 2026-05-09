@@ -28,6 +28,15 @@ public protocol RelayClientDelegate: AnyObject, Sendable {
         didReceiveBundleFrom fromPeer: Data,
         bundle: Data
     )
+    /// Peer minted delivery tokens for us to use when sending TO them
+    /// (Phase 3). Sent right after their BUNDLE_RESPONSE on first
+    /// contact and in response to a sealed token-refill-request.
+    /// Each token is 84 bytes (nonce + expiry + sig).
+    func relayClient(
+        _ client: RelayClient,
+        didReceiveTokenIssueFrom fromPeer: Data,
+        tokens: [Data]
+    )
 }
 
 public final class RelayClient: @unchecked Sendable {
@@ -41,19 +50,29 @@ public final class RelayClient: @unchecked Sendable {
     /// On-the-wire protocol version negotiated in HELLO. Bumped from 1
     /// when sealed-sender SEND/ACK landed; v1 relays/clients reject.
     public static let protocolVersion: UInt8 = 2
-    /// Inner-plaintext content marker for ACK envelopes — matches the
-    /// "ack: <16-byte message_id>" convention from Phase 4.
-    public static let ackMarker: Data = Data("ack:".utf8)
+
+    /// Inner-plaintext type byte. Sealed envelope contents always start
+    /// with one of these so the receiver can dispatch without parsing
+    /// ambiguous prefixes that could collide with user-typed text.
+    public enum InnerEnvelopeKind: UInt8 {
+        case chat = 0x01
+        case ack = 0x02
+        case tokenRefillRequest = 0x03
+        case readReceipt = 0x04
+    }
     private static let frameTypeHello: UInt8 = 1
     private static let frameTypeSend: UInt8 = 2
     private static let frameTypeBundleRequest: UInt8 = 3
     private static let frameTypeBundleResponse: UInt8 = 4
     private static let frameTypeRegisterPush: UInt8 = 5
     private static let frameTypeAck: UInt8 = 6
+    private static let frameTypeTokenIssue: UInt8 = 7
     private static let maxFrameBytes: UInt32 = 1024 * 1024
     /// Hard ceiling on the per-message TTL the sender can request; the
     /// relay clamps to this server-side too. 7 days.
     public static let maxTTLSeconds: UInt32 = 7 * 24 * 60 * 60
+    /// Wire size of a single delivery token (nonce16 + expiry_be_u32 + sig64).
+    public static let deliveryTokenLen: Int = 16 + 4 + 64
 
     public weak var delegate: RelayClientDelegate?
     public private(set) var state: State = .idle {
@@ -70,6 +89,7 @@ public final class RelayClient: @unchecked Sendable {
 
     private let queue = DispatchQueue(label: "app.pizzini.relay")
     private let myIdentity: Data
+    private let myDeliveryTokenVerifyKey: Data
     private var connection: NWConnection?
     private var readBuffer = Data()
     /// Latest APNs device token. Cached so we automatically re-register
@@ -77,8 +97,9 @@ public final class RelayClient: @unchecked Sendable {
     /// relay restart wipes it).
     private var pushToken: Data?
 
-    public init(myIdentity: Data) {
+    public init(myIdentity: Data, myDeliveryTokenVerifyKey: Data) {
         self.myIdentity = myIdentity
+        self.myDeliveryTokenVerifyKey = myDeliveryTokenVerifyKey
     }
 
     public func connect(to host: String, port: UInt16) {
@@ -182,12 +203,14 @@ public final class RelayClient: @unchecked Sendable {
         writeFrame(payload, on: connection)
     }
 
-    public func requestBundle(fromPeer to: Data) {
+    public func requestBundle(fromPeer to: Data, hashcashNonce: UInt64) {
         guard let connection, state == .connected else { return }
         var payload = Data()
         payload.append(Self.frameTypeBundleRequest)
         appendU16Blob(&payload, to)
         appendU16Blob(&payload, myIdentity)
+        var nonceBE = hashcashNonce.bigEndian
+        withUnsafeBytes(of: &nonceBE) { payload.append(contentsOf: $0) }
         writeFrame(payload, on: connection)
     }
 
@@ -198,6 +221,22 @@ public final class RelayClient: @unchecked Sendable {
         appendU16Blob(&payload, to)
         appendU16Blob(&payload, myIdentity)
         payload.append(bundle)
+        writeFrame(payload, on: connection)
+    }
+
+    /// TOKEN_ISSUE: ship 1024 fresh delivery tokens minted for `to` so
+    /// they can use them as the rate-limit gate when sending TO us.
+    public func sendTokenIssue(toPeer to: Data, tokens: [Data]) {
+        guard let connection, state == .connected else { return }
+        var payload = Data()
+        payload.append(Self.frameTypeTokenIssue)
+        appendU16Blob(&payload, to)
+        appendU16Blob(&payload, myIdentity)
+        var countBE = UInt32(tokens.count).bigEndian
+        withUnsafeBytes(of: &countBE) { payload.append(contentsOf: $0) }
+        for t in tokens {
+            payload.append(t)
+        }
         writeFrame(payload, on: connection)
     }
 
@@ -225,6 +264,7 @@ public final class RelayClient: @unchecked Sendable {
         payload.append(Self.frameTypeHello)
         payload.append(Self.protocolVersion)
         appendU16Blob(&payload, myIdentity)
+        appendU16Blob(&payload, myDeliveryTokenVerifyKey)
         writeFrame(payload, on: connection)
     }
 
@@ -317,6 +357,19 @@ public final class RelayClient: @unchecked Sendable {
             DispatchQueue.main.async {
                 delegate?.relayClient(client, didReceiveBundleFrom: from, bundle: bundle)
             }
+        case Self.frameTypeTokenIssue:
+            guard cursor.u16Blob() != nil else { return }
+            guard let from = cursor.u16Blob() else { return }
+            guard let count = cursor.u32() else { return }
+            var tokens: [Data] = []
+            tokens.reserveCapacity(Int(count))
+            for _ in 0..<count {
+                guard let tok = cursor.take(Self.deliveryTokenLen) else { return }
+                tokens.append(tok)
+            }
+            DispatchQueue.main.async {
+                delegate?.relayClient(client, didReceiveTokenIssueFrom: from, tokens: tokens)
+            }
         default:
             break
         }
@@ -357,6 +410,20 @@ private struct Cursor {
         guard buf.count >= n else { return false }
         buf = buf.dropFirst(n)
         return true
+    }
+    mutating func u32() -> UInt32? {
+        guard buf.count >= 4 else { return nil }
+        let v = buf.prefix(4).withUnsafeBytes { ptr in
+            UInt32(bigEndian: ptr.loadUnaligned(as: UInt32.self))
+        }
+        buf = buf.dropFirst(4)
+        return v
+    }
+    mutating func take(_ n: Int) -> Data? {
+        guard buf.count >= n else { return nil }
+        let blob = buf.prefix(n)
+        buf = buf.dropFirst(n)
+        return Data(blob)
     }
     mutating func rest() -> Data {
         let r = buf

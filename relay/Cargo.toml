@@ -18,6 +18,12 @@ reqwest = { version = "0.12", default-features = false, features = ["http2", "ru
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Token signature verification: the relay uses the same XEd25519
+# primitive iOS uses to sign, via libsignal's PublicKey::verify_signature.
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal.git", tag = "v0.93.2" }
+# First-contact PoW verification on BUNDLE_REQUEST frames. Single hash
+# per request, sub-microsecond.
+blake3 = { version = "1", default-features = false }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

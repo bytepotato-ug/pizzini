@@ -26,6 +26,10 @@ futures-util = { version = "0.3", default-features = false }
 # are already in libsignal's transitive tree — no supply-chain delta.
 hkdf = "0.12"
 sha2 = "0.10"
+# BLAKE3 hashcash for first-contact bundle anti-DoS (Phase 3) — pure Rust,
+# no C-link delta, also exposed via FFI as a hashcash-prover so iOS can
+# brute-force a nonce without a separate Swift BLAKE3 dep.
+blake3 = { version = "1", default-features = false }
 
 [build-dependencies]
 cbindgen = "0.29"

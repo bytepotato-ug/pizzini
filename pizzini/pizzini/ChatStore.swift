@@ -74,10 +74,13 @@ final class ChatStore: NSObject {
             oldRelay.delegate = nil
             oldRelay.disconnect()
         }
-        guard let myId = myIdentityPublicCached ?? (try? session.identityPublic()) else {
+        guard
+            let myId = myIdentityPublicCached ?? (try? session.identityPublic()),
+            let verifyKey = try? session.deliveryTokenVerifyKey()
+        else {
             return
         }
-        let client = RelayClient(myIdentity: myId)
+        let client = RelayClient(myIdentity: myId, myDeliveryTokenVerifyKey: verifyKey)
         client.delegate = self
         if let token = pushTokenCached {
             client.registerPush(token: token)
@@ -144,7 +147,7 @@ final class ChatStore: NSObject {
     func addContact(card: ContactCard, displayName: String?) {
         guard let session else { return }
         if state.contacts.contains(where: { $0.identityPub == card.peerId }) {
-            relay?.requestBundle(fromPeer: card.peerId)
+            requestBundleWithHashcash(fromPeer: card.peerId)
             return
         }
         let trimmed = (displayName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -154,8 +157,45 @@ final class ChatStore: NSObject {
         try? session.registerPeer(peerIdentity: card.peerId)
         persistAll()
         if relayState == .connected {
-            relay?.requestBundle(fromPeer: card.peerId)
+            requestBundleWithHashcash(fromPeer: card.peerId)
         }
+    }
+
+    /// Compute the BLAKE3 hashcash on a background queue (~1s on a
+    /// modern phone) and ship the BUNDLE_REQUEST. Async — bundle exchange
+    /// is rare so the latency is acceptable; the alternative would be a
+    /// pre-warmed nonce cache, which would freeze on first launch instead.
+    private func requestBundleWithHashcash(fromPeer peer: Data) {
+        guard let relay else { return }
+        let challenge = Self.hashcashChallenge(for: peer, hour: Self.currentHourBucket())
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let nonce = Hashcash.compute(challenge: challenge)
+            DispatchQueue.main.async {
+                guard self != nil else { return }
+                relay.requestBundle(fromPeer: peer, hashcashNonce: nonce)
+            }
+        }
+    }
+
+    private static func currentHourBucket() -> UInt64 {
+        UInt64(Date().timeIntervalSince1970) / 3600
+    }
+
+    /// Hashcash challenge layout, mirroring `relay::verify_hashcash`:
+    /// `BLAKE3(recipient_peer_id || hour_bucket_be_u64)`. CryptoKit
+    /// doesn't expose BLAKE3, so the iOS side reaches into the
+    /// `pizzini_blake3_hash` FFI rather than maintaining a parallel
+    /// pure-Swift hasher.
+    private static func hashcashChallenge(for peer: Data, hour: UInt64) -> Data {
+        var input = Data()
+        input.append(peer)
+        var hourBE = hour.bigEndian
+        withUnsafeBytes(of: &hourBE) { input.append(contentsOf: $0) }
+        return blake3(input)
+    }
+
+    private static func blake3(_ input: Data) -> Data {
+        Blake3.hash(input)
     }
 
     func send(_ text: String, to contact: Contact) {
@@ -169,21 +209,29 @@ final class ChatStore: NSObject {
             appendSystem("Session not established yet — waiting for the other side to scan you.", to: idx)
             return
         }
+        guard let token = popDeliveryToken(forContactAt: idx) else {
+            appendSystem("Out of delivery tokens — asking your peer for more.", to: idx)
+            requestTokenRefill(from: state.contacts[idx], via: relay, session: session)
+            return
+        }
         do {
             // Phase 2 wire format: sealed envelope on the wire, no
             // from_id / is_prekey at the relay layer. Phase 4 will lift
             // messageId out into a sender-side outbox for retries +
             // delivered (✓✓) tracking; for now generate-and-discard.
             let messageId = Self.makeMessageId()
+            var inner = Data([RelayClient.InnerEnvelopeKind.chat.rawValue])
+            inner.append(Data(trimmed.utf8))
             let sealed = try session.encryptSealed(
                 peer: contact.identityPub,
                 messageId: messageId,
-                plaintext: Data(trimmed.utf8),
+                plaintext: inner,
             )
             relay.sendSealed(
                 toPeer: contact.identityPub,
                 sealedCiphertext: sealed,
                 ttlSeconds: Self.defaultTTLSeconds,
+                token: token,
             )
             let entry = PersistedMessage(
                 side: .me,
@@ -198,9 +246,89 @@ final class ChatStore: NSObject {
             state.contacts[idx].log.append(entry)
             state.contacts[idx].lastMessageAt = entry.timestamp
             persistAll()
+            maybeRequestRefill(forContactAt: idx, via: relay, session: session)
         } catch {
             appendSystem("Encrypt failed: \(error)", to: idx)
         }
+    }
+
+    /// Pop one token from `contact.deliveryTokensForPeer`. Persists.
+    /// Returns nil if the stash is empty — caller must trigger a
+    /// refill before retrying.
+    private func popDeliveryToken(forContactAt idx: Int) -> Data? {
+        guard !state.contacts[idx].deliveryTokensForPeer.isEmpty else { return nil }
+        let token = state.contacts[idx].deliveryTokensForPeer.removeFirst()
+        Storage.persist(appState: state)
+        return token
+    }
+
+    /// If the stash dropped below `Contact.refillThreshold` and the
+    /// 6h cooldown has elapsed, send a sealed refill-request.
+    private func maybeRequestRefill(forContactAt idx: Int, via relay: RelayClient, session: Session) {
+        let c = state.contacts[idx]
+        guard c.deliveryTokensForPeer.count < Contact.refillThreshold else { return }
+        if let last = c.lastRefillRequestSentAt, Date().timeIntervalSince(last) < Contact.refillCooldown {
+            return
+        }
+        requestTokenRefill(from: c, via: relay, session: session)
+    }
+
+    private func requestTokenRefill(from contact: Contact, via relay: RelayClient, session: Session) {
+        guard let idx = contactIndex(forIdentity: contact.identityPub) else { return }
+        // Refill requests bypass the token rate-limit (the relay accepts
+        // a SEND with a 0-length token field iff the recipient has not
+        // yet registered a verify key for this connection — but in
+        // steady state that doesn't apply). The clean answer: spend a
+        // token to ask for tokens. If we're at zero, we can't refill —
+        // user must re-pair. This is the documented failure mode.
+        guard let token = popDeliveryToken(forContactAt: idx) else {
+            appendSystem("Token stash exhausted — re-pair this contact.", to: idx)
+            return
+        }
+        do {
+            let inner = Data([RelayClient.InnerEnvelopeKind.tokenRefillRequest.rawValue])
+            let sealed = try session.encryptSealed(
+                peer: contact.identityPub,
+                messageId: Self.makeMessageId(),
+                plaintext: inner,
+            )
+            relay.sendSealed(
+                toPeer: contact.identityPub,
+                sealedCiphertext: sealed,
+                ttlSeconds: Self.defaultTTLSeconds,
+                token: token,
+            )
+            state.contacts[idx].lastRefillRequestSentAt = Date()
+            Storage.persist(appState: state)
+        } catch {
+            appendSystem("Refill request failed: \(error)", to: idx)
+        }
+    }
+
+    /// Mint a fresh batch of tokens for `peer` and ship via TOKEN_ISSUE.
+    /// Used both at pair time (right after we send their bundle) and
+    /// in response to a refill request. Rate-limited to one issuance
+    /// per `Contact.refillCooldown` per peer.
+    private func issueTokens(for peer: Data, via relay: RelayClient, session: Session) {
+        guard let idx = contactIndex(forIdentity: peer) else { return }
+        if let last = state.contacts[idx].lastRefillRequestHandledAt,
+           Date().timeIntervalSince(last) < Contact.refillCooldown {
+            NSLog("[pizzini] refill rate-limited for \(self.short(peer))")
+            return
+        }
+        var tokens: [Data] = []
+        tokens.reserveCapacity(Contact.initialIssuance)
+        for _ in 0..<Contact.initialIssuance {
+            do {
+                tokens.append(try session.mintDeliveryToken())
+            } catch {
+                NSLog("[pizzini] mintDeliveryToken failed: \(error)")
+                return
+            }
+        }
+        relay.sendTokenIssue(toPeer: peer, tokens: tokens)
+        state.contacts[idx].lastRefillRequestHandledAt = Date()
+        Storage.persist(appState: state)
     }
 
     /// Default per-message TTL until Phase 4's per-message picker lands.
@@ -343,7 +471,7 @@ extension ChatStore: RelayClientDelegate {
                 // completed the handshake — the typical reason is "the
                 // other side hadn't scanned us when we last asked".
                 for c in self.state.contacts where !c.sessionEstablished {
-                    client.requestBundle(fromPeer: c.identityPub)
+                    self.requestBundleWithHashcash(fromPeer: c.identityPub)
                 }
             }
         }
@@ -354,95 +482,132 @@ extension ChatStore: RelayClientDelegate {
         didReceiveSealedSend sealedCiphertext: Data
     ) {
         Task { @MainActor in
-            guard let session = self.session else { return }
-            do {
-                let received = try session.decryptSealed(sealedCiphertext)
-                guard let idx = self.contactIndex(forIdentity: received.peer) else {
-                    NSLog("[pizzini] dropped sealed SEND from unknown peer \(self.short(received.peer))")
-                    return
-                }
-                // Detect ACK-shaped plaintexts that arrived as a
-                // SEND (defensive — the relay routes ACKs as type=6,
-                // but in case a peer mislabels we still recognise).
-                if Self.isAckPlaintext(received.plaintext) {
-                    self.handleAckPlaintext(received.plaintext, fromPeer: received.peer)
-                    return
-                }
-                let text = String(data: received.plaintext, encoding: .utf8)
-                    ?? "<\(received.plaintext.count) non-utf8 bytes>"
-                let entry = PersistedMessage(
-                    side: .peer,
-                    text: text,
-                    kind: .whisper,
-                    bytes: sealedCiphertext.count
-                )
-                self.state.contacts[idx].log.append(entry)
-                self.state.contacts[idx].lastMessageAt = entry.timestamp
-                self.state.contacts[idx].sessionEstablished = true
-                self.persistAll()
-                // Emit an ACK so the sender's outbox (Phase 4) can
-                // mark delivered. The ACK is itself a sealed envelope
-                // containing "ack: <16-byte message_id>" — relay
-                // forwards as a type=6 frame, identical otherwise to
-                // SEND.
-                self.emitAck(for: received.messageId, toPeer: received.peer, via: client)
-            } catch {
-                NSLog("[pizzini] sealed decrypt failed: \(error)")
-            }
+            self.handleSealedFrame(sealedCiphertext, isAckFrame: false, via: client)
         }
     }
 
     nonisolated func relayClient(_ client: RelayClient, didReceiveAck sealedCiphertext: Data) {
         Task { @MainActor in
-            guard let session = self.session else { return }
-            do {
-                let received = try session.decryptSealed(sealedCiphertext)
-                self.handleAckPlaintext(received.plaintext, fromPeer: received.peer)
-            } catch {
-                NSLog("[pizzini] sealed ACK decrypt failed: \(error)")
-            }
+            self.handleSealedFrame(sealedCiphertext, isAckFrame: true, via: client)
         }
     }
 
-    private static let ackMarker = RelayClient.ackMarker
-
-    private static func isAckPlaintext(_ data: Data) -> Bool {
-        data.starts(with: ackMarker)
+    nonisolated func relayClient(
+        _ client: RelayClient,
+        didReceiveTokenIssueFrom fromPeer: Data,
+        tokens: [Data]
+    ) {
+        Task { @MainActor in
+            guard let idx = self.contactIndex(forIdentity: fromPeer) else {
+                NSLog("[pizzini] dropped TOKEN_ISSUE from unknown peer \(self.short(fromPeer))")
+                return
+            }
+            // Append rather than replace — refills layer on top of any
+            // unspent tokens. Cap stash size so a malicious peer can't
+            // balloon Keychain by spamming refills.
+            let cap = 2 * Contact.initialIssuance
+            var stash = self.state.contacts[idx].deliveryTokensForPeer
+            stash.append(contentsOf: tokens)
+            if stash.count > cap {
+                stash.removeFirst(stash.count - cap)
+            }
+            self.state.contacts[idx].deliveryTokensForPeer = stash
+            self.persistAll()
+            NSLog(
+                "[pizzini] received \(tokens.count) tokens from \(self.short(fromPeer)); stash now \(stash.count)"
+            )
+        }
     }
 
     @MainActor
-    private func handleAckPlaintext(_ plaintext: Data, fromPeer: Data) {
-        guard plaintext.count == Self.ackMarker.count + 16,
-              plaintext.starts(with: Self.ackMarker)
-        else {
-            NSLog("[pizzini] malformed ACK from \(self.short(fromPeer))")
+    private func handleSealedFrame(_ sealedCiphertext: Data, isAckFrame: Bool, via client: RelayClient) {
+        guard let session = self.session else { return }
+        let received: Session.SealedReceived
+        do {
+            received = try session.decryptSealed(sealedCiphertext)
+        } catch {
+            NSLog("[pizzini] sealed decrypt failed: \(error)")
             return
         }
-        // Phase 4 hooks the per-message-id outbox here. For Phase 2 we
-        // just log so manual end-to-end verification can confirm acks
-        // are flowing both ways before the UI catches up.
-        let messageId = plaintext.suffix(16)
-        NSLog("[pizzini] ACK for message \(messageId.map { String(format: "%02x", $0) }.joined()) from \(self.short(fromPeer))")
+        guard let idx = self.contactIndex(forIdentity: received.peer) else {
+            NSLog("[pizzini] dropped sealed frame from unknown peer \(self.short(received.peer))")
+            return
+        }
+        guard let kindByte = received.plaintext.first,
+              let kind = RelayClient.InnerEnvelopeKind(rawValue: kindByte) else {
+            NSLog("[pizzini] dropped sealed frame: unknown inner-envelope kind")
+            return
+        }
+        let payload = received.plaintext.dropFirst()
+        switch kind {
+        case .chat:
+            self.handleChatPayload(payload, sealedSize: sealedCiphertext.count, contactIdx: idx, ackId: received.messageId, via: client)
+        case .ack:
+            self.handleAckPayload(payload, contactIdx: idx)
+        case .tokenRefillRequest:
+            guard let session = self.session else { return }
+            self.issueTokens(for: received.peer, via: client, session: session)
+        case .readReceipt:
+            // Phase 4 hooks read-receipt UI here.
+            NSLog("[pizzini] read-receipt from \(self.short(received.peer)) (Phase 4)")
+        }
+        // Defensive: an ACK arriving on the SEND channel would have
+        // landed in the chat path above unless its inner-kind byte is
+        // 0x02. The wire-frame `isAckFrame` distinguishes the relay's
+        // routing decision but the inner kind is authoritative.
+        let _ = isAckFrame
+    }
+
+    @MainActor
+    private func handleChatPayload(_ payload: Data, sealedSize: Int, contactIdx idx: Int, ackId: Data, via client: RelayClient) {
+        let text = String(data: payload, encoding: .utf8) ?? "<\(payload.count) non-utf8 bytes>"
+        let entry = PersistedMessage(
+            side: .peer,
+            text: text,
+            kind: .whisper,
+            bytes: sealedSize,
+        )
+        self.state.contacts[idx].log.append(entry)
+        self.state.contacts[idx].lastMessageAt = entry.timestamp
+        self.state.contacts[idx].sessionEstablished = true
+        self.persistAll()
+        // Emit an ACK so the sender's outbox (Phase 4) can flip ✓→✓✓.
+        self.emitAck(for: ackId, toPeer: state.contacts[idx].identityPub, via: client)
+    }
+
+    @MainActor
+    private func handleAckPayload(_ payload: Data, contactIdx idx: Int) {
+        guard payload.count == 16 else {
+            NSLog("[pizzini] malformed ACK from \(self.short(state.contacts[idx].identityPub))")
+            return
+        }
+        // Phase 4 hooks the per-message-id outbox here.
+        let messageId = payload.map { String(format: "%02x", $0) }.joined()
+        NSLog("[pizzini] ACK for message \(messageId) from \(self.short(state.contacts[idx].identityPub))")
     }
 
     @MainActor
     private func emitAck(for messageId: Data, toPeer: Data, via client: RelayClient) {
-        guard let session = self.session else { return }
-        // Outer ACK envelope's own message_id is fresh — separate from
-        // the messageId we're acking, which lives inside the plaintext.
-        let outerId = Self.makeMessageId()
-        var ackPlaintext = Self.ackMarker
-        ackPlaintext.append(messageId)
+        guard let session = self.session,
+              let idx = contactIndex(forIdentity: toPeer)
+        else { return }
+        guard let token = popDeliveryToken(forContactAt: idx) else {
+            NSLog("[pizzini] cannot emit ACK to \(self.short(toPeer)): out of tokens")
+            return
+        }
+        var inner = Data([RelayClient.InnerEnvelopeKind.ack.rawValue])
+        inner.append(messageId)
         do {
             let sealed = try session.encryptSealed(
                 peer: toPeer,
-                messageId: outerId,
-                plaintext: ackPlaintext,
+                messageId: Self.makeMessageId(),
+                plaintext: inner,
             )
             client.sendAck(
                 toPeer: toPeer,
                 sealedCiphertext: sealed,
                 ttlSeconds: Self.defaultTTLSeconds,
+                token: token,
             )
         } catch {
             NSLog("[pizzini] failed to emit ACK to \(self.short(toPeer)): \(error)")
@@ -460,6 +625,11 @@ extension ChatStore: RelayClientDelegate {
             do {
                 let bundle = try session.publishBundle()
                 client.sendBundle(toPeer: fromPeer, bundle: bundle)
+                // Right after the bundle, mint and ship a fresh stash
+                // of delivery tokens for the requester. They'll need
+                // these for every subsequent SEND/ACK to clear our
+                // relay-side rate-limit gate.
+                self.issueTokens(for: fromPeer, via: client, session: session)
                 self.persistAll()
                 // The peer just proved they have us in their contacts (we
                 // only get here if our own contact-gate let them through).
@@ -467,7 +637,7 @@ extension ChatStore: RelayClientDelegate {
                 // we were the second of the two to add the other — ask
                 // for their bundle now too. Closes the asymmetric pairing.
                 if !self.state.contacts[idx].sessionEstablished {
-                    client.requestBundle(fromPeer: fromPeer)
+                    self.requestBundleWithHashcash(fromPeer: fromPeer)
                 }
             } catch {
                 NSLog("[pizzini] publishBundle failed: \(error)")

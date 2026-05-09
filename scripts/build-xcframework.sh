@@ -43,6 +43,10 @@ rustup target add "${ALL_TARGETS[@]}" >/dev/null
 echo "==> Building crypto-core ($PROFILE) for ${#ALL_TARGETS[@]} target(s)"
 target_args=()
 for t in "${ALL_TARGETS[@]}"; do target_args+=(--target "$t"); done
+# Match the iOS app's deployment target (17.0). Cargo's aarch64-apple-ios
+# default is iOS 10, which is incompatible with blake3's NEON path
+# (links against `___chkstk_darwin`, present only since iOS 14).
+export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-17.0}"
 cargo build -p pizzini-crypto-core $CARGO_PROFILE_FLAG "${target_args[@]}"
 
 echo "==> Lipoing simulator slices into a fat archive"

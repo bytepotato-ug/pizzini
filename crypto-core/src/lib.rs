@@ -14,8 +14,13 @@ use libsignal_protocol::IdentityKeyPair;
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 
+mod hashcash;
 mod store;
-pub use store::{DeviceStore, EncryptResult, SealReceived, DELIVERY_TOKEN_VERIFY_KEY_LEN};
+pub use hashcash::{hashcash_compute, hashcash_verify, HASHCASH_DEFAULT_BITS};
+pub use store::{
+    DeviceStore, EncryptResult, SealReceived, DELIVERY_TOKEN_LEN, DELIVERY_TOKEN_NONCE_LEN,
+    DELIVERY_TOKEN_SIG_LEN, DELIVERY_TOKEN_TTL_SECS, DELIVERY_TOKEN_VERIFY_KEY_LEN,
+};
 
 // ───── Error codes ─────────────────────────────────────────────────────
 //
@@ -548,6 +553,94 @@ pub unsafe extern "C" fn pizzini_store_seal_send(
     };
     // SAFETY: out_sealed/out_sealed_len asserted valid.
     unsafe { copy_or_size_out(&bytes, out_sealed, out_sealed_cap, out_sealed_len) }
+}
+
+/// Mint a single delivery token: 16-byte nonce + u32 expiry + 64-byte
+/// XEd25519 signature, all 84 bytes total. The recipient's peer holds a
+/// stash; each SEND/ACK pops one and ships it on the wire so the relay
+/// can rate-limit by recipient consent. See `pizzini_store_delivery_token_verify_key`
+/// for the verify side.
+///
+/// # Safety
+/// `out_token` must point to at least `DELIVERY_TOKEN_LEN` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_store_mint_delivery_token(
+    store: *mut DeviceStore,
+    out_token: *mut u8,
+    out_token_cap: usize,
+    out_token_len: *mut usize,
+) -> i32 {
+    if store.is_null() || out_token.is_null() || out_token_len.is_null() {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted store is live.
+    let s = unsafe { &*store };
+    let token = match s.mint_delivery_token() {
+        Ok(t) => t,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    // SAFETY: out_token/out_len asserted valid.
+    unsafe { copy_or_size_out(&token, out_token, out_token_cap, out_token_len) }
+}
+
+/// BLAKE3-256 of `input`. Used by iOS to derive the hashcash challenge
+/// (`BLAKE3(recipient_peer_id || hour_bucket)`) — CryptoKit doesn't
+/// expose BLAKE3, and the relay's verifier hashes the same way, so the
+/// iOS side reaches across the FFI rather than maintaining a parallel
+/// pure-Swift implementation.
+///
+/// Writes 32 bytes to `out_hash_32`.
+///
+/// # Safety
+/// `input` must point to `input_len` readable bytes; `out_hash_32`
+/// must point to 32 writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_blake3_hash(
+    input: *const u8,
+    input_len: usize,
+    out_hash_32: *mut u8,
+) -> i32 {
+    if input.is_null() || out_hash_32.is_null() {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted input/output validity.
+    let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
+    let hash = blake3::hash(bytes);
+    unsafe {
+        std::ptr::copy_nonoverlapping(hash.as_bytes().as_ptr(), out_hash_32, 32);
+    }
+    PIZZINI_OK
+}
+
+/// BLAKE3 hashcash prover. Brute-forces a u64 nonce such that
+/// `BLAKE3(challenge || nonce_be) has at least `bits` leading zero
+/// bits`. Used by iOS to compute the proof attached to a
+/// BUNDLE_REQUEST; the relay verifies with a single hash.
+///
+/// Returns 0 on success and writes the nonce to `*out_nonce`. Returns
+/// `PIZZINI_ERR_INVALID_ARG` on null pointers. There is no upper-bound
+/// guard on `bits` here — the caller is responsible for picking a
+/// reasonable difficulty (the relay accepts the protocol-defined
+/// `HASHCASH_DEFAULT_BITS = 18`).
+///
+/// # Safety
+/// `challenge` must point to `challenge_len` readable bytes.
+/// `out_nonce` must point to a valid `u64`.
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_hashcash_compute(
+    challenge: *const u8,
+    challenge_len: usize,
+    bits: u32,
+    out_nonce: *mut u64,
+) -> i32 {
+    if challenge.is_null() || out_nonce.is_null() {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted challenge slice + nonce pointer valid.
+    let chal = unsafe { std::slice::from_raw_parts(challenge, challenge_len) };
+    let nonce = hashcash_compute(chal, bits);
+    unsafe { *out_nonce = nonce };
+    PIZZINI_OK
 }
 
 /// Sealed-sender RECEIVE. Validates the embedded cert against the

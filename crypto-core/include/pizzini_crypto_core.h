@@ -20,6 +20,11 @@
 #define PIZZINI_MSG_TYPE_WHISPER 1
 
 /**
+ * Default difficulty: 18 leading zero bits. ~250k expected attempts.
+ */
+#define HASHCASH_DEFAULT_BITS 18
+
+/**
  * libsignal-native public-key wire size: 1-byte DJB type prefix + 32-byte
  * Curve25519 point. The bundle field carries exactly this many bytes;
  * rejecting other sizes keeps the relay's per-recipient verify-key table
@@ -27,6 +32,24 @@
  * will trip the size check loudly instead of silently mis-verifying.
  */
 #define DELIVERY_TOKEN_VERIFY_KEY_LEN 33
+
+/**
+ * Delivery token wire format: nonce16 || expiry_be_u32 || sig64.
+ * The signature is over `nonce16 || expiry_be_u32` with the
+ * recipient's HKDF-derived signing key.
+ */
+#define DELIVERY_TOKEN_NONCE_LEN 16
+
+#define DELIVERY_TOKEN_SIG_LEN 64
+
+#define DELIVERY_TOKEN_LEN ((DELIVERY_TOKEN_NONCE_LEN + 4) + DELIVERY_TOKEN_SIG_LEN)
+
+/**
+ * How long an issued delivery token remains valid. 30 days lines up
+ * with the SenderCertificate TTL so a contact that goes dark for less
+ * than a month can still use their stash without a refill round trip.
+ */
+#define DELIVERY_TOKEN_TTL_SECS (((30 * 24) * 60) * 60)
 
 typedef struct DeviceStore DeviceStore;
 
@@ -264,6 +287,57 @@ int32_t pizzini_store_seal_send(struct DeviceStore *store,
                                 uint8_t *out_sealed,
                                 uintptr_t out_sealed_cap,
                                 uintptr_t *out_sealed_len);
+
+/**
+ * Mint a single delivery token: 16-byte nonce + u32 expiry + 64-byte
+ * XEd25519 signature, all 84 bytes total. The recipient's peer holds a
+ * stash; each SEND/ACK pops one and ships it on the wire so the relay
+ * can rate-limit by recipient consent. See `pizzini_store_delivery_token_verify_key`
+ * for the verify side.
+ *
+ * # Safety
+ * `out_token` must point to at least `DELIVERY_TOKEN_LEN` writable bytes.
+ */
+int32_t pizzini_store_mint_delivery_token(struct DeviceStore *store,
+                                          uint8_t *out_token,
+                                          uintptr_t out_token_cap,
+                                          uintptr_t *out_token_len);
+
+/**
+ * BLAKE3-256 of `input`. Used by iOS to derive the hashcash challenge
+ * (`BLAKE3(recipient_peer_id || hour_bucket)`) — CryptoKit doesn't
+ * expose BLAKE3, and the relay's verifier hashes the same way, so the
+ * iOS side reaches across the FFI rather than maintaining a parallel
+ * pure-Swift implementation.
+ *
+ * Writes 32 bytes to `out_hash_32`.
+ *
+ * # Safety
+ * `input` must point to `input_len` readable bytes; `out_hash_32`
+ * must point to 32 writable bytes.
+ */
+int32_t pizzini_blake3_hash(const uint8_t *input, uintptr_t input_len, uint8_t *out_hash_32);
+
+/**
+ * BLAKE3 hashcash prover. Brute-forces a u64 nonce such that
+ * `BLAKE3(challenge || nonce_be) has at least `bits` leading zero
+ * bits`. Used by iOS to compute the proof attached to a
+ * BUNDLE_REQUEST; the relay verifies with a single hash.
+ *
+ * Returns 0 on success and writes the nonce to `*out_nonce`. Returns
+ * `PIZZINI_ERR_INVALID_ARG` on null pointers. There is no upper-bound
+ * guard on `bits` here — the caller is responsible for picking a
+ * reasonable difficulty (the relay accepts the protocol-defined
+ * `HASHCASH_DEFAULT_BITS = 18`).
+ *
+ * # Safety
+ * `challenge` must point to `challenge_len` readable bytes.
+ * `out_nonce` must point to a valid `u64`.
+ */
+int32_t pizzini_hashcash_compute(const uint8_t *challenge,
+                                 uintptr_t challenge_len,
+                                 uint32_t bits,
+                                 uint64_t *out_nonce);
 
 /**
  * Sealed-sender RECEIVE. Validates the embedded cert against the

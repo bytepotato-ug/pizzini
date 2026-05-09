@@ -52,6 +52,19 @@ struct Contact: Codable, Identifiable, Sendable {
     /// means "never opened" — every received message is unread.
     var lastSeenAt: Date?
     let addedAt: Date
+    /// Phase 3 delivery-token stash: tokens this peer minted and gave us
+    /// for use when sending TO them. Each is 84 bytes (nonce + expiry +
+    /// XEd25519 sig). Pop from front; refill when it drops below
+    /// `Contact.refillThreshold`.
+    var deliveryTokensForPeer: [Data]
+    /// Last time we *sent* a refill-request to this peer. Rate-limited
+    /// to one request per `Contact.refillCooldown` so a malicious peer
+    /// can't burn our stash with a tight loop.
+    var lastRefillRequestSentAt: Date?
+    /// Last time we *handled* a refill-request from this peer. Same
+    /// rate-limit applied to incoming requests so we don't pay for
+    /// 1024 fresh signatures more than once per cooldown window.
+    var lastRefillRequestHandledAt: Date?
 
     init(
         id: UUID = UUID(),
@@ -61,7 +74,10 @@ struct Contact: Codable, Identifiable, Sendable {
         log: [PersistedMessage] = [],
         lastMessageAt: Date? = nil,
         lastSeenAt: Date? = nil,
-        addedAt: Date = Date()
+        addedAt: Date = Date(),
+        deliveryTokensForPeer: [Data] = [],
+        lastRefillRequestSentAt: Date? = nil,
+        lastRefillRequestHandledAt: Date? = nil
     ) {
         self.id = id
         self.identityPub = identityPub
@@ -71,6 +87,38 @@ struct Contact: Codable, Identifiable, Sendable {
         self.lastMessageAt = lastMessageAt
         self.lastSeenAt = lastSeenAt
         self.addedAt = addedAt
+        self.deliveryTokensForPeer = deliveryTokensForPeer
+        self.lastRefillRequestSentAt = lastRefillRequestSentAt
+        self.lastRefillRequestHandledAt = lastRefillRequestHandledAt
+    }
+
+    /// Restock target. Each fresh issuance refills the stash to this
+    /// many tokens. Brief specifies 1024.
+    static let initialIssuance: Int = 1024
+    /// When the stash drops below this we kick a sealed refill request.
+    static let refillThreshold: Int = 256
+    /// Minimum time between refill exchanges. 6h matches the brief.
+    static let refillCooldown: TimeInterval = 6 * 60 * 60
+
+    private enum CodingKeys: String, CodingKey {
+        case id, identityPub, displayName, sessionEstablished, log, lastMessageAt
+        case lastSeenAt, addedAt
+        case deliveryTokensForPeer, lastRefillRequestSentAt, lastRefillRequestHandledAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(UUID.self, forKey: .id)
+        self.identityPub = try c.decode(Data.self, forKey: .identityPub)
+        self.displayName = try c.decode(String.self, forKey: .displayName)
+        self.sessionEstablished = try c.decode(Bool.self, forKey: .sessionEstablished)
+        self.log = try c.decode([PersistedMessage].self, forKey: .log)
+        self.lastMessageAt = try c.decodeIfPresent(Date.self, forKey: .lastMessageAt)
+        self.lastSeenAt = try c.decodeIfPresent(Date.self, forKey: .lastSeenAt)
+        self.addedAt = try c.decode(Date.self, forKey: .addedAt)
+        self.deliveryTokensForPeer = try c.decodeIfPresent([Data].self, forKey: .deliveryTokensForPeer) ?? []
+        self.lastRefillRequestSentAt = try c.decodeIfPresent(Date.self, forKey: .lastRefillRequestSentAt)
+        self.lastRefillRequestHandledAt = try c.decodeIfPresent(Date.self, forKey: .lastRefillRequestHandledAt)
     }
 
     var unreadCount: Int {

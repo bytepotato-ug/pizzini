@@ -220,6 +220,15 @@ public final class Session: @unchecked Sendable {
         return Data(pt.prefix(Int(ptLen)))
     }
 
+    /// Mint a single delivery token (84 bytes). Each is one-use against
+    /// the relay's per-recipient replay set. Phase 3 hands out a stash
+    /// of 1024 to each newly-paired contact.
+    public func mintDeliveryToken() throws -> Data {
+        try readBlob(initialCap: 128) { handle, buf, cap, len in
+            pizzini_store_mint_delivery_token(handle, buf, cap, len)
+        }
+    }
+
     /// Recipient's published delivery-token verify key (33 bytes —
     /// libsignal-native PublicKey serialize() form). Deterministic per
     /// IdentityKeyPair via HKDF, so a Keychain restore reconstructs it
@@ -386,6 +395,50 @@ public final class Session: @unchecked Sendable {
         case PIZZINI_ERR_INTERNAL: throw CryptoCoreError.internalError
         default: throw CryptoCoreError.unknown(code: rc)
         }
+    }
+}
+
+/// BLAKE3-256 hash. Re-exposed across the FFI bridge because CryptoKit
+/// doesn't ship BLAKE3 — and the relay's hashcash verifier hashes the
+/// same way, so the iOS challenge derivation MUST match bit-for-bit.
+public enum Blake3 {
+    public static func hash(_ input: Data) -> Data {
+        var out = [UInt8](repeating: 0, count: 32)
+        let rc = input.withUnsafeBytes { ptr -> Int32 in
+            out.withUnsafeMutableBufferPointer { o in
+                pizzini_blake3_hash(
+                    ptr.bindMemory(to: UInt8.self).baseAddress,
+                    UInt(input.count),
+                    o.baseAddress
+                )
+            }
+        }
+        precondition(rc == PIZZINI_OK, "pizzini_blake3_hash never fails with valid args")
+        return Data(out)
+    }
+}
+
+/// BLAKE3 hashcash prover — used for first-contact BUNDLE_REQUEST anti-DoS.
+///
+/// The relay's challenge layout is
+/// `BLAKE3(recipient_peer_id || floor(unix_time / 3600))`. Caller derives
+/// that, hands it to `compute`, gets a u64 nonce that satisfies the
+/// 18-bit difficulty target. Cost ~1s on a modern phone.
+public enum Hashcash {
+    public static let defaultBits: UInt32 = 18
+
+    public static func compute(challenge: Data, bits: UInt32 = defaultBits) -> UInt64 {
+        var nonce: UInt64 = 0
+        let rc = challenge.withUnsafeBytes { ptr -> Int32 in
+            pizzini_hashcash_compute(
+                ptr.bindMemory(to: UInt8.self).baseAddress,
+                UInt(challenge.count),
+                bits,
+                &nonce
+            )
+        }
+        precondition(rc == PIZZINI_OK, "hashcash_compute should never fail with valid args")
+        return nonce
     }
 }
 

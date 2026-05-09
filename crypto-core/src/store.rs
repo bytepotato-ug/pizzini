@@ -102,6 +102,19 @@ const DELIVERY_TOKEN_HKDF_INFO: &[u8] = b"pizzini.delivery-token.v1";
 /// will trip the size check loudly instead of silently mis-verifying.
 pub const DELIVERY_TOKEN_VERIFY_KEY_LEN: usize = 33;
 
+/// Delivery token wire format: nonce16 || expiry_be_u32 || sig64.
+/// The signature is over `nonce16 || expiry_be_u32` with the
+/// recipient's HKDF-derived signing key.
+pub const DELIVERY_TOKEN_NONCE_LEN: usize = 16;
+pub const DELIVERY_TOKEN_SIG_LEN: usize = 64;
+pub const DELIVERY_TOKEN_LEN: usize =
+    DELIVERY_TOKEN_NONCE_LEN + 4 + DELIVERY_TOKEN_SIG_LEN;
+
+/// How long an issued delivery token remains valid. 30 days lines up
+/// with the SenderCertificate TTL so a contact that goes dark for less
+/// than a month can still use their stash without a refill round trip.
+pub const DELIVERY_TOKEN_TTL_SECS: u32 = 30 * 24 * 60 * 60;
+
 pub struct DeviceStore {
     inner: InMemSignalProtocolStore,
     next_pre_key_id: u32,
@@ -224,6 +237,34 @@ impl DeviceStore {
 
     pub fn delivery_token_verify_key_bytes(&self) -> Result<Vec<u8>, SignalProtocolError> {
         Ok(self.delivery_token_keypair()?.public_key.serialize().to_vec())
+    }
+
+    /// Mint a single delivery token: a 16-byte random nonce + a u32
+    /// expiry (seconds since epoch) + an XEd25519 signature over the
+    /// concatenation, all signed with the long-term delivery-token
+    /// signing key. The relay verifies against the recipient's
+    /// published verify_key.
+    pub fn mint_delivery_token(&self) -> Result<[u8; DELIVERY_TOKEN_LEN], SignalProtocolError> {
+        let mut rng = OsRng.unwrap_err();
+        let kp = self.delivery_token_keypair()?;
+        let mut nonce = [0u8; DELIVERY_TOKEN_NONCE_LEN];
+        rng.fill(&mut nonce);
+        let now = (now_millis() / 1000) as u32;
+        let expiry = now.saturating_add(DELIVERY_TOKEN_TTL_SECS);
+        let mut payload = [0u8; DELIVERY_TOKEN_NONCE_LEN + 4];
+        payload[..DELIVERY_TOKEN_NONCE_LEN].copy_from_slice(&nonce);
+        payload[DELIVERY_TOKEN_NONCE_LEN..].copy_from_slice(&expiry.to_be_bytes());
+        let sig = kp.private_key.calculate_signature(&payload, &mut rng)?;
+        if sig.len() != DELIVERY_TOKEN_SIG_LEN {
+            return Err(SignalProtocolError::InvalidArgument(format!(
+                "unexpected delivery-token signature length {}",
+                sig.len()
+            )));
+        }
+        let mut out = [0u8; DELIVERY_TOKEN_LEN];
+        out[..DELIVERY_TOKEN_NONCE_LEN + 4].copy_from_slice(&payload);
+        out[DELIVERY_TOKEN_NONCE_LEN + 4..].copy_from_slice(&sig);
+        Ok(out)
     }
 
     pub fn publish_bundle(&mut self) -> Result<Vec<u8>, SignalProtocolError> {
@@ -1060,6 +1101,26 @@ mod tests {
             s.delivery_token_verify_key_bytes().unwrap()
         );
         assert_eq!(decoded.delivery_token_verify_key.len(), DELIVERY_TOKEN_VERIFY_KEY_LEN);
+    }
+
+    #[test]
+    fn mint_delivery_token_signs_with_recipient_signing_key() {
+        // Mint a token; verify its signature against the published
+        // verify key. End-to-end shape that the relay (Phase 3) and
+        // any unit test of token semantics relies on.
+        use libsignal_protocol::PublicKey;
+        let s = DeviceStore::fresh().unwrap();
+        let token = s.mint_delivery_token().unwrap();
+        let verify_bytes = s.delivery_token_verify_key_bytes().unwrap();
+        let verify_key = PublicKey::deserialize(&verify_bytes).unwrap();
+        let payload = &token[..DELIVERY_TOKEN_NONCE_LEN + 4];
+        let sig = &token[DELIVERY_TOKEN_NONCE_LEN + 4..];
+        assert_eq!(sig.len(), DELIVERY_TOKEN_SIG_LEN);
+        assert!(verify_key.verify_signature(payload, sig));
+        // Tamper the payload — must not verify.
+        let mut tampered = payload.to_vec();
+        tampered[0] ^= 0x01;
+        assert!(!verify_key.verify_signature(&tampered, sig));
     }
 
     #[test]
