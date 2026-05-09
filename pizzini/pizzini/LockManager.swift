@@ -6,17 +6,35 @@ import SwiftUI
 /// (the others — at-rest DB encryption, duress passphrase, Lockdown
 /// Mode, App Attest — are tracked in the README's Status checklist).
 ///
-/// Behaviour:
+/// ## Why this is wired to `UIScene.*Notification` instead of SwiftUI's
+/// `@Environment(\.scenePhase)` — read this before changing it.
 ///
-/// - When `state.biometricLockEnabled == false`, the manager is
-///   permanently in `.unlocked` and short-circuits everything.
+/// SwiftUI updates `scenePhase` to `.active` *before* it runs the
+/// `.onChange(of: scenePhase)` callback. If we keyed the privacy
+/// shield to `scenePhase != .active`, the body would re-render with
+/// the shield gone in the same frame the scene became active, and
+/// the lock overlay would appear only on the *next* frame after
+/// our callback set `isLocked = true`. The user sees one frame of
+/// chat content. Bug.
+///
+/// The fix: don't ever let the privacy shield be tied to scenePhase.
+/// `isShielded` is set explicitly on `UIScene.willDeactivateNotification`
+/// and cleared explicitly on `UIScene.didActivateNotification`. The
+/// lock decision happens on `UIScene.willEnterForegroundNotification`,
+/// which fires *before* the scene becomes active — so by the time the
+/// scene is `.foregroundActive`, both `isLocked` and `isShielded` are
+/// already at their correct values and one render shows the right thing.
+///
+/// ## Behaviour
+///
+/// - When `state.biometricLockEnabled == false`, lock state is
+///   permanently `.unlocked` and the foreground hooks short-circuit.
 /// - When enabled, the app starts every cold launch in `.locked`.
-///   Backgrounding records the time; on next foreground we re-lock if
-///   `(now - backgrounded) >= state.autoLockTimeout.seconds`.
+///   Backgrounding records the time; `willEnterForeground` re-locks
+///   if `(now - backgrounded) >= state.autoLockTimeout.seconds`.
 /// - `LockOverlayView` calls `attemptUnlock()` on appear, which runs
 ///   `LAPolicy.deviceOwnerAuthentication` (biometrics with passcode
-///   fallback — same as Signal). On success we transition to
-///   `.unlocked` and the overlay dismisses.
+///   fallback — same as Signal).
 ///
 /// Why a singleton: same reason as ChatStore — SwiftUI's @State
 /// initialisers can fire more than once before the framework settles
@@ -29,6 +47,12 @@ final class LockManager {
 
     /// True when the lock overlay should be shown. Read by `ContentView`.
     private(set) var isLocked: Bool = false
+    /// True when the privacy shield should cover everything — i.e. the
+    /// scene is not currently active *or* we're in the middle of the
+    /// foreground transition and haven't decided whether to show the
+    /// lock overlay yet. Cleared only by `handleDidActivate`, which
+    /// runs after `handleWillEnterForeground` has set `isLocked`.
+    private(set) var isShielded: Bool = false
     /// True while a `LAContext.evaluatePolicy` call is in flight, so the
     /// UI can disable the "Unlock" button.
     private(set) var authInFlight: Bool = false
@@ -49,22 +73,39 @@ final class LockManager {
         }
     }
 
-    // MARK: - Scene-phase hooks
+    // MARK: - Scene lifecycle hooks
+    //
+    // Wired up by ContentView via four `.onReceive(NotificationCenter…)`
+    // modifiers. Order on a real foreground transition is:
+    //
+    //   willDeactivateNotification  (scene about to leave .active)
+    //   didEnterBackgroundNotification
+    //   …time passes…
+    //   willEnterForegroundNotification  (scene about to become .active)
+    //   didActivateNotification
+    //
+    // `isShielded` goes up at willDeactivate, the lock decision lands
+    // at willEnterForeground, and the shield comes down at didActivate
+    // — by which point `isLocked` is already correct, so the render
+    // that lifts the shield shows the lock overlay (if locked) or the
+    // chat (if unlocked) with no in-between frame.
 
-    func handleScenePhaseChange(to phase: ScenePhase) {
-        switch phase {
-        case .background:
-            backgroundedAt = Date()
-        case .active:
-            applyForegroundTimeout()
-        default:
-            break
-        }
+    func handleWillDeactivate() {
+        // Engage shield BEFORE the scene snapshot iOS captures for the
+        // multitasking thumbnail, system alerts, control-centre pulls.
+        isShielded = true
     }
 
-    private func applyForegroundTimeout() {
+    func handleDidEnterBackground() {
+        backgroundedAt = Date()
+    }
+
+    func handleWillEnterForeground() {
+        // Decide the lock state before the scene becomes active. The
+        // shield stays up until handleDidActivate clears it, so any
+        // re-render in this window is still safe.
         guard ChatStore.shared.state.biometricLockEnabled else {
-            isLocked = false
+            backgroundedAt = nil
             return
         }
         guard let backgroundedAt else { return }
@@ -74,6 +115,12 @@ final class LockManager {
             isLocked = true
         }
         self.backgroundedAt = nil
+    }
+
+    func handleDidActivate() {
+        // Lock decision is in place. Safe to lift the shield now —
+        // whatever's underneath (chat or lock overlay) is correct.
+        isShielded = false
     }
 
     // MARK: - Auth

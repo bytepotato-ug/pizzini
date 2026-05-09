@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import UIKit
 import PizziniCryptoCore
 
 struct ContentView: View {
@@ -19,9 +20,15 @@ struct ContentView: View {
     @State private var confirmReset = false
     @State private var pendingCard: ContactCard?
     @State private var pendingName: String = ""
-    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
+        // The body deliberately does NOT depend on `Environment(\.scenePhase)`
+        // — see LockManager's header doc for why. Privacy shielding and
+        // the lock overlay are driven exclusively by `lockManager.isShielded`
+        // / `lockManager.isLocked`, which are mutated by the four
+        // `.onReceive` hooks below at exactly the right lifecycle points.
+        // Animations are intentionally absent: a fade would let chat
+        // content peek through during the transition.
         ZStack {
             Group {
                 if let err = store.initError {
@@ -42,28 +49,32 @@ struct ContentView: View {
                 }
             }
 
-            // Lock overlay sits on top of the chat UI so the contacts +
-            // chat are not in any screenshot/snapshot taken while
-            // locked. The overlay is a peer of the privacy shield;
-            // when both apply, the privacy shield wins (rendered last).
+            // Lock overlay covers the chat UI when the app is locked. By
+            // the time `isLocked` flips to true on a foreground transition,
+            // `isShielded` is also still true (cleared only after this),
+            // so any frame in between renders the shield, not the chat.
             if lockManager.isLocked {
                 LockOverlayView(lockManager: lockManager)
-                    .transition(.opacity)
             }
 
-            // Privacy shield: any time iOS is about to capture a
-            // multitasking thumbnail (or the system briefly takes the
-            // screen, e.g. Control Centre), we cover everything with a
-            // neutral logo view.
-            if scenePhase != .active {
+            // Privacy shield. Set on `willDeactivate` so it's already in
+            // place by the time iOS captures the multitasking snapshot;
+            // cleared on `didActivate` after the lock decision has run.
+            if lockManager.isShielded {
                 PrivacyShieldView()
-                    .transition(.opacity)
             }
         }
-        .animation(.easeInOut(duration: 0.15), value: lockManager.isLocked)
-        .animation(.easeInOut(duration: 0.15), value: scenePhase)
-        .onChange(of: scenePhase) { _, newPhase in
-            lockManager.handleScenePhaseChange(to: newPhase)
+        .onReceive(NotificationCenter.default.publisher(for: UIScene.willDeactivateNotification)) { _ in
+            lockManager.handleWillDeactivate()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIScene.didEnterBackgroundNotification)) { _ in
+            lockManager.handleDidEnterBackground()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIScene.willEnterForegroundNotification)) { _ in
+            lockManager.handleWillEnterForeground()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIScene.didActivateNotification)) { _ in
+            lockManager.handleDidActivate()
         }
         .fullScreenCover(isPresented: Binding(
             get: { !store.state.onboardingCompleted && store.initError == nil },
