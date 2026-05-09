@@ -51,6 +51,18 @@ If you need anything else, stop and ask.
 - Attachment bytes go ONLY into the app's `Application Support/attachments/` sandbox with `FileProtectionType.completeUntilFirstUserAuthentication`, excluded from iCloud backup. Never `PHPhotoLibrary` (would back up to iCloud Photos), never `Documents/` (iCloud-Documents-backed by default).
 - iOS Lockdown Mode must work. Test it.
 
+## Architecture decisions
+
+Production deployment, relay topology, and other architectural
+decisions that don't fit in the code comments live in `docs/`:
+
+- [`docs/relay-architecture.md`](docs/relay-architecture.md) — Tor-only
+  transport (D1), multi-jurisdiction independent onions (D2), app-side
+  fanout instead of OnionBalance (D3), naming convention `pizzini{2-7}`
+  + country-named UI labels (D4), bundled allowlist + BYO override (D5).
+  Also lists alternatives considered and rejected so the same
+  conversations don't get re-litigated.
+
 ## Repo layout
 
 ```
@@ -103,7 +115,7 @@ will pick up the new binary on next build.
 - [x] iOS app skeleton (SwiftUI + Keychain integration; Tor.framework still TODO)
 - [x] PQXDH handshake working end-to-end (CLI test client) — `cargo run --example pqxdh_roundtrip`
 - [x] Triple Ratchet messaging working (PreKey → Whisper transition visible across two devices)
-- [x] Dev relay (LAN TCP); production Tor onion still TODO
+- [x] Dev relay (LAN TCP); production Tor-onion deployment still TODO (see [`docs/relay-architecture.md`](docs/relay-architecture.md) for the agreed rollout shape)
 - [x] Contact establishment (QR + clipboard fallback)
 - [x] In-app unread indicators (per-contact badge + app-icon total)
 - [x] Push notifications (payload-opaque "New message" wake-up; APNs gated on `APNS_*` env vars)
@@ -116,7 +128,9 @@ will pick up the new binary on next build.
 - [x] Per-message TTL (1h/24h/3d/7d, 7d hard cap)
 - [x] Recipient-issued delivery tokens (Ed25519)
 - [x] First-contact hashcash PoW
-- [ ] Multi-relay client fanout (deferred, post-audit)
+- [ ] Multi-relay client fanout (deferred, post-audit) — design in [`docs/relay-architecture.md`](docs/relay-architecture.md) D3
+- [ ] Production onion allowlist + signed bundle pipeline ([`docs/relay-architecture.md`](docs/relay-architecture.md) D5)
+- [ ] Three production onions stood up (`pizzini2/3/4`, vanity-prefix via `mkp224o`) — CH/IS/PA
 - [ ] Storage layer (SQLCipher) — outbox migrates from Keychain JSON when this lands
 - [ ] Session persistence across launches (currently identity persists, ratchet state does not)
 - [ ] Duress passphrase + cryptographic erasure
