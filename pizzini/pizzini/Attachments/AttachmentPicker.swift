@@ -44,39 +44,59 @@ struct PhotoVideoPicker: UIViewControllerRepresentable {
                 return
             }
             let provider = first.itemProvider
-            // PHPicker hands us provider-mediated file URLs that live
-            // in a system-scoped temp dir. We load via
-            // loadFileRepresentation, then copy the bytes into our
-            // own temp before the system reclaims it.
+            let suggestedName = first.itemProvider.suggestedName
+
+            // PHPicker advertises multiple type identifiers per asset.
+            // For Live Photos / iOS' .pvt-bundled assets the FIRST
+            // identifier is `com.apple.live-photo-bundle`, which is a
+            // *directory* on disk — `loadFileRepresentation` returns a
+            // URL pointing at a directory, and `FileManager.copyItem`
+            // fails with NSPOSIXErrorDomain 21 "Is a directory".
+            //
+            // Fix: rank concrete image/movie types ahead of bundle
+            // types, then ask for the *data* representation rather
+            // than the file representation — `loadDataRepresentation`
+            // gives us a Data blob even when the underlying asset is
+            // a bundle, and we write it to our own tmp under the
+            // sanitized filename.
             let typeIds = provider.registeredTypeIdentifiers
-            guard let utype = typeIds.first else {
+            let preferredOrder: [String] = [
+                "public.heic", "public.heif",
+                "public.jpeg", "public.png", "public.tiff", "public.webp",
+                "com.apple.quicktime-movie", "public.mpeg-4",
+                "public.movie", "public.image",
+            ]
+            let utype = preferredOrder.first(where: { typeIds.contains($0) })
+                ?? typeIds.filter { !$0.contains("bundle") }.first
+                ?? typeIds.first
+            guard let utype else {
                 parent.onCancel()
                 return
             }
-            provider.loadFileRepresentation(forTypeIdentifier: utype) { [weak self] sourceURL, error in
+            provider.loadDataRepresentation(forTypeIdentifier: utype) { [weak self] data, error in
                 guard let self else { return }
                 if let error {
-                    NSLog("[pizzini] PHPicker loadFileRepresentation error: \(error)")
+                    NSLog("[pizzini] PHPicker loadDataRepresentation error: \(error)")
                     DispatchQueue.main.async { self.parent.onCancel() }
                     return
                 }
-                guard let sourceURL else {
+                guard let data else {
                     DispatchQueue.main.async { self.parent.onCancel() }
                     return
                 }
-                // Stash a copy in our own temp space; PHPicker reaps
-                // its scratch URL the moment this closure returns.
-                let safeName = FilenameSanitizer.sanitize(
-                    sourceURL.lastPathComponent.isEmpty
-                        ? "photo.\(self.extensionForUTType(utype))"
-                        : sourceURL.lastPathComponent
-                )
+                // Build a sensible filename. PHPicker's `suggestedName`
+                // is the asset's PHAsset filename minus the extension,
+                // e.g. "IMG_4955" for `IMG_4955.HEIC`. We tack on the
+                // preferred extension for the resolved UTType.
+                let ext = UTType(utype)?.preferredFilenameExtension ?? "bin"
+                let stem = (suggestedName?.isEmpty == false) ? suggestedName! : "photo"
+                let safeName = FilenameSanitizer.sanitize("\(stem).\(ext)")
                 let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
                     .appending(path: "pick-\(UUID().uuidString)-\(safeName)", directoryHint: .notDirectory)
                 do {
-                    try FileManager.default.copyItem(at: sourceURL, to: tmp)
+                    try data.write(to: tmp, options: [.atomic])
                 } catch {
-                    NSLog("[pizzini] PHPicker copy failed: \(error)")
+                    NSLog("[pizzini] PHPicker tmp write failed: \(error)")
                     DispatchQueue.main.async { self.parent.onCancel() }
                     return
                 }
@@ -84,10 +104,6 @@ struct PhotoVideoPicker: UIViewControllerRepresentable {
                     self.parent.onPick(tmp, safeName)
                 }
             }
-        }
-
-        private func extensionForUTType(_ utype: String) -> String {
-            UTType(utype)?.preferredFilenameExtension ?? "bin"
         }
     }
 }
