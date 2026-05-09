@@ -42,15 +42,11 @@ struct ChatView: View {
             .onChange(of: contact.log.count) { _, _ in
                 store.markRead(contactID: contactID)
             }
-            .confirmationDialog(
-                "Attach a file",
-                isPresented: $showAttachSheet,
-                titleVisibility: .hidden
-            ) {
-                Button("Photo or video") { showPhotoPicker = true }
-                Button("File") { showDocumentPicker = true }
-                Button("Cancel", role: .cancel) {}
-            }
+            // NB: the `.confirmationDialog` for the paperclip lives on
+            // the paperclip button itself (see `composer`) so iOS uses
+            // the button as the popover anchor. Attaching it here at
+            // the body level made the popover float at the top of the
+            // screen with the arrow pointing nowhere.
             .sheet(isPresented: $showPhotoPicker) {
                 PhotoVideoPicker(
                     onPick: { url, name in
@@ -213,6 +209,15 @@ struct ChatView: View {
             .buttonStyle(.bordered)
             .disabled(disabled)
             .accessibilityLabel("Attach a file")
+            .confirmationDialog(
+                "Attach a file",
+                isPresented: $showAttachSheet,
+                titleVisibility: .hidden,
+            ) {
+                Button("Photo or video") { showPhotoPicker = true }
+                Button("File") { showDocumentPicker = true }
+                Button("Cancel", role: .cancel) {}
+            }
 
             TextField(
                 attachmentDraft == nil ? "type a message" : "add a caption (optional)",

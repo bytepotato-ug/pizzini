@@ -50,24 +50,25 @@ struct ContactsListView: View {
                     Image(systemName: "plus")
                 }
                 .accessibilityLabel("Add contact")
-            }
-        }
-        .confirmationDialog(
-            "Add a contact",
-            isPresented: $showAddContactDialog,
-            titleVisibility: .visible,
-        ) {
-            Button {
-                showScanner = true
-            } label: { Text("Scan their QR") }
-            Button {
-                if let s = UIPasteboard.general.string {
-                    onPasteContact(s)
+                // Attach the dialog to the trigger button so iOS uses
+                // it as the popover anchor — placing it on the parent
+                // view makes the arrow point at random screen edges.
+                .confirmationDialog(
+                    "Add a contact",
+                    isPresented: $showAddContactDialog,
+                    titleVisibility: .visible,
+                ) {
+                    Button { showScanner = true } label: { Text("Scan their QR") }
+                    Button {
+                        if let s = UIPasteboard.general.string {
+                            onPasteContact(s)
+                        }
+                    } label: { Text("Paste from clipboard") }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("Pair by scanning the other person's QR. They need to scan you back too.")
                 }
-            } label: { Text("Paste from clipboard") }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Pair by scanning the other person's QR. They need to scan you back too.")
+            }
         }
     }
 
