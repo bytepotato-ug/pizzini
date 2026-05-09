@@ -170,20 +170,30 @@ final class ChatStore: NSObject {
             return
         }
         do {
-            let result = try session.encrypt(
-                peerIdentity: contact.identityPub,
-                plaintext: Data(trimmed.utf8)
+            // Phase 2 wire format: sealed envelope on the wire, no
+            // from_id / is_prekey at the relay layer. Phase 4 will lift
+            // messageId out into a sender-side outbox for retries +
+            // delivered (✓✓) tracking; for now generate-and-discard.
+            let messageId = Self.makeMessageId()
+            let sealed = try session.encryptSealed(
+                peer: contact.identityPub,
+                messageId: messageId,
+                plaintext: Data(trimmed.utf8),
             )
-            relay.send(
+            relay.sendSealed(
                 toPeer: contact.identityPub,
-                ciphertext: result.ciphertext,
-                isPreKey: result.messageType == .preKey
+                sealedCiphertext: sealed,
+                ttlSeconds: Self.defaultTTLSeconds,
             )
             let entry = PersistedMessage(
                 side: .me,
                 text: trimmed,
-                kind: result.messageType == .preKey ? .preKey : .whisper,
-                bytes: result.ciphertext.count
+                // Bubble metadata stays "PreKey/Whisper" for now —
+                // sealed-sender hides that detail at the wire level
+                // but the cert-cached SenderCertificate path uses
+                // PreKey on the very first send, Whisper after.
+                kind: state.contacts[idx].sessionEstablished ? .whisper : .preKey,
+                bytes: sealed.count,
             )
             state.contacts[idx].log.append(entry)
             state.contacts[idx].lastMessageAt = entry.timestamp
@@ -191,6 +201,19 @@ final class ChatStore: NSObject {
         } catch {
             appendSystem("Encrypt failed: \(error)", to: idx)
         }
+    }
+
+    /// Default per-message TTL until Phase 4's per-message picker lands.
+    /// Matches the brief's "1 day (recommended)" default.
+    private static let defaultTTLSeconds: UInt32 = 24 * 60 * 60
+
+    /// 16 random bytes — Phase 4 plumbs this into the outbox so the
+    /// sender can match acks against in-flight entries.
+    private static func makeMessageId() -> Data {
+        var bytes = [UInt8](repeating: 0, count: 16)
+        let rc = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        precondition(rc == errSecSuccess, "SecRandom must succeed")
+        return Data(bytes)
     }
 
     func deleteChat(_ contact: Contact) {
@@ -328,37 +351,101 @@ extension ChatStore: RelayClientDelegate {
 
     nonisolated func relayClient(
         _ client: RelayClient,
-        didReceiveFrom fromPeer: Data,
-        ciphertext: Data,
-        isPreKey: Bool
+        didReceiveSealedSend sealedCiphertext: Data
     ) {
         Task { @MainActor in
-            guard let session = self.session,
-                  let idx = self.contactIndex(forIdentity: fromPeer)
-            else {
-                NSLog("[pizzini] dropped SEND from unknown peer \(self.short(fromPeer))")
-                return
-            }
+            guard let session = self.session else { return }
             do {
-                let pt = try session.decrypt(
-                    peerIdentity: fromPeer,
-                    ciphertext: ciphertext,
-                    isPreKey: isPreKey
-                )
-                let text = String(data: pt, encoding: .utf8) ?? "<\(pt.count) non-utf8 bytes>"
+                let received = try session.decryptSealed(sealedCiphertext)
+                guard let idx = self.contactIndex(forIdentity: received.peer) else {
+                    NSLog("[pizzini] dropped sealed SEND from unknown peer \(self.short(received.peer))")
+                    return
+                }
+                // Detect ACK-shaped plaintexts that arrived as a
+                // SEND (defensive — the relay routes ACKs as type=6,
+                // but in case a peer mislabels we still recognise).
+                if Self.isAckPlaintext(received.plaintext) {
+                    self.handleAckPlaintext(received.plaintext, fromPeer: received.peer)
+                    return
+                }
+                let text = String(data: received.plaintext, encoding: .utf8)
+                    ?? "<\(received.plaintext.count) non-utf8 bytes>"
                 let entry = PersistedMessage(
                     side: .peer,
                     text: text,
-                    kind: isPreKey ? .preKey : .whisper,
-                    bytes: ciphertext.count
+                    kind: .whisper,
+                    bytes: sealedCiphertext.count
                 )
                 self.state.contacts[idx].log.append(entry)
                 self.state.contacts[idx].lastMessageAt = entry.timestamp
                 self.state.contacts[idx].sessionEstablished = true
                 self.persistAll()
+                // Emit an ACK so the sender's outbox (Phase 4) can
+                // mark delivered. The ACK is itself a sealed envelope
+                // containing "ack: <16-byte message_id>" — relay
+                // forwards as a type=6 frame, identical otherwise to
+                // SEND.
+                self.emitAck(for: received.messageId, toPeer: received.peer, via: client)
             } catch {
-                NSLog("[pizzini] decrypt failed for \(self.short(fromPeer)): \(error)")
+                NSLog("[pizzini] sealed decrypt failed: \(error)")
             }
+        }
+    }
+
+    nonisolated func relayClient(_ client: RelayClient, didReceiveAck sealedCiphertext: Data) {
+        Task { @MainActor in
+            guard let session = self.session else { return }
+            do {
+                let received = try session.decryptSealed(sealedCiphertext)
+                self.handleAckPlaintext(received.plaintext, fromPeer: received.peer)
+            } catch {
+                NSLog("[pizzini] sealed ACK decrypt failed: \(error)")
+            }
+        }
+    }
+
+    private static let ackMarker = RelayClient.ackMarker
+
+    private static func isAckPlaintext(_ data: Data) -> Bool {
+        data.starts(with: ackMarker)
+    }
+
+    @MainActor
+    private func handleAckPlaintext(_ plaintext: Data, fromPeer: Data) {
+        guard plaintext.count == Self.ackMarker.count + 16,
+              plaintext.starts(with: Self.ackMarker)
+        else {
+            NSLog("[pizzini] malformed ACK from \(self.short(fromPeer))")
+            return
+        }
+        // Phase 4 hooks the per-message-id outbox here. For Phase 2 we
+        // just log so manual end-to-end verification can confirm acks
+        // are flowing both ways before the UI catches up.
+        let messageId = plaintext.suffix(16)
+        NSLog("[pizzini] ACK for message \(messageId.map { String(format: "%02x", $0) }.joined()) from \(self.short(fromPeer))")
+    }
+
+    @MainActor
+    private func emitAck(for messageId: Data, toPeer: Data, via client: RelayClient) {
+        guard let session = self.session else { return }
+        // Outer ACK envelope's own message_id is fresh — separate from
+        // the messageId we're acking, which lives inside the plaintext.
+        let outerId = Self.makeMessageId()
+        var ackPlaintext = Self.ackMarker
+        ackPlaintext.append(messageId)
+        do {
+            let sealed = try session.encryptSealed(
+                peer: toPeer,
+                messageId: outerId,
+                plaintext: ackPlaintext,
+            )
+            client.sendAck(
+                toPeer: toPeer,
+                sealedCiphertext: sealed,
+                ttlSeconds: Self.defaultTTLSeconds,
+            )
+        } catch {
+            NSLog("[pizzini] failed to emit ACK to \(self.short(toPeer)): \(error)")
         }
     }
 

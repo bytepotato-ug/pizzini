@@ -12,7 +12,7 @@
 //! production relay needs a separate task: bind via `arti-client` /
 //! `tor-hsservice` to an ephemeral onion service, drop the clearnet listener.
 //!
-//! ## Wire protocol (length-prefixed framing, big-endian)
+//! ## Wire protocol v2 (length-prefixed framing, big-endian)
 //!
 //! ```text
 //! Frame: u32 payload_len + payload
@@ -22,14 +22,26 @@
 //!   ...
 //!
 //! HELLO (type = 1) — client → relay, must be the first frame:
+//!   u8  protocol_version   (= 2; v1 clients are rejected)
 //!   u16 peer_id_len + peer_id_bytes
 //!
-//! SEND  (type = 2) — bidirectional. Sender writes; relay forwards verbatim
-//!                    if the recipient is online, otherwise drops:
+//! SEND  (type = 2) — bidirectional. The payload is a sealed-sender
+//!                    envelope; the relay never sees from_id, message
+//!                    type, or message_id. Drop or queue based on
+//!                    recipient online/offline:
 //!   u16 to_len   + to_id_bytes
-//!   u16 from_len + from_id_bytes
-//!   u8  is_prekey   (0 or 1; surfaces libsignal CiphertextMessageType)
-//!   ciphertext bytes (consume to end-of-payload)
+//!   u32 ttl_seconds                   (sender-chosen; clamped to 7d)
+//!   u16 token_len + token_bytes       (Phase 3: Ed25519 sig)
+//!   sealed_ciphertext                 (consume to end-of-payload)
+//!
+//! ACK   (type = 6) — same shape as SEND. The sealed payload's plaintext
+//!                    contains "ack: <16-byte message_id>" so the
+//!                    original sender can mark its outbox entry
+//!                    delivered. Forwarded and queued identically:
+//!   u16 to_len   + to_id_bytes
+//!   u32 ttl_seconds
+//!   u16 token_len + token_bytes
+//!   sealed_ciphertext
 //!
 //! BUNDLE_REQUEST  (type = 3) — "give me a fresh PreKey bundle to PQXDH with":
 //!   u16 to_len   + to_id_bytes
@@ -39,6 +51,13 @@
 //!   u16 to_len   + to_id_bytes
 //!   u16 from_len + from_id_bytes
 //!   bundle bytes (consume to end-of-payload)
+//!
+//! Bundle frames keep `from_id` at the wire level — bundle exchange is
+//! first-contact before a session exists; the SEND-level sealed envelope
+//! isn't yet usable. We accept the residual metadata leak (the relay
+//! sees who's QR-pairing with whom) for the rare bundle frequency. Phase
+//! 3 layers a hashcash PoW on bundle frames so the leak isn't free DoS
+//! amplification.
 //!
 //! REGISTER_PUSH  (type = 5) — client publishes its APNs device token so
 //!                              we can wake it on offline SEND:
@@ -83,23 +102,28 @@ use tokio::sync::mpsc;
 use crate::apns::{ApnsClient, ApnsConfig};
 
 const PORT: u16 = 7777;
+const PROTOCOL_VERSION: u8 = 2;
 const FRAME_TYPE_HELLO: u8 = 1;
 const FRAME_TYPE_SEND: u8 = 2;
 const FRAME_TYPE_BUNDLE_REQUEST: u8 = 3;
 const FRAME_TYPE_BUNDLE_RESPONSE: u8 = 4;
 const FRAME_TYPE_REGISTER_PUSH: u8 = 5;
+const FRAME_TYPE_ACK: u8 = 6;
 const MAX_FRAME_BYTES: u32 = 1024 * 1024;
 /// Hard ceiling on a single client's APNs device token. Real tokens are
 /// 32 bytes today; Apple has hinted they may grow. Reject anything above
 /// this so we don't memo absurd buffers per peer.
 const MAX_PUSH_TOKEN_BYTES: usize = 256;
 
-/// Per-peer pending-queue caps. The queue is purely in-memory; these
-/// caps bound RAM use and the post-seizure leak surface. 24h matches
-/// what a journalist/activist might reasonably go offline for; 100
-/// frames is a generous chat burst.
+/// Per-peer pending-queue cap. The queue is purely in-memory; this cap
+/// bounds RAM use and the post-seizure leak surface. 100 frames is a
+/// generous chat burst.
 const MAX_PENDING_PER_PEER: usize = 100;
-const PENDING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Hard ceiling on a sender-chosen TTL. Anything past 7 days is clamped
+/// down on enqueue. Bounds the seizure-window leak the same way the
+/// previous fixed 24h cap did, while letting senders explicitly choose
+/// shorter retention via the per-message TTL UI.
+const MAX_PENDING_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// How often the GC task scans every per-peer queue for expired entries.
 const PENDING_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
@@ -110,13 +134,14 @@ type Routes = Arc<Mutex<HashMap<PeerId, Outbox>>>;
 /// token when the recipient is *not* currently connected.
 type PushTokens = Arc<Mutex<HashMap<PeerId, Vec<u8>>>>;
 
-/// One queued routing frame. The body is the entire SEND frame as it
-/// would have been forwarded — including the leading frame_type byte
-/// and the to/from header — so we can hand it verbatim to the
-/// recipient's writer task on reconnect.
+/// One queued routing frame. The body is the entire frame as it would
+/// have been forwarded — including the leading frame_type byte and the
+/// recipient header — so we can hand it verbatim to the recipient's
+/// writer task on reconnect. `expires_at` is sender-chosen TTL clamped
+/// to `MAX_PENDING_TTL`; per-frame, not global.
 struct PendingFrame {
     bytes: Vec<u8>,
-    queued_at: Instant,
+    expires_at: Instant,
 }
 
 type Pending = Arc<Mutex<HashMap<PeerId, VecDeque<PendingFrame>>>>;
@@ -139,9 +164,10 @@ async fn main() -> std::io::Result<()> {
         }
     }
     println!(
-        "  DEV BUILD — clearnet, no auth, ephemeral in-memory queue (cap={MAX_PENDING_PER_PEER}/peer, ttl={}h). Tor-only in prod.",
-        PENDING_TTL.as_secs() / 3600,
+        "  DEV BUILD — clearnet, no auth, ephemeral in-memory queue (cap={MAX_PENDING_PER_PEER}/peer, max ttl={}h, sender-chosen per frame). Tor-only in prod.",
+        MAX_PENDING_TTL.as_secs() / 3600,
     );
+    println!("  protocol v{PROTOCOL_VERSION} — sealed-sender SEND/ACK, drop on TTL");
 
     let apns = match ApnsConfig::from_env() {
         Ok(Some(cfg)) => match ApnsClient::new(cfg) {
@@ -191,8 +217,11 @@ async fn main() -> std::io::Result<()> {
 }
 
 /// Background task that walks every per-peer queue and drops entries
-/// older than `PENDING_TTL`. Entries arrive in queue order so we can
-/// stop scanning a peer's deque on the first non-expired entry.
+/// past their per-frame `expires_at`. With sender-chosen TTLs the queue
+/// is no longer monotone in arrival order — a 1h-TTL frame queued
+/// after a 7d-TTL frame expires first — so we can't short-circuit on
+/// the front. Walks the whole deque every cycle, which is fine: caps
+/// keep each queue ≤ 100 entries.
 fn spawn_pending_gc(pending: Pending) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(PENDING_GC_INTERVAL);
@@ -201,15 +230,13 @@ fn spawn_pending_gc(pending: Pending) {
             let now = Instant::now();
             let mut map = pending.lock().await;
             map.retain(|peer_id, queue| {
-                while let Some(front) = queue.front() {
-                    if now.duration_since(front.queued_at) >= PENDING_TTL {
-                        queue.pop_front();
-                    } else {
-                        break;
-                    }
-                }
+                let before = queue.len();
+                queue.retain(|f| f.expires_at > now);
                 if queue.is_empty() {
-                    println!("pending: GC dropped empty queue for {}", short_hex(peer_id));
+                    println!(
+                        "pending: GC dropped {before} expired entries for {}",
+                        short_hex(peer_id)
+                    );
                     false
                 } else {
                     true
@@ -234,7 +261,13 @@ async fn handle_connection(
     if first.is_empty() || first[0] != FRAME_TYPE_HELLO {
         return Err(invalid("first frame must be HELLO"));
     }
-    let peer_id = parse_hello(&first[1..])?;
+    let peer_id = parse_hello(&first[1..]).map_err(|e| {
+        // Refuse v1 clients loudly so a stale build can't silently
+        // corrupt v2 routing state. Connection is closed by the caller
+        // on Err return.
+        eprintln!("[{peer_addr}] HELLO rejected: {e}");
+        e
+    })?;
     let peer_hex = hex(&peer_id);
     println!("[{peer_addr}] HELLO from peer {}", short_hex(&peer_id));
 
@@ -336,19 +369,51 @@ async fn read_loop(
                         .unwrap_or(0),
                 );
             }
-            FRAME_TYPE_SEND
-            | FRAME_TYPE_BUNDLE_REQUEST
-            | FRAME_TYPE_BUNDLE_RESPONSE => {
+            FRAME_TYPE_SEND | FRAME_TYPE_ACK => {
+                let parsed = match parse_sealed(&frame[1..]) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("malformed sealed frame: {e}");
+                        continue;
+                    }
+                };
+                let frame_type = frame[0];
+                let frame_len = frame.len();
+                let map = routes.lock().await;
+                if let Some(target) = map.get(&parsed.to_id) {
+                    let _ = target.send(frame);
+                    println!(
+                        "forward type={frame_type} → {} ({frame_len} bytes, ttl={}s, token={}B)",
+                        short_hex(&parsed.to_id),
+                        parsed.ttl_seconds,
+                        parsed.token.len(),
+                    );
+                } else {
+                    drop(map);
+                    enqueue_pending(&parsed.to_id, frame, parsed.ttl_seconds, pending).await;
+                    println!(
+                        "queued type={frame_type} → {}: recipient offline (ttl={}s)",
+                        short_hex(&parsed.to_id),
+                        parsed.ttl_seconds,
+                    );
+                    maybe_send_push(&parsed.to_id, push_tokens, apns.as_ref()).await;
+                }
+            }
+            FRAME_TYPE_BUNDLE_REQUEST | FRAME_TYPE_BUNDLE_RESPONSE => {
+                // Bundle frames keep the explicit from_id at the wire
+                // level — first contact pre-dates a session, so the
+                // sealed-sender envelope can't yet be applied. Spoof
+                // check still meaningful here.
                 let parsed = match parse_routed(&frame[1..]) {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("malformed routed frame: {e}");
+                        eprintln!("malformed bundle frame: {e}");
                         continue;
                     }
                 };
                 if parsed.from_id != self_id {
                     eprintln!(
-                        "rejecting frame with spoofed from_id {} (connection is {})",
+                        "rejecting bundle frame with spoofed from_id {} (connection is {})",
                         short_hex(&parsed.from_id),
                         short_hex(self_id),
                     );
@@ -360,36 +425,17 @@ async fn read_loop(
                     let frame_len = frame.len();
                     let _ = target.send(frame);
                     println!(
-                        "forward type={frame_type} {} → {} ({frame_len} bytes)",
+                        "forward bundle type={frame_type} {} → {} ({frame_len} bytes)",
                         short_hex(&parsed.from_id),
                         short_hex(&parsed.to_id),
                     );
                 } else {
-                    drop(map);
-                    if frame[0] == FRAME_TYPE_SEND {
-                        // Recipient offline → queue the ciphertext (in-memory,
-                        // capped, TTL'd) and fire a payload-opaque push so iOS
-                        // wakes the app. On the recipient's next HELLO,
-                        // `drain_pending` flushes the queue.
-                        enqueue_pending(&parsed.to_id, frame, pending).await;
-                        println!(
-                            "queued {} → {}: recipient offline",
-                            short_hex(&parsed.from_id),
-                            short_hex(&parsed.to_id),
-                        );
-                        maybe_send_push(&parsed.to_id, push_tokens, apns.as_ref()).await;
-                    } else {
-                        // BUNDLE_REQUEST / BUNDLE_RESPONSE are first-contact
-                        // handshake frames — both peers must be online to
-                        // exchange a fresh PreKey bundle. Queueing makes no
-                        // sense here.
-                        println!(
-                            "drop frame type={} {} → {}: recipient offline (bundle)",
-                            frame[0],
-                            short_hex(&parsed.from_id),
-                            short_hex(&parsed.to_id),
-                        );
-                    }
+                    println!(
+                        "drop bundle type={} {} → {}: recipient offline (bundle exchange requires both online)",
+                        frame[0],
+                        short_hex(&parsed.from_id),
+                        short_hex(&parsed.to_id),
+                    );
                 }
             }
             other => return Err(invalid(&format!("unknown frame type {other}"))),
@@ -397,7 +443,12 @@ async fn read_loop(
     }
 }
 
-async fn enqueue_pending(recipient: &[u8], frame: Vec<u8>, pending: &Pending) {
+async fn enqueue_pending(
+    recipient: &[u8],
+    frame: Vec<u8>,
+    ttl_seconds: u32,
+    pending: &Pending,
+) {
     let mut map = pending.lock().await;
     let queue = map.entry(recipient.to_vec()).or_default();
     // Per-peer cap is a DoS safeguard: an attacker spraying SEND at a
@@ -407,10 +458,20 @@ async fn enqueue_pending(recipient: &[u8], frame: Vec<u8>, pending: &Pending) {
     while queue.len() >= MAX_PENDING_PER_PEER {
         queue.pop_front();
     }
+    let ttl = clamp_ttl(ttl_seconds);
     queue.push_back(PendingFrame {
         bytes: frame,
-        queued_at: Instant::now(),
+        expires_at: Instant::now() + ttl,
     });
+}
+
+/// Sender-chosen TTL clamped to `MAX_PENDING_TTL`. A zero or absurd
+/// value still gets a small floor (60s) so we don't churn the queue on
+/// a misconfigured client without ever delivering.
+fn clamp_ttl(ttl_seconds: u32) -> Duration {
+    let secs = ttl_seconds as u64;
+    let secs = secs.max(60).min(MAX_PENDING_TTL.as_secs());
+    Duration::from_secs(secs)
 }
 
 /// Called right after a peer's HELLO is processed and their route is
@@ -431,7 +492,7 @@ async fn drain_pending(peer_id: &[u8], pending: &Pending, routes: &Routes) {
     let mut forwarded = 0usize;
     let mut expired = 0usize;
     for entry in queue {
-        if now.duration_since(entry.queued_at) >= PENDING_TTL {
+        if entry.expires_at <= now {
             expired += 1;
             continue;
         }
@@ -480,8 +541,20 @@ struct ParsedRouted {
     from_id: Vec<u8>,
 }
 
+struct ParsedSealed {
+    to_id: Vec<u8>,
+    ttl_seconds: u32,
+    token: Vec<u8>,
+}
+
 fn parse_hello(body: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut c = Cursor::new(body);
+    let version = c.u8()?;
+    if version != PROTOCOL_VERSION {
+        return Err(invalid(&format!(
+            "unsupported protocol version {version}; relay speaks {PROTOCOL_VERSION}"
+        )));
+    }
     let id = c.u16_blob()?.to_vec();
     if !c.is_empty() {
         return Err(invalid("trailing bytes after HELLO"));
@@ -495,6 +568,20 @@ fn parse_routed(body: &[u8]) -> std::io::Result<ParsedRouted> {
     let from_id = c.u16_blob()?.to_vec();
     // Anything after the routing prefix is opaque to the relay.
     Ok(ParsedRouted { to_id, from_id })
+}
+
+/// Parse the SEND v2 / ACK header. The relay validates structure and
+/// extracts to_id, ttl, token. The trailing sealed_ciphertext is not
+/// re-read here — `parse_sealed` runs purely for routing/queueing
+/// metadata and the relay forwards the raw frame bytes verbatim.
+fn parse_sealed(body: &[u8]) -> std::io::Result<ParsedSealed> {
+    let mut c = Cursor::new(body);
+    let to_id = c.u16_blob()?.to_vec();
+    let ttl_seconds = c.u32()?;
+    let token = c.u16_blob()?.to_vec();
+    // Remaining bytes are the sealed ciphertext — opaque to the relay.
+    let _ = c.rest();
+    Ok(ParsedSealed { to_id, ttl_seconds, token })
 }
 
 fn parse_register_push(body: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -596,11 +683,102 @@ impl<'a> Cursor<'a> {
         self.buf = tail;
         Ok(head)
     }
+    fn u8(&mut self) -> std::io::Result<u8> {
+        Ok(self.take(1)?[0])
+    }
     fn u16(&mut self) -> std::io::Result<u16> {
         Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn u32(&mut self) -> std::io::Result<u32> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
     }
     fn u16_blob(&mut self) -> std::io::Result<&'a [u8]> {
         let n = self.u16()? as usize;
         self.take(n)
+    }
+    fn rest(&mut self) -> &'a [u8] {
+        let r = self.buf;
+        self.buf = &[];
+        r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_send_v2(to: &[u8], ttl: u32, token: &[u8], sealed: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(FRAME_TYPE_SEND);
+        out.extend_from_slice(&(to.len() as u16).to_be_bytes());
+        out.extend_from_slice(to);
+        out.extend_from_slice(&ttl.to_be_bytes());
+        out.extend_from_slice(&(token.len() as u16).to_be_bytes());
+        out.extend_from_slice(token);
+        out.extend_from_slice(sealed);
+        out
+    }
+
+    #[test]
+    fn parse_send_v2_round_trips() {
+        let to = b"recipient_id_bytes";
+        let token = b"sigsigsig";
+        let sealed = b"sealedciphertextbytes";
+        let frame = build_send_v2(to, 3600, token, sealed);
+        let parsed = parse_sealed(&frame[1..]).unwrap();
+        assert_eq!(parsed.to_id, to);
+        assert_eq!(parsed.ttl_seconds, 3600);
+        assert_eq!(parsed.token, token);
+    }
+
+    #[test]
+    fn clamps_ttl_to_seven_days() {
+        // Sender asks for 30 days; relay clamps to 7d.
+        let huge: u32 = 30 * 24 * 3600;
+        let dur = clamp_ttl(huge);
+        assert_eq!(dur, MAX_PENDING_TTL);
+        // Sender asks for 0; relay floors to 60s so we don't churn.
+        let zero = clamp_ttl(0);
+        assert_eq!(zero, Duration::from_secs(60));
+        // Reasonable ttls pass through.
+        assert_eq!(clamp_ttl(3600), Duration::from_secs(3600));
+        assert_eq!(clamp_ttl(24 * 3600), Duration::from_secs(24 * 3600));
+    }
+
+    #[test]
+    fn rejects_protocol_v1() {
+        // v1 HELLO body had no version byte; it started straight with the
+        // u16 peer_id length. Re-encoding such a body and parsing it
+        // against v2 must fail with a clear "unsupported version" error.
+        let mut v1_body = Vec::new();
+        v1_body.extend_from_slice(&(4u16.to_be_bytes())); // peer_id_len = 4
+        v1_body.extend_from_slice(&[1, 2, 3, 4]);          // peer_id bytes
+        let err = parse_hello(&v1_body).unwrap_err();
+        assert!(format!("{err}").contains("protocol version"));
+    }
+
+    #[test]
+    fn parse_hello_accepts_protocol_v2() {
+        let mut body = Vec::new();
+        body.push(PROTOCOL_VERSION);
+        body.extend_from_slice(&(33u16.to_be_bytes()));
+        body.extend_from_slice(&[0u8; 33]);
+        let id = parse_hello(&body).unwrap();
+        assert_eq!(id, vec![0u8; 33]);
+    }
+
+    #[test]
+    fn parse_sealed_rejects_truncated_header() {
+        // Frame body too short to even hold the to_id length prefix.
+        let truncated = vec![0u8; 1];
+        assert!(parse_sealed(&truncated).is_err());
+        // Frame stops mid-token blob.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&(2u16.to_be_bytes()));
+        bad.extend_from_slice(&[0xab, 0xcd]);
+        bad.extend_from_slice(&3600u32.to_be_bytes());
+        bad.extend_from_slice(&(64u16.to_be_bytes()));
+        bad.extend_from_slice(&[0u8; 8]); // declared 64, gives 8
+        assert!(parse_sealed(&bad).is_err());
     }
 }

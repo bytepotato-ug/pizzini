@@ -12,14 +12,14 @@ import Network
 public protocol RelayClientDelegate: AnyObject, Sendable {
     /// Connection state crossed a meaningful threshold.
     func relayClient(_ client: RelayClient, didChange state: RelayClient.State)
-    /// A SEND frame arrived from `fromPeer`. `ciphertext` + `isPreKey` are
-    /// what `Session.decrypt` needs.
-    func relayClient(
-        _ client: RelayClient,
-        didReceiveFrom fromPeer: Data,
-        ciphertext: Data,
-        isPreKey: Bool
-    )
+    /// A SEND v2 frame arrived. The payload is the sealed-sender envelope
+    /// bytes — feed straight to `Session.decryptSealed`. The host owns
+    /// dedup on the unwrapped 16-byte message_id.
+    func relayClient(_ client: RelayClient, didReceiveSealedSend sealedCiphertext: Data)
+    /// An ACK frame arrived. The payload is itself a sealed-sender
+    /// envelope; the inner plaintext begins with `Self.ackMarker` followed
+    /// by the 16-byte message_id of the SEND being acked.
+    func relayClient(_ client: RelayClient, didReceiveAck sealedCiphertext: Data)
     /// Peer asked us for a fresh PreKey bundle to PQXDH with.
     func relayClient(_ client: RelayClient, didReceiveBundleRequestFrom fromPeer: Data)
     /// Peer answered our earlier `requestBundle` with the bundle bytes.
@@ -38,12 +38,22 @@ public final class RelayClient: @unchecked Sendable {
         case failed(String)
     }
 
+    /// On-the-wire protocol version negotiated in HELLO. Bumped from 1
+    /// when sealed-sender SEND/ACK landed; v1 relays/clients reject.
+    public static let protocolVersion: UInt8 = 2
+    /// Inner-plaintext content marker for ACK envelopes — matches the
+    /// "ack: <16-byte message_id>" convention from Phase 4.
+    public static let ackMarker: Data = Data("ack:".utf8)
     private static let frameTypeHello: UInt8 = 1
     private static let frameTypeSend: UInt8 = 2
     private static let frameTypeBundleRequest: UInt8 = 3
     private static let frameTypeBundleResponse: UInt8 = 4
     private static let frameTypeRegisterPush: UInt8 = 5
+    private static let frameTypeAck: UInt8 = 6
     private static let maxFrameBytes: UInt32 = 1024 * 1024
+    /// Hard ceiling on the per-message TTL the sender can request; the
+    /// relay clamps to this server-side too. 7 days.
+    public static let maxTTLSeconds: UInt32 = 7 * 24 * 60 * 60
 
     public weak var delegate: RelayClientDelegate?
     public private(set) var state: State = .idle {
@@ -118,14 +128,57 @@ public final class RelayClient: @unchecked Sendable {
         readBuffer.removeAll()
     }
 
-    public func send(toPeer to: Data, ciphertext: Data, isPreKey: Bool) {
+    /// SEND v2 — sealed envelope, sender-chosen TTL (clamped to 7 days
+    /// by the relay), optional Phase-3 token. `from_id` no longer rides
+    /// at the wire level; it's inside the cert in the sealed envelope.
+    public func sendSealed(
+        toPeer to: Data,
+        sealedCiphertext: Data,
+        ttlSeconds: UInt32,
+        token: Data = Data()
+    ) {
+        writeRoutedSealed(
+            frameType: Self.frameTypeSend,
+            toPeer: to,
+            sealedCiphertext: sealedCiphertext,
+            ttlSeconds: ttlSeconds,
+            token: token,
+        )
+    }
+
+    /// ACK frame — same shape as SEND v2. The sealed envelope's inner
+    /// plaintext should be `RelayClient.ackMarker || message_id`.
+    public func sendAck(
+        toPeer to: Data,
+        sealedCiphertext: Data,
+        ttlSeconds: UInt32,
+        token: Data = Data()
+    ) {
+        writeRoutedSealed(
+            frameType: Self.frameTypeAck,
+            toPeer: to,
+            sealedCiphertext: sealedCiphertext,
+            ttlSeconds: ttlSeconds,
+            token: token,
+        )
+    }
+
+    private func writeRoutedSealed(
+        frameType: UInt8,
+        toPeer to: Data,
+        sealedCiphertext: Data,
+        ttlSeconds: UInt32,
+        token: Data,
+    ) {
         guard let connection, state == .connected else { return }
+        let ttl = min(ttlSeconds, Self.maxTTLSeconds)
         var payload = Data()
-        payload.append(Self.frameTypeSend)
+        payload.append(frameType)
         appendU16Blob(&payload, to)
-        appendU16Blob(&payload, myIdentity)
-        payload.append(isPreKey ? 1 : 0)
-        payload.append(ciphertext)
+        var ttlBE = ttl.bigEndian
+        withUnsafeBytes(of: &ttlBE) { payload.append(contentsOf: $0) }
+        appendU16Blob(&payload, token)
+        payload.append(sealedCiphertext)
         writeFrame(payload, on: connection)
     }
 
@@ -170,6 +223,7 @@ public final class RelayClient: @unchecked Sendable {
         guard let connection else { return }
         var payload = Data()
         payload.append(Self.frameTypeHello)
+        payload.append(Self.protocolVersion)
         appendU16Blob(&payload, myIdentity)
         writeFrame(payload, on: connection)
     }
@@ -228,33 +282,37 @@ public final class RelayClient: @unchecked Sendable {
     private func handleFrame(_ payload: Data) {
         guard let type = payload.first else { return }
         var cursor = Cursor(payload.dropFirst())
-        guard
-            let to = cursor.u16Blob(),
-            let from = cursor.u16Blob()
-        else { return }
-        // We're the recipient — `to` should equal myIdentity, but the
-        // relay already routed by it. Mismatched senders surface as
-        // libsignal trust failures further up.
-        _ = to
         let delegate = self.delegate
         let client = self
         switch type {
-        case Self.frameTypeSend:
-            guard let isPreByte = cursor.u8() else { return }
-            let ciphertext = Data(cursor.rest())
-            DispatchQueue.main.async {
-                delegate?.relayClient(
-                    client,
-                    didReceiveFrom: from,
-                    ciphertext: ciphertext,
-                    isPreKey: isPreByte != 0
-                )
+        case Self.frameTypeSend, Self.frameTypeAck:
+            // SEND v2 / ACK: u16 to + u32 ttl + u16 token + sealed.
+            // `to` should equal myIdentity (relay routed by it). We
+            // re-read but don't validate — a malicious relay forwarding
+            // someone else's frame to us still has to clear the
+            // sealed-sender contact gate at the next layer.
+            guard cursor.u16Blob() != nil else { return }
+            guard cursor.skip(4) else { return }     // ttl_seconds
+            guard cursor.u16Blob() != nil else { return } // token (Phase 3)
+            let sealed = Data(cursor.rest())
+            if type == Self.frameTypeSend {
+                DispatchQueue.main.async {
+                    delegate?.relayClient(client, didReceiveSealedSend: sealed)
+                }
+            } else {
+                DispatchQueue.main.async {
+                    delegate?.relayClient(client, didReceiveAck: sealed)
+                }
             }
         case Self.frameTypeBundleRequest:
+            guard cursor.u16Blob() != nil else { return }
+            guard let from = cursor.u16Blob() else { return }
             DispatchQueue.main.async {
                 delegate?.relayClient(client, didReceiveBundleRequestFrom: from)
             }
         case Self.frameTypeBundleResponse:
+            guard cursor.u16Blob() != nil else { return }
+            guard let from = cursor.u16Blob() else { return }
             let bundle = Data(cursor.rest())
             DispatchQueue.main.async {
                 delegate?.relayClient(client, didReceiveBundleFrom: from, bundle: bundle)
@@ -294,6 +352,11 @@ private struct Cursor {
         let blob = buf.prefix(Int(n))
         buf = buf.dropFirst(Int(n))
         return Data(blob)
+    }
+    mutating func skip(_ n: Int) -> Bool {
+        guard buf.count >= n else { return false }
+        buf = buf.dropFirst(n)
+        return true
     }
     mutating func rest() -> Data {
         let r = buf
