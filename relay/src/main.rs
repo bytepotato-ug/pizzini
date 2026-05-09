@@ -503,24 +503,23 @@ async fn handle_connection(
     // *if* it still belongs to us (a newer HELLO from the same peer would
     // have replaced it). Then cancel the writer task. After both Senders
     // drop, the writer's `out_rx` returns None and it exits cleanly.
-    let was_ours = {
+    {
         let mut map = routes.lock().await;
-        let was_ours = map
+        let still_ours = map
             .get(&peer_id)
             .map(|e| e.same_channel(&our_tx))
             .unwrap_or(false);
-        if was_ours {
+        if still_ours {
             map.remove(&peer_id);
         }
-        was_ours
-    };
-    // N-002: previously this code eagerly removed verify_keys[peer_id]
-    // on disconnect when pending was empty. That broke offline-message
+    }
+    // N-002: verify_keys[peer_id] is NOT eagerly removed on disconnect.
+    // The pre-fix-review F-204 patch did that, which broke offline
     // delivery — incoming SENDs to a recently-disconnected peer rely
     // on `check_delivery_token` finding the recipient's verify_key,
     // and a missing key dropped the frame BEFORE `enqueue_pending`
     // could queue it. Verify_keys lifetime is now governed by
-    // `spawn_verify_keys_gc` instead, which prunes entries unused for
+    // `spawn_verify_keys_gc`, which prunes entries unused for
     // `VERIFY_KEY_TTL` (= token TTL = 30d). This bounds memory and
     // post-mortem linkability the same way (entries age out) without
     // breaking delivery to peers in their first 30d of disconnect.
