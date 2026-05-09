@@ -17,6 +17,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         UNUserNotificationCenter.current().delegate = self
+        // Window-level privacy shield: covers sheets and popovers in the
+        // multitasking snapshot, which an in-body overlay can't do.
+        // Install before any UI work so the observers are armed before
+        // the first scene connection.
+        PrivacyShieldWindow.shared.install()
         Task { await requestAuthorizationAndRegister() }
         return true
     }
