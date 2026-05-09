@@ -10,30 +10,67 @@ import PizziniCryptoCore
 
 struct ContentView: View {
     @State private var store = ChatStore.shared
+    @State private var lockManager = LockManager.shared
     @State private var showScanner = false
     @State private var showMyQR = false
     @State private var showRelaySheet = false
+    @State private var showSecuritySheet = false
     @State private var confirmDeleteAllChats = false
     @State private var confirmReset = false
     @State private var pendingCard: ContactCard?
     @State private var pendingName: String = ""
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
-        Group {
-            if let err = store.initError {
-                errorState(err)
-            } else {
-                NavigationStack {
-                    ContactsListView(
-                        store: store,
-                        showScanner: $showScanner,
-                        showMyQR: $showMyQR,
-                        showRelaySheet: $showRelaySheet,
-                        confirmDeleteAllChats: $confirmDeleteAllChats,
-                        confirmReset: $confirmReset,
-                        onPasteContact: promptForName(decoding:)
-                    )
+        ZStack {
+            Group {
+                if let err = store.initError {
+                    errorState(err)
+                } else {
+                    NavigationStack {
+                        ContactsListView(
+                            store: store,
+                            showScanner: $showScanner,
+                            showMyQR: $showMyQR,
+                            showRelaySheet: $showRelaySheet,
+                            showSecuritySheet: $showSecuritySheet,
+                            confirmDeleteAllChats: $confirmDeleteAllChats,
+                            confirmReset: $confirmReset,
+                            onPasteContact: promptForName(decoding:)
+                        )
+                    }
                 }
+            }
+
+            // Lock overlay sits on top of the chat UI so the contacts +
+            // chat are not in any screenshot/snapshot taken while
+            // locked. The overlay is a peer of the privacy shield;
+            // when both apply, the privacy shield wins (rendered last).
+            if lockManager.isLocked {
+                LockOverlayView(lockManager: lockManager)
+                    .transition(.opacity)
+            }
+
+            // Privacy shield: any time iOS is about to capture a
+            // multitasking thumbnail (or the system briefly takes the
+            // screen, e.g. Control Centre), we cover everything with a
+            // neutral logo view.
+            if scenePhase != .active {
+                PrivacyShieldView()
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.15), value: lockManager.isLocked)
+        .animation(.easeInOut(duration: 0.15), value: scenePhase)
+        .onChange(of: scenePhase) { _, newPhase in
+            lockManager.handleScenePhaseChange(to: newPhase)
+        }
+        .fullScreenCover(isPresented: Binding(
+            get: { !store.state.onboardingCompleted && store.initError == nil },
+            set: { _ in }
+        )) {
+            OnboardingView { enableBiometric in
+                store.completeOnboarding(enableBiometric: enableBiometric)
             }
         }
         .sheet(isPresented: $showScanner) {
@@ -77,6 +114,9 @@ struct ContentView: View {
                 },
                 onCancel: { showRelaySheet = false }
             )
+        }
+        .sheet(isPresented: $showSecuritySheet) {
+            SecuritySettingsView(store: store, onClose: { showSecuritySheet = false })
         }
         .confirmationDialog(
             "Delete all chats? Contacts and sessions stay; only message logs are wiped.",

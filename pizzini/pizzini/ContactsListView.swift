@@ -7,6 +7,7 @@ struct ContactsListView: View {
     @Binding var showScanner: Bool
     @Binding var showMyQR: Bool
     @Binding var showRelaySheet: Bool
+    @Binding var showSecuritySheet: Bool
     @Binding var confirmDeleteAllChats: Bool
     @Binding var confirmReset: Bool
     let onPasteContact: (String) -> Void
@@ -43,6 +44,14 @@ struct ContactsListView: View {
                         }
                     } label: { Label("Paste contact", systemImage: "doc.on.clipboard") }
                     Divider()
+                    Button {
+                        showSecuritySheet = true
+                    } label: {
+                        Label(
+                            store.state.biometricLockEnabled ? "Security (Face ID on)" : "Security",
+                            systemImage: "lock.shield"
+                        )
+                    }
                     Button {
                         showRelaySheet = true
                     } label: {

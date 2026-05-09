@@ -93,19 +93,80 @@ extension AppState {
     var totalUnread: Int { contacts.reduce(0) { $0 + $1.unreadCount } }
 }
 
+enum AutoLockTimeout: String, Codable, CaseIterable, Sendable {
+    case immediately
+    case oneMinute
+    case fiveMinutes
+    case fifteenMinutes
+
+    var seconds: TimeInterval {
+        switch self {
+        case .immediately: return 0
+        case .oneMinute: return 60
+        case .fiveMinutes: return 5 * 60
+        case .fifteenMinutes: return 15 * 60
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .immediately: return "Immediately"
+        case .oneMinute: return "After 1 minute"
+        case .fiveMinutes: return "After 5 minutes"
+        case .fifteenMinutes: return "After 15 minutes"
+        }
+    }
+}
+
 /// Everything the UI needs that lives outside the libsignal store. Encoded
 /// to JSON, sealed into Keychain. Bumping `version` lets us migrate.
+///
+/// `init(from:)` decodes the security fields with `decodeIfPresent` so an
+/// existing AppState blob (written before those fields existed) still
+/// loads cleanly. Synthesized `encode(to:)` writes them all.
 struct AppState: Codable, Sendable {
     var version: Int
     var relayHost: String
     var contacts: [Contact]
+    var onboardingCompleted: Bool
+    var biometricLockEnabled: Bool
+    var autoLockTimeout: AutoLockTimeout
 
     static let currentVersion = 1
     static let defaultRelayHost = "127.0.0.1"
 
-    init(version: Int = currentVersion, relayHost: String = defaultRelayHost, contacts: [Contact] = []) {
+    init(
+        version: Int = currentVersion,
+        relayHost: String = defaultRelayHost,
+        contacts: [Contact] = [],
+        onboardingCompleted: Bool = false,
+        biometricLockEnabled: Bool = false,
+        autoLockTimeout: AutoLockTimeout = .immediately
+    ) {
         self.version = version
         self.relayHost = relayHost
         self.contacts = contacts
+        self.onboardingCompleted = onboardingCompleted
+        self.biometricLockEnabled = biometricLockEnabled
+        self.autoLockTimeout = autoLockTimeout
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case relayHost
+        case contacts
+        case onboardingCompleted
+        case biometricLockEnabled
+        case autoLockTimeout
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = try c.decode(Int.self, forKey: .version)
+        relayHost = try c.decode(String.self, forKey: .relayHost)
+        contacts = try c.decode([Contact].self, forKey: .contacts)
+        onboardingCompleted = try c.decodeIfPresent(Bool.self, forKey: .onboardingCompleted) ?? false
+        biometricLockEnabled = try c.decodeIfPresent(Bool.self, forKey: .biometricLockEnabled) ?? false
+        autoLockTimeout = try c.decodeIfPresent(AutoLockTimeout.self, forKey: .autoLockTimeout) ?? .immediately
     }
 }

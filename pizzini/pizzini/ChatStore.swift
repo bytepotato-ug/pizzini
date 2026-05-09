@@ -213,6 +213,31 @@ final class ChatStore: NSObject {
         Storage.persist(appState: state)
     }
 
+    // MARK: - Onboarding + security settings
+
+    func completeOnboarding(enableBiometric: Bool) {
+        state.onboardingCompleted = true
+        state.biometricLockEnabled = enableBiometric
+        Storage.persist(appState: state)
+    }
+
+    func setBiometricLockEnabled(_ enabled: Bool) {
+        guard state.biometricLockEnabled != enabled else { return }
+        state.biometricLockEnabled = enabled
+        Storage.persist(appState: state)
+        // If the user just disabled the lock, lift any active gate so
+        // we don't strand them on an overlay they can no longer dismiss.
+        if !enabled {
+            LockManager.shared.unlockBecauseDisabled()
+        }
+    }
+
+    func setAutoLockTimeout(_ value: AutoLockTimeout) {
+        guard state.autoLockTimeout != value else { return }
+        state.autoLockTimeout = value
+        Storage.persist(appState: state)
+    }
+
     func resetIdentity() {
         relay?.disconnect()
         Storage.resetEverything()
