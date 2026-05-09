@@ -270,3 +270,312 @@ struct MetadataStripperTests {
         #expect(out == original)
     }
 }
+
+@Suite("FileChunkEnvelope codec")
+struct FileChunkEnvelopeTests {
+    private func sample(index: UInt32 = 0, count: UInt32 = 3, payload: Data = Data([1, 2, 3])) -> FileChunkEnvelope {
+        FileChunkEnvelope(
+            attachmentId: Data(repeating: 0xA5, count: 16),
+            totalSize: 9,
+            chunkIndex: index,
+            chunkCount: count,
+            mime: "image/jpeg",
+            filename: "kitten.jpg",
+            chunkBytes: payload,
+        )
+    }
+
+    @Test("round-trip preserves every field")
+    func roundTrip() throws {
+        let env = sample()
+        let wire = env.encode()
+        let decoded = try FileChunkEnvelope.decode(wire)
+        #expect(decoded == env)
+    }
+
+    @Test("rejects oversize chunk count (>1024)")
+    func rejectsOversizeChunkCount() {
+        var bytes = Data(repeating: 0xA5, count: 16)        // attachment_id
+        bytes.append(contentsOf: [UInt8](repeating: 0, count: 8))  // total_size
+        // chunk_index = 0, chunk_count = 99999 — over the 1024 cap.
+        bytes.append(contentsOf: [0, 0, 0, 0])
+        var bigCount = UInt32(99999).bigEndian
+        withUnsafeBytes(of: &bigCount) { bytes.append(contentsOf: $0) }
+        // mime_len = 0, filename_len = 0
+        bytes.append(contentsOf: [0, 0])
+        bytes.append(contentsOf: [0, 0])
+        #expect(throws: FileChunkEnvelope.CodecError.oversizedChunkCount) {
+            _ = try FileChunkEnvelope.decode(bytes)
+        }
+    }
+
+    @Test("rejects chunk_index out of range")
+    func rejectsBadIndex() {
+        var bytes = Data(repeating: 0, count: 16)
+        bytes.append(contentsOf: [UInt8](repeating: 0, count: 8))   // total_size
+        var idx = UInt32(5).bigEndian
+        var cnt = UInt32(3).bigEndian
+        withUnsafeBytes(of: &idx) { bytes.append(contentsOf: $0) }
+        withUnsafeBytes(of: &cnt) { bytes.append(contentsOf: $0) }
+        bytes.append(contentsOf: [0, 0, 0, 0])
+        #expect(throws: FileChunkEnvelope.CodecError.chunkIndexOutOfRange) {
+            _ = try FileChunkEnvelope.decode(bytes)
+        }
+    }
+
+    @Test("rejects oversized chunk plaintext")
+    func rejectsOversizedChunk() throws {
+        let env = FileChunkEnvelope(
+            attachmentId: Data(repeating: 0, count: 16),
+            totalSize: UInt64(FileChunkEnvelope.maxChunkPlaintextBytes + 1),
+            chunkIndex: 0,
+            chunkCount: 1,
+            mime: "x",
+            filename: "x",
+            chunkBytes: Data(repeating: 0, count: FileChunkEnvelope.maxChunkPlaintextBytes + 1),
+        )
+        let wire = env.encode()
+        #expect(throws: FileChunkEnvelope.CodecError.oversizedChunk) {
+            _ = try FileChunkEnvelope.decode(wire)
+        }
+    }
+
+    @Test("rejects truncated buffer")
+    func rejectsTruncated() {
+        let bytes = Data(repeating: 0, count: 10)
+        #expect(throws: FileChunkEnvelope.CodecError.truncated) {
+            _ = try FileChunkEnvelope.decode(bytes)
+        }
+    }
+}
+
+@MainActor
+@Suite("AttachmentReassembler state machine", .serialized)
+struct AttachmentReassemblerTests {
+    private func makeEnv(
+        attachmentId: Data,
+        index: UInt32,
+        count: UInt32,
+        totalSize: UInt64,
+        chunkBytes: Data,
+        filename: String = "doc.pdf",
+        mime: String = "application/pdf"
+    ) -> FileChunkEnvelope {
+        FileChunkEnvelope(
+            attachmentId: attachmentId,
+            totalSize: totalSize,
+            chunkIndex: index,
+            chunkCount: count,
+            mime: mime,
+            filename: filename,
+            chunkBytes: chunkBytes,
+        )
+    }
+
+    @Test("two chunks land out of order, file assembles correctly")
+    func reassembleTwoChunksOutOfOrder() throws {
+        let r = AttachmentReassembler()
+        let aid = Data((0..<16).map { _ in UInt8.random(in: 0...UInt8.max) })
+        let peer = Data(repeating: 0xBB, count: 33)
+        let part0 = Data("hello-".utf8)
+        let part1 = Data("world!".utf8)
+        let total = UInt64(part0.count + part1.count)
+
+        // Chunk 1 first.
+        let r1 = r.feed(envelope: makeEnv(
+            attachmentId: aid, index: 1, count: 2, totalSize: total, chunkBytes: part1
+        ), fromPeer: peer)
+        if case .progress(let received, let expected) = r1 {
+            #expect(received == 1)
+            #expect(expected == 2)
+        } else {
+            Issue.record("expected progress, got \(r1)")
+        }
+
+        // Chunk 0 last → completion.
+        let r0 = r.feed(envelope: makeEnv(
+            attachmentId: aid, index: 0, count: 2, totalSize: total, chunkBytes: part0
+        ), fromPeer: peer)
+        switch r0 {
+        case .complete(let comp):
+            let assembled = try Data(contentsOf: comp.url)
+            #expect(assembled == part0 + part1)
+            #expect(comp.sanitizedFilename == "doc.pdf")
+            #expect(comp.tier == .authorLeakingDoc)
+            // Cleanup so subsequent tests don't see the dir.
+            try? FileManager.default.removeItem(at: comp.url.deletingLastPathComponent())
+        default:
+            Issue.record("expected complete, got \(r0)")
+        }
+    }
+
+    /// Adversarial: sender claims chunk_count=64 but only ships 1 chunk.
+    /// Reassembler must time out and clean up partial state, not leak
+    /// storage. We force-expire the entry by reaching past `partialTTL`
+    /// with a custom now and confirm `staleEntries(now:)` flags it.
+    @Test("partial transfer (1 of 64) flagged stale and discarded")
+    func adversarialPartial() throws {
+        let r = AttachmentReassembler()
+        let aid = Data((0..<16).map { _ in UInt8.random(in: 0...UInt8.max) })
+        let peer = Data(repeating: 0xCC, count: 33)
+        // Sender claims 64 chunks but only sends one.
+        let chunk = Data(repeating: 0x42, count: 16)
+        let r0 = r.feed(envelope: makeEnv(
+            attachmentId: aid,
+            index: 0,
+            count: 64,
+            totalSize: UInt64(chunk.count) * 64,
+            chunkBytes: chunk,
+        ), fromPeer: peer)
+        if case .progress = r0 {} else {
+            Issue.record("expected progress, got \(r0)")
+        }
+        // No chunks 1..63 ever arrive. After partialTTL the entry is
+        // stale.
+        let future = Date().addingTimeInterval(AttachmentReassembler.partialTTL + 1)
+        let stale = r.staleEntries(now: future)
+        #expect(stale.count == 1)
+        #expect(stale.first?.attachmentId == aid)
+        // Discard wipes both the in-memory entry and the on-disk
+        // staging dir.
+        r.discard(peer: peer, attachmentId: aid)
+        // After discard, staleEntries returns empty.
+        #expect(r.staleEntries(now: future).isEmpty)
+        // And the directory is gone.
+        let dir = try AttachmentSandbox.inboundDirectory(forAttachmentId: aid)
+        let exists = (try? FileManager.default.attributesOfItem(atPath: dir.path)) != nil
+        // The next inboundDirectory call recreated it; the chunk file
+        // we wrote earlier should be gone.
+        let chunkFile = dir.appending(path: "chunk-00000.bin", directoryHint: .notDirectory)
+        #expect(!FileManager.default.fileExists(atPath: chunkFile.path))
+        if exists { try? FileManager.default.removeItem(at: dir) }
+    }
+
+    @Test("rejects mid-transfer if sender flips total_size")
+    func rejectsTotalSizeFlip() {
+        let r = AttachmentReassembler()
+        let aid = Data((0..<16).map { _ in UInt8.random(in: 0...UInt8.max) })
+        let peer = Data(repeating: 0xDD, count: 33)
+        _ = r.feed(envelope: makeEnv(
+            attachmentId: aid, index: 0, count: 2, totalSize: 200,
+            chunkBytes: Data(repeating: 0, count: 100),
+        ), fromPeer: peer)
+        // Now ship chunk 1 with a different total_size — paired peer
+        // trying to confuse reassembly. Drop.
+        let result = r.feed(envelope: makeEnv(
+            attachmentId: aid, index: 1, count: 2, totalSize: 999,
+            chunkBytes: Data(repeating: 0, count: 100),
+        ), fromPeer: peer)
+        #expect(result == .rejected(.attachmentIdMismatch))
+        // Cleanup.
+        r.discard(peer: peer, attachmentId: aid)
+    }
+
+    @Test("rejects when bytes summed don't match total_size")
+    func rejectsSizeMismatch() {
+        let r = AttachmentReassembler()
+        let aid = Data((0..<16).map { _ in UInt8.random(in: 0...UInt8.max) })
+        let peer = Data(repeating: 0xEE, count: 33)
+        // Both chunks consistent with total_size=300, but actual bytes
+        // sum to 200.
+        _ = r.feed(envelope: makeEnv(
+            attachmentId: aid, index: 0, count: 2, totalSize: 300,
+            chunkBytes: Data(repeating: 0, count: 100),
+        ), fromPeer: peer)
+        let result = r.feed(envelope: makeEnv(
+            attachmentId: aid, index: 1, count: 2, totalSize: 300,
+            chunkBytes: Data(repeating: 0, count: 100),
+        ), fromPeer: peer)
+        if case .rejected(let reason) = result {
+            #expect(reason == .sizeMismatch)
+        } else {
+            Issue.record("expected rejected(.sizeMismatch), got \(result)")
+        }
+        // Discard cleans up partial state.
+        r.discard(peer: peer, attachmentId: aid)
+    }
+}
+
+extension AttachmentReassembler.FeedResult: Equatable {
+    public static func == (lhs: AttachmentReassembler.FeedResult, rhs: AttachmentReassembler.FeedResult) -> Bool {
+        switch (lhs, rhs) {
+        case (.progress(let lr, let le), .progress(let rr, let re)):
+            return lr == rr && le == re
+        case (.complete(let lc), .complete(let rc)):
+            return lc.attachmentId == rc.attachmentId && lc.url == rc.url
+        case (.rejected(let lr), .rejected(let rr)):
+            return lr == rr
+        default:
+            return false
+        }
+    }
+}
+
+@Suite("OutboxStore.attachmentStatus")
+struct OutboxAttachmentRollupTests {
+    private func chunk(
+        attachmentId: Data,
+        idx: UInt32,
+        count: UInt32 = 3,
+        delivered: Bool = false,
+        relayed: Bool = false,
+        failed: Bool = false
+    ) -> OutboxEntry {
+        OutboxEntry(
+            messageId: Data((0..<16).map { _ in UInt8.random(in: 0...UInt8.max) }),
+            recipientPeerId: Data(repeating: 0xBB, count: 33),
+            sealedCiphertext: Data([0xCA]),
+            token: Data(),
+            ttl: 24 * 60 * 60,
+            sentAt: Date(),
+            retries: 0,
+            deliveredAt: delivered ? Date() : nil,
+            failedAt: failed ? Date() : nil,
+            relayedAt: relayed ? Date() : nil,
+            attachmentId: attachmentId,
+            chunkIndex: idx,
+            chunkCount: count,
+        )
+    }
+
+    @Test("all delivered → delivered (✓✓)")
+    func allDelivered() {
+        var s = OutboxStore.empty
+        let aid = Data(repeating: 0x01, count: 16)
+        for i in 0..<3 {
+            let e = chunk(attachmentId: aid, idx: UInt32(i), delivered: true, relayed: true)
+            s.entries[e.messageId] = e
+        }
+        #expect(s.attachmentStatus(forId: aid) == .delivered)
+    }
+
+    @Test("any failed → failed (✗) wins")
+    func anyFailed() {
+        var s = OutboxStore.empty
+        let aid = Data(repeating: 0x02, count: 16)
+        let e0 = chunk(attachmentId: aid, idx: 0, delivered: true, relayed: true)
+        let e1 = chunk(attachmentId: aid, idx: 1, failed: true)
+        let e2 = chunk(attachmentId: aid, idx: 2, relayed: true)
+        s.entries[e0.messageId] = e0
+        s.entries[e1.messageId] = e1
+        s.entries[e2.messageId] = e2
+        #expect(s.attachmentStatus(forId: aid) == .failed)
+    }
+
+    @Test("any pending → pending (⏳) over relayed")
+    func pendingWinsOverRelayed() {
+        var s = OutboxStore.empty
+        let aid = Data(repeating: 0x03, count: 16)
+        let e0 = chunk(attachmentId: aid, idx: 0, relayed: true)
+        let e1 = chunk(attachmentId: aid, idx: 1)  // pending
+        s.entries[e0.messageId] = e0
+        s.entries[e1.messageId] = e1
+        #expect(s.attachmentStatus(forId: aid) == .pending)
+    }
+
+    @Test("no entries → nil")
+    func noEntries() {
+        let s = OutboxStore.empty
+        #expect(s.attachmentStatus(forId: Data(repeating: 0x99, count: 16)) == nil)
+    }
+}

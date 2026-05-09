@@ -1,6 +1,7 @@
 import Foundation
 import PizziniCryptoCore
 import SwiftUI
+import UniformTypeIdentifiers
 import UserNotifications
 
 /// Coordinator: owns the libsignal `Session`, the `RelayClient`, the
@@ -53,6 +54,13 @@ final class ChatStore: NSObject {
     /// Periodic retry/TTL-expiry walk. Re-armed in `connectRelay` so
     /// each fresh socket gets one timer; cancelled on disconnect.
     private var retryTimer: Timer?
+    /// Phase 2 attachment reassembly state. Lives in-process: a force-
+    /// quit while a partial inbound is in flight loses the in-RAM
+    /// indices but the per-chunk files stay on disk under
+    /// `attachments/incoming/{aid}/`. The next push-driven launch
+    /// re-emits ACKs for any chunks that arrive again, and the 24h
+    /// disk TTL eventually GCs orphaned partials.
+    private let reassembler = AttachmentReassembler()
 
     override init() {
         self.state = Storage.loadAppState()
@@ -459,6 +467,257 @@ final class ChatStore: NSObject {
         } catch {
             appendSystem("Encrypt failed: \(error)", to: idx)
         }
+    }
+
+    /// Send a file attachment to `contact`. Phase 2 wire path: chunked
+    /// sealed envelopes (`.fileChunk` inner kind) keyed by a shared
+    /// `attachmentId`. Each chunk consumes one delivery token; a 10 MB
+    /// file is ~160 chunks → ~160 tokens. With `Contact.initialIssuance
+    /// = 1024` users can ship roughly six 10 MB files between refills,
+    /// which the maybeRequestRefill threshold (256) keeps lubricated
+    /// in steady state.
+    ///
+    /// Strip + chunk + encrypt happens off the main thread so the UI
+    /// stays responsive even on a multi-MB attachment with AVAsset
+    /// passes that take a couple of seconds. The post-prepared chunks
+    /// are submitted from the main actor as a sequence of
+    /// `relay.sendSealed` calls — one OutboxEntry per chunk, all
+    /// sharing the attachmentId for UI rollup via
+    /// `OutboxStore.attachmentStatus(forId:)`.
+    func sendFile(_ url: URL, to contact: Contact, caption: String?) {
+        guard let session,
+              let relay,
+              let idx = contactIndex(forIdentity: contact.identityPub)
+        else { return }
+        guard contact.sessionEstablished else {
+            appendSystem("Session not established yet — waiting for the other side to scan you.", to: idx)
+            return
+        }
+
+        // Sanitize the filename right at the boundary; we re-sanitize
+        // on receive too (defence in depth) but the sender side gets a
+        // clean rendering immediately and the wire bytes can never
+        // carry an RTL-override / path-separator name.
+        let rawFilename = url.lastPathComponent
+        let safeName = FilenameSanitizer.sanitize(rawFilename)
+        if AttachmentTierClassifier.isBlockedAtSend(filename: safeName) {
+            appendSystem(
+                "Can't send \(safeName): files of this type can run when tapped on iOS. Pizzini blocks them at send.",
+                to: idx,
+            )
+            return
+        }
+
+        // Preserve the recipient and contact identity OUT of the
+        // background closure — we'll re-resolve on the main hop after.
+        let peerId = contact.identityPub
+        let mime = mimeTypeForFilename(safeName)
+        let tier = AttachmentTierClassifier.tier(forFilename: safeName)
+        let ttlForChunks = state.contacts[idx].ttlSeconds
+        let captionText = caption?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // Off-main: read + (optionally) strip metadata. Tier-3
+            // strip on a 4K video can take seconds — keeping the UI
+            // responsive while it runs is non-negotiable.
+            let raw: Data
+            do {
+                raw = try Data(contentsOf: url, options: [.mappedIfSafe])
+            } catch {
+                Task { @MainActor [weak self] in
+                    self?.appendSystem("Couldn't read \(safeName): \(error)", to: idx)
+                }
+                return
+            }
+            let bytes: Data
+            do {
+                bytes = try MetadataStripper.stripped(
+                    raw, filename: safeName, mimeType: mime
+                )
+            } catch {
+                Task { @MainActor [weak self] in
+                    self?.appendSystem("Strip failed for \(safeName): \(error)", to: idx)
+                }
+                return
+            }
+            // Generate the attachmentId on the background hop — it's
+            // just 16 random bytes, no actor state needed.
+            var aidBytes = [UInt8](repeating: 0, count: 16)
+            _ = aidBytes.withUnsafeMutableBufferPointer { ptr in
+                SecRandomCopyBytes(kSecRandomDefault, ptr.count, ptr.baseAddress!)
+            }
+            let attachmentId = Data(aidBytes)
+            // Slice into chunks. Last chunk may be shorter than the
+            // target plaintext size; everything's u64 so a 4 GB-class
+            // attachment still indexes cleanly.
+            let chunkSize = FileChunkEnvelope.maxChunkPlaintextBytes
+            let totalSize = bytes.count
+            let chunkCount = max(1, (totalSize + chunkSize - 1) / chunkSize)
+            if UInt32(chunkCount) > FileChunkEnvelope.maxChunkCount {
+                Task { @MainActor [weak self] in
+                    self?.appendSystem(
+                        "\(safeName) is too large (\(totalSize) bytes; max \(FileChunkEnvelope.maxChunkPlaintextBytes * Int(FileChunkEnvelope.maxChunkCount)).",
+                        to: idx,
+                    )
+                }
+                return
+            }
+            var chunks: [Data] = []
+            chunks.reserveCapacity(chunkCount)
+            for i in 0..<chunkCount {
+                let start = i * chunkSize
+                let end = min(start + chunkSize, totalSize)
+                chunks.append(bytes.subdata(in: start..<end))
+            }
+            Task { @MainActor [weak self] in
+                self?.shipPreparedAttachment(
+                    contactId: peerId,
+                    attachmentId: attachmentId,
+                    sanitizedFilename: safeName,
+                    mime: mime,
+                    tier: tier,
+                    chunks: chunks,
+                    totalSize: UInt64(totalSize),
+                    ttl: ttlForChunks,
+                    captionText: captionText,
+                )
+            }
+        }
+    }
+
+    /// Main-actor continuation of `sendFile`: encrypts + dispatches each
+    /// chunk + records the chat row. Split out so the background read /
+    /// strip / chunk pass is a single self-contained closure.
+    @MainActor
+    private func shipPreparedAttachment(
+        contactId: Data,
+        attachmentId: Data,
+        sanitizedFilename: String,
+        mime: String,
+        tier: AttachmentTier,
+        chunks: [Data],
+        totalSize: UInt64,
+        ttl: UInt32,
+        captionText: String,
+    ) {
+        guard let session,
+              let relay,
+              let idx = contactIndex(forIdentity: contactId)
+        else { return }
+        // Token availability check — refuse the whole attachment up
+        // front rather than ship N chunks then bail mid-send. A 10 MB
+        // file = ~160 chunks; if the stash has 50 we should request a
+        // refill and abort, not trickle 50 partial chunks the receiver
+        // can't reassemble.
+        if state.contacts[idx].deliveryTokensForPeer.count < chunks.count {
+            appendSystem(
+                "Need \(chunks.count) tokens to send this file; only \(state.contacts[idx].deliveryTokensForPeer.count) on hand. Asking your peer for more.",
+                to: idx,
+            )
+            requestTokenRefill(from: state.contacts[idx], via: relay, session: session)
+            return
+        }
+
+        let chunkCountU32 = UInt32(chunks.count)
+        let now = Date()
+        // Encrypt + ship each chunk. We persist + send in one pass —
+        // crash mid-loop leaves outbox entries the retry walk re-sends
+        // on next launch (each chunk is its own OutboxEntry, so partial
+        // progress is a first-class state).
+        for i in 0..<chunks.count {
+            let envelope = FileChunkEnvelope(
+                attachmentId: attachmentId,
+                totalSize: totalSize,
+                chunkIndex: UInt32(i),
+                chunkCount: chunkCountU32,
+                mime: mime,
+                filename: sanitizedFilename,
+                chunkBytes: chunks[i],
+            )
+            var inner = Data([RelayClient.InnerEnvelopeKind.fileChunk.rawValue])
+            inner.append(envelope.encode())
+
+            let messageId = Self.makeMessageId()
+            do {
+                let sealed = try session.encryptSealed(
+                    peer: contactId,
+                    messageId: messageId,
+                    plaintext: inner,
+                )
+                // Pop a token AFTER successful encrypt so an encrypt
+                // failure doesn't burn one. Same shape as `send(_:to:)`.
+                guard let token = popDeliveryToken(forContactAt: idx) else {
+                    appendSystem(
+                        "Token stash exhausted mid-attachment after \(i)/\(chunks.count) chunks.",
+                        to: idx,
+                    )
+                    return
+                }
+                var entry = OutboxEntry(
+                    messageId: messageId,
+                    recipientPeerId: contactId,
+                    sealedCiphertext: sealed,
+                    token: token,
+                    ttl: TimeInterval(ttl),
+                    sentAt: now,
+                    retries: 0,
+                    deliveredAt: nil,
+                    failedAt: nil,
+                    relayedAt: nil,
+                    attachmentId: attachmentId,
+                    chunkIndex: UInt32(i),
+                    chunkCount: chunkCountU32,
+                )
+                outbox.entries[messageId] = entry
+                Storage.persist(outbox: outbox)
+                persistSession()
+                relay.sendSealed(
+                    toPeer: contactId,
+                    sealedCiphertext: sealed,
+                    ttlSeconds: ttl,
+                    token: token,
+                )
+                entry.relayedAt = now
+                entry.token = Data() // F-505: scrub once relayed
+                outbox.entries[messageId] = entry
+                Storage.persist(outbox: outbox)
+            } catch {
+                appendSystem("Encrypt failed at chunk \(i)/\(chunks.count): \(error)", to: idx)
+                return
+            }
+        }
+
+        // Record one chat row (not N — the user sees one attachment).
+        let info = AttachmentInfo(
+            attachmentId: attachmentId,
+            filename: sanitizedFilename,
+            byteSize: totalSize,
+            mime: mime,
+            tier: tier,
+            sandboxRelativePath: nil, // outbound: we don't keep a sandbox copy
+            isInbound: false,
+        )
+        let row = PersistedMessage(
+            side: .me,
+            text: captionText,
+            kind: .attachment,
+            bytes: Int(totalSize),
+            attachment: info,
+        )
+        state.contacts[idx].log.append(row)
+        state.contacts[idx].lastMessageAt = row.timestamp
+        persistAll()
+        maybeRequestRefill(forContactAt: idx, via: relay, session: session)
+    }
+
+    /// Map a sanitized filename to the best-guess MIME / UTI string.
+    /// Recipient treats this as informational only; classification is
+    /// re-derived from the filename extension on receive.
+    private nonisolated func mimeTypeForFilename(_ name: String) -> String {
+        guard let ext = FilenameSanitizer.trailingExtension(of: name)?.lowercased(),
+              let type = UTType(filenameExtension: ext)
+        else { return "application/octet-stream" }
+        return type.preferredMIMEType ?? type.identifier
     }
 
     /// Pop one token from `contact.deliveryTokensForPeer`. Persists.
@@ -952,6 +1211,14 @@ extension ChatStore: RelayClientDelegate {
             self.issueTokens(for: received.peer, via: client, session: session)
         case .readReceipt:
             self.handleReadReceiptPayload(payload, contactIdx: idx)
+        case .fileChunk:
+            self.handleFileChunkPayload(
+                payload,
+                contactIdx: idx,
+                fromPeer: received.peer,
+                ackId: received.messageId,
+                via: client,
+            )
         }
         // Defensive: an ACK arriving on the SEND channel would have
         // landed in the chat path above unless its inner-kind byte is
@@ -975,6 +1242,100 @@ extension ChatStore: RelayClientDelegate {
         self.persistAll()
         // Emit an ACK so the sender's outbox (Phase 4) can flip ✓→✓✓.
         self.emitAck(for: ackId, toPeer: state.contacts[idx].identityPub, via: client)
+    }
+
+    @MainActor
+    private func handleFileChunkPayload(
+        _ payload: Data,
+        contactIdx idx: Int,
+        fromPeer peer: Data,
+        ackId: Data,
+        via client: RelayClient,
+    ) {
+        let envelope: FileChunkEnvelope
+        do {
+            envelope = try FileChunkEnvelope.decode(Data(payload))
+        } catch {
+            // Malformed chunk — paired peer, malicious or buggy.
+            // Surface as a system row so the user knows something
+            // tried but couldn't be parsed; the ratchet step has
+            // already happened upstream so drop further work.
+            appendSystem(
+                "Got a malformed file chunk from \(state.contacts[idx].displayName). Dropped.",
+                to: idx,
+            )
+            // Still ACK so the sender's outbox doesn't retry forever.
+            emitAck(for: ackId, toPeer: peer, via: client)
+            return
+        }
+        let outcome = reassembler.feed(envelope: envelope, fromPeer: peer)
+        switch outcome {
+        case .progress:
+            // Mid-attachment — quiet. Sender will see ✓✓ for each
+            // chunk landing as the ACKs flow back; we don't surface
+            // intermediate progress to avoid log noise.
+            break
+        case .complete(let completion):
+            let safeName = completion.sanitizedFilename
+            let relPath = sandboxRelativePath(forURL: completion.url)
+            let info = AttachmentInfo(
+                attachmentId: completion.attachmentId,
+                filename: safeName,
+                byteSize: completion.totalSize,
+                mime: completion.mime,
+                tier: completion.tier,
+                sandboxRelativePath: relPath,
+                isInbound: true,
+            )
+            let row = PersistedMessage(
+                side: .peer,
+                text: "",   // captions are sender's chat-message; receiver sees attachment row only.
+                kind: .attachment,
+                bytes: Int(completion.totalSize),
+                attachment: info,
+            )
+            state.contacts[idx].log.append(row)
+            state.contacts[idx].lastMessageAt = row.timestamp
+            state.contacts[idx].sessionEstablished = true
+            persistAll()
+            NSLog(
+                "[pizzini] received attachment \(safeName) (\(completion.totalSize) bytes, tier=\(completion.tier.rawValue))"
+            )
+        case .rejected(let reason):
+            NSLog("[pizzini] reassembler rejected chunk: \(reason)")
+        }
+        // Always ACK — the sender needs to flip ✓→✓✓ on every chunk
+        // it submitted, regardless of reassembler outcome. Duplicates
+        // are handled by libsignal's seal_receive (this handler isn't
+        // even called for ratchet-level dups; the upstream
+        // `received.isDuplicate` branch re-emits the ACK there).
+        emitAck(for: ackId, toPeer: peer, via: client)
+    }
+
+    /// Convert a sandbox-rooted URL to its relative path under
+    /// `attachments/`. Stored on `AttachmentInfo` so a future SQLCipher
+    /// migration that relocates the sandbox doesn't strand existing
+    /// rows. Returns nil for URLs outside the sandbox (treat as a
+    /// programmer bug — log + nil rather than persist a brittle path).
+    private func sandboxRelativePath(forURL url: URL) -> String? {
+        guard let root = try? AttachmentSandbox.root() else { return nil }
+        let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        let p = url.path
+        guard p.hasPrefix(rootPath) else {
+            NSLog("[pizzini] attachment URL not under sandbox: \(p)")
+            return nil
+        }
+        return String(p.dropFirst(rootPath.count))
+    }
+
+    /// Resolve an `AttachmentInfo.sandboxRelativePath` back to an
+    /// absolute URL. Used by the receive UI to present
+    /// `UIDocumentInteractionController`.
+    func attachmentURL(for info: AttachmentInfo) -> URL? {
+        guard let rel = info.sandboxRelativePath,
+              let root = try? AttachmentSandbox.root()
+        else { return nil }
+        return root.appending(path: rel, directoryHint: .notDirectory)
     }
 
     @MainActor
@@ -1096,6 +1457,28 @@ extension ChatStore: RelayClientDelegate {
         }
 
         if changed { Storage.persist(outbox: outbox) }
+
+        // 4. Reassembler stale cleanup. A malicious sender shipping
+        // chunk_count=1024 then 1 chunk would otherwise pin a partial
+        // dir until the user resets the app. The reassembler stamps
+        // each pending entry with `expiresAt = now + partialTTL` (24h);
+        // we reap here on the same 30s tick so the leak is bounded.
+        let staleAttachments = reassembler.staleEntries(now: now)
+        for stale in staleAttachments {
+            NSLog(
+                "[pizzini] discarding stale partial attachment from \(short(stale.peer)): \(stale.claimedFilename)"
+            )
+            reassembler.discard(peer: stale.peer, attachmentId: stale.attachmentId)
+        }
+
+        // 5. Sandbox cleanup: drop assembled attachment files older
+        // than the per-chat TTL (the chat row stays as a record but
+        // the bytes are gone). 7d hard cap matches the relay's per-
+        // message TTL ceiling; longer would let an attacker who
+        // compromises the device read material that should have
+        // already been cryptographically erased.
+        let sandboxCutoff = now.addingTimeInterval(-7 * 24 * 60 * 60)
+        _ = AttachmentSandbox.cleanup(olderThan: sandboxCutoff)
     }
 
     @MainActor

@@ -34,6 +34,76 @@ struct OutboxEntry: Codable, Sendable {
     /// `deliveredAt == nil && relayedAt != nil` is the visible
     /// "single tick" state.
     var relayedAt: Date?
+
+    // MARK: - Phase 2 chunked-attachment grouping
+    /// 16-byte attachment id when this entry is a single chunk of a
+    /// chunked attachment send. Nil for plain chat / ack / token-refill
+    /// / read-receipt entries. Multiple OutboxEntries share the same
+    /// `attachmentId`; the UI rolls up per-attachment status across
+    /// chunks via `OutboxStore.attachmentStatus(forId:)`.
+    var attachmentId: Data?
+    /// 0-based chunk index in the attachment. Nil when `attachmentId`
+    /// is nil. Encoded with `encodeIfPresent` so non-attachment entries
+    /// don't grow the JSON.
+    var chunkIndex: UInt32?
+    /// Total chunk count for this attachment. Nil when attachmentId is
+    /// nil. Captured per-entry rather than referenced from a single
+    /// shared record so a future SQLCipher migration can drop the
+    /// JSON-blob OutboxStore without losing the grouping math.
+    var chunkCount: UInt32?
+
+    private enum CodingKeys: String, CodingKey {
+        case messageId, recipientPeerId, sealedCiphertext, token, ttl, sentAt
+        case retries, deliveredAt, failedAt, relayedAt
+        case attachmentId, chunkIndex, chunkCount
+    }
+
+    init(
+        messageId: Data,
+        recipientPeerId: Data,
+        sealedCiphertext: Data,
+        token: Data,
+        ttl: TimeInterval,
+        sentAt: Date,
+        retries: Int,
+        deliveredAt: Date?,
+        failedAt: Date?,
+        relayedAt: Date?,
+        attachmentId: Data? = nil,
+        chunkIndex: UInt32? = nil,
+        chunkCount: UInt32? = nil
+    ) {
+        self.messageId = messageId
+        self.recipientPeerId = recipientPeerId
+        self.sealedCiphertext = sealedCiphertext
+        self.token = token
+        self.ttl = ttl
+        self.sentAt = sentAt
+        self.retries = retries
+        self.deliveredAt = deliveredAt
+        self.failedAt = failedAt
+        self.relayedAt = relayedAt
+        self.attachmentId = attachmentId
+        self.chunkIndex = chunkIndex
+        self.chunkCount = chunkCount
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.messageId = try c.decode(Data.self, forKey: .messageId)
+        self.recipientPeerId = try c.decode(Data.self, forKey: .recipientPeerId)
+        self.sealedCiphertext = try c.decode(Data.self, forKey: .sealedCiphertext)
+        self.token = try c.decode(Data.self, forKey: .token)
+        self.ttl = try c.decode(TimeInterval.self, forKey: .ttl)
+        self.sentAt = try c.decode(Date.self, forKey: .sentAt)
+        self.retries = try c.decode(Int.self, forKey: .retries)
+        self.deliveredAt = try c.decodeIfPresent(Date.self, forKey: .deliveredAt)
+        self.failedAt = try c.decodeIfPresent(Date.self, forKey: .failedAt)
+        self.relayedAt = try c.decodeIfPresent(Date.self, forKey: .relayedAt)
+        self.attachmentId = try c.decodeIfPresent(Data.self, forKey: .attachmentId)
+        self.chunkIndex = try c.decodeIfPresent(UInt32.self, forKey: .chunkIndex)
+        self.chunkCount = try c.decodeIfPresent(UInt32.self, forKey: .chunkCount)
+    }
 }
 
 extension OutboxEntry {
@@ -119,5 +189,24 @@ struct OutboxStore: Codable, Sendable {
         entries.values
             .filter { $0.shouldRetry(now: now) }
             .sorted { $0.sentAt < $1.sentAt }
+    }
+
+    /// Roll up status across every chunk that belongs to a chunked
+    /// attachment. Used by the chat row to drive ⏳/✓/✓✓/✗ for the
+    /// attachment as a whole rather than its individual chunks (the
+    /// user just sees "the photo"; the chunk count is plumbing).
+    /// Status precedence (worst-wins):
+    ///   `failed` > `pending` > `relayed` > `delivered`
+    /// — that matches how the user reads the row: any failure ✗ wins,
+    /// otherwise the slowest tier across chunks. An attachment with
+    /// no entries (already GC'd post-delivery) returns nil; the row
+    /// falls back to "no status" which is fine post-completion.
+    func attachmentStatus(forId attachmentId: Data) -> OutboxEntry.Status? {
+        let chunks = entries.values.filter { $0.attachmentId == attachmentId }
+        guard !chunks.isEmpty else { return nil }
+        if chunks.contains(where: { $0.status == .failed }) { return .failed }
+        if chunks.contains(where: { $0.status == .pending }) { return .pending }
+        if chunks.contains(where: { $0.status == .relayed }) { return .relayed }
+        return .delivered
     }
 }

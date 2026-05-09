@@ -214,7 +214,7 @@ struct ChatRow: View {
     private var bubbleColor: Color {
         switch entry.kind {
         case .system: return Color.gray.opacity(0.15)
-        case .preKey, .whisper:
+        case .preKey, .whisper, .attachment:
             return entry.side == .me
                 ? Color.blue.opacity(0.18)
                 : Color.green.opacity(0.18)

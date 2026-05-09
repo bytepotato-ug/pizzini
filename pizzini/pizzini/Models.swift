@@ -9,6 +9,36 @@ enum ChatMessageKind: String, Codable, Sendable {
     case preKey
     case whisper
     case system
+    /// An incoming or outgoing attachment row. The text field carries
+    /// the optional caption (or "" if the user sent a bare file). All
+    /// the attachment-specific metadata lives on the `attachment`
+    /// optional.
+    case attachment
+}
+
+/// Per-attachment metadata attached to a `PersistedMessage` whose kind
+/// is `.attachment`. Hangs off the chat row so a single ChatRow can
+/// render the filename / size / tier banner / save-to-Files action
+/// without re-deriving from the outbox or the sandbox.
+///
+/// `sandboxRelativePath` is relative to `AttachmentSandbox.root()`. We
+/// store the relative form rather than an absolute URL so a future
+/// SQLCipher migration that sandbox-relocates the directory doesn't
+/// strand existing rows.
+struct AttachmentInfo: Codable, Sendable, Equatable {
+    let attachmentId: Data
+    let filename: String
+    let byteSize: UInt64
+    let mime: String
+    let tier: AttachmentTier
+    /// Filesystem path relative to `AttachmentSandbox.root()`. Nil for
+    /// outbound rows where the sandbox copy was already cleaned up
+    /// post-TTL — the chat row stays as a record but the bytes are gone.
+    var sandboxRelativePath: String?
+    /// True for attachments we received and reassembled on this device;
+    /// false for attachments we sent. Drives row layout (warning banner
+    /// only on inbound rows; outbound rows show their post-strip status).
+    let isInbound: Bool
 }
 
 struct PersistedMessage: Codable, Identifiable, Sendable {
@@ -26,6 +56,10 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
     /// covering this message. Drives the "Read" indicator in the chat
     /// row. Nil unless the recipient has read receipts on for us.
     var readAt: Date?
+    /// Attachment metadata for `kind == .attachment` rows. Nil for
+    /// every other kind. Decoded with `decodeIfPresent` so prior
+    /// non-attachment-aware Keychain blobs continue to load.
+    var attachment: AttachmentInfo?
 
     init(
         id: UUID = UUID(),
@@ -35,7 +69,8 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
         bytes: Int,
         timestamp: Date = Date(),
         messageId: Data? = nil,
-        readAt: Date? = nil
+        readAt: Date? = nil,
+        attachment: AttachmentInfo? = nil
     ) {
         self.id = id
         self.side = side
@@ -45,10 +80,11 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
         self.timestamp = timestamp
         self.messageId = messageId
         self.readAt = readAt
+        self.attachment = attachment
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, side, text, kind, bytes, timestamp, messageId, readAt
+        case id, side, text, kind, bytes, timestamp, messageId, readAt, attachment
     }
 
     init(from decoder: Decoder) throws {
@@ -61,6 +97,7 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
         self.timestamp = try c.decode(Date.self, forKey: .timestamp)
         self.messageId = try c.decodeIfPresent(Data.self, forKey: .messageId)
         self.readAt = try c.decodeIfPresent(Date.self, forKey: .readAt)
+        self.attachment = try c.decodeIfPresent(AttachmentInfo.self, forKey: .attachment)
     }
 }
 

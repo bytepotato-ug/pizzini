@@ -239,6 +239,17 @@ private struct ContactRow: View {
         case .preKey, .whisper:
             let prefix = msg.side == .me ? "you: " : ""
             return prefix + msg.text
+        case .attachment:
+            let prefix = msg.side == .me ? "you: " : ""
+            let name = msg.attachment?.filename ?? "file"
+            // The contacts list preview doesn't show the caption in
+            // its own line, but the line below is dense enough — name
+            // first wins because that's what the user is looking for
+            // when scanning the list.
+            if msg.text.isEmpty {
+                return "\(prefix)📎 \(name)"
+            }
+            return "\(prefix)📎 \(name) — \(msg.text)"
         }
     }
 }

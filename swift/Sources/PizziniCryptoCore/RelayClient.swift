@@ -69,6 +69,15 @@ public final class RelayClient: @unchecked Sendable {
         case ack = 0x02
         case tokenRefillRequest = 0x03
         case readReceipt = 0x04
+        /// Chunked file transfer (Phase 2). Each chunk rides a *separate*
+        /// sealed envelope (its own per-chunk replay nonce + delivery
+        /// token), but the inner plaintext carries a 16-byte
+        /// `attachmentId` shared across the whole file so the receiver
+        /// can reassemble. See `FileChunkEnvelope` in the iOS app for
+        /// the exact wire layout. Chosen over a relay-layer chunked-
+        /// frame type because adding a new outer frame would leak chunk
+        /// count + total size to the relay; sealed-sender hides them.
+        case fileChunk = 0x05
     }
     private static let frameTypeHello: UInt8 = 1
     private static let frameTypeSend: UInt8 = 2
