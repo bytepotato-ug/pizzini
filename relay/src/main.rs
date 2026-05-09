@@ -51,17 +51,29 @@
 //! For our stateless relay, both peers must be online for first contact.
 //! ```
 //!
-//! Stateless: if the recipient is not currently connected, the SEND
-//! payload is dropped (no queue, no ack, no retry). If the recipient
-//! has previously REGISTER_PUSH'd, we additionally fire a payload-opaque
-//! "New message" push via APNs as a wake-up. The push carries no peer
-//! information — see `apns.rs` for the threat-model rationale.
+//! Stateless-ish: if the recipient is not currently connected, the SEND
+//! frame is held in an *ephemeral, in-memory* per-peer queue (capped
+//! size, capped age — no disk persistence, process restart wipes
+//! everything). When the recipient HELLOs, the queue drains in order.
+//! Bundle frames are NOT queued — bundle exchange is a first-contact
+//! handshake and both peers must be online for it.
+//!
+//! The queue is consistent with the "stateless server" hard rule: there
+//! are no per-user accounts, no long-term state, no on-disk records that
+//! survive a process restart. The queue only buffers in-flight encrypted
+//! routing frames the relay was already going to forward — same
+//! threat-profile as the live route table itself.
+//!
+//! Push remains a wake-up: if APNs is configured and the recipient has
+//! REGISTER_PUSH'd, we fire a payload-opaque "New message" push so iOS
+//! brings the app forward. On reconnect, the queue drains.
 
 mod apns;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -82,12 +94,32 @@ const MAX_FRAME_BYTES: u32 = 1024 * 1024;
 /// this so we don't memo absurd buffers per peer.
 const MAX_PUSH_TOKEN_BYTES: usize = 256;
 
+/// Per-peer pending-queue caps. The queue is purely in-memory; these
+/// caps bound RAM use and the post-seizure leak surface. 24h matches
+/// what a journalist/activist might reasonably go offline for; 100
+/// frames is a generous chat burst.
+const MAX_PENDING_PER_PEER: usize = 100;
+const PENDING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How often the GC task scans every per-peer queue for expired entries.
+const PENDING_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
 type PeerId = Vec<u8>;
 type Outbox = mpsc::UnboundedSender<Vec<u8>>;
 type Routes = Arc<Mutex<HashMap<PeerId, Outbox>>>;
 /// Lives across reconnects — that's the whole point: we look up the
 /// token when the recipient is *not* currently connected.
 type PushTokens = Arc<Mutex<HashMap<PeerId, Vec<u8>>>>;
+
+/// One queued routing frame. The body is the entire SEND frame as it
+/// would have been forwarded — including the leading frame_type byte
+/// and the to/from header — so we can hand it verbatim to the
+/// recipient's writer task on reconnect.
+struct PendingFrame {
+    bytes: Vec<u8>,
+    queued_at: Instant,
+}
+
+type Pending = Arc<Mutex<HashMap<PeerId, VecDeque<PendingFrame>>>>;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -106,7 +138,10 @@ async fn main() -> std::io::Result<()> {
             println!("  reachable from LAN at {ip}:{PORT}");
         }
     }
-    println!("  DEV BUILD — clearnet, no queueing, no auth. Tor-only in prod.");
+    println!(
+        "  DEV BUILD — clearnet, no auth, ephemeral in-memory queue (cap={MAX_PENDING_PER_PEER}/peer, ttl={}h). Tor-only in prod.",
+        PENDING_TTL.as_secs() / 3600,
+    );
 
     let apns = match ApnsConfig::from_env() {
         Ok(Some(cfg)) => match ApnsClient::new(cfg) {
@@ -133,15 +168,21 @@ async fn main() -> std::io::Result<()> {
 
     let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
     let push_tokens: PushTokens = Arc::new(Mutex::new(HashMap::new()));
+    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+
+    spawn_pending_gc(pending.clone());
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         let routes = routes.clone();
         let push_tokens = push_tokens.clone();
+        let pending = pending.clone();
         let apns = apns.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(stream, routes, push_tokens, apns, peer_addr).await
+            if let Err(e) = handle_connection(
+                stream, routes, push_tokens, pending, apns, peer_addr,
+            )
+            .await
             {
                 eprintln!("[{peer_addr}] connection closed: {e}");
             }
@@ -149,10 +190,40 @@ async fn main() -> std::io::Result<()> {
     }
 }
 
+/// Background task that walks every per-peer queue and drops entries
+/// older than `PENDING_TTL`. Entries arrive in queue order so we can
+/// stop scanning a peer's deque on the first non-expired entry.
+fn spawn_pending_gc(pending: Pending) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(PENDING_GC_INTERVAL);
+        loop {
+            tick.tick().await;
+            let now = Instant::now();
+            let mut map = pending.lock().await;
+            map.retain(|peer_id, queue| {
+                while let Some(front) = queue.front() {
+                    if now.duration_since(front.queued_at) >= PENDING_TTL {
+                        queue.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                if queue.is_empty() {
+                    println!("pending: GC dropped empty queue for {}", short_hex(peer_id));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    });
+}
+
 async fn handle_connection(
     stream: TcpStream,
     routes: Routes,
     push_tokens: PushTokens,
+    pending: Pending,
     apns: Option<Arc<ApnsClient>>,
     peer_addr: SocketAddr,
 ) -> std::io::Result<()> {
@@ -193,8 +264,17 @@ async fn handle_connection(
         // owning `handle_connection` — it knows which entry was ours.
     });
 
-    let read_result =
-        read_loop(&mut reader, &routes, &push_tokens, apns.clone(), &peer_id).await;
+    drain_pending(&peer_id, &pending, &routes).await;
+
+    let read_result = read_loop(
+        &mut reader,
+        &routes,
+        &push_tokens,
+        &pending,
+        apns.clone(),
+        &peer_id,
+    )
+    .await;
 
     // Read side closed → this connection is done. Remove our route entry
     // *if* it still belongs to us (a newer HELLO from the same peer would
@@ -218,6 +298,7 @@ async fn read_loop(
     reader: &mut (impl AsyncReadExt + Unpin),
     routes: &Routes,
     push_tokens: &PushTokens,
+    pending: &Pending,
     apns: Option<Arc<ApnsClient>>,
     self_id: &[u8],
 ) -> std::io::Result<()> {
@@ -285,19 +366,90 @@ async fn read_loop(
                     );
                 } else {
                     drop(map);
-                    println!(
-                        "drop frame {} → {}: recipient offline",
-                        short_hex(&parsed.from_id),
-                        short_hex(&parsed.to_id),
-                    );
                     if frame[0] == FRAME_TYPE_SEND {
+                        // Recipient offline → queue the ciphertext (in-memory,
+                        // capped, TTL'd) and fire a payload-opaque push so iOS
+                        // wakes the app. On the recipient's next HELLO,
+                        // `drain_pending` flushes the queue.
+                        enqueue_pending(&parsed.to_id, frame, pending).await;
+                        println!(
+                            "queued {} → {}: recipient offline",
+                            short_hex(&parsed.from_id),
+                            short_hex(&parsed.to_id),
+                        );
                         maybe_send_push(&parsed.to_id, push_tokens, apns.as_ref()).await;
+                    } else {
+                        // BUNDLE_REQUEST / BUNDLE_RESPONSE are first-contact
+                        // handshake frames — both peers must be online to
+                        // exchange a fresh PreKey bundle. Queueing makes no
+                        // sense here.
+                        println!(
+                            "drop frame type={} {} → {}: recipient offline (bundle)",
+                            frame[0],
+                            short_hex(&parsed.from_id),
+                            short_hex(&parsed.to_id),
+                        );
                     }
                 }
             }
             other => return Err(invalid(&format!("unknown frame type {other}"))),
         }
     }
+}
+
+async fn enqueue_pending(recipient: &[u8], frame: Vec<u8>, pending: &Pending) {
+    let mut map = pending.lock().await;
+    let queue = map.entry(recipient.to_vec()).or_default();
+    // Per-peer cap is a DoS safeguard: an attacker spraying SEND at a
+    // long-offline peer should not be able to balloon our memory. Drop
+    // oldest first; the recipient will at least see the most recent
+    // messages on reconnect.
+    while queue.len() >= MAX_PENDING_PER_PEER {
+        queue.pop_front();
+    }
+    queue.push_back(PendingFrame {
+        bytes: frame,
+        queued_at: Instant::now(),
+    });
+}
+
+/// Called right after a peer's HELLO is processed and their route is
+/// installed. Forwards every non-expired queued frame to their writer
+/// task in arrival order, then drops the (now-empty) queue entry.
+async fn drain_pending(peer_id: &[u8], pending: &Pending, routes: &Routes) {
+    let queue = {
+        let mut map = pending.lock().await;
+        map.remove(peer_id)
+    };
+    let Some(queue) = queue else { return };
+    if queue.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let routes_map = routes.lock().await;
+    let Some(target) = routes_map.get(peer_id) else { return };
+    let mut forwarded = 0usize;
+    let mut expired = 0usize;
+    for entry in queue {
+        if now.duration_since(entry.queued_at) >= PENDING_TTL {
+            expired += 1;
+            continue;
+        }
+        if target.send(entry.bytes).is_err() {
+            // Writer task is gone (race with disconnect). Stop draining
+            // — the recipient effectively isn't connected anymore. Any
+            // remaining entries are dropped because we already removed
+            // the queue from `pending`. That's a knowing tradeoff
+            // against the alternative of partial reinsertion, which
+            // adds complexity for a rare race.
+            break;
+        }
+        forwarded += 1;
+    }
+    println!(
+        "drained pending for {}: forwarded={forwarded} expired={expired}",
+        short_hex(peer_id),
+    );
 }
 
 /// Look up the recipient's push token; if present and APNs is configured,
