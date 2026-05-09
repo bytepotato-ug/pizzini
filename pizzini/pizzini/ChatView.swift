@@ -380,8 +380,12 @@ struct ChatRow: View {
 
     var body: some View {
         HStack(alignment: .bottom) {
-            if entry.side == .peer { Spacer(minLength: 32) }
-            VStack(alignment: entry.side == .me ? .leading : .trailing, spacing: 4) {
+            // Standard chat-app convention: my messages on the right,
+            // peer's on the left. Spacer goes BEFORE my row's content
+            // (pushing it right) and AFTER the peer's (leaving it
+            // anchored to the leading edge).
+            if entry.side == .me { Spacer(minLength: 32) }
+            VStack(alignment: entry.side == .me ? .trailing : .leading, spacing: 4) {
                 if entry.kind == .attachment, let info = entry.attachment {
                     AttachmentRowCard(
                         info: info,
@@ -401,7 +405,7 @@ struct ChatRow: View {
                 }
                 metadata
             }
-            if entry.side == .me { Spacer(minLength: 32) }
+            if entry.side == .peer { Spacer(minLength: 32) }
         }
     }
 
@@ -511,10 +515,18 @@ struct AttachmentRowCard: View {
                 Text(captionText)
                     .font(.callout)
             }
+            // Receive-side banner only on inbound rows — the sender
+            // already saw the attach-time warning at compose time, no
+            // value re-litigating it on the outbound row.
             if info.isInbound, let banner = receiveBanner {
                 bannerView(banner)
             }
-            if info.isInbound {
+            // Save-to-Files / Preview show on BOTH sides as long as
+            // the sandbox copy still exists. The cleanup pass GCs
+            // outbound copies after the 7-day TTL same as inbound;
+            // post-cleanup the row stays as a chat record but the
+            // bytes are gone, and `resolveURL` will return nil.
+            if resolveURL(info) != nil {
                 HStack(spacing: 8) {
                     saveToFilesButton
                     if quickLookEnabled {

@@ -573,6 +573,33 @@ final class ChatStore: NSObject {
                 let end = min(start + chunkSize, totalSize)
                 working.append(bytes.subdata(in: start..<end))
             }
+            // Stage a copy of the post-strip bytes under the outbound
+            // sandbox so the sender's row can present Save-to-Files /
+            // Preview after send. Subject to the 7d sandbox TTL like
+            // inbound attachments — chat row stays past that, just
+            // without the bytes. Failure to write is non-fatal: the
+            // chunked send still proceeds, the row just won't have a
+            // viewable URL on the sender side.
+            let outboundRelPath: String? = {
+                guard let dir = try? AttachmentSandbox.outboundDirectory(
+                    forAttachmentId: attachmentId,
+                ) else { return nil }
+                let url = dir.appending(path: safeName, directoryHint: .notDirectory)
+                do {
+                    try bytes.write(
+                        to: url,
+                        options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication],
+                    )
+                } catch {
+                    NSLog("[pizzini] outbound sandbox write failed: \(error)")
+                    return nil
+                }
+                guard let root = try? AttachmentSandbox.root() else { return nil }
+                let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
+                return url.path.hasPrefix(rootPath)
+                    ? String(url.path.dropFirst(rootPath.count))
+                    : nil
+            }()
             // Swift 6 strict-concurrency: a `Task { @MainActor in ... }`
             // closure runs on a different executor and can't capture a
             // `var`. Bind the prepared chunks to an immutable `let`
@@ -589,6 +616,7 @@ final class ChatStore: NSObject {
                     totalSize: UInt64(totalSize),
                     ttl: ttlForChunks,
                     captionText: captionText,
+                    sandboxRelPath: outboundRelPath,
                 )
             }
         }
@@ -608,6 +636,7 @@ final class ChatStore: NSObject {
         totalSize: UInt64,
         ttl: UInt32,
         captionText: String,
+        sandboxRelPath: String?,
     ) {
         guard let session,
               let relay,
@@ -703,7 +732,7 @@ final class ChatStore: NSObject {
             byteSize: totalSize,
             mime: mime,
             tier: tier,
-            sandboxRelativePath: nil, // outbound: we don't keep a sandbox copy
+            sandboxRelativePath: sandboxRelPath,
             isInbound: false,
         )
         let row = PersistedMessage(
