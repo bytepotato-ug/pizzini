@@ -24,7 +24,6 @@ struct ChatView: View {
                     Divider()
                 }
                 messages(for: contact)
-                Divider()
                 composer(disabled: !contact.sessionEstablished)
             }
             .navigationTitle(contact.displayName)
@@ -116,6 +115,14 @@ struct ChatView: View {
                 }
                 .padding(.horizontal)
                 .padding(.vertical, 12)
+            }
+            .onAppear {
+                // Jump (no animation) to the latest message when the
+                // chat opens. Animating here looks janky because the
+                // ScrollView lays out mid-scroll.
+                if let last = contact.log.last {
+                    proxy.scrollTo(last.id, anchor: .bottom)
+                }
             }
             .onChange(of: contact.log.count) { _, _ in
                 if let last = contact.log.last {
