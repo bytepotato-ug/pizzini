@@ -47,6 +47,25 @@ for t in "${ALL_TARGETS[@]}"; do target_args+=(--target "$t"); done
 # default is iOS 10, which is incompatible with blake3's NEON path
 # (links against `___chkstk_darwin`, present only since iOS 14).
 export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-17.0}"
+
+# Crates with C/asm sources (notably blake3's NEON assembly) bake the
+# deployment target into the Mach-O `.o` header at build time. cargo
+# doesn't treat env-var changes as a rebuild trigger, so a build that
+# ran once without IPHONEOS_DEPLOYMENT_TARGET set sticks with the
+# wrong header forever — Xcode then warns "Object file was built for
+# newer iOS version (26.0) than being linked (17.0)" on every link.
+# Stamp the iOS targets with the current value; if it changes, force
+# a clean of the affected crates so they pick it up.
+target_marker="$TARGET_DIR/.iphoneos-deployment-target"
+if [[ ! -f "$target_marker" || "$(cat "$target_marker")" != "$IPHONEOS_DEPLOYMENT_TARGET" ]]; then
+    echo "==> IPHONEOS_DEPLOYMENT_TARGET changed (-> $IPHONEOS_DEPLOYMENT_TARGET); forcing native-code rebuild"
+    for t in "${ALL_TARGETS[@]}"; do
+        cargo clean -p blake3 -p signal-crypto -p libsignal-protocol --target "$t" 2>/dev/null || true
+    done
+    mkdir -p "$TARGET_DIR"
+    echo -n "$IPHONEOS_DEPLOYMENT_TARGET" > "$target_marker"
+fi
+
 cargo build -p pizzini-crypto-core $CARGO_PROFILE_FLAG "${target_args[@]}"
 
 echo "==> Lipoing simulator slices into a fat archive"
