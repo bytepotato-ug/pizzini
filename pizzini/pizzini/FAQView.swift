@@ -79,17 +79,34 @@ struct FAQContent: View {
 /// anchor (`ScrollViewReader.scrollTo`) and as the deep-link target
 /// from attachment banners.
 enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
+    case encryption
+    case relayVisibility
+    case qrCode
+    case noPhoneNumbers
+    case pushNotifications
     case mediaStripping
     case prnu
     case documentMetadata
     case noPreview
     case blockedTypes
     case executableWarning
+    case wipingData
+    case notYetShipped
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
+        case .encryption:
+            return "How Pizzini encrypts messages"
+        case .relayVisibility:
+            return "What the relay sees (and doesn’t see)"
+        case .qrCode:
+            return "What’s in your QR code"
+        case .noPhoneNumbers:
+            return "Why no phone numbers"
+        case .pushNotifications:
+            return "How push notifications work without leaking content"
         case .mediaStripping:
             return "What Pizzini removes from images and videos"
         case .prnu:
@@ -102,11 +119,117 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             return "Why some file types are blocked from sending"
         case .executableWarning:
             return "Files marked “executable” on receive"
+        case .wipingData:
+            return "What each delete option does"
+        case .notYetShipped:
+            return "What Pizzini doesn’t do yet"
         }
     }
 
     var body: String {
         switch self {
+        case .encryption:
+            return """
+            Pizzini uses Signal’s open-source libsignal library \
+            (pinned at v0.93.2). It handles every cryptographic step; \
+            Pizzini does not invent its own crypto.
+
+            Initial key exchange uses PQXDH, which combines classical \
+            X25519 with the post-quantum ML-KEM-768. Ongoing messages \
+            ride libsignal’s Triple Ratchet (the classical Double \
+            Ratchet plus the SPQR post-quantum ratchet that Signal \
+            shipped in October 2025). The actual message bytes are \
+            sealed with ChaCha20-Poly1305.
+
+            Pairwise sessions are also wrapped in a “sealed sender” \
+            envelope — that means the relay can route a message to its \
+            recipient without learning who sent it.
+            """
+        case .relayVisibility:
+            return """
+            The relay is what shuttles ciphertext from your phone to \
+            your contact’s phone. To do its job it sees:
+
+            • the recipient’s peer-id (so it knows where to forward)
+            • the sealed-envelope bytes (encrypted; it can’t decrypt)
+            • the IP address of any device that connects to it
+            • frame sizes and timing
+
+            It does NOT see:
+
+            • the sender’s peer-id (sealed sender hides it)
+            • message text or attachment content
+            • your contacts list
+            • anything across restarts — the relay is stateless, \
+              has no user accounts, and keeps everything in RAM only
+
+            Offline messages sit in an in-memory queue (capped at 100 \
+            frames per peer, with a sender-chosen TTL up to 7 days). A \
+            relay restart wipes the queue.
+
+            Today’s default relay is a dev build over plain TCP on \
+            your LAN. Production deployment over Tor onion services is \
+            still on the roadmap (see “What Pizzini doesn’t do yet”).
+            """
+        case .qrCode:
+            return """
+            Your QR code encodes a `pizzini1://` URL with two pieces:
+
+            • your 33-byte IdentityKey (peer-id), in hex
+            • the relay endpoint (host : port) that contacts should \
+              reach you through
+
+            That’s it. No name, no contact list, no message history.
+
+            However, a photograph of the QR — even from across a room, \
+            a security camera, or a window — links a face to that \
+            peer-id and identifies you on the network. That’s why the \
+            in-app QR sheet stays hidden behind an explicit “Tap to \
+            reveal” gesture and re-hides as soon as you switch away \
+            from the app. Sharing the QR via screenshot, AirDrop, or \
+            any other app carries the same risk; treat it as you would \
+            handing someone a printed copy.
+            """
+        case .noPhoneNumbers:
+            return """
+            Pizzini addresses are random IdentityKey-based peer-ids. \
+            There is no central directory mapping numbers to accounts \
+            and no signup flow that asks for one.
+
+            What that gets you:
+
+            • Nothing to subpoena from a phone carrier.
+            • SIM-swap attacks against your account are not possible — \
+              there’s no number to redirect.
+            • Recycled numbers can’t inherit access to a previous \
+              owner’s chats.
+            • Pairing happens in person via QR scan, so the choice of \
+              who is in your contacts list is entirely yours.
+
+            Both peers must scan each other for chat to unlock — a \
+            one-way scan does not establish a session.
+            """
+        case .pushNotifications:
+            return """
+            When a message arrives while you’re offline, the relay can \
+            ask Apple’s Push Notification Service to wake your phone. \
+            The push payload Pizzini sends is the literal string \
+            “New message”. That’s it — no sender name, no content \
+            preview, no peer-id.
+
+            Why so spartan: iOS keeps incoming notifications in a \
+            system-wide database that forensic-extraction tools can \
+            read. Anything in the payload sits there in cleartext. The \
+            actual encrypted message stays in the relay’s ephemeral \
+            queue and only reaches your device when the app reconnects.
+
+            The unread badge on the app icon is updated by a small \
+            Notification Service Extension that increments a shared \
+            counter — it never decrypts the message either.
+
+            Push is optional on the relay side. If the operator hasn’t \
+            configured an APNs auth key, push is simply disabled.
+            """
         case .mediaStripping:
             return """
             Before any image or video leaves your phone, Pizzini removes \
@@ -203,6 +326,52 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             desktop runs whatever the file says. Treat it like an \
             email attachment from an unknown sender — assume malicious \
             until verified.
+            """
+        case .wipingData:
+            return """
+            Pizzini gives you four levels of delete:
+
+            • Delete chat (per-contact ⋯ menu): wipes that contact’s \
+              message log only. The pairing and the libsignal session \
+              stay; you can keep chatting.
+            • Delete contact (per-contact ⋯ menu): drops the contact \
+              row and the encryption session. To talk again you both \
+              need to re-scan.
+            • Delete all chats (Settings → Advanced): wipes every \
+              contact’s message log at once. Contacts and sessions \
+              stay.
+            • Reset identity (Settings → Advanced): generates a fresh \
+              keypair and wipes contacts, sessions, and message logs. \
+              Everyone you talk to needs to scan you again. Your \
+              relay host, app-lock setting, auto-lock timeout, and \
+              onboarding state are kept — those aren’t identity-derived.
+
+            None of these actions are recoverable. There is no \
+            “undelete”.
+            """
+        case .notYetShipped:
+            return """
+            Pizzini is in active development. A few things are not \
+            yet ready and the README tracks them as open:
+
+            • Production Tor onion service for the relay (the current \
+              relay binds to plain TCP on your LAN — fine for testing, \
+              not yet what you’d use on the real internet).
+            • SQLCipher-backed storage. Your contacts, chats, and \
+              outbox currently sit in iOS Keychain JSON, which works \
+              for daily use but isn’t designed for very large or \
+              long-offline message logs.
+            • Duress passphrase + cryptographic erasure (a separate \
+              passphrase that wipes everything when entered).
+            • App Attest + ATS-strict transport policy.
+            • Reproducible build script.
+            • First independent security audit.
+            • Multi-relay client fanout (sending the same message to \
+              multiple jurisdictions in parallel for resilience).
+
+            If any of these matter to your threat model, hold off — \
+            the project README and the GitHub status section are the \
+            authoritative source of progress.
             """
         }
     }
