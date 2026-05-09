@@ -10,6 +10,10 @@ struct ChatView: View {
     @State private var renameDraft = ""
     @State private var confirmDeleteChat = false
     @State private var confirmDeleteContact = false
+    @State private var showAttachSheet = false
+    @State private var showPhotoPicker = false
+    @State private var showDocumentPicker = false
+    @State private var attachmentDraft: AttachmentDraft?
     @Environment(\.dismiss) private var dismiss
 
     private var contact: Contact? {
@@ -24,7 +28,11 @@ struct ChatView: View {
                     Divider()
                 }
                 messages(for: contact)
-                composer(disabled: !contact.sessionEstablished)
+                if let draft = attachmentDraft {
+                    attachmentPreview(draft: draft)
+                    Divider()
+                }
+                composer(disabled: !contact.sessionEstablished, contact: contact)
             }
             .navigationTitle(contact.displayName)
             .navigationBarTitleDisplayMode(.inline)
@@ -32,6 +40,37 @@ struct ChatView: View {
             .onDisappear { store.markRead(contactID: contactID) }
             .onChange(of: contact.log.count) { _, _ in
                 store.markRead(contactID: contactID)
+            }
+            .confirmationDialog(
+                "Attach a file",
+                isPresented: $showAttachSheet,
+                titleVisibility: .hidden
+            ) {
+                Button("Photo or video") { showPhotoPicker = true }
+                Button("File") { showDocumentPicker = true }
+                Button("Cancel", role: .cancel) {}
+            }
+            .sheet(isPresented: $showPhotoPicker) {
+                PhotoVideoPicker(
+                    onPick: { url, name in
+                        showPhotoPicker = false
+                        if let d = AttachmentDraft(url: url, filename: name) {
+                            attachmentDraft = d
+                        }
+                    },
+                    onCancel: { showPhotoPicker = false },
+                )
+            }
+            .sheet(isPresented: $showDocumentPicker) {
+                DocumentPicker(
+                    onPick: { url, name in
+                        showDocumentPicker = false
+                        if let d = AttachmentDraft(url: url, filename: name) {
+                            attachmentDraft = d
+                        }
+                    },
+                    onCancel: { showDocumentPicker = false },
+                )
             }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -160,27 +199,143 @@ struct ChatView: View {
         }
     }
 
-    private func composer(disabled: Bool) -> some View {
+    private func composer(disabled: Bool, contact: Contact) -> some View {
         HStack {
-            TextField("type a message", text: $draft)
+            Button {
+                showAttachSheet = true
+            } label: {
+                Image(systemName: "paperclip")
+                    .padding(.horizontal, 4)
+            }
+            .buttonStyle(.bordered)
+            .disabled(disabled)
+            .accessibilityLabel("Attach a file")
+
+            TextField(
+                attachmentDraft == nil ? "type a message" : "add a caption (optional)",
+                text: $draft,
+            )
                 .textFieldStyle(.roundedBorder)
                 .submitLabel(.send)
                 .disabled(disabled)
-                .onSubmit { sendDraft() }
+                .onSubmit { sendDraft(contact: contact) }
             Button {
-                sendDraft()
+                sendDraft(contact: contact)
             } label: {
                 Image(systemName: "paperplane.fill")
                     .padding(.horizontal, 4)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(disabled || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .disabled(disabled || !canSend)
         }
         .padding()
     }
 
-    private func sendDraft() {
-        guard let contact else { return }
+    /// Send is enabled if there's an attachment OR a non-blank caption.
+    /// "Bare attachment with empty caption" is a perfectly valid send.
+    private var canSend: Bool {
+        if attachmentDraft != nil { return true }
+        return !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Pre-send banner: filename + size + tier-appropriate warning. NO
+    /// image preview — the brief is explicit, parser surface is the
+    /// thing we're avoiding. Filename + system icon only.
+    private func attachmentPreview(draft: AttachmentDraft) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Image(systemName: iconName(forTier: draft.tier))
+                    .foregroundStyle(iconColor(forTier: draft.tier))
+                    .font(.title2)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(draft.filename)
+                        .font(.subheadline)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text("\(draft.displaySize) • \(tierLabel(draft.tier))")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button(role: .destructive) {
+                    discardAttachmentDraft()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Remove attachment")
+            }
+            if let warning = AttachmentCopy.attachWarning(forTier: draft.tier) {
+                Text(warning)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.yellow.opacity(0.15))
+                    )
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 10)
+        .background(Color(uiColor: .secondarySystemBackground))
+    }
+
+    private func iconName(forTier tier: AttachmentTier) -> String {
+        switch tier {
+        case .textFamily: return "doc.text"
+        case .archive: return "doc.zipper"
+        case .mediaStripAndWarn: return "photo"
+        case .authorLeakingDoc: return "doc.richtext"
+        case .codeOnTap: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private func iconColor(forTier tier: AttachmentTier) -> Color {
+        switch tier {
+        case .codeOnTap: return .red
+        case .mediaStripAndWarn, .authorLeakingDoc: return .orange
+        default: return .secondary
+        }
+    }
+
+    private func tierLabel(_ tier: AttachmentTier) -> String {
+        switch tier {
+        case .textFamily: return "text"
+        case .archive: return "archive"
+        case .mediaStripAndWarn: return "media"
+        case .authorLeakingDoc: return "document"
+        case .codeOnTap: return "executable"
+        }
+    }
+
+    private func discardAttachmentDraft() {
+        if let url = attachmentDraft?.url {
+            try? FileManager.default.removeItem(at: url)
+        }
+        attachmentDraft = nil
+    }
+
+    private func sendDraft(contact: Contact) {
+        // Two paths share this entrypoint: bare-text and attachment+
+        // optional-caption. The latter sends one chunked attachment
+        // logical message; the caption (if any) is currently embedded
+        // as the row's text (sender-side rendering only — receiver gets
+        // the attachment row with no caption). A future task can lift
+        // the caption into a paired sealed `.chat` envelope so the
+        // receiver also sees it; flagged for the maintainer.
+        let captionText = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let pending = attachmentDraft {
+            store.sendFile(pending.url, to: contact, caption: captionText)
+            try? FileManager.default.removeItem(at: pending.url)
+            attachmentDraft = nil
+            draft = ""
+            return
+        }
+        guard !captionText.isEmpty else { return }
         store.send(draft, to: contact)
         draft = ""
     }
