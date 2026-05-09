@@ -107,20 +107,35 @@ struct ContactsListView: View {
         .listStyle(.plain)
     }
 
+    /// Surface a connection status only when something is wrong.
+    /// A persistent green "connected" pill trains the eye to ignore it,
+    /// so when it eventually flips orange the user misses that too —
+    /// industry pattern (Signal, WhatsApp, iMessage) is to stay silent
+    /// on the happy path and only banner when reconnecting / offline.
+    /// "relay" is also wire-speak; users see "connection" instead.
+    @ViewBuilder
     private var relayBadge: some View {
-        let (text, color): (String, Color) = {
-            switch store.relayState {
-            case .idle:           return ("idle", .gray)
-            case .connecting:     return ("connecting", .orange)
-            case .connected:      return ("connected", .green)
-            case .failed:         return ("failed", .red)
+        switch store.relayState {
+        case .connected:
+            EmptyView()
+        case .idle, .connecting:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("connecting…")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
-        }()
-        return HStack(spacing: 4) {
-            Circle().frame(width: 6, height: 6).foregroundStyle(color)
-            Text("relay \(text)")
-                .font(.caption2.monospaced())
-                .foregroundStyle(.secondary)
+            .accessibilityLabel("Connecting")
+        case .failed:
+            HStack(spacing: 6) {
+                Image(systemName: "wifi.slash")
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                Text("no connection")
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
+            .accessibilityLabel("No connection — your messages will not send")
         }
     }
 }

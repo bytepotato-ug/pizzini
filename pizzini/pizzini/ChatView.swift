@@ -222,37 +222,40 @@ struct ChatRow: View {
     }
 
     private var metadata: some View {
+        // System rows (e.g. "Session not established yet…") get no
+        // metadata — they're the chat layer talking to itself, not a
+        // sent message.
         HStack(spacing: 6) {
-            Text(entry.side == .me ? "me" : "peer")
-                .foregroundStyle(.secondary)
             if entry.kind != .system {
-                Text("·").foregroundStyle(.tertiary)
-                Text(entry.kind == .preKey ? "PreKey" : "Whisper")
-                    .foregroundStyle(entry.kind == .preKey ? .orange : .green)
-                Text("·").foregroundStyle(.tertiary)
-                Text("\(entry.bytes) B").foregroundStyle(.secondary)
+                Text(timestampText)
+                    .foregroundStyle(.secondary)
             }
             if entry.side == .me, let status, entry.kind != .system {
-                Text("·").foregroundStyle(.tertiary)
                 statusIcon(status)
                 if entry.readAt != nil, status == .delivered {
-                    Text("·").foregroundStyle(.tertiary)
                     Text("Read").foregroundStyle(.blue)
                 }
             }
         }
-        .font(.caption2.monospaced())
+        .font(.caption2)
     }
 
+    private var timestampText: String {
+        entry.timestamp.formatted(date: .omitted, time: .shortened)
+    }
+
+    // Glyphs match the explainer in OnboardingView's `.icons` step —
+    // change one place and you change the other, otherwise the legend
+    // and the live UI drift apart.
     @ViewBuilder
     private func statusIcon(_ status: OutboxEntry.Status) -> some View {
         switch status {
         case .pending:
-            Text("⏳").help("Queued — waiting for the relay")
+            Text("⏳").help("Queued — waiting for the connection")
         case .relayed:
-            Text("✓").foregroundStyle(.secondary).help("Sent to the relay")
+            Text("✓").foregroundStyle(.secondary).help("Sent")
         case .delivered:
-            Text("✓✓").foregroundStyle(.blue).help("Your contact's phone got it")
+            Text("✓✓").foregroundStyle(.blue).help("Delivered to their phone")
         case .failed:
             Text("✗").foregroundStyle(.red).help("Expired before reaching them")
         }
