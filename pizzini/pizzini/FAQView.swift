@@ -81,6 +81,7 @@ struct FAQContent: View {
 enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
     case encryption
     case relayVisibility
+    case runYourOwnRelay
     case qrCode
     case noPhoneNumbers
     case pushNotifications
@@ -101,6 +102,8 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             return "How Pizzini encrypts messages"
         case .relayVisibility:
             return "What the relay sees (and doesn’t see)"
+        case .runYourOwnRelay:
+            return "Running your own relay (or using someone else’s)"
         case .qrCode:
             return "What’s in your QR code"
         case .noPhoneNumbers:
@@ -170,6 +173,63 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             Today’s default relay is a dev build over plain TCP on \
             your LAN. Production deployment over Tor onion services is \
             still on the roadmap (see “What Pizzini doesn’t do yet”).
+            """
+        case .runYourOwnRelay:
+            return """
+            The relay’s source code lives in this repository under \
+            AGPL-3.0. Anyone can run one — no licensing fee, no tokens, \
+            no vendor.
+
+            To self-host:
+
+            • Build with `cargo build -p pizzini-relay --release`.
+            • Run on any machine your peers can reach over the network \
+              (a VPS, a Pi at home, a Tor onion service if you set one \
+              up). It binds TCP on port 7777.
+            • Each phone in your group enters the relay’s address in \
+              Settings → Relay host.
+
+            Outsiders who don’t know your relay’s address can’t \
+            connect to it. That said, address secrecy is bonus — not \
+            the primary lock. The actual access control is layered:
+
+            • Contact-gate. Even if a stranger reaches your relay, \
+              your phone drops every inbound frame whose sender isn’t \
+              already in your contacts. Both sides must scan each \
+              other.
+            • Hashcash. First-contact bundle requests cost ~1 second \
+              of CPU work. Trivial on a phone, expensive in bulk.
+            • Recipient-issued delivery tokens. Once you’ve paired, \
+              your contact gets a batch of 1024 tokens minted by you, \
+              one per send/ack. They burn out a hostile peer fast.
+
+            Together these mean a leaked relay address is annoying \
+            (your friends might switch) but not catastrophic — \
+            strangers still cannot send you anything.
+
+            What if I don’t want to run my own?
+
+            Today: there is no centrally-operated production Pizzini \
+            relay. The app starts pointing at 127.0.0.1, which only \
+            works in the simulator. On a real phone you have to type \
+            in the address of whichever relay your community is \
+            running.
+
+            Roadmap: the README plans stateless relays in multiple \
+            jurisdictions, deployed initially in Switzerland, Iceland, \
+            and Panama, reachable over Tor onion services rather than \
+            clearnet IPs. Combined with the post-audit “multi-relay \
+            client fanout” feature, an app would be able to try \
+            several relays in parallel so a single one going offline \
+            wouldn’t take your group offline. None of that \
+            infrastructure is live yet; production rollout is queued \
+            behind the first external audit.
+
+            Today’s constraint to keep in mind: there is no \
+            inter-relay federation. Both peers in a conversation must \
+            connect to the same relay instance for messages to route. \
+            If your group changes relays, everyone updates Settings → \
+            Relay host on the same day.
             """
         case .qrCode:
             return """
