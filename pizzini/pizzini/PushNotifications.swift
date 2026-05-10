@@ -22,6 +22,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // Install before any UI work so the observers are armed before
         // the first scene connection.
         PrivacyShieldWindow.shared.install()
+        // Phase 5 self-test for the QR-screenshot-block trick. Runs
+        // once on first launch; re-runs whenever the iOS major version
+        // changes. Cheap (one offscreen UIView render) and idempotent —
+        // the runIfNeeded gate skips work when the result is already
+        // cached for the current OS major.
+        Task { @MainActor in
+            SecureScreenshotSelfTest.runIfNeeded(store: ChatStore.shared)
+        }
         Task { await requestAuthorizationAndRegister() }
         return true
     }

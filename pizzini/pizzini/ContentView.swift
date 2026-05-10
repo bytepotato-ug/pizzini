@@ -210,6 +210,18 @@ private struct MyQRSheet: View {
     @State private var revealed = false
     @State private var showDetails = false
     @State private var copyConfirmation = false
+    @State private var store = ChatStore.shared
+
+    /// True when the QR-block trick should be applied: the user hasn't
+    /// turned it off in Settings AND the runtime self-test hasn't
+    /// determined that the trick is broken on this iOS version.
+    /// `qrBlockEffective == nil` is treated as "may work" — the
+    /// self-test runs at app launch and writes a result before the
+    /// user can typically open this sheet.
+    private var qrBlockActive: Bool {
+        guard store.state.blockQRScreenshots else { return false }
+        return store.state.qrBlockEffective != false
+    }
 
     var body: some View {
         NavigationStack {
@@ -287,7 +299,21 @@ private struct MyQRSheet: View {
                     Button {
                         withAnimation(.easeInOut(duration: 0.15)) { revealed = false }
                     } label: {
-                        ContactQRImage(card: card)
+                        // Wrap the rendered QR in a SecureScreenshotShield
+                        // when the toggle is on AND the runtime self-test
+                        // didn't fail on this iOS version. The shield
+                        // makes iOS render this subtree blank in the
+                        // captured framebuffer for screenshots and
+                        // mirroring. Falls back to the plain image if
+                        // the trick has been disabled.
+                        if qrBlockActive {
+                            SecureScreenshotShield {
+                                ContactQRImage(card: card)
+                            }
+                            .frame(width: 196, height: 196)
+                        } else {
+                            ContactQRImage(card: card)
+                        }
                     }
                     .buttonStyle(.plain)
                 } else {
