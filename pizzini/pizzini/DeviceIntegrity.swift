@@ -90,7 +90,20 @@ final class DeviceIntegrityMonitor {
         if (jb || dylib || (!Self.isDebugBuild && dbg)) && self.detectedAt == nil {
             self.detectedAt = Date()
         }
-        if jb || dbg || dylib {
+        // Skip the log line when the ONLY thing that fired is the
+        // debugger flag in a DEBUG build — Xcode is always attached
+        // during dev work, the user can't act on it, and shipping a
+        // line per launch is just noise. Release builds DO log the
+        // debugger attach (real signal there).
+        let shouldLog: Bool
+        if jb || dylib {
+            shouldLog = true
+        } else if dbg && !Self.isDebugBuild {
+            shouldLog = true
+        } else {
+            shouldLog = false
+        }
+        if shouldLog {
             NSLog(
                 "[pizzini] device integrity flags — jailbroken=\(jb) debugger=\(dbg) suspiciousDylib=\(dylib)"
             )
