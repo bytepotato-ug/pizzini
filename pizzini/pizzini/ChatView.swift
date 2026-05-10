@@ -51,11 +51,31 @@ struct ChatView: View {
                             store.deleteChat(captured)
                         }
                     )
-                if let draft = attachmentDraft {
-                    attachmentPreview(draft: draft)
-                    Divider()
+            }
+            // Composer + (optional) attachment-preview live in a
+            // `.safeAreaInset(edge: .bottom)` rather than as the
+            // tail of the VStack. Two reasons:
+            //
+            // 1. Bottom-edge layout. Inside a VStack, the composer
+            //    sits ABOVE the home-indicator safe-area inset, with
+            //    a visible gap of empty space between composer and
+            //    indicator. With `.safeAreaInset`, iOS treats the
+            //    composer AS the bottom inset — the composer's
+            //    background extends through the indicator area and
+            //    the system blurs the indicator over our background,
+            //    exactly the pattern Messages / WhatsApp / Signal use.
+            // 2. Keyboard. `.safeAreaInset` automatically rises with
+            //    the keyboard when the composer's TextField becomes
+            //    first responder; no manual keyboard-avoidance code.
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(spacing: 0) {
+                    if let draft = attachmentDraft {
+                        attachmentPreview(draft: draft)
+                        Divider()
+                    }
+                    composer(disabled: !contact.sessionEstablished, contact: contact)
                 }
-                composer(disabled: !contact.sessionEstablished, contact: contact)
+                .background(.bar)
             }
             // Cover chat content during a screen recording or external
             // display. We sit inside the NavigationStack's child view
