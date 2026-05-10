@@ -160,11 +160,9 @@ extension ChatStore {
         let gIdx = state.groups.count - 1
         Storage.persist(appState: state)
 
-        NSLog(
-            "[pizzini.group] createGroup \(short(groupId)) name=\"\(trimmedName)\""
-                + " admin=\(short(myCard.peerId)) inviting \(initialContacts.count) member(s):"
-                + " " + initialContacts.map { short($0.identityPub) }.joined(separator: ", "),
-        )
+        diagLog("group", "createGroup \(short(groupId)) name=\"\(trimmedName)\""
+            + " admin=\(short(myCard.peerId)) inviting \(initialContacts.count) member(s):"
+            + " " + initialContacts.map { short($0.identityPub) }.joined(separator: ", "))
         // Broadcast: every invitee gets the signed Create op (0x08)
         // AND the creator's SKDM (0x07). Order matters only loosely
         // — both are independent inner envelopes, and the receiver
@@ -738,14 +736,12 @@ extension ChatStore {
     func handleGroupOp(payload: Data, fromPeer sender: Data) {
         guard let session, let myCard, let relay else { return }
         guard let op = GroupOp.decode(payload) else {
-            NSLog("[pizzini.group] groupOp ← \(short(sender)): malformed signed bytes")
+            diagLog("group", "groupOp ← \(short(sender)): malformed signed bytes")
             return
         }
-        NSLog(
-            "[pizzini.group] groupOp ← \(short(sender)): kind=\(opKindLabel(op.kind))"
-                + " group=\(short(op.groupId)) epoch=\(op.epoch)"
-                + " operator=\(short(op.operatorIdentity))",
-        )
+        diagLog("group", "groupOp ← \(short(sender)): kind=\(opKindLabel(op.kind))"
+            + " group=\(short(op.groupId)) epoch=\(op.epoch)"
+            + " operator=\(short(op.operatorIdentity))")
 
         if case .create = op.kind {
             // Bootstrap path. Audit CRITICAL-1: the trust anchor for
@@ -754,36 +750,24 @@ extension ChatStore {
             // and we'd be accepting groups from unverified
             // identities.
             guard sender == op.operatorIdentity else {
-                NSLog(
-                    "[pizzini.group] groupOp ← \(short(sender)):"
-                        + " Create rejected — sender \(short(sender))"
-                        + " is forwarding on behalf of \(short(op.operatorIdentity))"
-                        + " (forwarding not allowed for Create)",
-                )
+                diagLog("group", "Create REJECTED — sender \(short(sender))"
+                    + " forwarding on behalf of \(short(op.operatorIdentity))"
+                    + " (forwarding not allowed for Create)")
                 return
             }
             guard state.contacts.contains(where: { $0.identityPub == op.operatorIdentity }) else {
-                NSLog(
-                    "[pizzini.group] groupOp ← \(short(sender)):"
-                        + " Create rejected — operator \(short(op.operatorIdentity))"
-                        + " is not in our 1:1 contacts",
-                )
+                diagLog("group", "Create REJECTED — operator \(short(op.operatorIdentity))"
+                    + " is not in our 1:1 contacts")
                 return
             }
             if groupIndex(forId: op.groupId) != nil {
-                NSLog(
-                    "[pizzini.group] groupOp ← \(short(sender)):"
-                        + " Create for existing group \(short(op.groupId)) — ignoring",
-                )
+                diagLog("group", "Create for existing group \(short(op.groupId)) — ignoring")
                 return
             }
             // Verify the signature before constructing — Create
             // bypasses the apply state machine's verification path.
             guard (try? op.verifySignature()) == true else {
-                NSLog(
-                    "[pizzini.group] groupOp ← \(short(sender)):"
-                        + " Create signature INVALID, dropping",
-                )
+                diagLog("group", "Create signature INVALID, dropping")
                 return
             }
             // The Create payload must include US in the initial
@@ -792,10 +776,7 @@ extension ChatStore {
             guard case let .create(_, initialMembers) = op.kind,
                   initialMembers.contains(where: { $0.peerId == myCard.peerId })
             else {
-                NSLog(
-                    "[pizzini.group] groupOp ← \(short(sender)):"
-                        + " Create rejected — local user not in initialMembers",
-                )
+                diagLog("group", "Create REJECTED — local user not in initialMembers")
                 return
             }
             guard let signedBytes = try? op.encoded(),
@@ -805,18 +786,13 @@ extension ChatStore {
                       localIdentityPub: myCard.peerId,
                   )
             else {
-                NSLog(
-                    "[pizzini.group] groupOp ← \(short(sender)):"
-                        + " Create rejected (structural) for group \(short(op.groupId))",
-                )
+                diagLog("group", "Create REJECTED (structural) for group \(short(op.groupId))")
                 return
             }
             state.groups.append(group)
-            NSLog(
-                "[pizzini.group] groupOp ← \(short(sender)):"
-                    + " invitation received for \(short(op.groupId)) with \(group.members.count) member(s)"
-                    + " — awaiting user accept/decline",
-            )
+            diagLog("group", "invitation received for \(short(op.groupId))"
+                + " with \(group.members.count) member(s)"
+                + " — awaiting user accept/decline")
             // Receive-side bootstrap is now an INVITATION. We don't
             // enrol our chain or broadcast SKDMs until the user taps
             // Join — `enrolMyChainOnFirstJoin` is fired from
@@ -1378,14 +1354,12 @@ extension ChatStore {
         relay: RelayClient,
     ) {
         guard let cIdx = state.contacts.firstIndex(where: { $0.identityPub == recipient }) else {
-            NSLog("[pizzini.group] groupOp → \(short(recipient)): no contact (1:1 unpaired)")
+            diagLog("group", "groupOp → \(short(recipient)): NO CONTACT (1:1 unpaired)")
             return
         }
         guard let token = popDeliveryTokenPublic(forContactAt: cIdx) else {
-            NSLog(
-                "[pizzini.group] groupOp → \(short(recipient)): no delivery token "
-                    + "(stash empty); op dropped — outbox+retry pending v2",
-            )
+            diagLog("group", "groupOp → \(short(recipient)): NO DELIVERY TOKEN"
+                + " (stash empty for this peer); op dropped — outbox+retry pending v2")
             return
         }
         var inner = Data([RelayClient.InnerEnvelopeKind.groupOp.rawValue])
@@ -1403,9 +1377,9 @@ extension ChatStore {
                 ttlSeconds: state.contacts[cIdx].ttlSeconds,
                 token: token,
             )
-            NSLog("[pizzini.group] groupOp → \(short(recipient)): sealed=\(sealed.count) B, sent")
+            diagLog("group", "groupOp → \(short(recipient)): sealed=\(sealed.count) B, sent")
         } catch {
-            NSLog("[pizzini.group] groupOp → \(short(recipient)): seal failed — \(error)")
+            diagLog("group", "groupOp → \(short(recipient)): seal failed — \(error)")
         }
     }
 
@@ -1422,17 +1396,14 @@ extension ChatStore {
         groupAt gIdx: Int,
     ) {
         guard let cIdx = state.contacts.firstIndex(where: { $0.identityPub == recipient }) else {
-            NSLog(
-                "[pizzini.group] SKDM \(short(groupId)) → \(short(recipient)):"
-                    + " no contact (1:1 unpaired) — recipient cannot decrypt our messages",
-            )
+            diagLog("group", "SKDM \(short(groupId)) → \(short(recipient)):"
+                + " NO CONTACT (1:1 unpaired) — recipient cannot decrypt our messages")
             return
         }
         guard let token = popDeliveryTokenPublic(forContactAt: cIdx) else {
-            NSLog(
-                "[pizzini.group] SKDM \(short(groupId)) → \(short(recipient)):"
-                    + " no delivery token (stash empty); SKDM dropped, recipient cannot decrypt",
-            )
+            diagLog("group", "SKDM \(short(groupId)) → \(short(recipient)):"
+                + " NO DELIVERY TOKEN (stash empty for this peer);"
+                + " SKDM dropped, recipient cannot decrypt")
             return
         }
         var inner = Data([RelayClient.InnerEnvelopeKind.groupKeyDistribution.rawValue])
@@ -1453,15 +1424,11 @@ extension ChatStore {
             // Successful seal → record so the bidirectional hook
             // doesn't re-fire for this peer until next rotation.
             state.groups[gIdx].mySkdmRecipients.insert(recipient)
-            NSLog(
-                "[pizzini.group] SKDM \(short(groupId)) → \(short(recipient)):"
-                    + " sealed=\(sealed.count) B, sent",
-            )
+            diagLog("group", "SKDM \(short(groupId)) → \(short(recipient)):"
+                + " sealed=\(sealed.count) B, sent")
         } catch {
-            NSLog(
-                "[pizzini.group] SKDM \(short(groupId)) → \(short(recipient)):"
-                    + " seal failed — \(error)",
-            )
+            diagLog("group", "SKDM \(short(groupId)) → \(short(recipient)):"
+                + " seal failed — \(error)")
         }
     }
 

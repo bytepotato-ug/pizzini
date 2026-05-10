@@ -34,6 +34,43 @@ final class ChatStore: NSObject {
     var state: AppState
     private(set) var outbox: OutboxStore
     private(set) var initError: String?
+
+    /// In-memory ring buffer of recent group-flow events. NOT
+    /// persisted — this is a runtime diagnostic, not an audit log.
+    /// `DiagnosticsView` (Settings → Diagnostics) renders the
+    /// buffer so users can see why a group invitation didn't show
+    /// up without having to wire up Console.app. Capped at
+    /// `diagBufferCap` entries; oldest evictions are silent.
+    private(set) var diagEvents: [DiagEvent] = []
+    private let diagBufferCap = 200
+
+    /// One entry in the diagnostic ring buffer. The `category`
+    /// string is a one-word tag (`group`, `relay`, `pair`) so the
+    /// view can colour-code; `message` is human-readable text;
+    /// `timestamp` drives the most-recent-first sort.
+    struct DiagEvent: Identifiable, Sendable {
+        let id = UUID()
+        let timestamp: Date
+        let category: String
+        let message: String
+    }
+
+    /// Append a diagnostic event to the in-memory ring buffer AND
+    /// emit the same text to NSLog so `Console.app` users still
+    /// see it. Trims the buffer to `diagBufferCap` from the front.
+    /// Always called from `@MainActor`-bound code so the array
+    /// mutation is race-free.
+    func diagLog(_ category: String, _ message: String) {
+        NSLog("[pizzini.\(category)] \(message)")
+        diagEvents.append(DiagEvent(
+            timestamp: Date(),
+            category: category,
+            message: message,
+        ))
+        if diagEvents.count > diagBufferCap {
+            diagEvents.removeFirst(diagEvents.count - diagBufferCap)
+        }
+    }
     /// True iff the most recent attempt to persist the libsignal session
     /// blob to Keychain failed. F-602 fix-review: the audit's deeper
     /// recommendation was to "block further encrypts behind a 'Keychain
@@ -1297,7 +1334,9 @@ extension ChatStore: RelayClientDelegate {
         // already consumed and the whole conversation desyncs.
         persistSession()
         guard let idx = self.contactIndex(forIdentity: received.peer) else {
-            NSLog("[pizzini] dropped sealed frame from unknown peer \(self.short(received.peer))")
+            self.diagLog("relay", "DROPPED sealed frame from UNKNOWN PEER \(self.short(received.peer))"
+                + " — they are not in this device's contacts (you must QR-pair before they can"
+                + " send anything to you)")
             return
         }
         if received.isDuplicate {

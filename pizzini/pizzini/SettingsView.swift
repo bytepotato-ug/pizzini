@@ -115,6 +115,11 @@ struct SettingsView: View {
                 } label: {
                     SettingsRow(icon: "questionmark.circle", title: "FAQ")
                 }
+                NavigationLink {
+                    DiagnosticsView(store: store)
+                } label: {
+                    SettingsRow(icon: "stethoscope", title: "Diagnostics")
+                }
             }
 
             Section {
