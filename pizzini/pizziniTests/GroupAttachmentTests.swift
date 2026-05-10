@@ -239,6 +239,192 @@ struct ChatGroupSendGateTests {
     }
 }
 
+@Suite("OutboxStore.groupMessageStatus rollup (Phase 7)")
+struct OutboxGroupRollupTests {
+    private func leg(
+        groupMessageId: Data,
+        recipient: Data = Data(repeating: 0xBB, count: 33),
+        delivered: Bool = false,
+        relayed: Bool = false,
+        failed: Bool = false,
+        read: Bool = false,
+    ) -> OutboxEntry {
+        OutboxEntry(
+            messageId: Data((0..<16).map { _ in UInt8.random(in: 0...UInt8.max) }),
+            recipientPeerId: recipient,
+            sealedCiphertext: Data([0xCA]),
+            token: Data(),
+            ttl: 24 * 60 * 60,
+            sentAt: Date(),
+            retries: 0,
+            deliveredAt: delivered ? Date() : nil,
+            failedAt: failed ? Date() : nil,
+            relayedAt: relayed ? Date() : nil,
+            groupMessageId: groupMessageId,
+            readAt: read ? Date() : nil,
+        )
+    }
+
+    @Test("every leg delivered → status delivered (✓✓)")
+    func allDelivered() {
+        var s = OutboxStore.empty
+        let gmid = Data(repeating: 0x11, count: 16)
+        for i in 0..<3 {
+            let r = Data([UInt8(i)] + [UInt8](repeating: 0, count: 32))
+            let e = leg(groupMessageId: gmid, recipient: r, delivered: true, relayed: true)
+            s.entries[e.messageId] = e
+        }
+        #expect(s.groupMessageStatus(forId: gmid) == .delivered)
+    }
+
+    @Test("any leg failed → status failed (✗ wins)")
+    func anyFailed() {
+        var s = OutboxStore.empty
+        let gmid = Data(repeating: 0x22, count: 16)
+        let e0 = leg(groupMessageId: gmid, delivered: true, relayed: true)
+        let e1 = leg(groupMessageId: gmid, failed: true)
+        s.entries[e0.messageId] = e0
+        s.entries[e1.messageId] = e1
+        #expect(s.groupMessageStatus(forId: gmid) == .failed)
+    }
+
+    @Test("any leg pending → status pending (⏳ wins over relayed)")
+    func pendingWinsOverRelayed() {
+        var s = OutboxStore.empty
+        let gmid = Data(repeating: 0x33, count: 16)
+        let e0 = leg(groupMessageId: gmid, relayed: true)
+        let e1 = leg(groupMessageId: gmid)   // pending
+        s.entries[e0.messageId] = e0
+        s.entries[e1.messageId] = e1
+        #expect(s.groupMessageStatus(forId: gmid) == .pending)
+    }
+
+    @Test("no entries (post-GC) → nil")
+    func noEntries() {
+        let s = OutboxStore.empty
+        #expect(s.groupMessageStatus(forId: Data(repeating: 0x99, count: 16)) == nil)
+    }
+
+    @Test("readByAll true only when EVERY leg has readAt stamped")
+    func readByAllRequiresAllLegs() {
+        var s = OutboxStore.empty
+        let gmid = Data(repeating: 0x44, count: 16)
+        let e0 = leg(groupMessageId: gmid, delivered: true, relayed: true, read: true)
+        let e1 = leg(groupMessageId: gmid, delivered: true, relayed: true, read: false)
+        s.entries[e0.messageId] = e0
+        s.entries[e1.messageId] = e1
+        #expect(s.groupMessageReadByAll(forId: gmid) == false,
+                "one leg unread → row stays at ✓✓ delivered, no eye yet")
+        // Mark the second leg as read.
+        var updated = e1
+        updated.readAt = Date()
+        s.entries[e1.messageId] = updated
+        #expect(s.groupMessageReadByAll(forId: gmid) == true,
+                "every leg read → eye glyph fires")
+    }
+
+    @Test("readByAll returns false (not nil) when no entries exist — F-405 honesty")
+    func readByAllPostGCStaysFalse() {
+        // Post-GC, the row mustn't claim 'read by all' without
+        // explicit per-recipient confirmation in hand. The
+        // OutboxStore-level helper enforces this; the bubble's
+        // `read: false` parameter then keeps the icon at ✓✓ for the
+        // 24h post-delivery sandbox window before the row stops
+        // showing any indicator.
+        let s = OutboxStore.empty
+        #expect(s.groupMessageReadByAll(forId: Data(repeating: 0xEE, count: 16)) == false)
+    }
+}
+
+@Suite("PersistedMessage / OutboxEntry Phase 7 fields persist round-trip")
+struct GroupPhase7CodableTests {
+    @Test("PersistedMessage with groupMessageId round-trips through JSON")
+    func persistedMessageRoundTrip() throws {
+        let gmid = Data(repeating: 0xCA, count: 16)
+        let row = PersistedMessage(
+            side: .me,
+            text: "hi",
+            kind: .whisper,
+            bytes: 64,
+            groupMessageId: gmid,
+        )
+        let bytes = try JSONEncoder().encode(row)
+        let decoded = try JSONDecoder().decode(PersistedMessage.self, from: bytes)
+        #expect(decoded.groupMessageId == gmid)
+    }
+
+    @Test("OutboxEntry with groupMessageId + readAt round-trips through JSON")
+    func outboxEntryRoundTrip() throws {
+        let gmid = Data(repeating: 0xCB, count: 16)
+        let read = Date(timeIntervalSinceReferenceDate: 100)
+        let e = OutboxEntry(
+            messageId: Data(repeating: 0x01, count: 16),
+            recipientPeerId: Data(repeating: 0x02, count: 33),
+            sealedCiphertext: Data([0xCA]),
+            token: Data(),
+            ttl: 24 * 60 * 60,
+            sentAt: Date(),
+            retries: 0,
+            deliveredAt: nil,
+            failedAt: nil,
+            relayedAt: nil,
+            groupMessageId: gmid,
+            readAt: read,
+        )
+        let bytes = try JSONEncoder().encode(e)
+        let decoded = try JSONDecoder().decode(OutboxEntry.self, from: bytes)
+        #expect(decoded.groupMessageId == gmid)
+        #expect(decoded.readAt?.timeIntervalSinceReferenceDate
+            == read.timeIntervalSinceReferenceDate)
+    }
+
+    @Test("legacy PersistedMessage without groupMessageId decodes to nil (additive field)")
+    func legacyPersistedMessageDecodesNil() throws {
+        // Pre-Phase-7 row JSON — no `groupMessageId` key. The decoder
+        // must tolerate this so existing on-disk blobs don't fail
+        // to load on first launch after the upgrade. We construct
+        // the JSON by encoding a real PersistedMessage and stripping
+        // any `groupMessageId` key — robust against future Codable
+        // tweaks while still exercising the legacy-decode path.
+        let synthetic = PersistedMessage(
+            side: .me, text: "legacy", kind: .whisper, bytes: 42,
+            timestamp: Date(timeIntervalSinceReferenceDate: 0),
+        )
+        var bytes = try JSONEncoder().encode(synthetic)
+        // No `groupMessageId` key was emitted (encodeIfPresent
+        // synthesised). Decode and confirm.
+        let row = try JSONDecoder().decode(PersistedMessage.self, from: bytes)
+        #expect(row.groupMessageId == nil)
+        // Even if a future writer drops the field entirely (legacy
+        // format simulation) the decoder must still succeed.
+        if let s = String(data: bytes, encoding: .utf8),
+           let stripped = s.replacingOccurrences(of: "\"groupMessageId\"", with: "\"_x_\"")
+            .data(using: .utf8) {
+            bytes = stripped
+        }
+        let row2 = try JSONDecoder().decode(PersistedMessage.self, from: bytes)
+        #expect(row2.groupMessageId == nil)
+    }
+
+    @Test("legacy OutboxEntry without groupMessageId / readAt decodes additively")
+    func legacyOutboxEntryDecodesAdditively() throws {
+        let json = #"""
+        {
+            "messageId":"AQEBAQEBAQEBAQEBAQEBAQ==",
+            "recipientPeerId":"AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIC",
+            "sealedCiphertext":"yg==",
+            "token":"",
+            "ttl":86400,
+            "sentAt":0,
+            "retries":0
+        }
+        """#
+        let e = try JSONDecoder().decode(OutboxEntry.self, from: Data(json.utf8))
+        #expect(e.groupMessageId == nil)
+        #expect(e.readAt == nil)
+    }
+}
+
 @MainActor
 @Suite("group attachment reassembly", .serialized)
 struct GroupAttachmentReassemblyTests {

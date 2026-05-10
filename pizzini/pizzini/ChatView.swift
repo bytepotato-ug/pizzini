@@ -504,7 +504,7 @@ struct ChatRow: View {
                     .foregroundStyle(.secondary)
             }
             if entry.side == .me, let status, entry.kind != .system {
-                statusIcon(status, read: entry.readAt != nil)
+                ChatStatusIcon(status: status, read: entry.readAt != nil)
             }
         }
         .font(.caption2)
@@ -513,18 +513,23 @@ struct ChatRow: View {
     private var timestampText: String {
         entry.timestamp.formatted(date: .omitted, time: .shortened)
     }
+}
 
-    // Glyphs match the explainer in OnboardingView's `.icons` step —
-    // change one place and you change the other, otherwise the legend
-    // and the live UI drift apart.
-    //
-    // Progression: ⏳ pending → ✓ sent → ✓✓ delivered → 👁 read. The
-    // eye REPLACES the ✓✓ rather than appending — one glyph scale, no
-    // redundant "Read" text. Honours `Contact.readReceiptsEnabled`-off
-    // by default: with no incoming readAt timestamp the eye never
-    // shows, the row stays at ✓✓ delivered.
-    @ViewBuilder
-    private func statusIcon(_ status: OutboxEntry.Status, read: Bool) -> some View {
+/// Status indicator glyph for an outbound row. Lifted from `ChatRow`
+/// so the group chat bubble can render the same scale without
+/// duplicating the switch arm — the only place the legend lives now is
+/// `OnboardingView.iconsStep`. Pure rendering, no state.
+///
+/// Progression: ⏳ pending → ✓ sent → ✓✓ delivered → 👁 read. The
+/// eye REPLACES the ✓✓ rather than appending — one glyph scale, no
+/// redundant "Read" text. Honours `Contact.readReceiptsEnabled`-off
+/// by default: with no incoming readAt timestamp the eye never shows,
+/// the row stays at ✓✓ delivered.
+struct ChatStatusIcon: View {
+    let status: OutboxEntry.Status
+    let read: Bool
+
+    var body: some View {
         switch status {
         case .pending:
             Text("⏳").help("Queued — waiting for the connection")

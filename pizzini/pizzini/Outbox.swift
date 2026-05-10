@@ -52,10 +52,29 @@ struct OutboxEntry: Codable, Sendable {
     /// JSON-blob OutboxStore without losing the grouping math.
     var chunkCount: UInt32?
 
+    // MARK: - Phase 7 group fan-out grouping
+    /// 16-byte stable id of the LOGICAL group message this pairwise
+    /// send is one leg of. A group send to N members produces N
+    /// OutboxEntries (one per recipient) sharing the same
+    /// `groupMessageId`; a group attachment send produces N × chunkCount
+    /// entries sharing the same `groupMessageId` AND `attachmentId`.
+    /// The chat-row indicator rolls up via
+    /// `OutboxStore.groupMessageStatus(forId:)`. Nil for 1:1 entries
+    /// and for non-chat housekeeping entries.
+    var groupMessageId: Data?
+    /// `Date` the recipient emitted a 0x04 readReceipt covering this
+    /// pairwise send. The aggregate "group message read by all" eye-
+    /// glyph fires when every entry under the same `groupMessageId`
+    /// has `readAt != nil`. F-405 read-receipts-symmetry rule from 1:1
+    /// applies — we only honour an incoming readReceipt if the local
+    /// user's `readReceiptsEnabled` toggle is ON for that contact.
+    var readAt: Date?
+
     private enum CodingKeys: String, CodingKey {
         case messageId, recipientPeerId, sealedCiphertext, token, ttl, sentAt
         case retries, deliveredAt, failedAt, relayedAt
         case attachmentId, chunkIndex, chunkCount
+        case groupMessageId, readAt
     }
 
     init(
@@ -71,7 +90,9 @@ struct OutboxEntry: Codable, Sendable {
         relayedAt: Date?,
         attachmentId: Data? = nil,
         chunkIndex: UInt32? = nil,
-        chunkCount: UInt32? = nil
+        chunkCount: UInt32? = nil,
+        groupMessageId: Data? = nil,
+        readAt: Date? = nil
     ) {
         self.messageId = messageId
         self.recipientPeerId = recipientPeerId
@@ -86,6 +107,8 @@ struct OutboxEntry: Codable, Sendable {
         self.attachmentId = attachmentId
         self.chunkIndex = chunkIndex
         self.chunkCount = chunkCount
+        self.groupMessageId = groupMessageId
+        self.readAt = readAt
     }
 
     init(from decoder: Decoder) throws {
@@ -103,6 +126,8 @@ struct OutboxEntry: Codable, Sendable {
         self.attachmentId = try c.decodeIfPresent(Data.self, forKey: .attachmentId)
         self.chunkIndex = try c.decodeIfPresent(UInt32.self, forKey: .chunkIndex)
         self.chunkCount = try c.decodeIfPresent(UInt32.self, forKey: .chunkCount)
+        self.groupMessageId = try c.decodeIfPresent(Data.self, forKey: .groupMessageId)
+        self.readAt = try c.decodeIfPresent(Date.self, forKey: .readAt)
     }
 }
 
@@ -208,5 +233,34 @@ struct OutboxStore: Codable, Sendable {
         if chunks.contains(where: { $0.status == .pending }) { return .pending }
         if chunks.contains(where: { $0.status == .relayed }) { return .relayed }
         return .delivered
+    }
+
+    /// Roll up status across every pairwise leg of a group fan-out.
+    /// A group message to N members produces N entries (text) or
+    /// N × chunkCount entries (attachment); the chat row needs ONE
+    /// indicator. Same worst-wins precedence as
+    /// `attachmentStatus(forId:)`: any failure ✗ wins, otherwise the
+    /// slowest tier across the legs. A group message with no entries
+    /// (post-GC) returns nil; the row falls back to "no status".
+    func groupMessageStatus(forId groupMessageId: Data) -> OutboxEntry.Status? {
+        let legs = entries.values.filter { $0.groupMessageId == groupMessageId }
+        guard !legs.isEmpty else { return nil }
+        if legs.contains(where: { $0.status == .failed }) { return .failed }
+        if legs.contains(where: { $0.status == .pending }) { return .pending }
+        if legs.contains(where: { $0.status == .relayed }) { return .relayed }
+        return .delivered
+    }
+
+    /// True iff every pairwise leg of the named group message has
+    /// `readAt != nil`. The eye glyph in `GroupChatBubble` lights when
+    /// status == .delivered AND this returns true. Returns false (NOT
+    /// nil) when no entries exist — post-GC, we don't surface a stale
+    /// "all read" claim from a row whose backing receipts have aged
+    /// out. F-405-style honesty: only assert "read by everyone" when
+    /// we have explicit per-recipient confirmation in hand.
+    func groupMessageReadByAll(forId groupMessageId: Data) -> Bool {
+        let legs = entries.values.filter { $0.groupMessageId == groupMessageId }
+        guard !legs.isEmpty else { return false }
+        return legs.allSatisfy { $0.readAt != nil }
     }
 }

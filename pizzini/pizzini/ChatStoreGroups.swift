@@ -558,6 +558,11 @@ extension ChatStore {
                 + " " + recipients.map { short($0) }.joined(separator: ", "),
         )
         var skipped: [String] = []
+        // Stable per-logical-message id stamped on every pairwise leg
+        // so the chat row can roll up status across the fan-out via
+        // `OutboxStore.groupMessageStatus(forId:)`.
+        let groupMessageId = ChatStore.makeGroupMessageId()
+        let now = Date()
         // Fan-out timing leak (audit LOW-5): tight loop; relay can
         // correlate. Documented limitation; jitter is v2 work.
         for recipient in recipients {
@@ -568,29 +573,56 @@ extension ChatStore {
                 continue
             }
             let messageId = ChatStore.makeGroupMessageId()
+            let ttl = state.contacts[cIdx].ttlSeconds
             do {
                 let sealed = try session.encryptSealed(
                     peer: recipient,
                     messageId: messageId,
                     plaintext: inner,
                 )
+                // Persist the outbox entry BEFORE the relay handoff —
+                // a force-quit between encryptSealed and persist would
+                // otherwise lose the entry and the row would render as
+                // "no status" forever even though the bytes were sent.
+                var entry = OutboxEntry(
+                    messageId: messageId,
+                    recipientPeerId: recipient,
+                    sealedCiphertext: sealed,
+                    token: token,
+                    ttl: TimeInterval(ttl),
+                    sentAt: now,
+                    retries: 0,
+                    deliveredAt: nil,
+                    failedAt: nil,
+                    relayedAt: nil,
+                    groupMessageId: groupMessageId,
+                )
+                outbox.entries[messageId] = entry
+                Storage.persist(outbox: outbox)
                 relay.sendSealed(
                     toPeer: recipient,
                     sealedCiphertext: sealed,
-                    ttlSeconds: state.contacts[cIdx].ttlSeconds,
+                    ttlSeconds: ttl,
                     token: token,
                 )
+                entry.relayedAt = now
+                entry.token = Data() // F-505: scrub once relayed
+                outbox.entries[messageId] = entry
+                Storage.persist(outbox: outbox)
             } catch {
                 NSLog("[pizzini] group fan-out failed for \(short(recipient)): \(error)")
             }
         }
         // Append our own log row. Self-attributed messages render
-        // without the "Name: " prefix in the chat view.
+        // without the "Name: " prefix in the chat view. The
+        // `groupMessageId` stamp lets the bubble render-time lookup
+        // fan in the per-recipient outbox status to a single icon.
         state.groups[gIdx].log.append(PersistedMessage(
             side: .me,
             text: trimmed,
             kind: .whisper,
             bytes: ciphertext.count,
+            groupMessageId: groupMessageId,
         ))
         state.groups[gIdx].lastMessageAt = Date()
         state.groups[gIdx].sentSinceRotation &+= 1
@@ -798,6 +830,12 @@ extension ChatStore {
         let recipients = state.groups[gIdx].activeMembers
             .map(\.peerId)
             .filter { $0 != myCard.peerId }
+        // Stable id for the whole logical group attachment. Every
+        // outbox leg (chunkCount × recipients legs total) shares it
+        // so the chat row can roll up status across the entire fan-
+        // out via `OutboxStore.groupMessageStatus(forId:)`.
+        let groupMessageId = ChatStore.makeGroupMessageId()
+        let now = Date()
         diagLog("group", "sendGroupAttachment \(short(groupId)):"
             + " aid=\(short(attachmentId)) filename=\"\(sanitizedFilename)\""
             + " size=\(totalSize) chunks=\(chunkCountU32) tier=\(tier.rawValue)"
@@ -848,18 +886,41 @@ extension ChatStore {
                     continue
                 }
                 let messageId = ChatStore.makeGroupMessageId()
+                let ttl = state.contacts[cIdx].ttlSeconds
                 do {
                     let sealed = try session.encryptSealed(
                         peer: recipient,
                         messageId: messageId,
                         plaintext: inner,
                     )
+                    var entry = OutboxEntry(
+                        messageId: messageId,
+                        recipientPeerId: recipient,
+                        sealedCiphertext: sealed,
+                        token: token,
+                        ttl: TimeInterval(ttl),
+                        sentAt: now,
+                        retries: 0,
+                        deliveredAt: nil,
+                        failedAt: nil,
+                        relayedAt: nil,
+                        attachmentId: attachmentId,
+                        chunkIndex: UInt32(i),
+                        chunkCount: chunkCountU32,
+                        groupMessageId: groupMessageId,
+                    )
+                    outbox.entries[messageId] = entry
+                    Storage.persist(outbox: outbox)
                     relay.sendSealed(
                         toPeer: recipient,
                         sealedCiphertext: sealed,
-                        ttlSeconds: state.contacts[cIdx].ttlSeconds,
+                        ttlSeconds: ttl,
                         token: token,
                     )
+                    entry.relayedAt = now
+                    entry.token = Data() // F-505 scrub-on-relay
+                    outbox.entries[messageId] = entry
+                    Storage.persist(outbox: outbox)
                 } catch {
                     NSLog(
                         "[pizzini] group attachment fan-out failed for \(short(recipient))"
@@ -904,6 +965,7 @@ extension ChatStore {
             kind: .attachment,
             bytes: Int(totalSize),
             attachment: info,
+            groupMessageId: groupMessageId,
         )
         state.groups[gIdx].log.append(row)
         state.groups[gIdx].lastMessageAt = row.timestamp

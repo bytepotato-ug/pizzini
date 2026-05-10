@@ -126,6 +126,8 @@ struct GroupChatView: View {
                                 resolveURL: { info in store.attachmentURL(for: info) },
                                 quickLookEnabled: store.state.quickLookPreviewEnabled,
                                 onInfoTap: { section in faqAnchor = section },
+                                status: rowStatus(for: row),
+                                readByAll: rowReadByAll(for: row),
                             )
                             .id(row.id)
                         }
@@ -180,6 +182,31 @@ struct GroupChatView: View {
             }
             return store.memberDisplayName(peerId, in: group)
         }
+    }
+
+    /// Roll up the per-recipient outbox status to a single indicator
+    /// for `.me` group rows. Attachment rows with a `groupMessageId`
+    /// use it; bare 1:1-style attachment-id-only fallback isn't
+    /// applicable here because every group send carries a
+    /// `groupMessageId` by construction (see `sendGroupMessage` /
+    /// `shipPreparedGroupAttachment`).
+    private func rowStatus(for row: PersistedMessage) -> OutboxEntry.Status? {
+        guard row.side == .me, row.kind != .system,
+              let gmid = row.groupMessageId
+        else { return nil }
+        return store.outbox.groupMessageStatus(forId: gmid)
+    }
+
+    /// True when every recipient of this `.me` group row has emitted
+    /// a 0x04 readReceipt covering it. Drives the ✓✓ → 👁 swap on the
+    /// rolled-up status icon. False (NOT nil) when no outbox entries
+    /// remain — post-GC the row stays at ✓✓ rather than claiming
+    /// "read by all" without confirmation.
+    private func rowReadByAll(for row: PersistedMessage) -> Bool {
+        guard row.side == .me, row.kind != .system,
+              let gmid = row.groupMessageId
+        else { return false }
+        return store.outbox.groupMessageReadByAll(forId: gmid)
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, group: ChatGroup) {
@@ -376,6 +403,20 @@ private struct GroupChatBubble: View {
     /// FAQ deep-link callback for the receive-side warning banners
     /// inside `AttachmentRowCard`.
     let onInfoTap: ((FAQSection) -> Void)?
+    /// Worst-status-wins rollup across the N pairwise outbox legs of
+    /// this `.me` row's group fan-out. Nil for `.peer` / `.system`
+    /// rows and for `.me` rows whose backing entries have aged out
+    /// of the outbox (post-GC). Drives the ⏳ / ✓ / ✓✓ indicator in
+    /// the metadata strip below the bubble.
+    let status: OutboxEntry.Status?
+    /// True when every pairwise leg of this `.me` row has `readAt`
+    /// stamped — flips the ✓✓ glyph to 👁. Mirrors the 1:1 row's
+    /// "all readers confirmed" semantics; in a group, that means
+    /// every recipient has emitted a 0x04 readReceipt covering this
+    /// message. False when no entries exist (post-GC) so the row
+    /// doesn't claim "read by all" without explicit per-recipient
+    /// confirmation in hand.
+    let readByAll: Bool
 
     var body: some View {
         HStack(alignment: .top) {
@@ -388,7 +429,10 @@ private struct GroupChatBubble: View {
             case .preKey, .whisper, .attachment:
                 if message.side == .me {
                     Spacer(minLength: 40)
-                    bubbleContent(bubbleColor: Color.accentColor.opacity(0.20))
+                    VStack(alignment: .trailing, spacing: 4) {
+                        bubbleContent(bubbleColor: Color.accentColor.opacity(0.20))
+                        metadata
+                    }
                 } else {
                     VStack(alignment: .leading, spacing: 2) {
                         if let name = senderName {
@@ -398,11 +442,27 @@ private struct GroupChatBubble: View {
                                 .padding(.leading, 10)
                         }
                         bubbleContent(bubbleColor: Color(.secondarySystemBackground))
+                        metadata
                     }
                     Spacer(minLength: 40)
                 }
             }
         }
+    }
+
+    /// Timestamp + (for `.me` rows) status icon. Mirrors `ChatRow`'s
+    /// metadata strip so 1:1 and group chats render the same row
+    /// chrome — keeps the glyph legend in `OnboardingView` valid for
+    /// both surfaces.
+    private var metadata: some View {
+        HStack(spacing: 6) {
+            Text(message.timestamp.formatted(date: .omitted, time: .shortened))
+                .foregroundStyle(.secondary)
+            if message.side == .me, let status {
+                ChatStatusIcon(status: status, read: readByAll)
+            }
+        }
+        .font(.caption2)
     }
 
     @ViewBuilder

@@ -67,6 +67,13 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
     /// and for `.me` / `.system` rows in a group log (the row is
     /// implicitly self-attributed or has no sender).
     let senderPeerId: Data?
+    /// 16-byte stable id of the LOGICAL group message this row
+    /// represents — set on `.me` rows in groups (text and attachment
+    /// alike) so the chat-row indicator can roll up status across the
+    /// N pairwise outbox legs via
+    /// `OutboxStore.groupMessageStatus(forId:)`. Nil for 1:1 rows,
+    /// `.peer` rows in groups, and `.system` rows.
+    let groupMessageId: Data?
 
     init(
         id: UUID = UUID(),
@@ -78,7 +85,8 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
         messageId: Data? = nil,
         readAt: Date? = nil,
         attachment: AttachmentInfo? = nil,
-        senderPeerId: Data? = nil
+        senderPeerId: Data? = nil,
+        groupMessageId: Data? = nil
     ) {
         self.id = id
         self.side = side
@@ -90,10 +98,12 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
         self.readAt = readAt
         self.attachment = attachment
         self.senderPeerId = senderPeerId
+        self.groupMessageId = groupMessageId
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, side, text, kind, bytes, timestamp, messageId, readAt, attachment, senderPeerId
+        case id, side, text, kind, bytes, timestamp, messageId, readAt, attachment
+        case senderPeerId, groupMessageId
     }
 
     init(from decoder: Decoder) throws {
@@ -108,6 +118,7 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
         self.readAt = try c.decodeIfPresent(Date.self, forKey: .readAt)
         self.attachment = try c.decodeIfPresent(AttachmentInfo.self, forKey: .attachment)
         self.senderPeerId = try c.decodeIfPresent(Data.self, forKey: .senderPeerId)
+        self.groupMessageId = try c.decodeIfPresent(Data.self, forKey: .groupMessageId)
     }
 }
 

@@ -32,7 +32,12 @@ final class ChatStore: NSObject {
     /// surfaces also see the setter — they drive mutation through
     /// ChatStore methods by convention rather than language guard.
     var state: AppState
-    private(set) var outbox: OutboxStore
+    /// Internal-not-`private(set)` so the group fan-out extension in
+    /// `ChatStoreGroups.swift` can stamp per-leg outbox entries
+    /// directly. Mutation is still by-convention through ChatStore
+    /// methods (extensions count as part of the type for our purposes
+    /// — there's no out-of-module consumer).
+    var outbox: OutboxStore
     private(set) var initError: String?
 
     /// In-memory ring buffer of recent group-flow events. NOT
@@ -1579,6 +1584,27 @@ extension ChatStore: RelayClientDelegate {
             }
         }
         if changed { Storage.persist(appState: state) }
+        // Phase 7 group-read aggregation. The same incoming receipt
+        // ALSO covers every group fan-out leg we shipped to this peer
+        // up to the cutoff. Stamp `readAt` on those outbox entries so
+        // `OutboxStore.groupMessageReadByAll(forId:)` returns true
+        // once every member has confirmed — `GroupChatBubble` then
+        // flips ✓✓ → 👁 on the rolled-up row indicator. Honours the
+        // same `readReceiptsEnabled`-off symmetric drop as the 1:1
+        // path above (the early-return already guarded it).
+        let peerId = state.contacts[idx].identityPub
+        var outboxChanged = false
+        for (id, entry) in outbox.entries
+            where entry.recipientPeerId == peerId
+                && entry.groupMessageId != nil
+                && entry.sentAt <= cutoff
+                && entry.readAt == nil {
+            var updated = entry
+            updated.readAt = now
+            outbox.entries[id] = updated
+            outboxChanged = true
+        }
+        if outboxChanged { Storage.persist(outbox: outbox) }
     }
 
     @MainActor
