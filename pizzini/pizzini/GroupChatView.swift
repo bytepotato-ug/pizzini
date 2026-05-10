@@ -22,6 +22,22 @@ import UIKit
 struct GroupChatView: View {
     @Bindable var store: ChatStore
     let groupID: Data
+    /// Deep-link target from the global search results view. Same
+    /// shape and semantics as `ChatView.initialFocus` — when non-nil,
+    /// `onAppear` pre-populates the in-chat find-bar with `query` and
+    /// scrolls to `messageID` so a tap on a group-message result row
+    /// lands the user on the cited bubble with prev/next ready.
+    let initialFocus: ChatSearch.Focus?
+
+    init(
+        store: ChatStore,
+        groupID: Data,
+        initialFocus: ChatSearch.Focus? = nil,
+    ) {
+        self.store = store
+        self.groupID = groupID
+        self.initialFocus = initialFocus
+    }
 
     @State private var draft: String = ""
     @State private var showAttachSheet = false
@@ -30,6 +46,16 @@ struct GroupChatView: View {
     @State private var attachmentDraft: AttachmentDraft?
     @State private var faqAnchor: FAQSection?
     @FocusState private var composerFocused: Bool
+    /// In-chat find-bar state. Mirrors `ChatView`'s shape exactly —
+    /// `searchQuery` is bound to `.searchable(text:isPresented:)` on
+    /// the body; `searchActive` controls programmatic open/close via
+    /// the toolbar magnifying-glass button + the global-search deep
+    /// link. `currentMatchID` is the UUID (not index) of the focused
+    /// hit so a row arriving / TTL-expiring under the user's feet
+    /// doesn't shift the highlight to the wrong bubble.
+    @State private var searchQuery = ""
+    @State private var searchActive = false
+    @State private var currentMatchID: UUID?
     /// iOS 18 ScrollPosition binding for the group log. Mirrors the
     /// 1:1 `ChatView.scrollPosition` — opens at-bottom via
     /// `.defaultScrollAnchor(.bottom, for: .initialOffset)`, and
@@ -88,6 +114,17 @@ struct GroupChatView: View {
         //      rises and falls.
         .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(spacing: 0) {
+                // Find-bar pill, parity with `ChatView`. Sits ABOVE
+                // the attachment-preview banner and the composer so
+                // prev/next + "n of m" stays visible while the user
+                // types in either the composer or the search field.
+                // Visibility driven by `searchQuery` non-empty rather
+                // than `searchActive` so a deep-link arrival shows
+                // the pill without forcing the search field focused.
+                if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    findBar
+                    Divider()
+                }
                 if let draft = attachmentDraft {
                     attachmentPreview(draft: draft)
                     Divider()
@@ -96,9 +133,30 @@ struct GroupChatView: View {
             }
             .background(.bar)
         }
+        // In-chat find. Parity with `ChatView` — `.searchable` with
+        // the `isPresented` binding so the magnifying-glass toolbar
+        // button + the global-search deep-link can both programmatically
+        // open the search field, and the system Cancel button binds
+        // back to false on dismissal.
+        .searchable(
+            text: $searchQuery,
+            isPresented: $searchActive,
+            placement: .navigationBarDrawer(displayMode: .always),
+            prompt: Text("Find in this chat"),
+        )
+        .autocorrectionDisabled(true)
+        .textInputAutocapitalization(.never)
         .navigationTitle(group?.displayName ?? "Group")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    searchActive.toggle()
+                } label: {
+                    Image(systemName: "magnifyingglass")
+                }
+                .accessibilityLabel("Find in chat")
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 NavigationLink {
                     GroupSettingsView(store: store, groupID: groupID)
@@ -147,6 +205,7 @@ struct GroupChatView: View {
             // receipts toggled on. Same parity with `ChatView`'s
             // `markRead` for 1:1 chats.
             store.markGroupRead(groupID: groupID)
+            applyInitialFocusIfNeeded()
         }
         .onDisappear {
             if store.activeSurface == .group(groupId: groupID) {
@@ -169,6 +228,15 @@ struct GroupChatView: View {
             // without the user having to re-enter the chat — same
             // shape as `ChatView`'s 1:1 onChange.
             store.markGroupRead(groupID: groupID)
+        }
+        // Query change → anchor the find-bar to the newest match,
+        // same shape as `ChatView`. Empty query → clear anchor.
+        // Deliberately NOT also clearing on `searchActive` going
+        // false (Cancel-tap): the user might want to read context
+        // around the highlighted matches without ending search
+        // mode entirely. The find-pill's X is the explicit exit.
+        .onChange(of: searchQuery) { _, _ in
+            landOnNewestMatch()
         }
     }
 
@@ -201,6 +269,16 @@ struct GroupChatView: View {
                             onInfoTap: { section in faqAnchor = section },
                             status: rowStatus(for: row),
                             readByAll: rowReadByAll(for: row),
+                            // In-chat find: same shape as ChatView —
+                            // yellow background on matched substrings
+                            // for every hit, orange outer ring on the
+                            // currently-focused match the user cycled
+                            // to via prev/next. Driven by searchQuery
+                            // non-empty so deep-link arrivals (where
+                            // the search field is not focused) still
+                            // highlight matches.
+                            highlightQuery: searchQuery,
+                            isFocusedMatch: row.id == currentMatchID,
                         )
                         .id(row.id)
                     }
@@ -312,6 +390,128 @@ struct GroupChatView: View {
     /// viewport. Mirrors `ChatView.jumpToBottomOnSend`.
     private func jumpToBottomOnSend() {
         withAnimation { scrollPosition.scrollTo(edge: .bottom) }
+    }
+
+    // MARK: - In-chat find-bar (parity with `ChatView`)
+
+    /// Compact navigation pill — "n of m" + chevron-up / chevron-down
+    /// — docked above the composer when an in-chat search is active.
+    /// See `ChatView.findBar` for the full rationale; this is the
+    /// group surface's identical-shaped counterpart.
+    @ViewBuilder
+    private var findBar: some View {
+        let matches = matchedIDs()
+        HStack(spacing: 14) {
+            if matches.isEmpty {
+                Text("No matches")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                let displayIndex = matchedIndex(in: matches).map { $0 + 1 } ?? matches.count
+                Text("\(displayIndex) of \(matches.count)")
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button { jumpToPrevMatch(in: matches) } label: {
+                Image(systemName: "chevron.up")
+            }
+            .disabled(matches.isEmpty)
+            .accessibilityLabel("Previous match")
+            Button { jumpToNextMatch(in: matches) } label: {
+                Image(systemName: "chevron.down")
+            }
+            .disabled(matches.isEmpty)
+            .accessibilityLabel("Next match")
+            Button {
+                // Explicit exit from search mode. Parity with
+                // `ChatView.findBar`'s X — separate from the system
+                // Cancel button on the .searchable field so a user
+                // who's unfocused the bar to read context can leave
+                // search mode without having to re-focus first.
+                searchQuery = ""
+                currentMatchID = nil
+                searchActive = false
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Exit search")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+    }
+
+    /// All matching message IDs in the current group's log, in
+    /// chronological order. Empty when the group has been removed
+    /// from state under our feet. Driven by `searchQuery` rather
+    /// than `searchActive` for parity with `ChatView.matchedIDs`.
+    private func matchedIDs() -> [UUID] {
+        guard let group else { return [] }
+        return ChatSearch.findIDs(in: group.log, query: searchQuery)
+    }
+
+    /// 0-based index of `currentMatchID` within `matches`, or nil if
+    /// either is absent. Drives the find-bar's "n of m" counter.
+    private func matchedIndex(in matches: [UUID]) -> Int? {
+        guard let id = currentMatchID else { return nil }
+        return matches.firstIndex(of: id)
+    }
+
+    /// On query change, anchor the find-bar to the NEWEST match — same
+    /// "read forward from history" cadence as the 1:1 chat view.
+    private func landOnNewestMatch() {
+        let matches = matchedIDs()
+        guard let last = matches.last else {
+            currentMatchID = nil
+            return
+        }
+        currentMatchID = last
+        withAnimation { scrollPosition.scrollTo(id: last, anchor: .center) }
+    }
+
+    /// Cycle to the previous (older) match. Wraps. Same semantics as
+    /// `ChatView.jumpToPrevMatch`.
+    private func jumpToPrevMatch(in matches: [UUID]) {
+        guard !matches.isEmpty else { return }
+        let current = matchedIndex(in: matches) ?? matches.count - 1
+        let prev = (current - 1 + matches.count) % matches.count
+        currentMatchID = matches[prev]
+        withAnimation { scrollPosition.scrollTo(id: matches[prev], anchor: .center) }
+    }
+
+    /// Cycle to the next (newer) match. Wraps. Mirror of
+    /// `ChatView.jumpToNextMatch`.
+    private func jumpToNextMatch(in matches: [UUID]) {
+        guard !matches.isEmpty else { return }
+        let current = matchedIndex(in: matches) ?? 0
+        let next = (current + 1) % matches.count
+        currentMatchID = matches[next]
+        withAnimation { scrollPosition.scrollTo(id: matches[next], anchor: .center) }
+    }
+
+    /// Honour an `initialFocus` deep-link from the global search
+    /// results: same single-shot, only-once-per-view-lifetime guard
+    /// as `ChatView.applyInitialFocusIfNeeded`. See that method's
+    /// doc for the full rationale; in short, we pre-populate
+    /// `searchQuery` (so highlights + find pill render) but
+    /// deliberately leave `searchActive` false (so the keyboard
+    /// doesn't pop up over the chat content the user is trying to
+    /// read), and defer the scrollTo one runloop tick so the
+    /// LazyVStack measurement has resolved.
+    private func applyInitialFocusIfNeeded() {
+        guard let focus = initialFocus, currentMatchID == nil, let group else { return }
+        searchQuery = focus.query
+        let matches = ChatSearch.findIDs(in: group.log, query: focus.query)
+        let target = matches.contains(focus.messageID) ? focus.messageID
+            : matches.last ?? focus.messageID
+        currentMatchID = target
+        DispatchQueue.main.async {
+            withAnimation {
+                scrollPosition.scrollTo(id: target, anchor: .center)
+            }
+        }
     }
 
     private var composer: some View {
@@ -530,6 +730,14 @@ private struct GroupChatBubble: View {
     /// doesn't claim "read by all" without explicit per-recipient
     /// confirmation in hand.
     let readByAll: Bool
+    /// In-chat find query. Non-nil → matched substrings in the bubble
+    /// text get a yellow AttributedString background, same shape as
+    /// `ChatRow.highlightQuery`.
+    let highlightQuery: String?
+    /// True when this row is the currently-focused match in the
+    /// find-bar's prev/next cycle. Adds an outer orange ring so the
+    /// user can see WHERE they landed after a chevron tap.
+    let isFocusedMatch: Bool
 
     var body: some View {
         HStack(alignment: .top) {
@@ -590,14 +798,44 @@ private struct GroupChatBubble: View {
                 quickLookEnabled: quickLookEnabled,
                 onInfoTap: onInfoTap,
             )
+            .overlay(focusedMatchRing)
         } else {
-            Text(message.text)
-                .font(.body)
+            bubbleText
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
                 .textSelection(.enabled)
                 .background(bubbleColor)
                 .cornerRadius(12)
+                .overlay(focusedMatchRing)
+        }
+    }
+
+    /// Bubble text — AttributedString-highlighted when an in-chat
+    /// search query is active and contains a match in `message.text`;
+    /// plain `Text` otherwise. Same hookup as `ChatRow.bubbleText`,
+    /// kept here as a private helper rather than a free function so
+    /// the call site reads symmetrically to the 1:1 case.
+    @ViewBuilder
+    private var bubbleText: some View {
+        if let q = highlightQuery,
+           !q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            Text(SearchHighlight.attributed(text: message.text, query: q))
+                .font(.body)
+        } else {
+            Text(message.text)
+                .font(.body)
+        }
+    }
+
+    /// Outer orange ring around a focused-match bubble. Drawn ONLY
+    /// when this row is the find-bar's current match; for every
+    /// other matched row the per-substring yellow text-background
+    /// is signal enough.
+    @ViewBuilder
+    private var focusedMatchRing: some View {
+        if isFocusedMatch {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.orange, lineWidth: 2)
         }
     }
 }

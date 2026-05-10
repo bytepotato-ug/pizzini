@@ -15,10 +15,35 @@ struct ContactsListView: View {
     /// 1:1 contacts to invite). Local to the list — surfaced via the
     /// "+" toolbar menu.
     @State private var showNewGroupSheet = false
+    /// `.searchable` text binding. Non-empty (after trimming) → the
+    /// body swaps the normal contacts/groups list for a
+    /// `SearchResultsView` that scans every chat log + name
+    /// in-memory. Empty → normal list. iOS's search machinery owns
+    /// the visible search field, the cancel button, and the keyboard
+    /// dismissal flow; we just react to the value it produces.
+    @State private var searchQuery = ""
+
+    /// True when the user typed something searchable (non-blank).
+    /// Computed rather than stored so a programmatic mutation to
+    /// `searchQuery` flips this through `body` without a second
+    /// `onChange` hop.
+    private var isSearching: Bool {
+        !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     var body: some View {
         ZStack {
-            if store.state.contacts.isEmpty, store.state.groups.isEmpty {
+            if isSearching {
+                // Global search swap: replace the normal list with
+                // the search-results surface. SwiftUI's `.searchable`
+                // (applied below) renders the search bar in the nav
+                // bar drawer above this view — the user types there,
+                // we re-render here. Keeps the search keyboard / cancel
+                // button / focus-state owned by SwiftUI's nav-bar
+                // search machinery rather than something we own
+                // manually.
+                SearchResultsView(store: store, query: searchQuery)
+            } else if store.state.contacts.isEmpty, store.state.groups.isEmpty {
                 emptyState
             } else {
                 list
@@ -29,6 +54,25 @@ struct ContactsListView: View {
         // a user who triggered Control-Centre Record by mistake can
         // still navigate out / open Settings to disable recording.
         .screenCaptureShielded()
+        // Global search across every chat log + chat name. Lives on
+        // the root contacts list so it's reachable from anywhere via
+        // the nav-stack drag-down gesture. The placement explicitly
+        // hoists it INTO the nav bar drawer (default on iOS) so the
+        // search field reads as part of the list's nav chrome rather
+        // than a body element.
+        .searchable(
+            text: $searchQuery,
+            placement: .navigationBarDrawer(displayMode: .automatic),
+            prompt: Text("Search chats and messages"),
+        )
+        // Default-disable autocorrect on the search field. A user
+        // searching "alice" doesn't want iOS to helpfully replace it
+        // with "slice" — and an activist searching for a sensitive
+        // keyword doesn't want it landing in the system's keyboard-
+        // learning cache where another app or a forensic extract
+        // would find it. Same posture as the chat composer.
+        .autocorrectionDisabled(true)
+        .textInputAutocapitalization(.never)
         .navigationTitle("Pizzini")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {

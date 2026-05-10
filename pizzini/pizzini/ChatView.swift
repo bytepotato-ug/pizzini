@@ -5,6 +5,23 @@ import QuickLook
 struct ChatView: View {
     @Bindable var store: ChatStore
     let contactID: UUID
+    /// Deep-link target from the global search results view. Nil for
+    /// the normal contacts-list NavigationLink path. When non-nil,
+    /// `onAppear` pre-populates the in-chat find-bar with the query
+    /// and scrolls to the cited message so the user lands on the
+    /// exact row that matched, with prev/next ready to cycle through
+    /// other hits in the same chat.
+    let initialFocus: ChatSearch.Focus?
+
+    init(
+        store: ChatStore,
+        contactID: UUID,
+        initialFocus: ChatSearch.Focus? = nil,
+    ) {
+        self.store = store
+        self.contactID = contactID
+        self.initialFocus = initialFocus
+    }
 
     @State private var draft = ""
     @State private var renaming = false
@@ -20,6 +37,17 @@ struct ChatView: View {
     /// this to deep-link into FAQView at the right anchor.
     @State private var faqAnchor: FAQSection?
     @FocusState private var composerFocused: Bool
+    /// In-chat find-bar state. `searchQuery` is bound to a
+    /// `.searchable(text:isPresented:)` modifier; `searchActive` is
+    /// bound to the same modifier's isPresented argument so the
+    /// toolbar magnifying-glass button can toggle the search bar
+    /// programmatically. `currentMatchID` tracks which hit the user
+    /// has cycled to — index-by-UUID rather than by integer offset so
+    /// a row arriving / TTL-expiring under the user's feet doesn't
+    /// shift the highlighted "current match" to the wrong bubble.
+    @State private var searchQuery = ""
+    @State private var searchActive = false
+    @State private var currentMatchID: UUID?
     // iOS 18 ScrollPosition binding for the message list. Two roles:
     //   1. Initial position is `.bottom`, so opening the chat lands
     //      on the latest message without any imperative `scrollTo`.
@@ -92,6 +120,21 @@ struct ChatView: View {
             //    first responder; no manual keyboard-avoidance code.
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 VStack(spacing: 0) {
+                    // Find-bar pill sits ABOVE the attachment-preview
+                    // banner and the composer whenever the user has
+                    // a non-empty query. Decoupled from `searchActive`
+                    // (which only tracks search-field focus) so that:
+                    //   • a global-search deep-link arrives with the
+                    //     pill visible and the cited match highlighted
+                    //     EVEN THOUGH the search field is not focused
+                    //     (no keyboard hiding the chat content);
+                    //   • a user who Cancels the search field to read
+                    //     context still sees the prev/next pill, and
+                    //     the pill's X is the explicit exit.
+                    if !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        findBar
+                        Divider()
+                    }
                     if let draft = attachmentDraft {
                         attachmentPreview(draft: draft)
                         Divider()
@@ -106,11 +149,33 @@ struct ChatView: View {
             // the user can pop back out without seeing what they were
             // reading mirror to a TV.
             .screenCaptureShielded()
+            // In-chat find. `isPresented` is wired through so the
+            // toolbar magnifying-glass button can programmatically
+            // open the search bar, and so a global-search-result
+            // deep-link arriving via `initialFocus` can pre-activate
+            // it. Cancel on the bar binds back to false; our
+            // `.onChange(of: searchActive)` below clears the query +
+            // current-match-id when that happens so the next
+            // re-activation starts fresh.
+            .searchable(
+                text: $searchQuery,
+                isPresented: $searchActive,
+                placement: .navigationBarDrawer(displayMode: .always),
+                prompt: Text("Find in this chat"),
+            )
+            // Same posture as the global search field on
+            // `ContactsListView`: don't let iOS autocorrect a user
+            // searching for a sensitive keyword into something else,
+            // and don't leak the typed-but-not-sent terms into the
+            // device's keyboard-learning store.
+            .autocorrectionDisabled(true)
+            .textInputAutocapitalization(.never)
             .navigationTitle(contact.displayName)
             .navigationBarTitleDisplayMode(.inline)
             .onAppear {
                 store.activeSurface = .oneOnOne(peerIdentity: contact.identityPub)
                 store.markRead(contactID: contactID)
+                applyInitialFocusIfNeeded(contact: contact)
             }
             .onDisappear {
                 if store.activeSurface == .oneOnOne(peerIdentity: contact.identityPub) {
@@ -120,6 +185,17 @@ struct ChatView: View {
             }
             .onChange(of: contact.log.count) { _, _ in
                 store.markRead(contactID: contactID)
+            }
+            // When the user edits the query the current match anchors
+            // to the newest hit so they read forward into history with
+            // ↑. Empty query → no anchor; the find pill disappears.
+            // Deliberately NOT also clearing on `searchActive` going
+            // false: the user might Cancel the field to read context
+            // around the highlighted matches without ending search
+            // mode entirely. The find-pill's X button is the explicit
+            // exit path; Cancel just unfocuses the bar.
+            .onChange(of: searchQuery) { _, _ in
+                landOnNewestMatch(in: contact.log)
             }
             // NB: the `.confirmationDialog` for the paperclip lives on
             // the paperclip button itself (see `composer`) so iOS uses
@@ -152,6 +228,18 @@ struct ChatView: View {
                 )
             }
             .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        // Toggle the find-bar. `.searchable(isPresented:)`
+                        // takes care of focusing the TextField, raising
+                        // the keyboard, and rendering the Cancel button;
+                        // we just flip the binding.
+                        searchActive.toggle()
+                    } label: {
+                        Image(systemName: "magnifyingglass")
+                    }
+                    .accessibilityLabel("Find in chat")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Button {
@@ -257,6 +345,18 @@ struct ChatView: View {
                         resolveURL: { info in store.attachmentURL(for: info) },
                         quickLookEnabled: store.state.quickLookPreviewEnabled,
                         onInfoTap: { section in faqAnchor = section },
+                        // In-chat find: when the user has an active
+                        // query, every matched bubble gets a yellow
+                        // AttributedString highlight on the matched
+                        // substrings, AND the currently-focused match
+                        // (the one prev/next is anchored to) gets an
+                        // extra outer orange ring so the user can see
+                        // WHERE in the list they just jumped to.
+                        // Decoupled from `searchActive` so a deep-link
+                        // arrival shows highlights even when the
+                        // search field isn't focused.
+                        highlightQuery: searchQuery,
+                        isFocusedMatch: entry.id == currentMatchID,
                     ).id(entry.id)
                 }
             }
@@ -485,6 +585,153 @@ struct ChatView: View {
     private func jumpToBottomOnSend() {
         withAnimation { scrollPosition.scrollTo(edge: .bottom) }
     }
+
+    // MARK: - In-chat find-bar
+
+    /// Compact navigation pill docked above the composer when an
+    /// in-chat search is active. Shows the current match's 1-based
+    /// position out of total matches, with ↑ / ↓ chevrons to cycle.
+    /// "No matches" surfaces explicitly so the user knows they're
+    /// not just scrolled to an irrelevant spot — the query simply
+    /// has zero hits in this chat.
+    @ViewBuilder
+    private var findBar: some View {
+        let matches = matchedIDs(in: contact?.log ?? [])
+        HStack(spacing: 14) {
+            if matches.isEmpty {
+                Text("No matches")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                let displayIndex = matchedIndex(in: matches).map { $0 + 1 } ?? matches.count
+                Text("\(displayIndex) of \(matches.count)")
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button { jumpToPrevMatch(in: matches) } label: {
+                Image(systemName: "chevron.up")
+            }
+            .disabled(matches.isEmpty)
+            .accessibilityLabel("Previous match")
+            Button { jumpToNextMatch(in: matches) } label: {
+                Image(systemName: "chevron.down")
+            }
+            .disabled(matches.isEmpty)
+            .accessibilityLabel("Next match")
+            Button {
+                // Explicit exit from search mode. Clears the query +
+                // current-match-id (which removes the highlights + the
+                // pill itself) and unfocuses the search field if it
+                // happened to be focused. Separate from the system
+                // Cancel button on the search bar so a user who's
+                // unfocused the bar to read context can still leave
+                // search mode without having to re-focus first.
+                searchQuery = ""
+                currentMatchID = nil
+                searchActive = false
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Exit search")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+    }
+
+    /// All matching message IDs for the current `searchQuery`, in
+    /// chronological order. Recomputed on every read so a new row
+    /// landing under the user's feet (inbound message, or our own
+    /// send) is included immediately; the underlying scan is a
+    /// linear pass over the in-RAM log and the cost is negligible.
+    /// Driven by `searchQuery` rather than `searchActive` for the
+    /// same reason as the highlights and the find-pill: a deep-link
+    /// from global search produces a non-empty query without the
+    /// search field being focused, and we want prev/next to work
+    /// from the moment the chat opens.
+    private func matchedIDs(in log: [PersistedMessage]) -> [UUID] {
+        ChatSearch.findIDs(in: log, query: searchQuery)
+    }
+
+    /// 0-based index of `currentMatchID` within `matches`, or nil if
+    /// either is absent or out of sync. Drives the "n of m" pill.
+    private func matchedIndex(in matches: [UUID]) -> Int? {
+        guard let id = currentMatchID else { return nil }
+        return matches.firstIndex(of: id)
+    }
+
+    /// On query change, anchor the find-bar to the NEWEST match. The
+    /// user reads-forward-from-history pattern: land on the most
+    /// recent hit, ↑ goes backward in time. Mirrors the find-bar
+    /// behaviour in iMessage / Mail.
+    private func landOnNewestMatch(in log: [PersistedMessage]) {
+        let matches = matchedIDs(in: log)
+        guard let last = matches.last else {
+            currentMatchID = nil
+            return
+        }
+        currentMatchID = last
+        withAnimation { scrollPosition.scrollTo(id: last, anchor: .center) }
+    }
+
+    /// Cycle to the previous (older) match. Wraps to the newest when
+    /// already at the oldest, matching browser find-in-page.
+    private func jumpToPrevMatch(in matches: [UUID]) {
+        guard !matches.isEmpty else { return }
+        let current = matchedIndex(in: matches) ?? matches.count - 1
+        let prev = (current - 1 + matches.count) % matches.count
+        currentMatchID = matches[prev]
+        withAnimation { scrollPosition.scrollTo(id: matches[prev], anchor: .center) }
+    }
+
+    /// Cycle to the next (newer) match. Wraps to the oldest when
+    /// already at the newest. Same browser-find semantics.
+    private func jumpToNextMatch(in matches: [UUID]) {
+        guard !matches.isEmpty else { return }
+        let current = matchedIndex(in: matches) ?? 0
+        let next = (current + 1) % matches.count
+        currentMatchID = matches[next]
+        withAnimation { scrollPosition.scrollTo(id: matches[next], anchor: .center) }
+    }
+
+    /// Honour an `initialFocus` deep-link from the global search
+    /// results: pre-populate the find-bar with the result's query
+    /// and scroll-snap to the cited message. Called from `onAppear`
+    /// exactly once per view-lifetime; guards on `currentMatchID`
+    /// being nil so a programmatic state reset that happens to
+    /// re-run `onAppear` doesn't yank the user back to the original
+    /// focus row after they cycled away.
+    ///
+    /// Deliberately does NOT set `searchActive = true`. Activating
+    /// the search field would focus its TextField and raise the
+    /// keyboard, hiding the chat content the user is trying to
+    /// read — and the user tapped a search-result to READ context,
+    /// not to keep typing. The find-pill renders off `searchQuery`'s
+    /// non-empty value (not `searchActive`), so the user lands with
+    /// the cited match highlighted + prev/next ready while the
+    /// chat itself stays unobscured. They can tap the toolbar
+    /// magnifying-glass any time to refine the query.
+    private func applyInitialFocusIfNeeded(contact: Contact) {
+        guard let focus = initialFocus, currentMatchID == nil else { return }
+        searchQuery = focus.query
+        let matches = ChatSearch.findIDs(in: contact.log, query: focus.query)
+        let target = matches.contains(focus.messageID) ? focus.messageID
+            : matches.last ?? focus.messageID
+        currentMatchID = target
+        // Defer the scrollTo to the next runloop tick so the
+        // LazyVStack has measured the rows that just became visible
+        // before ScrollPosition is asked to jump. Without the defer
+        // the position binding sometimes computes against pre-layout
+        // offsets and the target row lands clipped under the
+        // nav-bar search drawer.
+        DispatchQueue.main.async {
+            withAnimation {
+                scrollPosition.scrollTo(id: target, anchor: .center)
+            }
+        }
+    }
 }
 
 struct ChatRow: View {
@@ -501,19 +748,34 @@ struct ChatRow: View {
     /// Bubble (i) info-button taps up to the parent ChatView so it
     /// can present the FAQ sheet at the right anchor.
     let onInfoTap: ((FAQSection) -> Void)?
+    /// In-chat find query. Non-nil → matched substrings in the bubble
+    /// text get a yellow AttributedString background; nil → render
+    /// the bubble exactly as before. The text content is unchanged
+    /// either way; only the visual styling differs.
+    let highlightQuery: String?
+    /// True when this row is the currently-focused match in the
+    /// find-bar's prev/next cycle. Adds an outer orange ring around
+    /// the bubble so the user can see WHERE they landed after a
+    /// chevron tap, separate from the yellow text-background that
+    /// marks every match generically.
+    let isFocusedMatch: Bool
 
     init(
         entry: PersistedMessage,
         status: OutboxEntry.Status? = nil,
         resolveURL: @escaping (AttachmentInfo) -> URL? = { _ in nil },
         quickLookEnabled: Bool = false,
-        onInfoTap: ((FAQSection) -> Void)? = nil
+        onInfoTap: ((FAQSection) -> Void)? = nil,
+        highlightQuery: String? = nil,
+        isFocusedMatch: Bool = false
     ) {
         self.entry = entry
         self.status = status
         self.resolveURL = resolveURL
         self.quickLookEnabled = quickLookEnabled
         self.onInfoTap = onInfoTap
+        self.highlightQuery = highlightQuery
+        self.isFocusedMatch = isFocusedMatch
     }
 
     var body: some View {
@@ -534,17 +796,50 @@ struct ChatRow: View {
                         quickLookEnabled: quickLookEnabled,
                         onInfoTap: onInfoTap,
                     )
+                    .overlay(focusedMatchRing)
                 } else {
-                    Text(entry.text)
-                        .font(.body)
+                    bubbleText
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
                         .background(bubbleColor)
                         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .overlay(focusedMatchRing)
                 }
                 metadata
             }
             if entry.side == .peer { Spacer(minLength: 32) }
+        }
+    }
+
+    /// Bubble text rendered as plain `Text` when search is inactive,
+    /// or as an AttributedString (`SearchHighlight.attributed`) when
+    /// the find-bar is engaged. Same font + colour either way — the
+    /// only differences are the per-match yellow background runs and
+    /// the forced `.primary` foreground inside those runs (so the
+    /// match reads against the yellow fill regardless of light/dark
+    /// mode).
+    @ViewBuilder
+    private var bubbleText: some View {
+        if let q = highlightQuery,
+           !q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            Text(SearchHighlight.attributed(text: entry.text, query: q))
+                .font(.body)
+        } else {
+            Text(entry.text)
+                .font(.body)
+        }
+    }
+
+    /// Outer orange ring around a focused-match bubble. The rounded
+    /// rectangle matches the bubble's own clipShape so the ring sits
+    /// flush against the bubble's edge. Drawn ONLY when this row is
+    /// the find-bar's current match; for every other matched row the
+    /// per-substring yellow text-background is enough signal.
+    @ViewBuilder
+    private var focusedMatchRing: some View {
+        if isFocusedMatch {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Color.orange, lineWidth: 2)
         }
     }
 
