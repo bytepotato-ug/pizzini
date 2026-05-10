@@ -20,6 +20,18 @@ struct ChatView: View {
     /// this to deep-link into FAQView at the right anchor.
     @State private var faqAnchor: FAQSection?
     @FocusState private var composerFocused: Bool
+    // iOS 18 ScrollPosition binding for the message list. Two roles:
+    //   1. Initial position is `.bottom`, so opening the chat lands
+    //      on the latest message without any imperative `scrollTo`.
+    //      `.defaultScrollAnchor(.bottom, for: .initialOffset)` on the
+    //      ScrollView reads this on first layout.
+    //   2. After the user hits Send we call `scrollTo(edge: .bottom)`
+    //      explicitly — `.defaultScrollAnchor(.bottom, for: .sizeChanges)`
+    //      already keeps an at-bottom user pinned when a new row
+    //      lands, but a user who scrolled UP to read history then
+    //      tapped Send still needs to see their own message arrive,
+    //      and the anchor alone won't yank them down for that case.
+    @State private var scrollPosition = ScrollPosition(edge: .bottom)
     @Environment(\.dismiss) private var dismiss
 
     private var contact: Contact? {
@@ -231,67 +243,61 @@ struct ChatView: View {
     }
 
     private func messages(for contact: Contact) -> some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 12) {
-                    if contact.log.isEmpty {
-                        Text(contact.sessionEstablished ? "Say hi." : "Pairing in progress.")
-                            .foregroundStyle(.secondary)
-                            .padding(.top, 48)
-                    }
-                    ForEach(contact.log) { entry in
-                        ChatRow(
-                            entry: entry,
-                            status: rowStatus(forEntry: entry),
-                            resolveURL: { info in store.attachmentURL(for: info) },
-                            quickLookEnabled: store.state.quickLookPreviewEnabled,
-                            onInfoTap: { section in faqAnchor = section },
-                        ).id(entry.id)
-                    }
-                    // Invisible 1pt anchor at the natural bottom of
-                    // the log. `LazyVStack` lazy-renders rows as
-                    // they scroll into view, so `proxy.scrollTo` to
-                    // the LAST chat row may compute against rows
-                    // that haven't materialized yet. A constant-id
-                    // anchor lives at the very end of the stack —
-                    // SwiftUI always materializes it (it's the
-                    // bottom of the lazy region) and the proxy can
-                    // scroll to it reliably.
-                    Color.clear.frame(height: 1).id(Self.bottomAnchor)
+        ScrollView {
+            LazyVStack(spacing: 12) {
+                if contact.log.isEmpty {
+                    Text(contact.sessionEstablished ? "Say hi." : "Pairing in progress.")
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 48)
                 }
-                .padding(.horizontal)
-                .padding(.vertical, 12)
+                ForEach(contact.log) { entry in
+                    ChatRow(
+                        entry: entry,
+                        status: rowStatus(forEntry: entry),
+                        resolveURL: { info in store.attachmentURL(for: info) },
+                        quickLookEnabled: store.state.quickLookPreviewEnabled,
+                        onInfoTap: { section in faqAnchor = section },
+                    ).id(entry.id)
+                }
             }
-            .scrollDismissesKeyboard(.interactively)
-            .onAppear { scrollToBottom(proxy: proxy, animated: false) }
-            .onChange(of: contact.log.count) { _, _ in
-                scrollToBottom(proxy: proxy, animated: true)
-            }
+            .padding(.horizontal)
+            .padding(.vertical, 12)
         }
-    }
-
-    /// Constant id for the LazyVStack's trailing 1pt anchor row.
-    /// Using a string lets `ScrollViewReader.scrollTo` target the
-    /// natural-bottom-of-content regardless of which chat row is
-    /// last — and survives row-count changes without us having to
-    /// re-derive the latest entry's UUID at every scrollTo call.
-    private static let bottomAnchor = "__chat_bottom__"
-
-    /// Defer the actual scrollTo to the next runloop tick so the
-    /// `.safeAreaInset` composer has propagated its bottom inset and
-    /// the LazyVStack has measured the rows that just became visible.
-    /// Without the defer the proxy computes against pre-layout
-    /// offsets and the last row lands clipped behind the composer
-    /// (the reproducible symptom of the previous chat-doesn't-open-
-    /// at-bottom + send-doesn't-scroll-fully bugs).
-    private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
-        DispatchQueue.main.async {
-            if animated {
-                withAnimation { proxy.scrollTo(Self.bottomAnchor, anchor: .bottom) }
-            } else {
-                proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
-            }
-        }
+        // The three iOS 18 scroll primitives that together replace the
+        // old `ScrollViewReader` + 1pt-bottom-anchor + deferred
+        // `proxy.scrollTo` workaround:
+        //
+        //   • `.initialOffset = .bottom` — open the chat with the last
+        //     row already in view. Replaces `onAppear { scrollToBottom }`,
+        //     which fired one runloop tick after layout and so visibly
+        //     "jumped" on first appearance.
+        //   • `.sizeChanges = .bottom` — keep the bottom of visible
+        //     content stable when the ScrollView's viewport OR content
+        //     size changes. Two cases this matters for:
+        //       (a) Keyboard rises → bottom safe-area inset grows →
+        //           viewport shrinks. The anchor keeps the bottom row
+        //           visible just above the composer-on-keyboard instead
+        //           of letting it slide behind. This is the core fix
+        //           for the "keyboard rises, latest message vanishes"
+        //           complaint.
+        //       (b) A new row lands. If the user was at-bottom, the
+        //           new row scrolls into view. If the user was scrolled
+        //           up reading history, they STAY where they are — the
+        //           anchor preserves the visible content rather than
+        //           yanking them down. The old `onChange(log.count)`
+        //           pull-to-bottom did yank, and that misbehavior is
+        //           a regression we're fixing here.
+        //   • `.scrollPosition($scrollPosition)` — programmatic hook so
+        //     `sendDraft` can `scrollTo(edge: .bottom)` AFTER a user-
+        //     initiated send. Covers the edge case where the user
+        //     scrolled up, then tapped the composer + Send: the
+        //     sizeChanges anchor won't reveal the new row on its own
+        //     because it preserves the user's position; this jumps to
+        //     bottom so they always see their own message land.
+        .defaultScrollAnchor(.bottom, for: .initialOffset)
+        .defaultScrollAnchor(.bottom, for: .sizeChanges)
+        .scrollPosition($scrollPosition)
+        .scrollDismissesKeyboard(.interactively)
     }
 
     private func composer(disabled: Bool, contact: Contact) -> some View {
@@ -460,11 +466,24 @@ struct ChatView: View {
             try? FileManager.default.removeItem(at: pending.url)
             attachmentDraft = nil
             draft = ""
+            jumpToBottomOnSend()
             return
         }
         guard !captionText.isEmpty else { return }
         store.send(draft, to: contact)
         draft = ""
+        jumpToBottomOnSend()
+    }
+
+    /// Jump the chat scroll to the absolute bottom after the user
+    /// hit Send. `.defaultScrollAnchor(.bottom, for: .sizeChanges)`
+    /// already keeps an at-bottom user pinned through a row append,
+    /// but a user who scrolled up to re-read history then sent still
+    /// needs to see their own message arrive — the anchor preserves
+    /// their reading position, which would otherwise hide the new
+    /// row off the bottom of the viewport.
+    private func jumpToBottomOnSend() {
+        withAnimation { scrollPosition.scrollTo(edge: .bottom) }
     }
 }
 

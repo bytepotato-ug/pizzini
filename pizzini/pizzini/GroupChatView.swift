@@ -30,36 +30,71 @@ struct GroupChatView: View {
     @State private var attachmentDraft: AttachmentDraft?
     @State private var faqAnchor: FAQSection?
     @FocusState private var composerFocused: Bool
+    /// iOS 18 ScrollPosition binding for the group log. Mirrors the
+    /// 1:1 `ChatView.scrollPosition` — opens at-bottom via
+    /// `.defaultScrollAnchor(.bottom, for: .initialOffset)`, and
+    /// `send()` calls `scrollTo(edge: .bottom)` to surface a user's
+    /// own row even when they were scrolled up reading history at
+    /// the moment they tapped Send.
+    @State private var scrollPosition = ScrollPosition(edge: .bottom)
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        VStack(spacing: 0) {
-            log
-                .frame(maxHeight: .infinity)
-                // Bitchat-style panic gesture, parity with `ChatView`:
-                // three fast taps on the chat-content area instantly
-                // wipe this group's local log (membership + chain
-                // state stay; the rest of the group sees no change).
-                // Gated behind the same `panicModeEnabled` Settings
-                // toggle that 1:1 honours, off by default. The
-                // single-tap-to-dismiss-keyboard gesture inside `log`
-                // coexists via `simultaneousGesture` — one tap fires
-                // the dismiss; only the third successive tap fires
-                // the panic.
-                .simultaneousGesture(
-                    TapGesture(count: 3).onEnded {
-                        guard store.state.panicModeEnabled else { return }
-                        UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
-                        let captured = groupID
-                        dismiss()
-                        store.deleteGroupChat(groupId: captured)
-                    }
-                )
-            if let draft = attachmentDraft {
-                attachmentPreview(draft: draft)
-                Divider()
+        log
+            // Bitchat-style panic gesture, parity with `ChatView`:
+            // three fast taps on the chat-content area instantly
+            // wipe this group's local log (membership + chain state
+            // stay; the rest of the group sees no change). Gated
+            // behind the same `panicModeEnabled` Settings toggle
+            // that 1:1 honours, off by default.
+            .simultaneousGesture(
+                TapGesture(count: 3).onEnded {
+                    guard store.state.panicModeEnabled else { return }
+                    UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+                    let captured = groupID
+                    dismiss()
+                    store.deleteGroupChat(groupId: captured)
+                }
+            )
+            // Single-tap dismisses the keyboard. Same shape as the
+            // 1:1 `ChatView` — both gestures are simultaneous, so a
+            // triple-tap also dismisses on the first tap (and
+            // panic-deletes on the third); on a single tap, only
+            // this fires.
+            .simultaneousGesture(
+                TapGesture(count: 1).onEnded {
+                    composerFocused = false
+                }
+            )
+        // Composer + (optional) attachment-preview banner live in
+        // `.safeAreaInset(edge: .bottom)` rather than as the tail of
+        // a VStack. Two reasons, identical to the 1:1 `ChatView`:
+        //
+        //   1. Bottom-edge layout. Inside a VStack the composer sits
+        //      ABOVE the home-indicator safe-area inset, with a
+        //      visible gap of empty space between composer and
+        //      indicator. In the inset, iOS treats the composer AS
+        //      the bottom safe area — the composer's background
+        //      extends through the indicator area and the system
+        //      blurs the indicator over our background. Matches
+        //      Messages / WhatsApp / Signal / Threema.
+        //   2. Keyboard tracking. `.safeAreaInset` rides the iOS 18
+        //      keyboardLayoutGuide, so the composer is glued to the
+        //      keyboard's top edge through every transition — not
+        //      animated one render-pass behind it. Combined with
+        //      `.defaultScrollAnchor(.bottom, for: .sizeChanges)` on
+        //      the log inside, the bottom row of chat content stays
+        //      visible just above the composer as the keyboard
+        //      rises and falls.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                if let draft = attachmentDraft {
+                    attachmentPreview(draft: draft)
+                    Divider()
+                }
+                composer
             }
-            composer
+            .background(.bar)
         }
         .navigationTitle(group?.displayName ?? "Group")
         .navigationBarTitleDisplayMode(.inline)
@@ -144,59 +179,60 @@ struct GroupChatView: View {
     @ViewBuilder
     private var log: some View {
         if let group {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 6) {
-                        ForEach(Array(group.log.enumerated()), id: \.element.id) { idx, row in
-                            let prior = idx > 0 ? group.log[idx - 1] : nil
-                            GroupChatBubble(
-                                message: row,
-                                // Dedup the sender name when the
-                                // immediately-prior row is from the same
-                                // peer — adjacent bubbles read as one
-                                // attributed run, matching the standard
-                                // messaging-app cadence (Signal /
-                                // iMessage / WhatsApp). A system row in
-                                // between resets the run because the
-                                // previous-row check is by senderPeerId.
-                                senderName: senderName(
-                                    for: row, in: group, previousRow: prior,
-                                ),
-                                resolveURL: { info in store.attachmentURL(for: info) },
-                                quickLookEnabled: store.state.quickLookPreviewEnabled,
-                                onInfoTap: { section in faqAnchor = section },
-                                status: rowStatus(for: row),
-                                readByAll: rowReadByAll(for: row),
-                            )
-                            .id(row.id)
-                        }
-                        // Invisible bottom anchor — same shape as
-                        // `ChatView.messages`. LazyVStack always
-                        // materializes its trailing row, so
-                        // scrollTo this fixed-id anchor reliably
-                        // lands at the natural bottom regardless of
-                        // which chat row is last.
-                        Color.clear.frame(height: 1).id(Self.bottomAnchor)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(group.log.enumerated()), id: \.element.id) { idx, row in
+                        let prior = idx > 0 ? group.log[idx - 1] : nil
+                        GroupChatBubble(
+                            message: row,
+                            // Dedup the sender name when the
+                            // immediately-prior row is from the same
+                            // peer — adjacent bubbles read as one
+                            // attributed run, matching the standard
+                            // messaging-app cadence (Signal /
+                            // iMessage / WhatsApp). A system row in
+                            // between resets the run because the
+                            // previous-row check is by senderPeerId.
+                            senderName: senderName(
+                                for: row, in: group, previousRow: prior,
+                            ),
+                            resolveURL: { info in store.attachmentURL(for: info) },
+                            quickLookEnabled: store.state.quickLookPreviewEnabled,
+                            onInfoTap: { section in faqAnchor = section },
+                            status: rowStatus(for: row),
+                            readByAll: rowReadByAll(for: row),
+                        )
+                        .id(row.id)
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
                 }
-                .scrollDismissesKeyboard(.interactively)
-                // Single-tap on the chat area dismisses the keyboard,
-                // matching the 1:1 chat. `simultaneousGesture` keeps
-                // attachment-row buttons (Save to Files / Preview)
-                // and bubble text-selection working — they fire
-                // independently of this gesture.
-                .simultaneousGesture(
-                    TapGesture(count: 1).onEnded {
-                        composerFocused = false
-                    }
-                )
-                .onAppear { scrollToBottom(proxy: proxy, animated: false) }
-                .onChange(of: group.log.count) { _, _ in
-                    scrollToBottom(proxy: proxy, animated: true)
-                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
             }
+            // iOS 18 scroll primitives, identical shape to the 1:1
+            // `ChatView.messages`. See the comment block there for
+            // the full rationale; in short:
+            //
+            //   • `.initialOffset = .bottom` — open at the latest row.
+            //   • `.sizeChanges = .bottom` — when the viewport
+            //     shrinks (keyboard rises) or content grows (new
+            //     row), keep the bottom of visible content stable.
+            //     An at-bottom user sees the new row scroll into
+            //     view; a scrolled-up-reading-history user stays
+            //     where they are rather than getting yanked down.
+            //   • `.scrollPosition($scrollPosition)` — programmatic
+            //     hook so `send()` can `scrollTo(edge: .bottom)`
+            //     after a user-initiated send, covering the case
+            //     where the user was scrolled up and so the size-
+            //     change anchor wouldn't reveal their own new row.
+            //
+            // Combined with the `.safeAreaInset(.bottom)` composer
+            // on the body, this is enough to replace the previous
+            // `ScrollViewReader` + 1pt-bottom-anchor + deferred
+            // `proxy.scrollTo` workaround completely.
+            .defaultScrollAnchor(.bottom, for: .initialOffset)
+            .defaultScrollAnchor(.bottom, for: .sizeChanges)
+            .scrollPosition($scrollPosition)
+            .scrollDismissesKeyboard(.interactively)
         } else {
             // Transient state: between `state.groups.remove(at:)` and
             // the auto-dismiss `onChange` firing. Don't surface any
@@ -266,22 +302,16 @@ struct GroupChatView: View {
         return store.outbox.groupMessageReadByAll(forId: gmid)
     }
 
-    /// Constant id for the LazyVStack's trailing 1pt anchor row.
-    /// Mirrors the 1:1 `ChatView.bottomAnchor`.
-    private static let bottomAnchor = "__group_chat_bottom__"
-
-    /// Defer scrollTo to the next runloop tick — gives the
-    /// `.safeAreaInset` composer's bottom inset and LazyVStack
-    /// row materialization a layout pass before we compute the
-    /// scroll offset. Same shape as `ChatView.scrollToBottom`.
-    private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
-        DispatchQueue.main.async {
-            if animated {
-                withAnimation { proxy.scrollTo(Self.bottomAnchor, anchor: .bottom) }
-            } else {
-                proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
-            }
-        }
+    /// Jump the chat scroll to the absolute bottom after the user
+    /// hit Send. `.defaultScrollAnchor(.bottom, for: .sizeChanges)`
+    /// on the log already keeps an at-bottom user pinned through a
+    /// row append, but a user who scrolled up to re-read group
+    /// history then sent still needs to see their own message
+    /// arrive — the anchor preserves their reading position, which
+    /// would otherwise hide the new row off the bottom of the
+    /// viewport. Mirrors `ChatView.jumpToBottomOnSend`.
+    private func jumpToBottomOnSend() {
+        withAnimation { scrollPosition.scrollTo(edge: .bottom) }
     }
 
     private var composer: some View {
@@ -328,7 +358,11 @@ struct GroupChatView: View {
             .disabled(!canSend || !sendEnabled)
         }
         .padding(8)
-        .background(.bar)
+        // NB: no `.background(.bar)` here — the surrounding
+        // `.safeAreaInset` content (this composer + the optional
+        // attachment-preview banner above it) shares one `.bar`
+        // background on its outer VStack so the inset reads as a
+        // single docked surface.
     }
 
     /// True when the local user is still an active member of this
@@ -361,11 +395,13 @@ struct GroupChatView: View {
             try? FileManager.default.removeItem(at: pending.url)
             attachmentDraft = nil
             draft = ""
+            jumpToBottomOnSend()
             return
         }
         guard !captionText.isEmpty else { return }
         if store.sendGroupMessage(groupId: groupID, text: captionText) {
             draft = ""
+            jumpToBottomOnSend()
         }
     }
 
