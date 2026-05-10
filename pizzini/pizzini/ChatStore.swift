@@ -61,6 +61,25 @@ final class ChatStore: NSObject {
     /// re-emits ACKs for any chunks that arrive again, and the 24h
     /// disk TTL eventually GCs orphaned partials.
     private let reassembler = AttachmentReassembler()
+    /// Identifies the chat the user is currently reading, if any. Set
+    /// by `ChatView.onAppear` and cleared by `onDisappear`. Read by
+    /// the screenshot reaction so we know which contact's log to
+    /// append the "Screenshot taken" system row to. Nil when the user
+    /// is on the contacts list, in Settings, or anywhere else — in
+    /// those cases a screenshot still triggers the monitor's counter
+    /// bump but no chat row is written.
+    private(set) var activeChatID: UUID?
+    /// Marker prefix used by the optional "Tell my contact when I
+    /// screenshot" path. The sealed envelope's chat payload starts
+    /// with this (zero-width-space + literal tag) and the receiver
+    /// renders it as a system row instead of bubble text. Zero-width
+    /// space is invisible if a future bug ever leaks the marker into
+    /// a rendered bubble; the literal tag is unique enough that
+    /// accidentally typing the prefix is implausible. NOT a security
+    /// boundary — anyone with the chat key can synthesise this
+    /// envelope; the worst case is "your contact spoofed a 'they
+    /// screenshotted' notification on you", which is in the noise.
+    static let screenshotNotifyMarker: String = "\u{200B}pizzini_screenshot"
 
     override init() {
         self.state = Storage.loadAppState()
@@ -74,7 +93,79 @@ final class ChatStore: NSObject {
         } catch {
             self.initError = String(describing: error)
         }
+        // Wire the screenshot reaction. The closure captures `self`;
+        // ChatStore is a process-lifetime singleton, so the cycle is
+        // fine — `ScreenCaptureMonitor.shared` is also a singleton.
+        ScreenCaptureMonitor.shared.onScreenshot = { [weak self] in
+            self?.handleScreenshot()
+        }
         refreshAppBadge()
+    }
+
+    // MARK: - Active chat tracking (Phase 3 screenshot reaction)
+
+    /// Called by `ChatView.onAppear` so the screenshot reaction knows
+    /// which contact's log to append to.
+    func setActiveChat(_ contactID: UUID) {
+        activeChatID = contactID
+    }
+
+    /// Called by `ChatView.onDisappear`. Clears `activeChatID` only if
+    /// it still matches — guards a navigation order where one chat
+    /// closes after another has opened (rare but possible mid-push).
+    func clearActiveChat(_ contactID: UUID) {
+        if activeChatID == contactID {
+            activeChatID = nil
+        }
+    }
+
+    /// Wired to `ScreenCaptureMonitor.onScreenshot`. Appends a
+    /// "Screenshot taken." system row to the active chat (if any) and,
+    /// when the user has opted in via `state.notifyPeerOnScreenshot`,
+    /// sends a sealed marker envelope to that contact.
+    @MainActor
+    private func handleScreenshot() {
+        guard let chatID = activeChatID,
+              let idx = state.contacts.firstIndex(where: { $0.id == chatID })
+        else { return }
+        appendSystem("Screenshot taken.", to: idx)
+        guard state.notifyPeerOnScreenshot else { return }
+        sendScreenshotMarker(toContactAt: idx)
+    }
+
+    /// Send a peer-notification screenshot marker via a sealed `.chat`
+    /// envelope. Mirrors `send(_:to:)`'s wire path but skips the
+    /// outbound chat-row append (we already wrote the local "Screenshot
+    /// taken." row in `handleScreenshot`). If the session isn't
+    /// established or the token stash is empty, swallow silently —
+    /// surfacing a "couldn't tell them you screenshot" error would
+    /// itself be a privacy regression.
+    @MainActor
+    private func sendScreenshotMarker(toContactAt idx: Int) {
+        let contact = state.contacts[idx]
+        guard contact.sessionEstablished,
+              let session, let relay,
+              let token = popDeliveryToken(forContactAt: idx)
+        else { return }
+        do {
+            var inner = Data([RelayClient.InnerEnvelopeKind.chat.rawValue])
+            inner.append(Data(Self.screenshotNotifyMarker.utf8))
+            let messageId = Self.makeMessageId()
+            let sealed = try session.encryptSealed(
+                peer: contact.identityPub,
+                messageId: messageId,
+                plaintext: inner,
+            )
+            persistSession()
+            relay.sendSealed(
+                toPeer: contact.identityPub,
+                sealedCiphertext: sealed,
+                ttlSeconds: contact.ttlSeconds,
+                token: token,
+            )
+        } catch {
+            NSLog("[pizzini] screenshot-notify encrypt failed: \(error)")
+        }
     }
 
     /// Outbox entry for `messageId`, if any. Used by the chat row to
@@ -993,6 +1084,35 @@ final class ChatStore: NSObject {
         Storage.persist(appState: state)
     }
 
+    /// Toggle "tell my contact when I screenshot" peer notifications.
+    /// Default OFF — most users save chats for legitimate reasons and
+    /// surfacing every screenshot to the peer is a privacy decision the
+    /// user makes, not a default we make for them.
+    func setNotifyPeerOnScreenshot(_ enabled: Bool) {
+        guard state.notifyPeerOnScreenshot != enabled else { return }
+        state.notifyPeerOnScreenshot = enabled
+        Storage.persist(appState: state)
+    }
+
+    /// Toggle the QR-sheet `isSecureTextEntry` workaround. Default ON
+    /// (subject to the runtime self-test). Off for VoiceOver users; the
+    /// trick breaks selection and screen-reader semantics for anything
+    /// nested inside the secure container.
+    func setBlockQRScreenshots(_ enabled: Bool) {
+        guard state.blockQRScreenshots != enabled else { return }
+        state.blockQRScreenshots = enabled
+        Storage.persist(appState: state)
+    }
+
+    /// Persist the runtime-self-test result for the QR-block trick.
+    /// Called by `SecureScreenshotShield.runtimeSelfTest` once on first
+    /// launch and again after every iOS major-version change.
+    func setQRBlockEffective(_ effective: Bool, osVersion: String) {
+        state.qrBlockEffective = effective
+        state.qrBlockTestedOSVersion = osVersion
+        Storage.persist(appState: state)
+    }
+
     func resetIdentity() {
         // F-704: full teardown — null self.relay, invalidate retry
         // timer, clear delegate. Mirrors disconnectForBackground so
@@ -1285,10 +1405,24 @@ extension ChatStore: RelayClientDelegate {
     @MainActor
     private func handleChatPayload(_ payload: Data, sealedSize: Int, contactIdx idx: Int, ackId: Data, via client: RelayClient) {
         let text = String(data: payload, encoding: .utf8) ?? "<\(payload.count) non-utf8 bytes>"
+        // Phase 3: screenshot peer-notification arrives as a chat
+        // envelope whose payload begins with a marker tag. Render as a
+        // system row so the receiver sees something like "Your contact
+        // took a screenshot." rather than a chat bubble of garbage.
+        let isScreenshotMarker = text.hasPrefix(Self.screenshotNotifyMarker)
+        let displayText: String
+        let messageKind: ChatMessageKind
+        if isScreenshotMarker {
+            displayText = "\(state.contacts[idx].displayName) took a screenshot."
+            messageKind = .system
+        } else {
+            displayText = text
+            messageKind = .whisper
+        }
         let entry = PersistedMessage(
-            side: .peer,
-            text: text,
-            kind: .whisper,
+            side: isScreenshotMarker ? .me : .peer,
+            text: displayText,
+            kind: messageKind,
             bytes: sealedSize,
         )
         self.state.contacts[idx].log.append(entry)

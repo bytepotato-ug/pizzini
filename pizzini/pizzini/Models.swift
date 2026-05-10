@@ -300,6 +300,33 @@ struct AppState: Codable, Sendable {
     /// in QuickLook's XPC, but it does widen the in-process integration
     /// surface a hair vs the strict default.
     var quickLookPreviewEnabled: Bool
+    /// When true, screenshotting a chat sends the peer a sealed
+    /// envelope they render as "Your contact took a screenshot." Default
+    /// OFF — most users save messages for legitimate reasons (their own
+    /// records) and pushing that to the peer is a privacy decision they
+    /// make, not a default we make for them. Telegram-style behaviour.
+    var notifyPeerOnScreenshot: Bool
+    /// When true, the QR sheet wraps its rendered code inside an
+    /// `isSecureTextEntry`-backed UITextField container. iOS's screenshot
+    /// pipeline skips views nested inside a secure-text-entry field, so
+    /// a screenshot of the QR sheet captures black/blank pixels rather
+    /// than a scannable code. Default ON — but only effective when
+    /// `qrBlockEffective != false` (a runtime self-test pass). Turn off
+    /// for VoiceOver / accessibility users; the trick breaks selection
+    /// and screen-reader semantics for the wrapped subtree.
+    var blockQRScreenshots: Bool
+    /// Result of the most recent runtime self-test for the
+    /// `isSecureTextEntry` workaround. Nil = not yet tested. True = the
+    /// trick blocked the screenshot pipeline on this iOS version. False
+    /// = the trick failed (Apple has narrowed the gap on this version);
+    /// the QR-block path silently falls back to a conventional shield.
+    var qrBlockEffective: Bool?
+    /// `UIDevice.current.systemVersion` at the time `qrBlockEffective`
+    /// was determined. We re-run the self-test whenever the major
+    /// component differs — Apple has only ever changed
+    /// secure-text-entry behaviour in major iOS releases, and a re-test
+    /// every minor would be wasteful.
+    var qrBlockTestedOSVersion: String?
 
     static let currentVersion = 1
     static let defaultRelayHost = "127.0.0.1"
@@ -311,7 +338,11 @@ struct AppState: Codable, Sendable {
         onboardingCompleted: Bool = false,
         biometricLockEnabled: Bool = false,
         autoLockTimeout: AutoLockTimeout = .immediately,
-        quickLookPreviewEnabled: Bool = false
+        quickLookPreviewEnabled: Bool = false,
+        notifyPeerOnScreenshot: Bool = false,
+        blockQRScreenshots: Bool = true,
+        qrBlockEffective: Bool? = nil,
+        qrBlockTestedOSVersion: String? = nil
     ) {
         self.version = version
         self.relayHost = relayHost
@@ -320,6 +351,10 @@ struct AppState: Codable, Sendable {
         self.biometricLockEnabled = biometricLockEnabled
         self.autoLockTimeout = autoLockTimeout
         self.quickLookPreviewEnabled = quickLookPreviewEnabled
+        self.notifyPeerOnScreenshot = notifyPeerOnScreenshot
+        self.blockQRScreenshots = blockQRScreenshots
+        self.qrBlockEffective = qrBlockEffective
+        self.qrBlockTestedOSVersion = qrBlockTestedOSVersion
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -330,6 +365,10 @@ struct AppState: Codable, Sendable {
         case biometricLockEnabled
         case autoLockTimeout
         case quickLookPreviewEnabled
+        case notifyPeerOnScreenshot
+        case blockQRScreenshots
+        case qrBlockEffective
+        case qrBlockTestedOSVersion
     }
 
     init(from decoder: Decoder) throws {
@@ -341,5 +380,9 @@ struct AppState: Codable, Sendable {
         biometricLockEnabled = try c.decodeIfPresent(Bool.self, forKey: .biometricLockEnabled) ?? false
         autoLockTimeout = try c.decodeIfPresent(AutoLockTimeout.self, forKey: .autoLockTimeout) ?? .immediately
         quickLookPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .quickLookPreviewEnabled) ?? false
+        notifyPeerOnScreenshot = try c.decodeIfPresent(Bool.self, forKey: .notifyPeerOnScreenshot) ?? false
+        blockQRScreenshots = try c.decodeIfPresent(Bool.self, forKey: .blockQRScreenshots) ?? true
+        qrBlockEffective = try c.decodeIfPresent(Bool.self, forKey: .qrBlockEffective)
+        qrBlockTestedOSVersion = try c.decodeIfPresent(String.self, forKey: .qrBlockTestedOSVersion)
     }
 }

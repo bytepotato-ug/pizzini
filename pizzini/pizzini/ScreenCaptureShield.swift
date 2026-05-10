@@ -100,7 +100,37 @@ extension View {
     /// Wraps the view in a `ScreenCaptureShield` overlay that activates
     /// while iOS reports a screen recording or an external display.
     /// Apply to any surface that contains chat / contact / QR data.
-    func screenCaptureShielded(monitor: ScreenCaptureMonitor = .shared) -> some View {
-        modifier(ScreenCaptureShieldModifier(monitor: monitor))
+    ///
+    /// Reads `ScreenCaptureMonitor.shared` directly inside a
+    /// `@MainActor` body rather than via a default arg — Swift 6
+    /// rejects a main-actor-isolated default expression on a
+    /// nonisolated callsite, and SwiftUI body callsites are
+    /// nonisolated. Tests / previews that need to inject a custom
+    /// monitor can construct `ScreenCaptureShieldModifier` directly.
+    func screenCaptureShielded() -> some View {
+        modifier(SharedScreenCaptureShieldModifier())
+    }
+}
+
+/// Thin wrapper that resolves `ScreenCaptureMonitor.shared` lazily on
+/// the main actor (where SwiftUI's body runs). Splitting this out keeps
+/// `ScreenCaptureShieldModifier` test-friendly: tests can inject a
+/// custom monitor; callers in production code never have to think
+/// about the actor isolation.
+private struct SharedScreenCaptureShieldModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        // SwiftUI body runs on the main actor, so it's safe to touch
+        // the main-actor-isolated `.shared` here.
+        let monitor = ScreenCaptureMonitor.shared
+        return ZStack {
+            content
+            if monitor.hasExternalDisplay {
+                ScreenCaptureShield(reason: .externalDisplay)
+                    .transition(.opacity)
+            } else if monitor.isRecording {
+                ScreenCaptureShield(reason: .recording)
+                    .transition(.opacity)
+            }
+        }
     }
 }
