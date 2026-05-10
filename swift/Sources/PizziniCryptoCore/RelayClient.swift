@@ -111,6 +111,21 @@ public final class RelayClient: @unchecked Sendable {
         /// receiver's 1:1 contacts. Without all three, the bootstrap
         /// is dropped — the same trust gate as the Create op.
         case groupBootstrap = 0x09
+        /// Group chunked file transfer. Body: `groupId(16) ‖
+        /// group_encrypt(FileChunkEnvelope bytes)`. Sender encrypts
+        /// each chunk's `FileChunkEnvelope` payload once via libsignal
+        /// `group_encrypt` against the local sender-key chain, then
+        /// fans out the result as N independent pairwise sealed-sender
+        /// envelopes, one per active member. The plaintext envelope
+        /// re-uses the 1:1 `FileChunkEnvelope` codec so the
+        /// `attachmentId`, total size, chunk index/count, mime, and
+        /// filename are still hidden from the relay; what's sealed at
+        /// the group layer is the `SenderKeyMessage` carrying the
+        /// envelope bytes. Trust gates on receive mirror `groupChat`
+        /// (CRITICAL-2): only chunks from active members of the named
+        /// group are decrypted; pending-invitation groups advance the
+        /// chain but render nothing.
+        case groupFileChunk = 0x0A
     }
     private static let frameTypeHello: UInt8 = 1
     private static let frameTypeSend: UInt8 = 2

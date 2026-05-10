@@ -1,7 +1,8 @@
 import Foundation
 
-/// Inner-envelope payload codec for the four group inner-kind bytes
-/// added in slice 3 + the audit-driven slice 4 ([RelayClient.swift:67](swift/Sources/PizziniCryptoCore/RelayClient.swift:67)):
+/// Inner-envelope payload codec for the five group inner-kind bytes
+/// added in slice 3, the audit-driven slice 4, and the post-audit
+/// group-attachments wire ([RelayClient.swift:67](swift/Sources/PizziniCryptoCore/RelayClient.swift:67)):
 ///
 ///   0x06 groupChat            → `groupId(16) ‖ SenderKeyMessage`
 ///   0x07 groupKeyDistribution → `groupId(16) ‖ SenderKeyDistributionMessage`
@@ -12,6 +13,12 @@ import Foundation
 ///                                so a newly-added member can build a
 ///                                local `ChatGroup` without replaying
 ///                                the entire op chain)
+///   0x0A groupFileChunk       → `groupId(16) ‖ SenderKeyMessage`
+///                                (the SenderKeyMessage encrypts a
+///                                `FileChunkEnvelope` plaintext —
+///                                same per-chunk codec as 1:1 so the
+///                                AttachmentReassembler input is
+///                                identical between the two paths)
 ///
 /// The codecs sit between `ChatStore`'s receive-path dispatch and the
 /// libsignal FFI so that the ChatStore switch-arm is one parse + one
@@ -78,4 +85,29 @@ enum GroupEnvelope {
     // inner envelope is exactly `GroupOp.encoded()` and parsed by
     // `GroupOp.decode(_:)` already. Keeping them out of this file
     // avoids a redundant pass-through that could drift.
+
+    /// Build the body of a `groupFileChunk = 0x0A` inner envelope.
+    /// `senderKeyMessage` is the libsignal SenderKeyMessage produced
+    /// by `Session.groupEncrypt` over a `FileChunkEnvelope.encode()`
+    /// plaintext — identical layout to `groupChat` so the same FFI
+    /// path applies on receive.
+    static func encodeGroupFileChunk(groupId: Data, senderKeyMessage: Data) -> Data {
+        var out = Data(capacity: groupIdSize + senderKeyMessage.count)
+        out.append(groupId)
+        out.append(senderKeyMessage)
+        return out
+    }
+
+    /// Parse the body of a `groupFileChunk = 0x0A` inner envelope.
+    /// nil for a payload too short to carry the 16-byte groupId
+    /// prefix. The returned `senderKeyMessage` slice is fed straight
+    /// to `Session.groupDecrypt`; the resulting plaintext is then
+    /// decoded with `FileChunkEnvelope.decode(_:)` and submitted to
+    /// the group reassembler.
+    static func decodeGroupFileChunk(_ payload: Data) -> (groupId: Data, senderKeyMessage: Data)? {
+        guard payload.count >= groupIdSize else { return nil }
+        let lo = payload.startIndex
+        let mid = lo + groupIdSize
+        return (Data(payload[lo..<mid]), Data(payload[mid..<payload.endIndex]))
+    }
 }

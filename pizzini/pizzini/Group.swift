@@ -252,6 +252,69 @@ struct ChatGroup: Codable, Identifiable, Sendable {
         members.first(where: { $0.peerId == identityPub })?.role
     }
 
+    /// Receive-side trust gate. Mirrors the inline check at the head
+    /// of `handleGroupChat` and `handleGroupFileChunk` (audit
+    /// CRITICAL-2): the sender must be an active, non-removed member
+    /// of this group. A peer who is not in `members` at all, or is in
+    /// the list with `.removed` status, MUST NOT be able to inject
+    /// content into the group log even if they're 1:1-paired with us.
+    func acceptsIncomingMessage(from senderPeerId: Data) -> Bool {
+        members.contains { $0.peerId == senderPeerId && $0.status != .removed }
+    }
+
+    /// Send-side trust gate. The local user can post to this group
+    /// only if they are an active member, the invitation is no
+    /// longer pending, AND they have minted a sender-key chain (no
+    /// chain ⇒ no peer can decrypt our output). The composer in
+    /// `GroupChatView` and the runtime guards in `sendGroupMessage`
+    /// / `sendGroupAttachment` both consult this so the UI affordance
+    /// and the wire-level guard never drift.
+    func canSend(asLocal localIdentity: Data) -> Bool {
+        guard !pendingInvitation else { return false }
+        guard myCurrentDistributionId != nil else { return false }
+        return members.contains {
+            $0.peerId == localIdentity && $0.status != .removed
+        }
+    }
+
+    /// Append a fully-reassembled inbound attachment to this group's
+    /// log and return the persisted row. Centralises the
+    /// `PersistedMessage` shape so the receive path can't drift from
+    /// the 1:1 attachment row layout — `senderPeerId` is mandatory
+    /// (group rendering depends on it for member-name resolution; see
+    /// `GroupChatView.senderName(for:in:)`).
+    @discardableResult
+    mutating func appendIncomingAttachment(
+        attachmentId: Data,
+        filename: String,
+        byteSize: UInt64,
+        mime: String,
+        tier: AttachmentTier,
+        sandboxRelativePath: String?,
+        senderPeerId: Data,
+    ) -> PersistedMessage {
+        let info = AttachmentInfo(
+            attachmentId: attachmentId,
+            filename: filename,
+            byteSize: byteSize,
+            mime: mime,
+            tier: tier,
+            sandboxRelativePath: sandboxRelativePath,
+            isInbound: true,
+        )
+        let row = PersistedMessage(
+            side: .peer,
+            text: "",
+            kind: .attachment,
+            bytes: Int(byteSize),
+            attachment: info,
+            senderPeerId: senderPeerId,
+        )
+        log.append(row)
+        lastMessageAt = row.timestamp
+        return row
+    }
+
     /// Decoder is hand-rolled so additive fields land with sensible
     /// defaults on existing on-disk blobs (`mySkdmRecipients` was added
     /// post-audit; older blobs lack it). Synthesizing would otherwise

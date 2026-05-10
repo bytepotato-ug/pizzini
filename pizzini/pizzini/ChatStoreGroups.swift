@@ -1,5 +1,6 @@
 import Foundation
 import PizziniCryptoCore
+import UniformTypeIdentifiers
 
 /// Group-chat surface on `ChatStore`. Lives in its own file to keep
 /// ChatStore.swift's 1.5K-line core legible while still piggybacking
@@ -602,6 +603,441 @@ extension ChatStore {
         }
         Storage.persist(appState: state)
         return true
+    }
+
+    /// Send a chunked file attachment to the named group. Mirrors
+    /// `sendGroupMessage` for the gate / rotation / fan-out pattern
+    /// and `sendFile` for the off-main strip + chunk pass:
+    ///
+    /// 1. Send-side trust gates (mirror `sendGroupMessage`): refuse
+    ///    if the local user is no longer an active member or the
+    ///    invitation is still pending. Audit HIGH-3.
+    /// 2. Periodic-rotation hygiene: if `shouldRotateBeforeSend`,
+    ///    rotate the chain BEFORE the off-main pass so all chunks
+    ///    of this attachment ride the post-rotation chain.
+    /// 3. Off-main: read bytes, sanitize filename, classify tier,
+    ///    metadata-strip (Tier-3 strip on a 4K video can take
+    ///    seconds), and slice into ≤64 KB plaintext chunks.
+    /// 4. Main hop: for each chunk, `groupEncrypt` once with our
+    ///    chain, wrap in the `groupFileChunk = 0x0A` inner envelope,
+    ///    fan out to every active member except self as N
+    ///    independent pairwise sealed-sender envelopes. Per-recipient
+    ///    delivery-token depletion is silently skipped (mirrors
+    ///    `sendGroupMessage`'s skipped-member handling); recipient
+    ///    sees a partial transfer that times out at the 24h
+    ///    reassembler TTL — no user-visible "out of tokens" dialog.
+    /// 5. Append a single `.attachment` `PersistedMessage` to the
+    ///    group log. Outbox+retry is deferred to v2 (the brief is
+    ///    explicit: each chunk is fire-and-forget at the sender).
+    func sendGroupAttachment(groupId: Data, attachmentURL: URL, caption: String?) {
+        // Precondition: session + relay must exist so the off-main
+        // strip pass isn't wasted; we re-resolve both inside
+        // `shipPreparedGroupAttachment` after the hop because those
+        // properties are mutable across foreground re-arms.
+        guard session != nil, let myCard, relay != nil,
+              let gIdx = groupIndex(forId: groupId)
+        else { return }
+        // HIGH-3: refuse if we're no longer an active member.
+        guard state.groups[gIdx].activeMembers.contains(where: { $0.peerId == myCard.peerId }) else {
+            appendGroupSystem(groupAt: gIdx, "You are no longer a member of this group.")
+            Storage.persist(appState: state)
+            return
+        }
+        // Refuse while pending — composer is also disabled in this
+        // state, this is the runtime backstop.
+        guard !state.groups[gIdx].pendingInvitation else { return }
+
+        // Sanitize filename at the boundary; the receiver re-sanitizes
+        // (defence in depth) but the sender side gets a clean
+        // rendering immediately and the wire bytes can never carry an
+        // RTL-override / path-separator name.
+        let rawFilename = attachmentURL.lastPathComponent
+        let safeName = FilenameSanitizer.sanitize(rawFilename)
+        if AttachmentTierClassifier.isBlockedAtSend(filename: safeName) {
+            appendGroupSystem(
+                groupAt: gIdx,
+                "Can't send \(safeName): files of this type can run when tapped on iOS. Pizzini blocks them at send.",
+            )
+            Storage.persist(appState: state)
+            return
+        }
+        let mime = mimeTypeForFilename(safeName)
+        let tier = AttachmentTierClassifier.tier(forFilename: safeName)
+        let captionText = caption?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        // Periodic-rotation gate. Rotate BEFORE the off-main pass so
+        // every chunk of this attachment uses the same (post-rotation)
+        // chain. A rotation mid-attachment would force the receiver
+        // to install a fresh chain partway through, which the
+        // groupDecrypt path can handle but is needlessly noisy.
+        if shouldRotateBeforeSend(groupAt: gIdx) {
+            rotateMyGroupChain(groupId: groupId)
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // Off-main: read + (optionally) strip metadata.
+            let raw: Data
+            do {
+                raw = try Data(contentsOf: attachmentURL, options: [.mappedIfSafe])
+            } catch {
+                Task { @MainActor [weak self] in
+                    self?.appendGroupSystem(groupId: groupId, text: "Couldn't read \(safeName): \(error)")
+                }
+                return
+            }
+            let bytes: Data
+            do {
+                bytes = try MetadataStripper.stripped(
+                    raw, filename: safeName, mimeType: mime
+                )
+            } catch {
+                Task { @MainActor [weak self] in
+                    self?.appendGroupSystem(groupId: groupId, text: "Strip failed for \(safeName): \(error)")
+                }
+                return
+            }
+            var aidBytes = [UInt8](repeating: 0, count: 16)
+            _ = aidBytes.withUnsafeMutableBufferPointer { ptr in
+                SecRandomCopyBytes(kSecRandomDefault, ptr.count, ptr.baseAddress!)
+            }
+            let attachmentId = Data(aidBytes)
+            let chunkSize = FileChunkEnvelope.maxChunkPlaintextBytes
+            let totalSize = bytes.count
+            let chunkCount = max(1, (totalSize + chunkSize - 1) / chunkSize)
+            if UInt32(chunkCount) > FileChunkEnvelope.maxChunkCount {
+                Task { @MainActor [weak self] in
+                    self?.appendGroupSystem(
+                        groupId: groupId,
+                        text: "\(safeName) is too large (\(totalSize) bytes; max \(FileChunkEnvelope.maxChunkPlaintextBytes * Int(FileChunkEnvelope.maxChunkCount))).",
+                    )
+                }
+                return
+            }
+            var working: [Data] = []
+            working.reserveCapacity(chunkCount)
+            for i in 0..<chunkCount {
+                let start = i * chunkSize
+                let end = min(start + chunkSize, totalSize)
+                working.append(bytes.subdata(in: start..<end))
+            }
+            // Stage a sender-side sandbox copy so the local row can
+            // present Save-to-Files / Preview after send. Subject to
+            // the 7d sandbox TTL like inbound attachments — chat row
+            // stays past that, just without the bytes.
+            let outboundRelPath: String? = {
+                guard let dir = try? AttachmentSandbox.outboundDirectory(
+                    forAttachmentId: attachmentId,
+                ) else { return nil }
+                let url = dir.appending(path: safeName, directoryHint: .notDirectory)
+                do {
+                    try bytes.write(
+                        to: url,
+                        options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication],
+                    )
+                } catch {
+                    NSLog("[pizzini] outbound sandbox write failed: \(error)")
+                    return nil
+                }
+                guard let root = try? AttachmentSandbox.root() else { return nil }
+                let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
+                return url.path.hasPrefix(rootPath)
+                    ? String(url.path.dropFirst(rootPath.count))
+                    : nil
+            }()
+            let preparedChunks = working
+            Task { @MainActor [weak self] in
+                self?.shipPreparedGroupAttachment(
+                    groupId: groupId,
+                    attachmentId: attachmentId,
+                    sanitizedFilename: safeName,
+                    mime: mime,
+                    tier: tier,
+                    chunks: preparedChunks,
+                    totalSize: UInt64(totalSize),
+                    captionText: captionText,
+                    sandboxRelPath: outboundRelPath,
+                )
+            }
+        }
+    }
+
+    /// Main-actor continuation of `sendGroupAttachment`. For each
+    /// chunk: `groupEncrypt` once → wrap in `groupFileChunk` →
+    /// fan out per active member as a 1:1 sealed envelope.
+    @MainActor
+    private func shipPreparedGroupAttachment(
+        groupId: Data,
+        attachmentId: Data,
+        sanitizedFilename: String,
+        mime: String,
+        tier: AttachmentTier,
+        chunks: [Data],
+        totalSize: UInt64,
+        captionText: String,
+        sandboxRelPath: String?,
+    ) {
+        guard let session, let myCard, let relay,
+              let gIdx = groupIndex(forId: groupId)
+        else { return }
+        // Re-check gates after the off-main hop: state may have
+        // mutated (e.g. a RemoveMember-self landed while we were
+        // stripping). HIGH-3 still applies.
+        guard state.groups[gIdx].activeMembers.contains(where: { $0.peerId == myCard.peerId }) else {
+            appendGroupSystem(groupAt: gIdx, "You are no longer a member of this group.")
+            Storage.persist(appState: state)
+            return
+        }
+        guard !state.groups[gIdx].pendingInvitation else { return }
+        guard let myDist = state.groups[gIdx].myCurrentDistributionId else {
+            appendGroupSystem(groupAt: gIdx, "Group encryption not yet ready — waiting for SKDM exchange.")
+            Storage.persist(appState: state)
+            return
+        }
+
+        let chunkCountU32 = UInt32(chunks.count)
+        let recipients = state.groups[gIdx].activeMembers
+            .map(\.peerId)
+            .filter { $0 != myCard.peerId }
+        diagLog("group", "sendGroupAttachment \(short(groupId)):"
+            + " aid=\(short(attachmentId)) filename=\"\(sanitizedFilename)\""
+            + " size=\(totalSize) chunks=\(chunkCountU32) tier=\(tier.rawValue)"
+            + " fan-out=\(recipients.count) member(s)")
+
+        var perRecipientSkippedChunks: [Data: Int] = [:]
+        for i in 0..<chunks.count {
+            let envelope = FileChunkEnvelope(
+                attachmentId: attachmentId,
+                totalSize: totalSize,
+                chunkIndex: UInt32(i),
+                chunkCount: chunkCountU32,
+                mime: mime,
+                filename: sanitizedFilename,
+                chunkBytes: chunks[i],
+            )
+            let plaintext = envelope.encode()
+            let ciphertext: Data
+            do {
+                ciphertext = try session.groupEncrypt(distributionId: myDist, plaintext: plaintext)
+            } catch {
+                appendGroupSystem(groupAt: gIdx, "Encrypt failed at chunk \(i)/\(chunks.count): \(error)")
+                Storage.persist(appState: state)
+                return
+            }
+            // Persist the chain advance immediately. A force-quit
+            // between groupEncrypt and persist would otherwise roll
+            // back the on-disk chain by one step, and the next
+            // outbound chunk would reuse a chain key the receiver
+            // has already consumed.
+            persistSession()
+            let body = GroupEnvelope.encodeGroupFileChunk(
+                groupId: groupId, senderKeyMessage: ciphertext)
+            var inner = Data([RelayClient.InnerEnvelopeKind.groupFileChunk.rawValue])
+            inner.append(body)
+            // Per-recipient pairwise wrap + send.
+            for recipient in recipients {
+                guard let cIdx = state.contacts.firstIndex(where: { $0.identityPub == recipient }) else {
+                    perRecipientSkippedChunks[recipient, default: 0] += 1
+                    continue
+                }
+                guard let token = popDeliveryTokenPublic(forContactAt: cIdx) else {
+                    // Silent-drop per the brief. The diagLog buffer in
+                    // Settings → Diagnostics surfaces it for users
+                    // debugging "why did Bob's screen show a partial
+                    // attachment?" without a user-visible quota dialog.
+                    perRecipientSkippedChunks[recipient, default: 0] += 1
+                    continue
+                }
+                let messageId = ChatStore.makeGroupMessageId()
+                do {
+                    let sealed = try session.encryptSealed(
+                        peer: recipient,
+                        messageId: messageId,
+                        plaintext: inner,
+                    )
+                    relay.sendSealed(
+                        toPeer: recipient,
+                        sealedCiphertext: sealed,
+                        ttlSeconds: state.contacts[cIdx].ttlSeconds,
+                        token: token,
+                    )
+                } catch {
+                    NSLog(
+                        "[pizzini] group attachment fan-out failed for \(short(recipient))"
+                            + " chunk \(i)/\(chunks.count): \(error)",
+                    )
+                    perRecipientSkippedChunks[recipient, default: 0] += 1
+                }
+            }
+            // Persist again after the per-chunk fan-out: each
+            // `encryptSealed` advanced a 1:1 ratchet that must hit
+            // disk before we move on to the next chunk.
+            persistSession()
+        }
+        if !perRecipientSkippedChunks.isEmpty {
+            // Diagnostic-only: surface in the in-app Diagnostics
+            // ring buffer so users can see why a recipient saw a
+            // partial transfer. No system row in the chat — silent
+            // drop matches the 1:1 attachment behaviour today.
+            for (peer, dropped) in perRecipientSkippedChunks {
+                diagLog("group", "sendGroupAttachment \(short(groupId)):"
+                    + " \(short(peer)) dropped \(dropped)/\(chunkCountU32) chunk(s)"
+                    + " (out of delivery tokens or unpaired)")
+            }
+        }
+        // Single `.attachment` chat row for the sender — captions
+        // (if any) ride on the row text the same way 1:1 sendFile
+        // surfaces them locally. Receivers see the attachment row
+        // without the caption (parity with 1:1; lifting the caption
+        // into a paired text envelope is future work).
+        let info = AttachmentInfo(
+            attachmentId: attachmentId,
+            filename: sanitizedFilename,
+            byteSize: totalSize,
+            mime: mime,
+            tier: tier,
+            sandboxRelativePath: sandboxRelPath,
+            isInbound: false,
+        )
+        let row = PersistedMessage(
+            side: .me,
+            text: captionText,
+            kind: .attachment,
+            bytes: Int(totalSize),
+            attachment: info,
+        )
+        state.groups[gIdx].log.append(row)
+        state.groups[gIdx].lastMessageAt = row.timestamp
+        // sendGroupMessage bumps `sentSinceRotation` per send. Bump
+        // by chunkCount here so the periodic-rotation threshold
+        // (`ChatGroup.rotationMessageThreshold`) is reached at the
+        // intuitive cadence regardless of attachment vs text mix.
+        state.groups[gIdx].sentSinceRotation &+= chunkCountU32
+        Storage.persist(appState: state)
+    }
+
+    /// Process an inbound `groupFileChunk = 0x0A` envelope. Same
+    /// trust ladder as `handleGroupChat`:
+    ///
+    /// 1. Decode body → `(groupId, ciphertext)`.
+    /// 2. Resolve local `ChatGroup` for the named groupId — drop if
+    ///    we don't have one.
+    /// 3. CRITICAL-2 membership gate: drop if sender is not an
+    ///    active (non-removed) member. Any 1:1-paired peer who has
+    ///    previously installed a chain with us could otherwise
+    ///    inject content into a group log they know the ID of.
+    /// 4. `pendingInvitation` gate: still call `groupDecrypt` to
+    ///    keep the sender's chain in sync with us, but DROP the
+    ///    plaintext without rendering. Mirrors `handleGroupChat`'s
+    ///    accept-later-no-backlog behaviour.
+    /// 5. Decrypt, parse `FileChunkEnvelope`, feed
+    ///    `groupReassembler`. Capture `(peer, attachmentId) →
+    ///    groupId` on first chunk and verify on every subsequent
+    ///    chunk so a sender flipping the groupId mid-transfer is
+    ///    treated as hostile.
+    /// 6. On `.complete`, append a single `.attachment`
+    ///    `PersistedMessage` to the group log via
+    ///    `ChatGroup.appendIncomingAttachment` — `senderPeerId`
+    ///    populated so the group view's render-time member-name
+    ///    resolution (`memberDisplayName`) works.
+    func handleGroupFileChunk(payload: Data, fromPeer sender: Data) {
+        guard let session else { return }
+        guard let parsed = GroupEnvelope.decodeGroupFileChunk(payload) else {
+            NSLog("[pizzini.group] groupFileChunk ← \(short(sender)): malformed body")
+            return
+        }
+        let (groupId, ciphertext) = parsed
+        guard let gIdx = groupIndex(forId: groupId) else {
+            NSLog(
+                "[pizzini.group] groupFileChunk ← \(short(sender)):"
+                    + " unknown group \(short(groupId)), dropping",
+            )
+            return
+        }
+        // CRITICAL-2 membership gate.
+        guard state.groups[gIdx].acceptsIncomingMessage(from: sender) else {
+            NSLog(
+                "[pizzini.group] groupFileChunk ← \(short(sender)) for \(short(groupId)):"
+                    + " DROPPED — sender is not an active member",
+            )
+            return
+        }
+        // pendingInvitation: advance chain but drop without rendering.
+        if state.groups[gIdx].pendingInvitation {
+            NSLog(
+                "[pizzini.group] groupFileChunk ← \(short(sender)) for \(short(groupId)):"
+                    + " group is pendingInvitation — chunk dropped without rendering",
+            )
+            _ = try? session.groupDecrypt(senderIdentity: sender, ciphertext: ciphertext)
+            persistSession()
+            return
+        }
+        let plaintext: Data
+        do {
+            plaintext = try session.groupDecrypt(senderIdentity: sender, ciphertext: ciphertext)
+        } catch {
+            NSLog(
+                "[pizzini.group] groupFileChunk ← \(short(sender)) for \(short(groupId)):"
+                    + " DECRYPT FAILED — \(error). Likely cause: SKDM never arrived from this sender.",
+            )
+            return
+        }
+        persistSession()
+        let envelope: FileChunkEnvelope
+        do {
+            envelope = try FileChunkEnvelope.decode(plaintext)
+        } catch {
+            NSLog(
+                "[pizzini.group] groupFileChunk ← \(short(sender)) for \(short(groupId)):"
+                    + " malformed FileChunkEnvelope — \(error). Dropped.",
+            )
+            return
+        }
+        // First-chunk capture / subsequent-chunk verify of
+        // `(peer, attachmentId) → groupId`. A sender who flips the
+        // groupId mid-transfer is hostile (or buggy); drop the chunk
+        // and the prior reassembly state to fail the transfer cleanly.
+        let routingKey = sender + envelope.attachmentId
+        if let prior = groupAttachmentRouting[routingKey] {
+            if prior != groupId {
+                NSLog(
+                    "[pizzini.group] groupFileChunk ← \(short(sender)):"
+                        + " groupId flip mid-attachment for aid=\(short(envelope.attachmentId))"
+                        + " (prior=\(short(prior)) new=\(short(groupId))) — discarding partial",
+                )
+                groupReassembler.discard(peer: sender, attachmentId: envelope.attachmentId)
+                groupAttachmentRouting.removeValue(forKey: routingKey)
+                return
+            }
+        } else {
+            groupAttachmentRouting[routingKey] = groupId
+        }
+        let outcome = groupReassembler.feed(envelope: envelope, fromPeer: sender)
+        switch outcome {
+        case .progress:
+            // Mid-attachment — quiet. The completion arm renders the
+            // single chat row when every chunk has landed.
+            break
+        case .complete(let completion):
+            groupAttachmentRouting.removeValue(forKey: routingKey)
+            let safeName = completion.sanitizedFilename
+            let relPath = sandboxRelativePath(forURL: completion.url)
+            state.groups[gIdx].appendIncomingAttachment(
+                attachmentId: completion.attachmentId,
+                filename: safeName,
+                byteSize: completion.totalSize,
+                mime: completion.mime,
+                tier: completion.tier,
+                sandboxRelativePath: relPath,
+                senderPeerId: sender,
+            )
+            Storage.persist(appState: state)
+            NSLog(
+                "[pizzini.group] received attachment \(safeName) (\(completion.totalSize) bytes,"
+                    + " tier=\(completion.tier.rawValue)) for group \(short(groupId)) from \(short(sender))",
+            )
+        case .rejected(let reason):
+            NSLog("[pizzini.group] group reassembler rejected chunk: \(reason)")
+        }
     }
 
     /// Generate a fresh sender-key chain, broadcast a
@@ -1475,6 +1911,16 @@ extension ChatStore {
         state.groups[gIdx].log.append(
             PersistedMessage(side: .me, text: text, kind: .system, bytes: 0),
         )
+    }
+
+    /// `groupId`-keyed variant for call sites that hop back from a
+    /// background queue and don't have the array index in hand.
+    /// Silent no-op if the group has been removed since the hop —
+    /// e.g. the user tapped Leave during the off-main strip pass.
+    fileprivate func appendGroupSystem(groupId: Data, text: String) {
+        guard let gIdx = groupIndex(forId: groupId) else { return }
+        appendGroupSystem(groupAt: gIdx, text)
+        Storage.persist(appState: state)
     }
 
     private static func makeGroupMessageId() -> Data {

@@ -107,6 +107,25 @@ final class ChatStore: NSObject {
     /// re-emits ACKs for any chunks that arrive again, and the 24h
     /// disk TTL eventually GCs orphaned partials.
     private let reassembler = AttachmentReassembler()
+    /// Group-attachment reassembly state. A separate instance from the
+    /// 1:1 `reassembler` so a paired peer who simultaneously ships a
+    /// 1:1 file and a group file with colliding `attachmentId` (16
+    /// random bytes — collision probability ~2^-128, but the audit-
+    /// era code partitions trust surfaces explicitly) cannot confuse
+    /// the dispatcher about which log row a completion belongs to.
+    /// Internal-not-private so `ChatStoreGroups.swift` can feed
+    /// chunks; on completion the host drains the corresponding entry
+    /// from `groupAttachmentRouting` to look up the destination
+    /// group.
+    let groupReassembler = AttachmentReassembler()
+    /// First-chunk capture of `(peer + attachmentId) → groupId` so a
+    /// later completion knows which `ChatGroup.log` to append to.
+    /// Set on every accepted group-file-chunk; verified for stability
+    /// on every subsequent chunk (a sender flipping the groupId mid-
+    /// transfer is hostile and the chunk is dropped). Drained on
+    /// completion or stale-cleanup. Internal-not-private so the group
+    /// receive handler can mutate it.
+    var groupAttachmentRouting: [Data: Data] = [:]
 
     override init() {
         self.state = Storage.loadAppState()
@@ -800,8 +819,10 @@ final class ChatStore: NSObject {
     /// the MainActor (no `nonisolated`) because the only call site
     /// is from `sendFile` *before* the off-main hop, and
     /// `FilenameSanitizer` is MainActor-isolated under the iOS
-    /// app's default isolation rules.
-    private func mimeTypeForFilename(_ name: String) -> String {
+    /// app's default isolation rules. Internal-not-private so the
+    /// group attachment sender in `ChatStoreGroups.swift` reuses
+    /// the same UTType lookup rather than forking a parallel copy.
+    func mimeTypeForFilename(_ name: String) -> String {
         guard let ext = FilenameSanitizer.trailingExtension(of: name)?.lowercased(),
               let type = UTType(filenameExtension: ext)
         else { return "application/octet-stream" }
@@ -1394,6 +1415,8 @@ extension ChatStore: RelayClientDelegate {
             self.handleGroupOp(payload: Data(payload), fromPeer: received.peer)
         case .groupBootstrap:
             self.handleGroupBootstrap(payload: Data(payload), fromPeer: received.peer)
+        case .groupFileChunk:
+            self.handleGroupFileChunk(payload: Data(payload), fromPeer: received.peer)
         }
         // Defensive: an ACK arriving on the SEND channel would have
         // landed in the chat path above unless its inner-kind byte is
@@ -1492,7 +1515,10 @@ extension ChatStore: RelayClientDelegate {
     /// migration that relocates the sandbox doesn't strand existing
     /// rows. Returns nil for URLs outside the sandbox (treat as a
     /// programmer bug — log + nil rather than persist a brittle path).
-    private func sandboxRelativePath(forURL url: URL) -> String? {
+    /// Internal-not-private so the group receive path in
+    /// `ChatStoreGroups.swift` resolves completion URLs through the
+    /// same logic as the 1:1 receive path.
+    func sandboxRelativePath(forURL url: URL) -> String? {
         guard let root = try? AttachmentSandbox.root() else { return nil }
         let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
         let p = url.path
@@ -1644,6 +1670,19 @@ extension ChatStore: RelayClientDelegate {
                 "[pizzini] discarding stale partial attachment from \(short(stale.peer)): \(stale.claimedFilename)"
             )
             reassembler.discard(peer: stale.peer, attachmentId: stale.attachmentId)
+        }
+        // Same walk for the group reassembler — a partial group
+        // transfer is just as exploitable and shares the same disk-
+        // pinning surface. We also drop the routing map entry so a
+        // re-send under the same (peer, aid) is treated as a fresh
+        // attachment rather than colliding with the GC'd chain.
+        let staleGroupAttachments = groupReassembler.staleEntries(now: now)
+        for stale in staleGroupAttachments {
+            NSLog(
+                "[pizzini] discarding stale partial group attachment from \(short(stale.peer)): \(stale.claimedFilename)"
+            )
+            groupReassembler.discard(peer: stale.peer, attachmentId: stale.attachmentId)
+            groupAttachmentRouting.removeValue(forKey: stale.peer + stale.attachmentId)
         }
 
         // 5. Sandbox cleanup: drop assembled attachment files older
