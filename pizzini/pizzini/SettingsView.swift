@@ -1,131 +1,121 @@
 import SwiftUI
 
-/// Unified settings entry point. Reached from the gear icon on the
-/// contacts list. Replaces the old "stack everything in the ⋯ Menu"
-/// approach where adding a contact, changing relay host, toggling
-/// Face ID, and resetting identity all sat one tap apart.
+/// Unified settings entry point. Reached as a NavigationLink push from
+/// the contacts toolbar (gear icon). Lives inside the parent
+/// `NavigationStack`, so the back button is automatic and there is no
+/// modal feel — Apple's own Settings, WhatsApp, Signal, and Telegram
+/// all use push for primary navigation.
 ///
-/// Layout follows iOS settings conventions:
-/// - Connection / Security as named sections with NavigationLink rows
-///   and the current value on the trailing edge.
-/// - Destructive actions (Delete all chats, Reset identity) live one
-///   navigation level deeper under "Advanced", behind explicit
-///   confirmation dialogs. Mis-tapping "Reset identity" while looking
-///   for a relay-host edit is no longer possible.
+/// Each toggle row is intentionally bare: just `Label` + the
+/// SwiftUI-rendered switch. The 1-line section footer carries the
+/// rationale; anyone wanting more taps Help → FAQ. This is the
+/// Apple-Settings pattern, and it scales — verbose inline text under
+/// every row makes the surface feel cluttered.
+///
+/// Layout:
+/// - Connection: NavigationLink to RelayHostScreen
+/// - Security: NavigationLink to SecuritySettingsView
+/// - Panic mode: inline Toggle + 1-line footer
+/// - Attachments: inline Toggle + 1-line footer
+/// - (conditional) Screenshot protection — degraded notice
+/// - Help: NavigationLink to FAQ
+/// - Advanced: NavigationLink to AdvancedScreen (delete-all-chats /
+///   reset-identity)
 struct SettingsView: View {
     @Bindable var store: ChatStore
-    let onClose: () -> Void
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    NavigationLink {
-                        RelayHostScreen(store: store)
-                    } label: {
-                        SettingsRow(
-                            icon: "antenna.radiowaves.left.and.right",
-                            title: "Relay host",
-                            value: store.state.relayHost,
-                        )
-                    }
-                } header: {
-                    Text("Connection")
-                } footer: {
-                    Text("Both peers must use the same relay. The relay sees only ciphertext and routing identifiers.")
+        Form {
+            Section {
+                NavigationLink {
+                    RelayHostScreen(store: store)
+                } label: {
+                    SettingsRow(
+                        icon: "antenna.radiowaves.left.and.right",
+                        title: "Relay host",
+                        value: store.state.relayHost,
+                    )
                 }
+            } header: {
+                Text("Connection")
+            } footer: {
+                Text("Both peers must use the same relay.")
+            }
 
-                Section("Security") {
-                    NavigationLink {
-                        SecuritySettingsView(store: store)
-                    } label: {
-                        SettingsRow(
-                            icon: "faceid",
-                            title: "App lock",
-                            value: store.state.biometricLockEnabled ? "Face ID" : "Off",
-                        )
-                    }
-                }
-
-                Section {
-                    Toggle(isOn: Binding(
-                        get: { store.state.panicModeEnabled },
-                        set: { store.setPanicModeEnabled($0) }
-                    )) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Label("Panic mode", systemImage: "exclamationmark.octagon")
-                            Text("Off by default. When on, three fast taps on the chat area inside an open chat instantly delete that chat — no confirmation, no undo. The contact and your encryption session stay; only the message log is wiped. Heavy haptic confirms the gesture fired.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                } header: {
-                    Text("Panic mode")
-                } footer: {
-                    Text("Modelled on the triple-tap-the-logo panic gesture in Bitchat, scoped to the chat you're in. Use only if you're prepared for an accidental triple-tap to delete a chat with no warning.")
-                }
-
-                if store.state.qrBlockEffective == false {
-                    Section {
-                        HStack(alignment: .top, spacing: 8) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundStyle(.orange)
-                            Text("Pizzini's screenshot block didn't pass its runtime self-test on this iOS version, so screenshots will capture what's on screen. The screen-recording shield (chats hidden whenever iOS reports a recording or external display) still works. We re-test on every iOS update.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    } header: {
-                        Text("Screenshot protection — degraded")
-                    }
-                }
-
-                Section {
-                    Toggle(isOn: Binding(
-                        get: { store.state.quickLookPreviewEnabled },
-                        set: { store.setQuickLookPreviewEnabled($0) }
-                    )) {
-                        Label("In-app preview", systemImage: "eye")
-                    }
-                } header: {
-                    Text("Attachments")
-                } footer: {
-                    Text("Off (default): received files show only the filename, with a Save-to-Files button. On: also shows a Preview button that opens the file in iOS QuickLook. The file is parsed by Apple's QuickLook service either way once you tap; off keeps Pizzini's process out of the loop entirely. Recommended off for journalists and anyone targeted by sophisticated adversaries.")
-                }
-
-                Section("Help") {
-                    NavigationLink {
-                        FAQContent(initialSection: nil)
-                            .navigationTitle("FAQ")
-                            .navigationBarTitleDisplayMode(.inline)
-                    } label: {
-                        SettingsRow(icon: "questionmark.circle", title: "FAQ")
-                    }
-                }
-
-                Section {
-                    NavigationLink {
-                        AdvancedScreen(store: store, onResetClose: onClose)
-                    } label: {
-                        SettingsRow(icon: "exclamationmark.triangle", title: "Advanced")
-                    }
-                } footer: {
-                    Text("Delete all chats, reset your identity. Hidden behind an extra tap so you don't trip on them.")
+            Section("Security") {
+                NavigationLink {
+                    SecuritySettingsView(store: store)
+                } label: {
+                    SettingsRow(
+                        icon: "faceid",
+                        title: "App lock",
+                        value: store.state.biometricLockEnabled ? "Face ID" : "Off",
+                    )
                 }
             }
-            .navigationTitle("Settings")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done", action: onClose)
+
+            Section {
+                Toggle(isOn: Binding(
+                    get: { store.state.panicModeEnabled },
+                    set: { store.setPanicModeEnabled($0) }
+                )) {
+                    Label("Panic mode", systemImage: "exclamationmark.octagon")
+                }
+            } header: {
+                Text("Panic mode")
+            } footer: {
+                Text("Three fast taps in a chat instantly delete it. No undo.")
+            }
+
+            Section {
+                Toggle(isOn: Binding(
+                    get: { store.state.quickLookPreviewEnabled },
+                    set: { store.setQuickLookPreviewEnabled($0) }
+                )) {
+                    Label("In-app preview", systemImage: "eye")
+                }
+            } header: {
+                Text("Attachments")
+            } footer: {
+                Text("Off keeps received files out of Pizzini until you tap Save to Files.")
+            }
+
+            if store.state.qrBlockEffective == false {
+                Section {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text("This iOS version blocks the screenshot mask. Screenshots will capture content. We'll ship a fix.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Screenshot protection — degraded")
                 }
             }
-            // Settings exposes the relay-host (a routing identifier)
-            // and the toggles that govern privacy posture. Cover it
-            // during a screen recording / external display the same as
-            // chat content. Done button stays in the toolbar so the
-            // user can dismiss without seeing the form.
-            .screenCaptureShielded()
+
+            Section("Help") {
+                NavigationLink {
+                    FAQContent(initialSection: nil)
+                        .navigationTitle("FAQ")
+                        .navigationBarTitleDisplayMode(.inline)
+                } label: {
+                    SettingsRow(icon: "questionmark.circle", title: "FAQ")
+                }
+            }
+
+            Section {
+                NavigationLink {
+                    AdvancedScreen(store: store)
+                } label: {
+                    SettingsRow(icon: "exclamationmark.triangle", title: "Advanced")
+                }
+            } footer: {
+                Text("Delete all chats, reset your identity.")
+            }
         }
+        .navigationTitle("Settings")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
@@ -152,9 +142,8 @@ private struct SettingsRow: View {
     }
 }
 
-/// Form-only relay-host editor pushed via NavigationLink. Replaces
-/// the old modal RelaySettingsSheet — settings flow now stays in one
-/// navigation stack instead of stacking sheets-on-sheets.
+/// Form-only relay-host editor pushed via NavigationLink onto the
+/// parent NavigationStack.
 private struct RelayHostScreen: View {
     @Bindable var store: ChatStore
     @Environment(\.dismiss) private var dismiss
@@ -193,16 +182,12 @@ private struct RelayHostScreen: View {
 }
 
 /// Destructive actions live here, one navigation level below the
-/// settings root, with explicit explanation footers. Each action
-/// goes through a confirmationDialog before executing — two intents
+/// settings root, with explicit confirmation dialogs. Two intents
 /// (navigate here + tap destructive + confirm) before anything
 /// dangerous happens.
 private struct AdvancedScreen: View {
     @Bindable var store: ChatStore
-    /// `resetIdentity` on the store eventually rebuilds the relay
-    /// connection; we close the parent settings sheet so the user
-    /// lands back on a freshly-initialized contacts list.
-    let onResetClose: () -> Void
+    @Environment(\.dismiss) private var dismiss
 
     @State private var confirmDeleteAllChats = false
     @State private var confirmReset = false
@@ -216,7 +201,7 @@ private struct AdvancedScreen: View {
                     Label("Delete all chats", systemImage: "trash")
                 }
             } footer: {
-                Text("Wipes every contact's message log. Contacts and sessions stay; you can keep chatting with them. The wiped messages cannot be recovered.")
+                Text("Wipes every chat log. Contacts and sessions stay.")
             }
 
             Section {
@@ -226,7 +211,7 @@ private struct AdvancedScreen: View {
                     Label("Reset identity", systemImage: "arrow.counterclockwise")
                 }
             } footer: {
-                Text("Generates a fresh keypair and wipes contacts, sessions, and message logs. Every contact will need to scan you again to chat. There is no recovery.")
+                Text("Generates a fresh keypair and wipes contacts and chats. Every contact must scan you again.")
             }
         }
         .navigationTitle("Advanced")
@@ -250,7 +235,14 @@ private struct AdvancedScreen: View {
         ) {
             Button("Reset identity", role: .destructive) {
                 store.resetIdentity()
-                onResetClose()
+                // Pop AdvancedScreen back to Settings. The user can
+                // tap back once more to see the now-empty contacts
+                // list. We deliberately don't pop all the way to root
+                // because that would require threading a NavigationPath
+                // closure through three layers — for an action the
+                // user has already double-confirmed (tap → dialog →
+                // confirm), the extra back-tap is fine.
+                dismiss()
             }
             Button("Cancel", role: .cancel) {}
         } message: {

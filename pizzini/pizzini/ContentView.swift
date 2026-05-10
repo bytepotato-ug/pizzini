@@ -16,7 +16,6 @@ struct ContentView: View {
     @State private var integrity = DeviceIntegrityMonitor.shared
     @State private var showScanner = false
     @State private var showMyQR = false
-    @State private var showSettings = false
     @State private var pendingCard: ContactCard?
     @State private var pendingName: String = ""
     /// FAQ deep-link target for the integrity banner's (i) button. Nil
@@ -41,7 +40,6 @@ struct ContentView: View {
                             store: store,
                             showScanner: $showScanner,
                             showMyQR: $showMyQR,
-                            showSettings: $showSettings,
                             onPasteContact: promptForName(decoding:)
                         )
                     }
@@ -148,10 +146,6 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showMyQR) {
             MyQRSheet(card: store.myCard, onDone: { showMyQR = false })
-                .maskAppContents()
-        }
-        .sheet(isPresented: $showSettings) {
-            SettingsView(store: store, onClose: { showSettings = false })
                 .maskAppContents()
         }
         .sheet(item: $integrityFAQ) { anchor in

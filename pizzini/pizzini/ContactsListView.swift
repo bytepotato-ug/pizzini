@@ -6,7 +6,6 @@ struct ContactsListView: View {
     @Bindable var store: ChatStore
     @Binding var showScanner: Bool
     @Binding var showMyQR: Bool
-    @Binding var showSettings: Bool
     let onPasteContact: (String) -> Void
 
     /// Confirmation-dialog state for the `+` add-contact action sheet.
@@ -67,8 +66,8 @@ struct ContactsListView: View {
                 relayBadge
             }
             ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    showSettings = true
+                NavigationLink {
+                    SettingsView(store: store)
                 } label: {
                     Image(systemName: "gearshape")
                 }

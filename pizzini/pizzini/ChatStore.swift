@@ -1046,12 +1046,14 @@ final class ChatStore: NSObject {
         let preservedBiometric = state.biometricLockEnabled
         let preservedOnboarding = state.onboardingCompleted
         let preservedQuickLook = state.quickLookPreviewEnabled
+        let preservedPanicMode = state.panicModeEnabled
         let resetState = AppState(
             relayHost: preservedHost,
             onboardingCompleted: preservedOnboarding,
             biometricLockEnabled: preservedBiometric,
             autoLockTimeout: preservedAutoLock,
             quickLookPreviewEnabled: preservedQuickLook,
+            panicModeEnabled: preservedPanicMode,
         )
         // F-703: write the post-reset AppState to Keychain BEFORE wiping
         // the device-store / outbox / legacy slots. The previous order
