@@ -87,6 +87,12 @@ struct SettingsView: View {
                     Button("Done", action: onClose)
                 }
             }
+            // Settings exposes the relay-host (a routing identifier)
+            // and the toggles that govern privacy posture. Cover it
+            // during a screen recording / external display the same as
+            // chat content. Done button stays in the toolbar so the
+            // user can dismiss without seeing the form.
+            .screenCaptureShielded()
         }
     }
 }

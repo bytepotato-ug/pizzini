@@ -12,6 +12,7 @@ import PizziniCryptoCore
 struct ContentView: View {
     @State private var store = ChatStore.shared
     @State private var lockManager = LockManager.shared
+    @State private var captureMonitor = ScreenCaptureMonitor.shared
     @State private var showScanner = false
     @State private var showMyQR = false
     @State private var showSettings = false
@@ -232,6 +233,12 @@ private struct MyQRSheet: View {
                     Button("Done", action: onDone)
                 }
             }
+            // Cover the QR sheet during a screen recording or external
+            // display — this is the highest-leak surface in the app
+            // (a single capture deanonymises the user), so the shield
+            // applies even if `revealed == false`. Done button stays
+            // available in the toolbar.
+            .screenCaptureShielded()
             // F-802: re-hide the QR whenever the scene deactivates
             // (background, Control Centre pull-down, incoming call,
             // app-switcher peek). The privacy shield masks the

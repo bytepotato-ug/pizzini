@@ -21,6 +21,11 @@ struct ContactsListView: View {
                 list
             }
         }
+        // Hide the contacts list when iOS reports a screen recording
+        // or external display. The toolbar above stays interactive so
+        // a user who triggered Control-Centre Record by mistake can
+        // still navigate out / open Settings to disable recording.
+        .screenCaptureShielded()
         .navigationTitle("Pizzini")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {

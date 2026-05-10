@@ -39,6 +39,12 @@ struct ChatView: View {
                 }
                 composer(disabled: !contact.sessionEstablished, contact: contact)
             }
+            // Cover chat content during a screen recording or external
+            // display. We sit inside the NavigationStack's child view
+            // so the nav bar (back button, ⋯ menu) stays interactive —
+            // the user can pop back out without seeing what they were
+            // reading mirror to a TV.
+            .screenCaptureShielded()
             .navigationTitle(contact.displayName)
             .navigationBarTitleDisplayMode(.inline)
             .onAppear { store.markRead(contactID: contactID) }
