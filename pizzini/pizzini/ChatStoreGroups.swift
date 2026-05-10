@@ -975,10 +975,9 @@ extension ChatStore {
         do {
             plaintext = try session.groupDecrypt(senderIdentity: sender, ciphertext: ciphertext)
         } catch {
-            NSLog(
-                "[pizzini.group] groupFileChunk ← \(short(sender)) for \(short(groupId)):"
-                    + " DECRYPT FAILED — \(error). Likely cause: SKDM never arrived from this sender.",
-            )
+            diagLog("group", "groupFileChunk ← \(short(sender)) for \(short(groupId)):"
+                + " DECRYPT FAILED — \(error). Likely cause: SKDM never arrived from this sender.")
+            surfaceUndecryptable(groupAt: gIdx, sender: sender, error: error)
             return
         }
         persistSession()
@@ -1528,10 +1527,9 @@ extension ChatStore {
         do {
             plaintext = try session.groupDecrypt(senderIdentity: sender, ciphertext: ciphertext)
         } catch {
-            NSLog(
-                "[pizzini.group] groupChat ← \(short(sender)) for \(short(groupId)):"
-                    + " DECRYPT FAILED — \(error). Likely cause: SKDM never arrived from this sender.",
-            )
+            diagLog("group", "groupChat ← \(short(sender)) for \(short(groupId)):"
+                + " DECRYPT FAILED — \(error). Likely cause: SKDM never arrived from this sender.")
+            surfaceUndecryptable(groupAt: gIdx, sender: sender, error: error)
             return
         }
         NSLog(
@@ -1920,6 +1918,35 @@ extension ChatStore {
     fileprivate func appendGroupSystem(groupId: Data, text: String) {
         guard let gIdx = groupIndex(forId: groupId) else { return }
         appendGroupSystem(groupAt: gIdx, text)
+        Storage.persist(appState: state)
+    }
+
+    /// Surface an in-chat system row when `groupDecrypt` fails so the
+    /// user knows a peer's message arrived but couldn't be read —
+    /// previously this was NSLog-only and the message just vanished.
+    /// Most common root cause is that the sender's SKDM never reached
+    /// us (delivery-token depletion, app backgrounded mid-broadcast,
+    /// dev-relay queue eviction); the recovery action is the
+    /// "Resend my keys" button on the *sender's* Group Settings.
+    ///
+    /// Dedups against the immediately-previous log row so a malicious
+    /// peer (or a stuck SKDM that's failing on every retry) can't
+    /// flood the log with system rows. After any other row interleaves
+    /// — a successful decrypt from this or another member, an op
+    /// apply system row — the next failure surfaces a fresh banner.
+    private func surfaceUndecryptable(groupAt gIdx: Int, sender: Data, error: Error) {
+        let name = memberDisplayName(sender, in: state.groups[gIdx])
+        let body = "Couldn't decrypt a message from \(name)."
+            + " They may need to tap 'Resend my keys' in Group Settings."
+        if let last = state.groups[gIdx].log.last,
+           last.kind == .system,
+           last.text == body {
+            // Run-of-failures dedup. The chain still advances on
+            // every undecryptable; we just don't repaint the same
+            // banner.
+            return
+        }
+        appendGroupSystem(groupAt: gIdx, body)
         Storage.persist(appState: state)
     }
 
