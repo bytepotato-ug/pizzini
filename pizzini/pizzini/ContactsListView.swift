@@ -290,12 +290,19 @@ private struct ContactRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            // No status dot here. A solid coloured circle next to a
-            // contact's name reads as a presence/online indicator in
-            // every other messenger, and Pizzini deliberately doesn't
-            // leak that — the relay sees who's connected, the user's
-            // contact list shouldn't. Handshake-pending state is shown
+            // Leading icon mirrors the group row's three-people
+            // glyph at the same size + accent colour, so the eye
+            // reads contacts and groups as siblings of one list.
+            // No status dot — a solid coloured circle next to a
+            // contact's name reads as a presence/online indicator
+            // in every other messenger, and Pizzini deliberately
+            // doesn't leak that. Handshake-pending state is shown
             // by an explicit hourglass + caption instead.
+            Image(systemName: "person.fill")
+                .font(.title3)
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 28)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     if !contact.sessionEstablished {
