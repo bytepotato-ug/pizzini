@@ -47,17 +47,8 @@ struct ChatView: View {
             .screenCaptureShielded()
             .navigationTitle(contact.displayName)
             .navigationBarTitleDisplayMode(.inline)
-            .onAppear {
-                store.markRead(contactID: contactID)
-                // Tell the screenshot-reaction hook which chat to write
-                // a "Screenshot taken." system row into if iOS posts
-                // userDidTakeScreenshotNotification while we're here.
-                store.setActiveChat(contactID)
-            }
-            .onDisappear {
-                store.markRead(contactID: contactID)
-                store.clearActiveChat(contactID)
-            }
+            .onAppear { store.markRead(contactID: contactID) }
+            .onDisappear { store.markRead(contactID: contactID) }
             .onChange(of: contact.log.count) { _, _ in
                 store.markRead(contactID: contactID)
             }

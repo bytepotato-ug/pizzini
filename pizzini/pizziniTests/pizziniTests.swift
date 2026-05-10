@@ -105,124 +105,63 @@ struct ContactSettingsTests {
     }
 }
 
-@Suite("Screenshot system-row codable round-trip")
-struct ScreenshotSystemRowTests {
-    @Test("PersistedMessage with kind == .system encodes / decodes lossless")
-    func systemRowRoundTrip() throws {
-        let row = PersistedMessage(
-            side: .me,
-            text: "Screenshot taken.",
-            kind: .system,
-            bytes: 0,
-        )
-        let data = try JSONEncoder().encode(row)
-        let decoded = try JSONDecoder().decode(PersistedMessage.self, from: data)
-        #expect(decoded.kind == .system)
-        #expect(decoded.text == "Screenshot taken.")
-        #expect(decoded.bytes == 0)
-        #expect(decoded.messageId == nil)
-        #expect(decoded.attachment == nil)
-    }
-}
-
-@Suite("Screen-capture settings + Phase-5 self-test codec")
-struct ScreenCaptureSettingsTests {
-    @Test("notifyPeerOnScreenshot defaults off")
-    func notifyPeerDefault() {
-        let s = AppState()
-        #expect(s.notifyPeerOnScreenshot == false)
-    }
-
-    @Test("blockQRScreenshots defaults on")
-    func blockQRDefault() {
-        let s = AppState()
-        #expect(s.blockQRScreenshots == true)
-    }
-
-    @Test("blockChatScreenshots defaults off")
-    func blockChatDefault() {
-        let s = AppState()
-        #expect(s.blockChatScreenshots == false)
-    }
-
-    @Test("blockAppScreenshots defaults on")
-    func blockAppDefault() {
-        let s = AppState()
-        #expect(s.blockAppScreenshots == true)
-    }
-
-    @Test("legacy AppState with blockQRScreenshots = false migrates blockAppScreenshots to false")
-    func appWideMigrationFromQRDisabled() throws {
-        // VoiceOver-using upgrade path: a user who turned the QR-only
-        // toggle off in the previous build should NOT be silently
-        // re-enabled with the default-ON app-wide toggle. Migration
-        // inherits the OFF preference.
-        let json = """
-        {
-            "version": 1,
-            "relayHost": "127.0.0.1",
-            "contacts": [],
-            "onboardingCompleted": true,
-            "biometricLockEnabled": false,
-            "autoLockTimeout": "immediately",
-            "quickLookPreviewEnabled": false,
-            "blockQRScreenshots": false
-        }
-        """.data(using: .utf8)!
-        let decoded = try JSONDecoder().decode(AppState.self, from: json)
-        #expect(decoded.blockQRScreenshots == false)
-        #expect(decoded.blockAppScreenshots == false)
-    }
-
-    @Test("legacy AppState with no screen-capture fields defaults blockAppScreenshots ON")
-    func appWideDefaultOnLegacy() throws {
-        let json = """
-        {
-            "version": 1,
-            "relayHost": "127.0.0.1",
-            "contacts": [],
-            "onboardingCompleted": true,
-            "biometricLockEnabled": false,
-            "autoLockTimeout": "immediately",
-            "quickLookPreviewEnabled": false
-        }
-        """.data(using: .utf8)!
-        let decoded = try JSONDecoder().decode(AppState.self, from: json)
-        #expect(decoded.blockAppScreenshots == true)
-    }
-
-    @Test("qrBlockEffective defaults nil (untested)")
-    func qrBlockEffectiveDefault() {
+@Suite("Screenshot self-test result codec")
+struct ScreenshotSelfTestCodecTests {
+    @Test("qrBlockEffective + qrBlockTestedOSVersion default nil (untested)")
+    func defaultsNil() {
         let s = AppState()
         #expect(s.qrBlockEffective == nil)
         #expect(s.qrBlockTestedOSVersion == nil)
     }
 
-    @Test("AppState round-trips the new screen-capture fields")
-    func roundTripPhase5Fields() throws {
+    @Test("AppState round-trips the self-test result fields")
+    func roundTripSelfTestFields() throws {
         let s = AppState(
-            notifyPeerOnScreenshot: true,
-            blockQRScreenshots: false,
-            blockChatScreenshots: true,
-            blockAppScreenshots: false,
-            qrBlockEffective: false,
+            qrBlockEffective: true,
             qrBlockTestedOSVersion: "26.0",
         )
         let data = try JSONEncoder().encode(s)
         let decoded = try JSONDecoder().decode(AppState.self, from: data)
-        #expect(decoded.notifyPeerOnScreenshot == true)
-        #expect(decoded.blockQRScreenshots == false)
-        #expect(decoded.blockChatScreenshots == true)
-        #expect(decoded.blockAppScreenshots == false)
-        #expect(decoded.qrBlockEffective == false)
+        #expect(decoded.qrBlockEffective == true)
         #expect(decoded.qrBlockTestedOSVersion == "26.0")
     }
 
-    @Test("legacy AppState JSON without the new fields decodes with defaults")
-    func legacyAppStateBackwardsCompat() throws {
-        // JSON snapshot of an AppState written before the screen-capture
-        // fields existed. decodeIfPresent must keep this loadable so
-        // upgrades don't silently lose biometric / relay-host config.
+    @Test("legacy AppState JSON carrying removed toggle keys decodes cleanly")
+    func legacyTogglesAreIgnored() throws {
+        // JSON snapshot from an earlier build that wrote the now-
+        // removed `notifyPeerOnScreenshot`, `blockQRScreenshots`,
+        // `blockChatScreenshots`, and `blockAppScreenshots` keys.
+        // JSONDecoder ignores unknown keys silently, so the blob
+        // must still load — losing those (now-meaningless) keys on
+        // next encode is the desired outcome.
+        let json = """
+        {
+            "version": 1,
+            "relayHost": "127.0.0.1",
+            "contacts": [],
+            "onboardingCompleted": true,
+            "biometricLockEnabled": true,
+            "autoLockTimeout": "fiveMinutes",
+            "quickLookPreviewEnabled": false,
+            "notifyPeerOnScreenshot": true,
+            "blockQRScreenshots": false,
+            "blockChatScreenshots": true,
+            "blockAppScreenshots": false,
+            "qrBlockEffective": true,
+            "qrBlockTestedOSVersion": "26.0"
+        }
+        """.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(AppState.self, from: json)
+        // Removed keys silently dropped; still-present keys preserved.
+        #expect(decoded.relayHost == "127.0.0.1")
+        #expect(decoded.biometricLockEnabled == true)
+        #expect(decoded.autoLockTimeout == .fiveMinutes)
+        #expect(decoded.qrBlockEffective == true)
+        #expect(decoded.qrBlockTestedOSVersion == "26.0")
+    }
+
+    @Test("legacy AppState JSON without screen-capture fields still decodes")
+    func legacyMinimalJsonDecodes() throws {
         let json = """
         {
             "version": 1,
@@ -235,12 +174,8 @@ struct ScreenCaptureSettingsTests {
         }
         """.data(using: .utf8)!
         let decoded = try JSONDecoder().decode(AppState.self, from: json)
-        #expect(decoded.notifyPeerOnScreenshot == false)
-        #expect(decoded.blockQRScreenshots == true)
-        #expect(decoded.blockChatScreenshots == false)
         #expect(decoded.qrBlockEffective == nil)
         #expect(decoded.qrBlockTestedOSVersion == nil)
-        // Pre-existing fields still load.
         #expect(decoded.relayHost == "127.0.0.1")
         #expect(decoded.biometricLockEnabled == true)
         #expect(decoded.autoLockTimeout == .fiveMinutes)

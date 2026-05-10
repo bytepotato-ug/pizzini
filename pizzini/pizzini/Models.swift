@@ -300,53 +300,15 @@ struct AppState: Codable, Sendable {
     /// in QuickLook's XPC, but it does widen the in-process integration
     /// surface a hair vs the strict default.
     var quickLookPreviewEnabled: Bool
-    /// When true, screenshotting a chat sends the peer a sealed
-    /// envelope they render as "Your contact took a screenshot." Default
-    /// OFF — most users save messages for legitimate reasons (their own
-    /// records) and pushing that to the peer is a privacy decision they
-    /// make, not a default we make for them. Telegram-style behaviour.
-    var notifyPeerOnScreenshot: Bool
-    /// When true, the QR sheet wraps its rendered code inside an
-    /// `isSecureTextEntry`-backed UITextField container. iOS's screenshot
-    /// pipeline skips views nested inside a secure-text-entry field, so
-    /// a screenshot of the QR sheet captures black/blank pixels rather
-    /// than a scannable code. Default ON — but only effective when
-    /// `qrBlockEffective != false` (a runtime self-test pass). Turn off
-    /// for VoiceOver / accessibility users; the trick breaks selection
-    /// and screen-reader semantics for the wrapped subtree.
-    var blockQRScreenshots: Bool
-    /// When true, ChatView wraps its message scroll view in the same
-    /// `isSecureTextEntry` container the QR sheet uses, so the chat
-    /// bubbles also blank out in screenshots / recordings. Default OFF
-    /// because the wrap breaks system text-selection (long-press →
-    /// Copy on a bubble) and VoiceOver inside the wrapped subtree —
-    /// non-trivial accessibility cost. Same effective-gate as the QR:
-    /// only applied when `qrBlockEffective != false`.
-    ///
-    /// Superseded by `blockAppScreenshots` (app-wide). Kept on the
-    /// type for codable backwards-compat with blobs written by the
-    /// previous build; not exposed in the new Settings UI.
-    var blockChatScreenshots: Bool
-    /// When true, the ENTIRE app is wrapped in a secure-text-entry
-    /// container at every entry point — main content, sheets, and
-    /// full-screen covers all blank out in screenshots, screen
-    /// recordings, AirPlay mirroring, and remote-screen-sharing
-    /// captures. Default ON. Same effective-gate as the QR/chat
-    /// blocks: only applied when `qrBlockEffective != false`.
-    ///
-    /// What this CANNOT mask: iOS-rendered chrome above the app —
-    /// system permission alerts ("Camera access?", "Allow
-    /// notifications?"), the title strings in `.alert(...)` and
-    /// `.confirmationDialog(...)` (those use system services), the
-    /// app-switcher snapshot itself (covered separately by
-    /// `PrivacyShieldView`/`PrivacyShieldWindow`). Documented in the
-    /// FAQ.
-    var blockAppScreenshots: Bool
     /// Result of the most recent runtime self-test for the
-    /// `isSecureTextEntry` workaround. Nil = not yet tested. True = the
-    /// trick blocked the screenshot pipeline on this iOS version. False
-    /// = the trick failed (Apple has narrowed the gap on this version);
-    /// the QR-block path silently falls back to a conventional shield.
+    /// `isSecureTextEntry` workaround that powers the app-wide
+    /// screenshot mask. Nil = not yet tested. True = the trick
+    /// blocked the screenshot pipeline on this iOS version. False =
+    /// the trick failed (Apple has narrowed the gap on this version)
+    /// and the mask falls back to no-wrap — accessibility is
+    /// preserved at the cost of the protection. Internal diagnostic
+    /// only; not exposed as a Settings toggle (the mask is
+    /// unconditionally on whenever it works).
     var qrBlockEffective: Bool?
     /// `UIDevice.current.systemVersion` at the time `qrBlockEffective`
     /// was determined. We re-run the self-test whenever the major
@@ -366,10 +328,6 @@ struct AppState: Codable, Sendable {
         biometricLockEnabled: Bool = false,
         autoLockTimeout: AutoLockTimeout = .immediately,
         quickLookPreviewEnabled: Bool = false,
-        notifyPeerOnScreenshot: Bool = false,
-        blockQRScreenshots: Bool = true,
-        blockChatScreenshots: Bool = false,
-        blockAppScreenshots: Bool = true,
         qrBlockEffective: Bool? = nil,
         qrBlockTestedOSVersion: String? = nil
     ) {
@@ -380,10 +338,6 @@ struct AppState: Codable, Sendable {
         self.biometricLockEnabled = biometricLockEnabled
         self.autoLockTimeout = autoLockTimeout
         self.quickLookPreviewEnabled = quickLookPreviewEnabled
-        self.notifyPeerOnScreenshot = notifyPeerOnScreenshot
-        self.blockQRScreenshots = blockQRScreenshots
-        self.blockChatScreenshots = blockChatScreenshots
-        self.blockAppScreenshots = blockAppScreenshots
         self.qrBlockEffective = qrBlockEffective
         self.qrBlockTestedOSVersion = qrBlockTestedOSVersion
     }
@@ -396,10 +350,6 @@ struct AppState: Codable, Sendable {
         case biometricLockEnabled
         case autoLockTimeout
         case quickLookPreviewEnabled
-        case notifyPeerOnScreenshot
-        case blockQRScreenshots
-        case blockChatScreenshots
-        case blockAppScreenshots
         case qrBlockEffective
         case qrBlockTestedOSVersion
     }
@@ -413,23 +363,13 @@ struct AppState: Codable, Sendable {
         biometricLockEnabled = try c.decodeIfPresent(Bool.self, forKey: .biometricLockEnabled) ?? false
         autoLockTimeout = try c.decodeIfPresent(AutoLockTimeout.self, forKey: .autoLockTimeout) ?? .immediately
         quickLookPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .quickLookPreviewEnabled) ?? false
-        notifyPeerOnScreenshot = try c.decodeIfPresent(Bool.self, forKey: .notifyPeerOnScreenshot) ?? false
-        blockQRScreenshots = try c.decodeIfPresent(Bool.self, forKey: .blockQRScreenshots) ?? true
-        blockChatScreenshots = try c.decodeIfPresent(Bool.self, forKey: .blockChatScreenshots) ?? false
-        // blockAppScreenshots default true. Migration: a user who
-        // previously turned the QR-only toggle OFF (because they use
-        // VoiceOver and the secure container breaks it on the QR)
-        // would not want the app-wide default ON to bring the same
-        // breakage everywhere. Inherit blockQRScreenshots' value when
-        // the new field is missing AND the legacy field was OFF.
-        if let appBlock = try c.decodeIfPresent(Bool.self, forKey: .blockAppScreenshots) {
-            blockAppScreenshots = appBlock
-        } else if blockQRScreenshots == false {
-            blockAppScreenshots = false
-        } else {
-            blockAppScreenshots = true
-        }
         qrBlockEffective = try c.decodeIfPresent(Bool.self, forKey: .qrBlockEffective)
         qrBlockTestedOSVersion = try c.decodeIfPresent(String.self, forKey: .qrBlockTestedOSVersion)
+        // Pre-existing JSON blobs from earlier builds may carry the
+        // `notifyPeerOnScreenshot`, `blockQRScreenshots`,
+        // `blockChatScreenshots`, and `blockAppScreenshots` keys.
+        // JSONDecoder silently ignores unknown keys, so those blobs
+        // load cleanly and the legacy keys are dropped on the next
+        // encode. No migration code needed.
     }
 }

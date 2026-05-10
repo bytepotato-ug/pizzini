@@ -3,16 +3,17 @@ import Testing
 import UIKit
 @testable import pizzini
 
-/// NotificationCenter-driven tests for `ScreenCaptureMonitor`. The four
+/// NotificationCenter-driven tests for `ScreenCaptureMonitor`. The
 /// observed notifications are posted on the main actor and the
 /// monitor's published state is read back after a yield so the
 /// internal `Task { @MainActor in ... }` hop has a chance to commit.
 ///
 /// `isRecording` / `hasExternalDisplay` post-conditions are asserted
 /// against the value the monitor *would* read on a real device — we
-/// can't fake `UIScreen.main.isCaptured` or `UIScreen.screens.count`
-/// from a unit test, so we instead assert the notification path runs
-/// without crashing and produces a value consistent with the screen.
+/// can't fake the foreground scene's `screen.isCaptured` or
+/// `connectedScenes` content from a unit test, so we instead assert
+/// the notification path runs without crashing and produces a value
+/// consistent with what the monitor's own static helpers see.
 @Suite("ScreenCaptureMonitor", .serialized)
 @MainActor
 struct ScreenCaptureMonitorTests {
@@ -24,44 +25,6 @@ struct ScreenCaptureMonitorTests {
     private func settle() async {
         await Task.yield()
         await Task.yield()
-    }
-
-    @Test("screenshot notification updates lastScreenshotAt + counter")
-    func screenshotNotificationUpdatesState() async {
-        let monitor = ScreenCaptureMonitor.shared
-        let before = monitor.screenshotCount
-        let beforeAt = monitor.lastScreenshotAt
-        NotificationCenter.default.post(
-            name: UIApplication.userDidTakeScreenshotNotification,
-            object: nil,
-        )
-        await settle()
-        #expect(monitor.screenshotCount == before &+ 1)
-        // lastScreenshotAt must have been refreshed to a strictly later
-        // wall-clock than its prior value (or be non-nil if it was nil).
-        if let beforeAt {
-            #expect(monitor.lastScreenshotAt != nil)
-            if let now = monitor.lastScreenshotAt {
-                #expect(now >= beforeAt)
-            }
-        } else {
-            #expect(monitor.lastScreenshotAt != nil)
-        }
-    }
-
-    @Test("onScreenshot closure fires on screenshot")
-    func onScreenshotClosureFires() async {
-        let monitor = ScreenCaptureMonitor.shared
-        let priorClosure = monitor.onScreenshot
-        var fired = false
-        monitor.onScreenshot = { @MainActor in fired = true }
-        defer { monitor.onScreenshot = priorClosure }
-        NotificationCenter.default.post(
-            name: UIApplication.userDidTakeScreenshotNotification,
-            object: nil,
-        )
-        await settle()
-        #expect(fired)
     }
 
     @Test("capturedDidChange does not crash and reflects the active scene's screen")

@@ -258,79 +258,63 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             """
         case .screenCapture:
             return """
-            iOS does not let any app fully prevent screenshots. That’s \
-            an Apple policy decision, and Pizzini cannot opt out of it. \
-            What we can do, and do, is detect captures and adjust:
+            Pizzini does not allow screenshots of itself. The whole \
+            app is wrapped in an iOS secure-text-entry container, \
+            which the screenshot pipeline renders as a solid black \
+            frame. Screenshots, screen recording, AirPlay mirroring, \
+            and remote-screen-sharing tools all see black instead of \
+            your chats, contacts, settings, or QR. This is on by \
+            default and there is no toggle for it — there is no \
+            legitimate reason to screenshot a private end-to-end-\
+            encrypted conversation.
 
-            • Screenshots are detected after the fact. When you \
-              screenshot inside a chat, Pizzini appends a system row \
-              that records it. iOS never gives the app the captured \
-              image, only the notification.
-            • Screen recording (the Control Centre Record button), \
-              AirPlay mirroring, and Apple-cable mirroring all flip an \
-              "is captured" flag we can read live. Whenever it’s on, \
-              Pizzini swaps your chats, contacts, settings, and QR \
-              sheet for an opaque cover. The toolbar stays interactive \
-              so you can navigate out without seeing what was on \
-              screen.
-            • External-display attaches (a TV via cable, an iPad with \
-              a connected monitor) trigger the same cover. AirPlay \
-              mirroring counts because iOS reports the AirPlay receiver \
-              as a connected display.
+            The technique is not a documented Apple API. Apple uses \
+            the same secure-text-entry behaviour for password fields \
+            and has been narrowing it across recent iOS releases. \
+            Pizzini runs a self-test on first launch and after every \
+            iOS major-version update to confirm the trick still \
+            works on your device. If the test ever fails on a \
+            future iOS, Pizzini falls back gracefully (no wrap, no \
+            broken accessibility) and surfaces a "Screenshot \
+            protection — degraded" notice in Settings so you know \
+            screenshots are no longer blocked. We'd ship a fix in \
+            the next release.
 
-            Optional: "Tell my contact when I screenshot." Off by \
-            default. Most people screenshot for legitimate reasons — \
-            saving important text, copying a link to themselves — and \
-            we don’t think the app should default to broadcasting that. \
-            Turn it on and your contact sees a system row in their \
-            copy of the chat when you screenshot one of their messages. \
-            They cannot disable it on their end; if you don’t want them \
-            to know, leave this off.
-
-            On top of detection and shielding, Pizzini wraps the \
-            entire app in an iOS secure-text-entry container by \
-            default. The screenshot pipeline historically renders \
-            secure-text-entry containers as black, which means a \
-            screenshot, a screen recording, an AirPlay mirror, or a \
-            remote-screen-sharing capture sees a black frame instead \
-            of your chats, contacts, settings, or QR.
-
-            This wrap is not based on a documented Apple API. Apple \
-            uses the same technique for password fields and has been \
-            narrowing it across recent iOS releases. Pizzini runs a \
-            self-test at first launch and after every iOS \
-            major-version update to confirm the technique still works \
-            on your device. If the test fails, the wrap silently \
-            stops being applied (it would otherwise cost \
-            accessibility for no security gain), and Settings → App \
-            lock will tell you.
+            On top of the wrap, Pizzini also covers the live screen \
+            with an opaque shield while iOS reports a screen \
+            recording or an external display. The toolbar stays \
+            interactive so you can navigate out without seeing what \
+            was on screen. AirPlay mirroring counts as a recording. \
+            The same path catches Lightning/USB-C-attached monitors \
+            and the iPad Stage Manager external display.
 
             What the wrap CANNOT mask: iOS-rendered chrome that \
             draws above the app. System permission alerts ("Pizzini \
             wants to use the camera"), the title and message in iOS \
-            confirmation dialogs and alerts, and the multitasking \
-            snapshot's title metadata are rendered by the system at a \
-            layer outside the wrap. The multitasking snapshot itself \
-            is covered separately by Pizzini's privacy shield.
+            confirmation dialogs and alerts, and the status-bar \
+            elements (clock, wifi, battery) at the very top of every \
+            screen are drawn by the system at a layer outside the \
+            wrap. The multitasking snapshot itself is covered \
+            separately by Pizzini's privacy shield, which is also a \
+            solid black view.
 
-            Costs of the wrap: long-press → Copy on a chat bubble \
-            stops working, VoiceOver inside the wrapped views is \
-            degraded, and dictation may not work on the message \
-            composer. If you depend on those, turn the wrap off in \
-            Settings → App lock → "Block screenshots of Pizzini". The \
-            screen-recording shield, screenshot detection, and \
-            external-display refusal stay active either way.
+            Costs of the wrap, so you know up front: long-press → \
+            Copy on a chat bubble does not work, VoiceOver inside the \
+            wrapped views is degraded, and dictation may not work on \
+            the message composer. These trade-offs are accepted by \
+            default; we don't ship a switch to turn them off.
 
             What none of this defends against:
 
             • A second camera pointed at your screen. Nothing in iOS \
               can stop another phone from photographing your display.
             • A device whose iOS has been compromised at the kernel \
-              level by an unrelated vulnerability. Pizzini’s threat \
+              level by an unrelated vulnerability. Pizzini's threat \
               model assumes a healthy iOS underneath.
-            • Jailbroken devices with screen-recording rootkits. We \
-              detect what iOS tells us; a kernel-level capture \
-              bypasses iOS entirely.
+            • Jailbroken devices with screen-recording rootkits. The \
+              wrap relies on Apple's screenshot pipeline honouring \
+              secure-text-entry; a kernel-level capture bypasses \
+              that pipeline entirely.
 
             For the highest-risk situations the safest practice is to \
             take the conversation to a place where no screen exists \

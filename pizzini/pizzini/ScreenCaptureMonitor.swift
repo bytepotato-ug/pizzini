@@ -6,21 +6,27 @@ import UIKit
 ///
 /// What iOS lets us see, ordered by what an attacker would do:
 ///
-/// 1. **Screenshot** (`UIApplication.userDidTakeScreenshotNotification`) —
-///    fires *after* the system has captured the framebuffer. iOS
-///    deliberately exposes no API to *prevent* a screenshot from any
-///    app — the policy is Apple's, not ours. Reactive only.
-/// 2. **Screen recording / mirroring** (`UIScreen.capturedDidChangeNotification`
+/// 1. **Screen recording / mirroring** (`UIScreen.capturedDidChangeNotification`
 ///    + the foreground scene's `windowScene.screen.isCaptured`) —
 ///    fires while a capture pipeline is active. Includes Control-
 ///    Centre Record, AirPlay mirroring, QuickTime over USB, and
 ///    external-display mirroring on single-window apps.
-/// 3. **External display connected** (`UIScene.willConnectNotification`,
+/// 2. **External display connected** (`UIScene.willConnectNotification`,
 ///    `UIScene.didDisconnectNotification`, filtered by
 ///    `UISceneSession.role == .windowExternalDisplayNonInteractive`).
 ///    Doubles as a refusal hook for multi-window-capable builds; for
 ///    single-window apps like ours, the mirroring case lights up
-///    `isCaptured` and (2) catches it instead.
+///    `isCaptured` and (1) catches it instead.
+///
+/// **What we do NOT observe.** `UIApplication.userDidTakeScreenshotNotification`
+/// is unused — Pizzini's screenshot defence is the unconditional
+/// `SecureScreenshotShield` wrap (see `.maskAppContents()`). When the
+/// wrap works, screenshots capture a black frame and there's no
+/// after-the-fact reaction worth taking; when it doesn't (Apple has
+/// closed the gap on this iOS), reacting to the notification doesn't
+/// rebuild the protection. The wrap is the answer; this monitor only
+/// watches the live-recording surface that needs an extra in-body
+/// shield overlay.
 ///
 /// **API choice — why scene-based, not screen-based.** Apple
 /// deprecated `UIScreen.screens`, `UIScreen.didConnectNotification`
@@ -33,11 +39,6 @@ import UIKit
 /// fallback for the launch-time window before any scene is
 /// foreground-active.
 ///
-/// What we DO NOT promise: there's no "prevent screenshot" API. The QR
-/// sheet has a separate `isSecureTextEntry` workaround, gated by a
-/// runtime self-test, and even there the user-facing copy is "best
-/// effort, may break in future iOS releases."
-///
 /// Why a singleton: same shape as `LockManager.shared` — `@State`
 /// initialisers can fire more than once before SwiftUI commits to one
 /// instance, and we want exactly one notification observer per
@@ -49,8 +50,9 @@ final class ScreenCaptureMonitor {
 
     /// True while iOS reports the framebuffer is being captured —
     /// screen-recording, AirPlay mirror, USB mirror, or any third
-    /// `UIScreen` mirroring our window. Mirrors `UIScreen.main.isCaptured`
-    /// and is updated on every `UIScreen.capturedDidChangeNotification`.
+    /// `UIScreen` mirroring our window. Read from the foreground
+    /// scene's `windowScene.screen.isCaptured` and re-polled on
+    /// every `UIScreen.capturedDidChangeNotification`.
     private(set) var isRecording: Bool
 
     /// True while there is more than one connected `UIScreen`, i.e. an
@@ -61,24 +63,6 @@ final class ScreenCaptureMonitor {
     /// app explicitly opts into a separate scene, which we don't.
     private(set) var hasExternalDisplay: Bool
 
-    /// Wall-clock the most recent `userDidTakeScreenshotNotification`
-    /// arrived. ChatStore reads this transiently so the chat layer can
-    /// append a "Screenshot taken" system row at the moment it happens;
-    /// the value otherwise lingers for the lifetime of the process.
-    private(set) var lastScreenshotAt: Date?
-
-    /// Bumped every time a screenshot notification arrives. Exists so
-    /// SwiftUI re-renders even when two screenshots land in the same
-    /// wall-clock second (Date equality at second precision would
-    /// otherwise fail to fire `@Observable`'s change tracking).
-    private(set) var screenshotCount: Int = 0
-
-    /// Closure invoked on every screenshot, on the main actor. ChatStore
-    /// registers itself here at init so the system-row append happens
-    /// without a circular import — the monitor compiles in tests with
-    /// no ChatStore visible.
-    var onScreenshot: (@MainActor () -> Void)?
-
     private init() {
         // Initial snapshot — covers the case where a recording was
         // already underway when the app launched (e.g. user started a
@@ -86,12 +70,6 @@ final class ScreenCaptureMonitor {
         self.isRecording = Self.computeIsRecording()
         self.hasExternalDisplay = Self.computeHasExternalDisplay()
         let nc = NotificationCenter.default
-        nc.addObserver(
-            self,
-            selector: #selector(handleScreenshot(_:)),
-            name: UIApplication.userDidTakeScreenshotNotification,
-            object: nil,
-        )
         nc.addObserver(
             self,
             selector: #selector(handleCapturedChanged(_:)),
@@ -118,20 +96,9 @@ final class ScreenCaptureMonitor {
         )
     }
 
-    // The four @objc handlers are `nonisolated` so NotificationCenter
-    // can call them from whatever thread Apple posts on (documented as
-    // main for the screenshot notification, but the others are not
-    // contractually pinned). They bounce immediately onto the main
-    // actor before touching observable state. Tests post the same
-    // notifications and assert state via an `await` on MainActor.
-
-    @objc nonisolated private func handleScreenshot(_ note: Notification) {
-        Task { @MainActor in
-            self.lastScreenshotAt = Date()
-            self.screenshotCount &+= 1
-            self.onScreenshot?()
-        }
-    }
+    // The three @objc handlers are `nonisolated` so NotificationCenter
+    // can call them from whatever thread Apple posts on. They bounce
+    // immediately onto the main actor before touching observable state.
 
     @objc nonisolated private func handleCapturedChanged(_ note: Notification) {
         // We do NOT trust the notification's userInfo — Apple has
