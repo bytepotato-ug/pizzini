@@ -1110,10 +1110,35 @@ final class ChatStore: NSObject {
     /// inside the wrapped container. Effective only when the QR-block
     /// runtime self-test passed (`qrBlockEffective != false`); same
     /// underlying technique.
+    ///
+    /// Superseded by `setBlockAppScreenshots`; retained for codable
+    /// backwards-compat.
     func setBlockChatScreenshots(_ enabled: Bool) {
         guard state.blockChatScreenshots != enabled else { return }
         state.blockChatScreenshots = enabled
         Storage.persist(appState: state)
+    }
+
+    /// Toggle app-wide screenshot masking. When ON, every visible
+    /// surface (main content, sheets, full-screen covers) is wrapped
+    /// in `SecureScreenshotShield` so screenshots / recordings /
+    /// AirPlay capture an entirely black frame instead of the app's
+    /// content. Default ON; turn off only if the resulting
+    /// accessibility cost (system text-selection, VoiceOver inside
+    /// wrapped subtrees) is unacceptable.
+    func setBlockAppScreenshots(_ enabled: Bool) {
+        guard state.blockAppScreenshots != enabled else { return }
+        state.blockAppScreenshots = enabled
+        Storage.persist(appState: state)
+    }
+
+    /// True when the app-wide screenshot mask should be applied: the
+    /// user hasn't disabled it AND the runtime self-test for the
+    /// underlying technique passed on this iOS version. Read from
+    /// every surface that opts into the mask via the
+    /// `.maskAppContents()` view modifier.
+    var shouldMaskAppContents: Bool {
+        state.blockAppScreenshots && state.qrBlockEffective != false
     }
 
     /// Persist the runtime-self-test result for the QR-block trick.

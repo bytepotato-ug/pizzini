@@ -4,10 +4,10 @@ import UIKit
 /// SwiftUI wrapper that hosts arbitrary content inside a
 /// `UITextField` whose `isSecureTextEntry == true`. iOS's screenshot
 /// service renders the secure container blank in the captured
-/// framebuffer; the same skip applies to AirPlay mirroring of
-/// secure-text fields. Used ONLY on `MyQRSheet`'s qrSurface, where a
-/// single screenshot would deanonymise the user on the relay network
-/// — the QR is the highest-leak surface in the app.
+/// framebuffer; the same skip applies to AirPlay mirroring,
+/// screen-recording, and most remote-access tooling that uses the
+/// public capture pipeline. Apple uses this for password fields; we
+/// re-purpose it to mask sensitive surfaces.
 ///
 /// **Honesty about what this is** (developer comments — NEVER user
 /// copy): this is not a documented API. Banking apps and password
@@ -19,8 +19,10 @@ import UIKit
 /// to falsely advertise the protection.
 ///
 /// Prior art consulted (one-shot read; no code copied verbatim):
-/// - freeRASP-iOS (Talsec, MIT) — same `subviews.last` containment
-/// - ScreenShield by Diego Rico — same pattern, MIT
+/// - freeRASP-iOS (Talsec, MIT)
+/// - ScreenShield by Diego Rico (MIT)
+/// - The Moin iOS app's internal handoff (the source of the
+///   `NonInteractiveSecureTextField` subclass pattern below).
 ///
 /// We deliberately reimplemented in-tree to keep this security-critical
 /// path off any third-party iOS dependency, per the README's "no
@@ -33,19 +35,19 @@ struct SecureScreenshotShield<Content: View>: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> UIView {
-        let textField = UITextField()
+        let textField = NonInteractiveSecureTextField()
         textField.isSecureTextEntry = true
-        textField.isUserInteractionEnabled = false
         textField.backgroundColor = .clear
         textField.translatesAutoresizingMaskIntoConstraints = false
 
-        // The last subview of a secure UITextField is the "canvas" iOS
-        // draws masked content into. We host our SwiftUI content inside
-        // that canvas so its bytes live inside the secret container.
-        // Apple has not stabilised this layout, but it's been the same
-        // shape since iOS 13 — the runtime self-test catches any future
-        // change.
-        guard let canvas = textField.subviews.last else {
+        // Canvas lookup is iOS-version-fragile — Apple has used both
+        // `subviews.first` and `subviews.last` as the masked container
+        // across releases, and the class is the private
+        // `_UITextLayoutCanvasView`. `findCanvas` walks the subview
+        // list and prefers a class-name match before falling back to
+        // index heuristics, so a future shuffle that keeps the same
+        // class survives without code change.
+        guard let canvas = Self.findCanvas(in: textField) else {
             // Structural fallback — render the content normally rather
             // than crash. The runtime self-test will mark
             // `qrBlockEffective = false` so the call site falls back
@@ -57,6 +59,12 @@ struct SecureScreenshotShield<Content: View>: UIViewRepresentable {
             context.coordinator.hostController = host
             return textField
         }
+        // CRITICAL: the canvas defaults to `isUserInteractionEnabled =
+        // false`. Without flipping this, every tap, gesture, and text
+        // input inside the wrapped content silently no-ops. Source of
+        // the pattern: Moin iOS team's WebView wrapper.
+        canvas.isUserInteractionEnabled = true
+
         let host = UIHostingController(rootView: content())
         context.coordinator.hostController = host
         host.view.translatesAutoresizingMaskIntoConstraints = false
@@ -81,6 +89,102 @@ struct SecureScreenshotShield<Content: View>: UIViewRepresentable {
     final class Coordinator {
         var hostController: UIHostingController<Content>?
     }
+
+    /// Walks `textField.subviews` looking for the masked canvas view.
+    /// Strategy:
+    /// 1. Prefer a subview whose class name matches Apple's known
+    ///    pattern (`_UITextLayoutCanvasView`, `UITextLayoutCanvasView`,
+    ///    or any "*Canvas*" class) — robust to subview-order shuffles.
+    /// 2. Fall back to `.last` (correct on iOS 16-26) and then
+    ///    `.first` (correct on the older code paths some references
+    ///    still document) so we degrade gracefully if the class names
+    ///    change.
+    @MainActor
+    static func findCanvas(in textField: UITextField) -> UIView? {
+        for sv in textField.subviews {
+            let name = String(describing: type(of: sv))
+            // Common class names across iOS versions:
+            //   _UITextLayoutCanvasView (iOS 16+)
+            //   UITextLayoutCanvasView (iOS 14-15-ish)
+            //   _UITextFieldCanvasView (older)
+            // Substring "Canvas" is the stable signal across all three.
+            if name.contains("Canvas") {
+                return sv
+            }
+        }
+        // Index-based fallbacks. `.last` is the heuristic used by
+        // freeRASP / ScreenShield references; `.first` is what the
+        // Moin iOS handoff documents. Try last → first → nil.
+        return textField.subviews.last ?? textField.subviews.first
+    }
+}
+
+extension View {
+    /// Wraps `self` in `SecureScreenshotShield` so the entire view
+    /// hierarchy is masked from screenshots / mirroring / AirPlay /
+    /// remote-screen-sharing capture. Reads
+    /// `ChatStore.shared.shouldMaskAppContents` so the mask honours
+    /// both the user's Settings toggle and the runtime self-test
+    /// result. Apply at every visible-surface entry point —
+    /// `ContentView`'s root, every `.sheet { … }`, every
+    /// `.fullScreenCover { … }`, and any other modal presentation —
+    /// because SwiftUI sheets present in their own UIWindow chain and
+    /// a single root-level wrap does not cover them.
+    ///
+    /// What this CANNOT mask: iOS-rendered chrome above the app
+    /// (system permission alerts, `.alert(...)`-rendered dialogs,
+    /// `.confirmationDialog(...)` action sheets). Those are drawn by
+    /// the system at a layer outside the wrap; documented in the FAQ.
+    ///
+    /// Returning `some View` either way means SwiftUI's diffing keeps
+    /// view identity stable when the toggle flips at runtime — no
+    /// state churn on the wrapped subtree.
+    @ViewBuilder
+    func maskAppContents() -> some View {
+        SecureScreenshotMaskWrapper { self }
+    }
+}
+
+/// Helper that resolves `ChatStore.shared.shouldMaskAppContents` on
+/// the main actor and conditionally inserts the wrap. Lives as a
+/// dedicated type so SwiftUI's identity tracking sees a stable
+/// container — using `@ViewBuilder` directly with an if/else builds
+/// `_ConditionalContent`, which would re-instantiate the inner view
+/// every time the toggle flips. With this wrapper, only the wrap
+/// boundary changes; the inner content keeps its state.
+private struct SecureScreenshotMaskWrapper<Wrapped: View>: View {
+    @ViewBuilder let content: () -> Wrapped
+
+    var body: some View {
+        // SwiftUI body runs on the main actor; safe to read the
+        // singleton here.
+        let store = ChatStore.shared
+        if store.shouldMaskAppContents {
+            SecureScreenshotShield {
+                content()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            content()
+        }
+    }
+}
+
+/// Subclassed secure UITextField that hosts our content but never
+/// participates in keyboard / selection / first-responder chains.
+/// Without these overrides, a tap on the wrapped content would (a)
+/// raise the system keyboard targeting the secure field, (b) draw a
+/// caret pixel, and (c) expose Cut/Copy/Paste menu items targeting
+/// nothing. Pattern lifted from the Moin iOS WebView wrapper. The
+/// subclass MUST be `final` and `@objc` — UIKit reflection paths used
+/// by `findCanvas`'s class-name match rely on Objective-C runtime
+/// metadata.
+@objc(PizziniNonInteractiveSecureTextField)
+final class NonInteractiveSecureTextField: UITextField {
+    override var canBecomeFirstResponder: Bool { false }
+    override func caretRect(for position: UITextPosition) -> CGRect { .zero }
+    override func selectionRects(for range: UITextRange) -> [UITextSelectionRect] { [] }
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool { false }
 }
 
 /// Runtime self-test. Renders a sentinel red square inside a
@@ -131,14 +235,15 @@ enum SecureScreenshotSelfTest {
         let sentinelColor = UIColor.red
         let probeSize: CGFloat = 64
 
-        let secureField = UITextField()
+        let secureField = NonInteractiveSecureTextField()
         secureField.isSecureTextEntry = true
-        secureField.isUserInteractionEnabled = false
         secureField.frame = CGRect(x: 0, y: 0, width: probeSize, height: probeSize)
 
         // Structural check first — if we can't find the canvas at all,
-        // the trick is unreachable on this OS.
-        guard let canvas = secureField.subviews.last else { return false }
+        // the trick is unreachable on this OS. Uses the same finder as
+        // the production shield so a class-name shuffle catches both.
+        guard let canvas = SecureScreenshotShield<EmptyView>.findCanvas(in: secureField) else { return false }
+        canvas.isUserInteractionEnabled = true
 
         let sentinel = UIView(frame: CGRect(x: 0, y: 0, width: probeSize, height: probeSize))
         sentinel.backgroundColor = sentinelColor

@@ -145,6 +145,52 @@ struct ScreenCaptureSettingsTests {
         #expect(s.blockChatScreenshots == false)
     }
 
+    @Test("blockAppScreenshots defaults on")
+    func blockAppDefault() {
+        let s = AppState()
+        #expect(s.blockAppScreenshots == true)
+    }
+
+    @Test("legacy AppState with blockQRScreenshots = false migrates blockAppScreenshots to false")
+    func appWideMigrationFromQRDisabled() throws {
+        // VoiceOver-using upgrade path: a user who turned the QR-only
+        // toggle off in the previous build should NOT be silently
+        // re-enabled with the default-ON app-wide toggle. Migration
+        // inherits the OFF preference.
+        let json = """
+        {
+            "version": 1,
+            "relayHost": "127.0.0.1",
+            "contacts": [],
+            "onboardingCompleted": true,
+            "biometricLockEnabled": false,
+            "autoLockTimeout": "immediately",
+            "quickLookPreviewEnabled": false,
+            "blockQRScreenshots": false
+        }
+        """.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(AppState.self, from: json)
+        #expect(decoded.blockQRScreenshots == false)
+        #expect(decoded.blockAppScreenshots == false)
+    }
+
+    @Test("legacy AppState with no screen-capture fields defaults blockAppScreenshots ON")
+    func appWideDefaultOnLegacy() throws {
+        let json = """
+        {
+            "version": 1,
+            "relayHost": "127.0.0.1",
+            "contacts": [],
+            "onboardingCompleted": true,
+            "biometricLockEnabled": false,
+            "autoLockTimeout": "immediately",
+            "quickLookPreviewEnabled": false
+        }
+        """.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(AppState.self, from: json)
+        #expect(decoded.blockAppScreenshots == true)
+    }
+
     @Test("qrBlockEffective defaults nil (untested)")
     func qrBlockEffectiveDefault() {
         let s = AppState()
@@ -158,6 +204,7 @@ struct ScreenCaptureSettingsTests {
             notifyPeerOnScreenshot: true,
             blockQRScreenshots: false,
             blockChatScreenshots: true,
+            blockAppScreenshots: false,
             qrBlockEffective: false,
             qrBlockTestedOSVersion: "26.0",
         )
@@ -166,6 +213,7 @@ struct ScreenCaptureSettingsTests {
         #expect(decoded.notifyPeerOnScreenshot == true)
         #expect(decoded.blockQRScreenshots == false)
         #expect(decoded.blockChatScreenshots == true)
+        #expect(decoded.blockAppScreenshots == false)
         #expect(decoded.qrBlockEffective == false)
         #expect(decoded.qrBlockTestedOSVersion == "26.0")
     }

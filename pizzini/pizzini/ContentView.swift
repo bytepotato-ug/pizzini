@@ -79,6 +79,14 @@ struct ContentView: View {
                 PrivacyShieldView()
             }
         }
+        // App-wide screenshot mask. Wraps the ENTIRE ZStack — including
+        // the contacts UI, the lock overlay, the keychain banner, and
+        // the in-flight privacy shield — in a secure-text-entry
+        // container so screenshots / mirroring / AirPlay capture a
+        // black frame. Sheets and full-screen covers below get their
+        // own .maskAppContents() because SwiftUI presents them outside
+        // this view's hierarchy.
+        .maskAppContents()
         .onReceive(NotificationCenter.default.publisher(for: UIScene.willDeactivateNotification)) { _ in
             lockManager.handleWillDeactivate()
         }
@@ -106,6 +114,7 @@ struct ContentView: View {
             OnboardingView { enableBiometric in
                 store.completeOnboarding(enableBiometric: enableBiometric)
             }
+            .maskAppContents()
         }
         .sheet(isPresented: $showScanner) {
             QRScannerView(
@@ -115,6 +124,7 @@ struct ContentView: View {
                 },
                 onCancel: { showScanner = false }
             )
+            .maskAppContents()
         }
         .alert(
             "Add contact",
@@ -138,12 +148,15 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showMyQR) {
             MyQRSheet(card: store.myCard, onDone: { showMyQR = false })
+                .maskAppContents()
         }
         .sheet(isPresented: $showSettings) {
             SettingsView(store: store, onClose: { showSettings = false })
+                .maskAppContents()
         }
         .sheet(item: $integrityFAQ) { anchor in
             FAQView(initialSection: anchor) { integrityFAQ = nil }
+                .maskAppContents()
         }
     }
 
@@ -275,18 +288,6 @@ private struct MyQRSheet: View {
     @State private var revealed = false
     @State private var showDetails = false
     @State private var copyConfirmation = false
-    @State private var store = ChatStore.shared
-
-    /// True when the QR-block trick should be applied: the user hasn't
-    /// turned it off in Settings AND the runtime self-test hasn't
-    /// determined that the trick is broken on this iOS version.
-    /// `qrBlockEffective == nil` is treated as "may work" — the
-    /// self-test runs at app launch and writes a result before the
-    /// user can typically open this sheet.
-    private var qrBlockActive: Bool {
-        guard store.state.blockQRScreenshots else { return false }
-        return store.state.qrBlockEffective != false
-    }
 
     var body: some View {
         NavigationStack {
@@ -364,21 +365,11 @@ private struct MyQRSheet: View {
                     Button {
                         withAnimation(.easeInOut(duration: 0.15)) { revealed = false }
                     } label: {
-                        // Wrap the rendered QR in a SecureScreenshotShield
-                        // when the toggle is on AND the runtime self-test
-                        // didn't fail on this iOS version. The shield
-                        // makes iOS render this subtree blank in the
-                        // captured framebuffer for screenshots and
-                        // mirroring. Falls back to the plain image if
-                        // the trick has been disabled.
-                        if qrBlockActive {
-                            SecureScreenshotShield {
-                                ContactQRImage(card: card)
-                            }
-                            .frame(width: 196, height: 196)
-                        } else {
-                            ContactQRImage(card: card)
-                        }
+                        // Per-QR `SecureScreenshotShield` removed — the
+                        // entire sheet is now wrapped at presentation
+                        // time via `.maskAppContents()` in ContentView,
+                        // which subsumes this surface.
+                        ContactQRImage(card: card)
                     }
                     .buttonStyle(.plain)
                 } else {

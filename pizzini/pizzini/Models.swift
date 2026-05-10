@@ -322,7 +322,26 @@ struct AppState: Codable, Sendable {
     /// Copy on a bubble) and VoiceOver inside the wrapped subtree —
     /// non-trivial accessibility cost. Same effective-gate as the QR:
     /// only applied when `qrBlockEffective != false`.
+    ///
+    /// Superseded by `blockAppScreenshots` (app-wide). Kept on the
+    /// type for codable backwards-compat with blobs written by the
+    /// previous build; not exposed in the new Settings UI.
     var blockChatScreenshots: Bool
+    /// When true, the ENTIRE app is wrapped in a secure-text-entry
+    /// container at every entry point — main content, sheets, and
+    /// full-screen covers all blank out in screenshots, screen
+    /// recordings, AirPlay mirroring, and remote-screen-sharing
+    /// captures. Default ON. Same effective-gate as the QR/chat
+    /// blocks: only applied when `qrBlockEffective != false`.
+    ///
+    /// What this CANNOT mask: iOS-rendered chrome above the app —
+    /// system permission alerts ("Camera access?", "Allow
+    /// notifications?"), the title strings in `.alert(...)` and
+    /// `.confirmationDialog(...)` (those use system services), the
+    /// app-switcher snapshot itself (covered separately by
+    /// `PrivacyShieldView`/`PrivacyShieldWindow`). Documented in the
+    /// FAQ.
+    var blockAppScreenshots: Bool
     /// Result of the most recent runtime self-test for the
     /// `isSecureTextEntry` workaround. Nil = not yet tested. True = the
     /// trick blocked the screenshot pipeline on this iOS version. False
@@ -350,6 +369,7 @@ struct AppState: Codable, Sendable {
         notifyPeerOnScreenshot: Bool = false,
         blockQRScreenshots: Bool = true,
         blockChatScreenshots: Bool = false,
+        blockAppScreenshots: Bool = true,
         qrBlockEffective: Bool? = nil,
         qrBlockTestedOSVersion: String? = nil
     ) {
@@ -363,6 +383,7 @@ struct AppState: Codable, Sendable {
         self.notifyPeerOnScreenshot = notifyPeerOnScreenshot
         self.blockQRScreenshots = blockQRScreenshots
         self.blockChatScreenshots = blockChatScreenshots
+        self.blockAppScreenshots = blockAppScreenshots
         self.qrBlockEffective = qrBlockEffective
         self.qrBlockTestedOSVersion = qrBlockTestedOSVersion
     }
@@ -378,6 +399,7 @@ struct AppState: Codable, Sendable {
         case notifyPeerOnScreenshot
         case blockQRScreenshots
         case blockChatScreenshots
+        case blockAppScreenshots
         case qrBlockEffective
         case qrBlockTestedOSVersion
     }
@@ -394,6 +416,19 @@ struct AppState: Codable, Sendable {
         notifyPeerOnScreenshot = try c.decodeIfPresent(Bool.self, forKey: .notifyPeerOnScreenshot) ?? false
         blockQRScreenshots = try c.decodeIfPresent(Bool.self, forKey: .blockQRScreenshots) ?? true
         blockChatScreenshots = try c.decodeIfPresent(Bool.self, forKey: .blockChatScreenshots) ?? false
+        // blockAppScreenshots default true. Migration: a user who
+        // previously turned the QR-only toggle OFF (because they use
+        // VoiceOver and the secure container breaks it on the QR)
+        // would not want the app-wide default ON to bring the same
+        // breakage everywhere. Inherit blockQRScreenshots' value when
+        // the new field is missing AND the legacy field was OFF.
+        if let appBlock = try c.decodeIfPresent(Bool.self, forKey: .blockAppScreenshots) {
+            blockAppScreenshots = appBlock
+        } else if blockQRScreenshots == false {
+            blockAppScreenshots = false
+        } else {
+            blockAppScreenshots = true
+        }
         qrBlockEffective = try c.decodeIfPresent(Bool.self, forKey: .qrBlockEffective)
         qrBlockTestedOSVersion = try c.decodeIfPresent(String.self, forKey: .qrBlockTestedOSVersion)
     }

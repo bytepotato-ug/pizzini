@@ -287,27 +287,39 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             They cannot disable it on their end; if you don’t want them \
             to know, leave this off.
 
-            The QR sheet — your one-photo deanonymisation surface — \
-            uses an extra technique. The rendered QR is wrapped in an \
-            iOS secure-text-entry container, which the screenshot \
-            pipeline historically renders blank. This is not a \
-            documented API and Apple has been narrowing the technique \
-            in recent iOS releases. Pizzini runs a self-test on first \
-            launch and after every iOS major-version change to confirm \
-            the technique still works on your device; if it fails, the \
-            QR sheet silently falls back to the standard cover, and \
-            Settings → App lock will tell you. Either way the sheet \
-            still opens hidden behind a "Tap to reveal" gesture and \
-            re-hides whenever the app deactivates.
+            On top of detection and shielding, Pizzini wraps the \
+            entire app in an iOS secure-text-entry container by \
+            default. The screenshot pipeline historically renders \
+            secure-text-entry containers as black, which means a \
+            screenshot, a screen recording, an AirPlay mirror, or a \
+            remote-screen-sharing capture sees a black frame instead \
+            of your chats, contacts, settings, or QR.
 
-            The same technique is available for chat bubbles via \
-            Settings → App lock → "Block screenshots of chats". It is \
-            off by default because the cost is real: long-press → Copy \
-            on a message stops working, and VoiceOver inside the chat \
-            is degraded. Turn it on only if you understand and accept \
-            those costs in exchange for the additional masking. The \
-            same self-test gates this toggle: if the technique fails \
-            on your iOS version, turning the toggle on has no effect.
+            This wrap is not based on a documented Apple API. Apple \
+            uses the same technique for password fields and has been \
+            narrowing it across recent iOS releases. Pizzini runs a \
+            self-test at first launch and after every iOS \
+            major-version update to confirm the technique still works \
+            on your device. If the test fails, the wrap silently \
+            stops being applied (it would otherwise cost \
+            accessibility for no security gain), and Settings → App \
+            lock will tell you.
+
+            What the wrap CANNOT mask: iOS-rendered chrome that \
+            draws above the app. System permission alerts ("Pizzini \
+            wants to use the camera"), the title and message in iOS \
+            confirmation dialogs and alerts, and the multitasking \
+            snapshot's title metadata are rendered by the system at a \
+            layer outside the wrap. The multitasking snapshot itself \
+            is covered separately by Pizzini's privacy shield.
+
+            Costs of the wrap: long-press → Copy on a chat bubble \
+            stops working, VoiceOver inside the wrapped views is \
+            degraded, and dictation may not work on the message \
+            composer. If you depend on those, turn the wrap off in \
+            Settings → App lock → "Block screenshots of Pizzini". The \
+            screen-recording shield, screenshot detection, and \
+            external-display refusal stay active either way.
 
             What none of this defends against:
 
