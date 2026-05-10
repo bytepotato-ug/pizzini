@@ -231,42 +231,37 @@ struct ChatView: View {
     }
 
     private func messages(for contact: Contact) -> some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 12) {
-                    if contact.log.isEmpty {
-                        Text(contact.sessionEstablished ? "Say hi." : "Pairing in progress.")
-                            .foregroundStyle(.secondary)
-                            .padding(.top, 48)
-                    }
-                    ForEach(contact.log) { entry in
-                        ChatRow(
-                            entry: entry,
-                            status: rowStatus(forEntry: entry),
-                            resolveURL: { info in store.attachmentURL(for: info) },
-                            quickLookEnabled: store.state.quickLookPreviewEnabled,
-                            onInfoTap: { section in faqAnchor = section },
-                        ).id(entry.id)
-                    }
+        ScrollView {
+            LazyVStack(spacing: 12) {
+                if contact.log.isEmpty {
+                    Text(contact.sessionEstablished ? "Say hi." : "Pairing in progress.")
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 48)
                 }
-                .padding(.horizontal)
-                .padding(.vertical, 12)
-            }
-            .onAppear {
-                // Jump (no animation) to the latest message when the
-                // chat opens. Animating here looks janky because the
-                // ScrollView lays out mid-scroll.
-                if let last = contact.log.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
+                ForEach(contact.log) { entry in
+                    ChatRow(
+                        entry: entry,
+                        status: rowStatus(forEntry: entry),
+                        resolveURL: { info in store.attachmentURL(for: info) },
+                        quickLookEnabled: store.state.quickLookPreviewEnabled,
+                        onInfoTap: { section in faqAnchor = section },
+                    ).id(entry.id)
                 }
             }
-            .onChange(of: contact.log.count) { _, _ in
-                if let last = contact.log.last {
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                }
-            }
-            .scrollDismissesKeyboard(.interactively)
+            .padding(.horizontal)
+            .padding(.vertical, 12)
         }
+        // `.defaultScrollAnchor(.bottom)` pins the natural anchor to
+        // the bottom of the content — initial open lands at the
+        // latest row, and new rows arriving while the user is
+        // already at the bottom auto-scroll. Replaces the prior
+        // `ScrollViewReader + onAppear/onChange scrollTo` pattern
+        // which fired BEFORE the `.safeAreaInset` composer's bottom
+        // inset propagated, leaving the last row visually clipped
+        // behind the composer (and the same race for new messages
+        // sent / received).
+        .defaultScrollAnchor(.bottom)
+        .scrollDismissesKeyboard(.interactively)
     }
 
     private func composer(disabled: Bool, contact: Contact) -> some View {

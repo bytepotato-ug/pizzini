@@ -144,52 +144,54 @@ struct GroupChatView: View {
     @ViewBuilder
     private var log: some View {
         if let group {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 6) {
-                        ForEach(Array(group.log.enumerated()), id: \.element.id) { idx, row in
-                            let prior = idx > 0 ? group.log[idx - 1] : nil
-                            GroupChatBubble(
-                                message: row,
-                                // Dedup the sender name when the
-                                // immediately-prior row is from the same
-                                // peer — adjacent bubbles read as one
-                                // attributed run, matching the standard
-                                // messaging-app cadence (Signal /
-                                // iMessage / WhatsApp). A system row in
-                                // between resets the run because the
-                                // previous-row check is by senderPeerId.
-                                senderName: senderName(
-                                    for: row, in: group, previousRow: prior,
-                                ),
-                                resolveURL: { info in store.attachmentURL(for: info) },
-                                quickLookEnabled: store.state.quickLookPreviewEnabled,
-                                onInfoTap: { section in faqAnchor = section },
-                                status: rowStatus(for: row),
-                                readByAll: rowReadByAll(for: row),
-                            )
-                            .id(row.id)
-                        }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(group.log.enumerated()), id: \.element.id) { idx, row in
+                        let prior = idx > 0 ? group.log[idx - 1] : nil
+                        GroupChatBubble(
+                            message: row,
+                            // Dedup the sender name when the
+                            // immediately-prior row is from the same
+                            // peer — adjacent bubbles read as one
+                            // attributed run, matching the standard
+                            // messaging-app cadence (Signal /
+                            // iMessage / WhatsApp). A system row in
+                            // between resets the run because the
+                            // previous-row check is by senderPeerId.
+                            senderName: senderName(
+                                for: row, in: group, previousRow: prior,
+                            ),
+                            resolveURL: { info in store.attachmentURL(for: info) },
+                            quickLookEnabled: store.state.quickLookPreviewEnabled,
+                            onInfoTap: { section in faqAnchor = section },
+                            status: rowStatus(for: row),
+                            readByAll: rowReadByAll(for: row),
+                        )
+                        .id(row.id)
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
                 }
-                .scrollDismissesKeyboard(.interactively)
-                // Single-tap on the chat area dismisses the keyboard,
-                // matching the 1:1 chat. `simultaneousGesture` keeps
-                // attachment-row buttons (Save to Files / Preview)
-                // and bubble text-selection working — they fire
-                // independently of this gesture.
-                .simultaneousGesture(
-                    TapGesture(count: 1).onEnded {
-                        composerFocused = false
-                    }
-                )
-                .onAppear { scrollToBottom(proxy, group: group) }
-                .onChange(of: group.log.count) { _, _ in
-                    scrollToBottom(proxy, group: group)
-                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
             }
+            // Same as 1:1 `ChatView.messages`: anchor the natural
+            // scroll position at the bottom so the view opens
+            // already-at-bottom AND new rows auto-scroll into view.
+            // Drops the previous `ScrollViewReader + onAppear/
+            // onChange scrollTo` pattern which fired before the
+            // composer's `.safeAreaInset` settled its bottom inset,
+            // leaving the last row visually clipped behind it.
+            .defaultScrollAnchor(.bottom)
+            .scrollDismissesKeyboard(.interactively)
+            // Single-tap on the chat area dismisses the keyboard,
+            // matching the 1:1 chat. `simultaneousGesture` keeps
+            // attachment-row buttons (Save to Files / Preview)
+            // and bubble text-selection working — they fire
+            // independently of this gesture.
+            .simultaneousGesture(
+                TapGesture(count: 1).onEnded {
+                    composerFocused = false
+                }
+            )
         } else {
             // Transient state: between `state.groups.remove(at:)` and
             // the auto-dismiss `onChange` firing. Don't surface any
@@ -257,11 +259,6 @@ struct GroupChatView: View {
               let gmid = row.groupMessageId
         else { return false }
         return store.outbox.groupMessageReadByAll(forId: gmid)
-    }
-
-    private func scrollToBottom(_ proxy: ScrollViewProxy, group: ChatGroup) {
-        guard let last = group.log.last else { return }
-        proxy.scrollTo(last.id, anchor: .bottom)
     }
 
     private var composer: some View {
