@@ -93,6 +93,19 @@ struct SettingsView: View {
                 Text("Off keeps received files out of Pizzini until you tap Save to Files.")
             }
 
+            Section {
+                Toggle(isOn: Binding(
+                    get: { store.state.inAppHapticsEnabled },
+                    set: { store.setInAppHapticsEnabled($0) }
+                )) {
+                    Label("Haptic on new messages", systemImage: "iphone.radiowaves.left.and.right")
+                }
+            } header: {
+                Text("Notifications")
+            } footer: {
+                Text("On: a soft haptic fires when a new message lands in a chat other than the one you're in. No banner, no sound, no preview — same posture as Signal / WhatsApp / Threema. The badge and chat list always update either way.")
+            }
+
             if store.state.qrBlockEffective == false {
                 Section {
                     HStack(alignment: .top, spacing: 8) {

@@ -96,8 +96,16 @@ struct ChatView: View {
             .screenCaptureShielded()
             .navigationTitle(contact.displayName)
             .navigationBarTitleDisplayMode(.inline)
-            .onAppear { store.markRead(contactID: contactID) }
-            .onDisappear { store.markRead(contactID: contactID) }
+            .onAppear {
+                store.activeSurface = .oneOnOne(peerIdentity: contact.identityPub)
+                store.markRead(contactID: contactID)
+            }
+            .onDisappear {
+                if store.activeSurface == .oneOnOne(peerIdentity: contact.identityPub) {
+                    store.activeSurface = .none
+                }
+                store.markRead(contactID: contactID)
+            }
             .onChange(of: contact.log.count) { _, _ in
                 store.markRead(contactID: contactID)
             }

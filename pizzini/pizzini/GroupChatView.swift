@@ -102,11 +102,22 @@ struct GroupChatView: View {
             // Mark the group as seen for unread tracking. If the
             // group is gone (e.g. we left from settings before this
             // re-appears), pop ourselves.
-            guard let idx = store.groupIndex(forId: groupID) else {
+            guard store.groupIndex(forId: groupID) != nil else {
                 dismiss()
                 return
             }
-            store.state.groups[idx].lastSeenAt = Date()
+            store.activeSurface = .group(groupId: groupID)
+            // `markGroupRead` stamps lastSeenAt + emits 0x04 read
+            // receipts to each member who's a 1:1 contact with
+            // receipts toggled on. Same parity with `ChatView`'s
+            // `markRead` for 1:1 chats.
+            store.markGroupRead(groupID: groupID)
+        }
+        .onDisappear {
+            if store.activeSurface == .group(groupId: groupID) {
+                store.activeSurface = .none
+            }
+            store.markGroupRead(groupID: groupID)
         }
         .onChange(of: group?.id) { _, newId in
             // The group was removed from `state.groups` — most
@@ -115,6 +126,14 @@ struct GroupChatView: View {
             // dismiss ourselves to land back on the contacts list
             // instead of rendering against a now-nil group.
             if newId == nil { dismiss() }
+        }
+        .onChange(of: group?.log.count ?? 0) { _, _ in
+            // A new row landed while the user is looking at this
+            // group. Mark-read ships fresh receipts so the sender's
+            // outbox flips ✓✓ → 👁 on the just-arrived message
+            // without the user having to re-enter the chat — same
+            // shape as `ChatView`'s 1:1 onChange.
+            store.markGroupRead(groupID: groupID)
         }
     }
 

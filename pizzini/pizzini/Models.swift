@@ -365,6 +365,16 @@ struct AppState: Codable, Sendable {
     /// Toggle exposed in `SettingsView`. Pending invitations always
     /// pin to the top regardless of this setting.
     var contactsBeforeGroups: Bool
+    /// When true, a soft haptic fires on the device when a new
+    /// message lands in a chat OTHER than the one currently open.
+    /// No banner, no sound, no preview — the privacy-first messengers
+    /// (Signal / WhatsApp / Threema / iMessage) all skip in-app
+    /// banners because a "Alice: meet at 4pm" toast leaks content to
+    /// anyone glancing at the screen, exactly the threat model
+    /// Pizzini's screenshot-shield + no-thumbnails posture is built
+    /// against. Default OFF: silent reliance on the badge + chat
+    /// list updates is the safe default; the haptic is opt-in.
+    var inAppHapticsEnabled: Bool
 
     static let currentVersion = 1
     static let defaultRelayHost = "127.0.0.1"
@@ -381,7 +391,8 @@ struct AppState: Codable, Sendable {
         qrBlockEffective: Bool? = nil,
         qrBlockTestedOSVersion: String? = nil,
         groups: [ChatGroup] = [],
-        contactsBeforeGroups: Bool = true
+        contactsBeforeGroups: Bool = true,
+        inAppHapticsEnabled: Bool = false
     ) {
         self.version = version
         self.relayHost = relayHost
@@ -395,6 +406,7 @@ struct AppState: Codable, Sendable {
         self.qrBlockTestedOSVersion = qrBlockTestedOSVersion
         self.groups = groups
         self.contactsBeforeGroups = contactsBeforeGroups
+        self.inAppHapticsEnabled = inAppHapticsEnabled
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -410,6 +422,7 @@ struct AppState: Codable, Sendable {
         case qrBlockTestedOSVersion
         case groups
         case contactsBeforeGroups
+        case inAppHapticsEnabled
     }
 
     init(from decoder: Decoder) throws {
@@ -426,6 +439,7 @@ struct AppState: Codable, Sendable {
         qrBlockTestedOSVersion = try c.decodeIfPresent(String.self, forKey: .qrBlockTestedOSVersion)
         groups = try c.decodeIfPresent([ChatGroup].self, forKey: .groups) ?? []
         contactsBeforeGroups = try c.decodeIfPresent(Bool.self, forKey: .contactsBeforeGroups) ?? true
+        inAppHapticsEnabled = try c.decodeIfPresent(Bool.self, forKey: .inAppHapticsEnabled) ?? false
         // Pre-existing JSON blobs from earlier builds may carry the
         // `notifyPeerOnScreenshot`, `blockQRScreenshots`,
         // `blockChatScreenshots`, and `blockAppScreenshots` keys.

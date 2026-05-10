@@ -1,6 +1,7 @@
 import Foundation
 import PizziniCryptoCore
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 import UserNotifications
 
@@ -123,6 +124,20 @@ final class ChatStore: NSObject {
     /// from `groupAttachmentRouting` to look up the destination
     /// group.
     let groupReassembler = AttachmentReassembler()
+    /// Which chat surface the user is currently looking at, if any.
+    /// Used by the receive path to suppress the in-app haptic when a
+    /// message arrives in the chat the user is already in (the
+    /// haptic only fires for messages landing in a *different* chat
+    /// while the app is foregrounded, matching the
+    /// privacy-first messengers' "no in-app banner, optional sound"
+    /// posture). Updated by `ChatView.onAppear/onDisappear` and
+    /// `GroupChatView.onAppear/onDisappear`.
+    enum ActiveSurface: Equatable, Sendable {
+        case none
+        case oneOnOne(peerIdentity: Data)
+        case group(groupId: Data)
+    }
+    var activeSurface: ActiveSurface = .none
     /// First-chunk capture of `(peer + attachmentId) → groupId` so a
     /// later completion knows which `ChatGroup.log` to append to.
     /// Set on every accepted group-file-chunk; verified for stability
@@ -996,17 +1011,32 @@ final class ChatStore: NSObject {
     @MainActor
     private func emitReadReceiptIfEnabled(forContactAt idx: Int) {
         let contact = state.contacts[idx]
-        guard contact.readReceiptsEnabled,
-              let session, let relay,
-              let last = contact.log.last(where: { $0.side == .peer && $0.messageId != nil }),
+        guard let last = contact.log.last(where: { $0.side == .peer && $0.messageId != nil }),
               let highest = last.messageId
+        else { return }
+        emitReadReceipt(forContactAt: idx, highestMessageId: highest)
+    }
+
+    /// Encrypt + ship one 0x04 readReceipt to the contact at `idx`
+    /// covering `highestMessageId`. Internal-not-private so the group
+    /// read path in `ChatStoreGroups.swift` can drive per-sender
+    /// receipts without re-implementing the seal-and-send shell.
+    /// Honours the same `readReceiptsEnabled` toggle: if the local
+    /// user hasn't opted in to telling THIS contact when they read,
+    /// the helper returns silently (the F-405 symmetric-drop guard
+    /// on the receive side is the matching half).
+    @MainActor
+    func emitReadReceipt(forContactAt idx: Int, highestMessageId: Data) {
+        let contact = state.contacts[idx]
+        guard contact.readReceiptsEnabled,
+              let session, let relay
         else { return }
         guard let token = popDeliveryToken(forContactAt: idx) else {
             NSLog("[pizzini] cannot emit read receipt: out of tokens")
             return
         }
         var inner = Data([RelayClient.InnerEnvelopeKind.readReceipt.rawValue])
-        inner.append(highest)
+        inner.append(highestMessageId)
         do {
             let sealed = try session.encryptSealed(
                 peer: contact.identityPub,
@@ -1091,6 +1121,17 @@ final class ChatStore: NSObject {
     func setContactsBeforeGroups(_ enabled: Bool) {
         guard state.contactsBeforeGroups != enabled else { return }
         state.contactsBeforeGroups = enabled
+        Storage.persist(appState: state)
+    }
+
+    /// Toggle the in-app haptic for messages landing in a chat OTHER
+    /// than the active one. Default OFF — silent reliance on the
+    /// badge + chat list updates is the privacy-first default; the
+    /// haptic is opt-in for users who want a felt cue without the
+    /// content leak of a banner.
+    func setInAppHapticsEnabled(_ enabled: Bool) {
+        guard state.inAppHapticsEnabled != enabled else { return }
+        state.inAppHapticsEnabled = enabled
         Storage.persist(appState: state)
     }
 
@@ -1223,7 +1264,26 @@ final class ChatStore: NSObject {
     /// baseline whenever a push arrives while the app is dead. The
     /// extension reads, increments, writes back; the main app then
     /// re-syncs from `state.totalUnread` on next launch.
-    private func refreshAppBadge() {
+    /// Fire the soft "new message somewhere else" haptic if the
+    /// user opted in AND the incoming message landed in a chat the
+    /// user is NOT currently looking at. Privacy-first messengers
+    /// (Signal / WhatsApp / Threema / iMessage) skip in-app banners
+    /// entirely because a "Alice: meet at 4pm" toast leaks content
+    /// to anyone glancing at the screen — exactly the threat model
+    /// Pizzini's screenshot-shield + no-thumbnails posture is built
+    /// against. We match that posture: no banner, no sound, no
+    /// preview, just a single soft haptic. Default off; toggle in
+    /// Settings → "Haptic on new messages".
+    func maybeFireBackgroundHaptic(forIncoming incoming: ActiveSurface) {
+        guard state.inAppHapticsEnabled else { return }
+        // Suppress when the message arrived in the chat the user is
+        // already in — those rows render right under their thumb;
+        // an extra haptic is redundant noise.
+        if activeSurface == incoming { return }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
+    func refreshAppBadge() {
         let count = state.totalUnread
         UNUserNotificationCenter.current().setBadgeCount(count) { _ in }
         SharedAppGroup.defaults?.set(count, forKey: SharedAppGroup.unreadCountKey)
@@ -1413,7 +1473,11 @@ extension ChatStore: RelayClientDelegate {
                 via: client,
             )
         case .groupChat:
-            self.handleGroupChat(payload: Data(payload), fromPeer: received.peer)
+            self.handleGroupChat(
+                payload: Data(payload),
+                fromPeer: received.peer,
+                pairwiseMessageId: received.messageId,
+            )
         case .groupKeyDistribution:
             self.handleGroupKeyDistribution(payload: Data(payload), fromPeer: received.peer)
         case .groupOp:
@@ -1433,15 +1497,23 @@ extension ChatStore: RelayClientDelegate {
     @MainActor
     private func handleChatPayload(_ payload: Data, sealedSize: Int, contactIdx idx: Int, ackId: Data, via client: RelayClient) {
         let text = String(data: payload, encoding: .utf8) ?? "<\(payload.count) non-utf8 bytes>"
+        // Stamp `messageId` on the inbound row so a later
+        // `emitReadReceiptIfEnabled` can find the highest-read-msg
+        // to confirm. Without this the receipt path was a silent
+        // no-op (the helper filters on `messageId != nil`).
         let entry = PersistedMessage(
             side: .peer,
             text: text,
             kind: .whisper,
             bytes: sealedSize,
+            messageId: ackId,
         )
         self.state.contacts[idx].log.append(entry)
         self.state.contacts[idx].lastMessageAt = entry.timestamp
         self.state.contacts[idx].sessionEstablished = true
+        maybeFireBackgroundHaptic(
+            forIncoming: .oneOnOne(peerIdentity: state.contacts[idx].identityPub),
+        )
         self.persistAll()
         // Emit an ACK so the sender's outbox (Phase 4) can flip ✓→✓✓.
         self.emitAck(for: ackId, toPeer: state.contacts[idx].identityPub, via: client)
@@ -1501,6 +1573,9 @@ extension ChatStore: RelayClientDelegate {
             state.contacts[idx].lastMessageAt = row.timestamp
             state.contacts[idx].sessionEstablished = true
             persistAll()
+            maybeFireBackgroundHaptic(
+                forIncoming: .oneOnOne(peerIdentity: state.contacts[idx].identityPub),
+            )
             NSLog(
                 "[pizzini] received attachment \(safeName) (\(completion.totalSize) bytes, tier=\(completion.tier.rawValue))"
             )

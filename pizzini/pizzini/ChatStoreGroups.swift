@@ -469,6 +469,51 @@ extension ChatStore {
         return true
     }
 
+    /// Counterpart to 1:1 `markRead(contactID:)` for groups: stamp
+    /// `lastSeenAt` (drives the unread-count badge), refresh the app
+    /// badge, and emit a 0x04 readReceipt to every active member who
+    /// has authored at least one inbound row in this group's log
+    /// AND for whom we've toggled read-receipts ON in their 1:1
+    /// chat. Each per-sender receipt covers the highest pairwise
+    /// `messageId` they sent us, so the sender's outbox can mark
+    /// every leg of every group message at-or-below that as `readAt`
+    /// (Phase 7 rollup picks it up from there).
+    ///
+    /// The receipt rides each member's existing pairwise sealed-
+    /// sender channel — no new wire kind. F-405 symmetric drop on
+    /// the receiver: even with our emit, a member who has toggled
+    /// receipts OFF for us simply drops the claim.
+    func markGroupRead(groupID: Data) {
+        guard let gIdx = groupIndex(forId: groupID) else { return }
+        state.groups[gIdx].lastSeenAt = Date()
+        Storage.persist(appState: state)
+        refreshAppBadge()
+        // Per-sender highest-messageId scan over the group log.
+        var highestPerSender: [Data: (messageId: Data, timestamp: Date)] = [:]
+        for row in state.groups[gIdx].log
+            where row.side == .peer && row.kind != .system {
+            guard let senderPeerId = row.senderPeerId,
+                  let mid = row.messageId
+            else { continue }
+            if let existing = highestPerSender[senderPeerId],
+               row.timestamp <= existing.timestamp {
+                continue
+            }
+            highestPerSender[senderPeerId] = (mid, row.timestamp)
+        }
+        for (sender, info) in highestPerSender {
+            guard let cIdx = state.contacts.firstIndex(where: { $0.identityPub == sender }) else {
+                // Member who isn't a 1:1 contact of ours — we have
+                // no pairwise channel to ship the receipt over.
+                // (Practically rare: group invitees must be 1:1-paired
+                // by an admin, but a contact-deletion since join could
+                // strand a row here.)
+                continue
+            }
+            emitReadReceipt(forContactAt: cIdx, highestMessageId: info.messageId)
+        }
+    }
+
     /// Panic-mode counterpart to 1:1 `deleteChat(_:)`: wipe the
     /// group's local log but keep the user's membership and chain
     /// state intact. Mirrors the activist threat model — instant
@@ -1109,6 +1154,7 @@ extension ChatStore {
                 senderPeerId: sender,
             )
             Storage.persist(appState: state)
+            maybeFireBackgroundHaptic(forIncoming: .group(groupId: groupId))
             NSLog(
                 "[pizzini.group] received attachment \(safeName) (\(completion.totalSize) bytes,"
                     + " tier=\(completion.tier.rawValue)) for group \(short(groupId)) from \(short(sender))",
@@ -1560,7 +1606,7 @@ extension ChatStore {
     /// non-member are dropped — without this gate, any 1:1-paired
     /// peer who has previously installed a chain with us could
     /// inject content into any group log they know the ID of.
-    func handleGroupChat(payload: Data, fromPeer sender: Data) {
+    func handleGroupChat(payload: Data, fromPeer sender: Data, pairwiseMessageId: Data) {
         guard let session else { return }
         guard let parsed = GroupEnvelope.decodeGroupChat(payload) else {
             NSLog("[pizzini.group] groupChat ← \(short(sender)): malformed body")
@@ -1622,16 +1668,22 @@ extension ChatStore {
         // the sender's peerId on the row so `GroupChatView` resolves
         // the display name dynamically (rename of a 1:1 contact
         // propagates to every historical row immediately).
+        // The pairwise sealed-sender messageId rides along too so
+        // `markGroupRead` can later emit a 0x04 readReceipt covering
+        // this row — same shape as 1:1 read receipts, scoped to the
+        // sender's pairwise channel.
         let row = PersistedMessage(
             side: .peer,
             text: text,
             kind: .whisper,
             bytes: ciphertext.count,
+            messageId: pairwiseMessageId,
             senderPeerId: sender,
         )
         state.groups[gIdx].log.append(row)
         state.groups[gIdx].lastMessageAt = Date()
         Storage.persist(appState: state)
+        maybeFireBackgroundHaptic(forIncoming: .group(groupId: groupId))
     }
 
     // ─── Utilities ──────────────────────────────────────────────────
