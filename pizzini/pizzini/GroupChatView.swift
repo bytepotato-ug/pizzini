@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Chat view for a single `ChatGroup`. Mirrors the 1:1 `ChatView`'s
 /// shape — message bubbles + inline composer — but pulls from
@@ -35,6 +36,25 @@ struct GroupChatView: View {
         VStack(spacing: 0) {
             log
                 .frame(maxHeight: .infinity)
+                // Bitchat-style panic gesture, parity with `ChatView`:
+                // three fast taps on the chat-content area instantly
+                // wipe this group's local log (membership + chain
+                // state stay; the rest of the group sees no change).
+                // Gated behind the same `panicModeEnabled` Settings
+                // toggle that 1:1 honours, off by default. The
+                // single-tap-to-dismiss-keyboard gesture inside `log`
+                // coexists via `simultaneousGesture` — one tap fires
+                // the dismiss; only the third successive tap fires
+                // the panic.
+                .simultaneousGesture(
+                    TapGesture(count: 3).onEnded {
+                        guard store.state.panicModeEnabled else { return }
+                        UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+                        let captured = groupID
+                        dismiss()
+                        store.deleteGroupChat(groupId: captured)
+                    }
+                )
             if let draft = attachmentDraft {
                 attachmentPreview(draft: draft)
                 Divider()

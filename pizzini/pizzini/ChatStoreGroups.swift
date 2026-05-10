@@ -469,6 +469,23 @@ extension ChatStore {
         return true
     }
 
+    /// Panic-mode counterpart to 1:1 `deleteChat(_:)`: wipe the
+    /// group's local log but keep the user's membership and chain
+    /// state intact. Mirrors the activist threat model — instant
+    /// cleanup of visible content without changing what the rest
+    /// of the group sees about us. To actually leave the group the
+    /// user goes through `leaveGroup(_:)` (which rotates the chain
+    /// and removes the local row); panic intentionally stops short
+    /// of that so a recovery from a bad triple-tap is just "you'll
+    /// have to scroll up — your participation is unchanged."
+    func deleteGroupChat(groupId: Data) {
+        guard let gIdx = groupIndex(forId: groupId) else { return }
+        state.groups[gIdx].log.removeAll()
+        state.groups[gIdx].lastMessageAt = nil
+        state.groups[gIdx].lastSeenAt = Date()
+        Storage.persist(appState: state)
+    }
+
     /// Local-only leave: drop the group from this device. We rotate
     /// our chain first so remaining members can no longer decrypt
     /// our future messages with the chain we abandoned (audit fix
