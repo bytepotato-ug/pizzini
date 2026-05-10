@@ -53,6 +53,8 @@ struct SecuritySettingsView: View {
                 }
             }
 
+            screenCaptureSection
+
             if let error {
                 Section {
                     Text(error)
@@ -63,6 +65,52 @@ struct SecuritySettingsView: View {
         }
         .navigationTitle("App lock")
         .navigationBarTitleDisplayMode(.inline)
+    }
+
+    /// Phase 6: user-facing controls for the screen-capture protection
+    /// stack. Sits under "App lock" rather than as its own screen
+    /// because the threats are adjacent (an attacker with brief
+    /// physical access can either kill the lock or screenshot a chat;
+    /// keep the controls together).
+    @ViewBuilder
+    private var screenCaptureSection: some View {
+        Section {
+            Toggle(isOn: Binding(
+                get: { store.state.notifyPeerOnScreenshot },
+                set: { store.setNotifyPeerOnScreenshot($0) }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label("Tell my contact when I screenshot", systemImage: "bell.badge")
+                    Text("Off by default. Sends a sealed marker to your contact when you screenshot one of their chats; they see 'You took a screenshot.' as a system row.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Toggle(isOn: Binding(
+                get: { store.state.blockQRScreenshots },
+                set: { store.setBlockQRScreenshots($0) }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label("Block screenshots of my QR", systemImage: "qrcode")
+                    Text("Best effort. iOS doesn't let any app fully prevent screenshots, but the QR sheet uses a known technique that masks the code in the captured image. Turn off if you use VoiceOver — the technique breaks selection and screen-reader semantics.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if store.state.qrBlockEffective == false {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text("On this iOS version, the QR-block technique didn't pass our runtime self-test. The QR sheet falls back to the same shield used during screen recording — your QR is still hidden by default and re-hides whenever the app deactivates.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } header: {
+            Text("Screen capture")
+        } footer: {
+            Text("Pizzini detects screenshots and screen recording. While recording is active, your chats are blurred. iOS does not let any app fully prevent screenshots — we will tell you in the chat when one is taken.")
+        }
     }
 
     private func handleToggle(target enable: Bool) {

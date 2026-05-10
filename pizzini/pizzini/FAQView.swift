@@ -83,6 +83,7 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
     case relayVisibility
     case runYourOwnRelay
     case qrCode
+    case screenCapture
     case noPhoneNumbers
     case pushNotifications
     case mediaStripping
@@ -106,6 +107,8 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             return "Running your own relay (or using someone else’s)"
         case .qrCode:
             return "What’s in your QR code"
+        case .screenCapture:
+            return "Screenshots, screen recording, and AirPlay"
         case .noPhoneNumbers:
             return "Why no phone numbers"
         case .pushNotifications:
@@ -249,6 +252,65 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             from the app. Sharing the QR via screenshot, AirDrop, or \
             any other app carries the same risk; treat it as you would \
             handing someone a printed copy.
+            """
+        case .screenCapture:
+            return """
+            iOS does not let any app fully prevent screenshots. That’s \
+            an Apple policy decision, and Pizzini cannot opt out of it. \
+            What we can do, and do, is detect captures and adjust:
+
+            • Screenshots are detected after the fact. When you \
+              screenshot inside a chat, Pizzini appends a system row \
+              that records it. iOS never gives the app the captured \
+              image, only the notification.
+            • Screen recording (the Control Centre Record button), \
+              AirPlay mirroring, and Apple-cable mirroring all flip an \
+              "is captured" flag we can read live. Whenever it’s on, \
+              Pizzini swaps your chats, contacts, settings, and QR \
+              sheet for an opaque cover. The toolbar stays interactive \
+              so you can navigate out without seeing what was on \
+              screen.
+            • External-display attaches (a TV via cable, an iPad with \
+              a connected monitor) trigger the same cover. AirPlay \
+              mirroring counts because iOS reports the AirPlay receiver \
+              as a connected display.
+
+            Optional: "Tell my contact when I screenshot." Off by \
+            default. Most people screenshot for legitimate reasons — \
+            saving important text, copying a link to themselves — and \
+            we don’t think the app should default to broadcasting that. \
+            Turn it on and your contact sees a system row in their \
+            copy of the chat when you screenshot one of their messages. \
+            They cannot disable it on their end; if you don’t want them \
+            to know, leave this off.
+
+            The QR sheet — your one-photo deanonymisation surface — \
+            uses an extra technique. The rendered QR is wrapped in an \
+            iOS secure-text-entry container, which the screenshot \
+            pipeline historically renders blank. This is not a \
+            documented API and Apple has been narrowing the technique \
+            in recent iOS releases. Pizzini runs a self-test on first \
+            launch and after every iOS major-version change to confirm \
+            the technique still works on your device; if it fails, the \
+            QR sheet silently falls back to the standard cover, and \
+            Settings → App lock will tell you. Either way the sheet \
+            still opens hidden behind a "Tap to reveal" gesture and \
+            re-hides whenever the app deactivates.
+
+            What none of this defends against:
+
+            • A second camera pointed at your screen. Nothing in iOS \
+              can stop another phone from photographing your display.
+            • A device whose iOS has been compromised at the kernel \
+              level by an unrelated vulnerability. Pizzini’s threat \
+              model assumes a healthy iOS underneath.
+            • Jailbroken devices with screen-recording rootkits. We \
+              detect what iOS tells us; a kernel-level capture \
+              bypasses iOS entirely.
+
+            For the highest-risk situations the safest practice is to \
+            take the conversation to a place where no screen exists \
+            in the first place: hand-to-hand, in person.
             """
         case .noPhoneNumbers:
             return """

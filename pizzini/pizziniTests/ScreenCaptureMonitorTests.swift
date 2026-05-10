@@ -13,7 +13,7 @@ import UIKit
 /// can't fake `UIScreen.main.isCaptured` or `UIScreen.screens.count`
 /// from a unit test, so we instead assert the notification path runs
 /// without crashing and produces a value consistent with the screen.
-@Suite("ScreenCaptureMonitor")
+@Suite("ScreenCaptureMonitor", .serialized)
 @MainActor
 struct ScreenCaptureMonitorTests {
     /// Yield twice so any `Task { @MainActor in ... }` queued by the
