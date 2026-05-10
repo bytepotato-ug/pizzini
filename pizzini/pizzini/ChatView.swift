@@ -231,37 +231,67 @@ struct ChatView: View {
     }
 
     private func messages(for contact: Contact) -> some View {
-        ScrollView {
-            LazyVStack(spacing: 12) {
-                if contact.log.isEmpty {
-                    Text(contact.sessionEstablished ? "Say hi." : "Pairing in progress.")
-                        .foregroundStyle(.secondary)
-                        .padding(.top, 48)
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: 12) {
+                    if contact.log.isEmpty {
+                        Text(contact.sessionEstablished ? "Say hi." : "Pairing in progress.")
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 48)
+                    }
+                    ForEach(contact.log) { entry in
+                        ChatRow(
+                            entry: entry,
+                            status: rowStatus(forEntry: entry),
+                            resolveURL: { info in store.attachmentURL(for: info) },
+                            quickLookEnabled: store.state.quickLookPreviewEnabled,
+                            onInfoTap: { section in faqAnchor = section },
+                        ).id(entry.id)
+                    }
+                    // Invisible 1pt anchor at the natural bottom of
+                    // the log. `LazyVStack` lazy-renders rows as
+                    // they scroll into view, so `proxy.scrollTo` to
+                    // the LAST chat row may compute against rows
+                    // that haven't materialized yet. A constant-id
+                    // anchor lives at the very end of the stack —
+                    // SwiftUI always materializes it (it's the
+                    // bottom of the lazy region) and the proxy can
+                    // scroll to it reliably.
+                    Color.clear.frame(height: 1).id(Self.bottomAnchor)
                 }
-                ForEach(contact.log) { entry in
-                    ChatRow(
-                        entry: entry,
-                        status: rowStatus(forEntry: entry),
-                        resolveURL: { info in store.attachmentURL(for: info) },
-                        quickLookEnabled: store.state.quickLookPreviewEnabled,
-                        onInfoTap: { section in faqAnchor = section },
-                    ).id(entry.id)
-                }
+                .padding(.horizontal)
+                .padding(.vertical, 12)
             }
-            .padding(.horizontal)
-            .padding(.vertical, 12)
+            .scrollDismissesKeyboard(.interactively)
+            .onAppear { scrollToBottom(proxy: proxy, animated: false) }
+            .onChange(of: contact.log.count) { _, _ in
+                scrollToBottom(proxy: proxy, animated: true)
+            }
         }
-        // `.defaultScrollAnchor(.bottom)` pins the natural anchor to
-        // the bottom of the content — initial open lands at the
-        // latest row, and new rows arriving while the user is
-        // already at the bottom auto-scroll. Replaces the prior
-        // `ScrollViewReader + onAppear/onChange scrollTo` pattern
-        // which fired BEFORE the `.safeAreaInset` composer's bottom
-        // inset propagated, leaving the last row visually clipped
-        // behind the composer (and the same race for new messages
-        // sent / received).
-        .defaultScrollAnchor(.bottom)
-        .scrollDismissesKeyboard(.interactively)
+    }
+
+    /// Constant id for the LazyVStack's trailing 1pt anchor row.
+    /// Using a string lets `ScrollViewReader.scrollTo` target the
+    /// natural-bottom-of-content regardless of which chat row is
+    /// last — and survives row-count changes without us having to
+    /// re-derive the latest entry's UUID at every scrollTo call.
+    private static let bottomAnchor = "__chat_bottom__"
+
+    /// Defer the actual scrollTo to the next runloop tick so the
+    /// `.safeAreaInset` composer has propagated its bottom inset and
+    /// the LazyVStack has measured the rows that just became visible.
+    /// Without the defer the proxy computes against pre-layout
+    /// offsets and the last row lands clipped behind the composer
+    /// (the reproducible symptom of the previous chat-doesn't-open-
+    /// at-bottom + send-doesn't-scroll-fully bugs).
+    private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation { proxy.scrollTo(Self.bottomAnchor, anchor: .bottom) }
+            } else {
+                proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+            }
+        }
     }
 
     private func composer(disabled: Bool, contact: Contact) -> some View {
