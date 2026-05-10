@@ -47,6 +47,24 @@ struct SettingsView: View {
                     }
                 }
 
+                Section {
+                    Toggle(isOn: Binding(
+                        get: { store.state.panicModeEnabled },
+                        set: { store.setPanicModeEnabled($0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Label("Panic mode", systemImage: "exclamationmark.octagon")
+                            Text("Off by default. When on, three fast taps on the chat area inside an open chat instantly delete that chat — no confirmation, no undo. The contact and your encryption session stay; only the message log is wiped. Heavy haptic confirms the gesture fired.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("Panic mode")
+                } footer: {
+                    Text("Modelled on the triple-tap-the-logo panic gesture in Bitchat, scoped to the chat you're in. Use only if you're prepared for an accidental triple-tap to delete a chat with no warning.")
+                }
+
                 if store.state.qrBlockEffective == false {
                     Section {
                         HStack(alignment: .top, spacing: 8) {

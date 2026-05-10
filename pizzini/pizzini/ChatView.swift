@@ -33,6 +33,24 @@ struct ChatView: View {
                     Divider()
                 }
                 messages(for: contact)
+                    // Bitchat-style panic gesture: three fast taps on
+                    // the chat-content area instantly delete this
+                    // chat (per-contact log only; contact + session
+                    // stay). Gated behind the Settings toggle, off
+                    // by default — accidental triggers would silently
+                    // destroy history with no undo. `simultaneousGesture`
+                    // means scrolling, attachment-row buttons, and
+                    // (i)-info taps still work; only the specific
+                    // three-taps-in-quick-succession pattern triggers.
+                    .simultaneousGesture(
+                        TapGesture(count: 3).onEnded {
+                            guard store.state.panicModeEnabled else { return }
+                            UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+                            let captured = contact
+                            dismiss()
+                            store.deleteChat(captured)
+                        }
+                    )
                 if let draft = attachmentDraft {
                     attachmentPreview(draft: draft)
                     Divider()

@@ -300,6 +300,19 @@ struct AppState: Codable, Sendable {
     /// in QuickLook's XPC, but it does widen the in-process integration
     /// surface a hair vs the strict default.
     var quickLookPreviewEnabled: Bool
+    /// When true, three fast taps anywhere on the chat-content area
+    /// inside an open chat instantly deletes that chat (the
+    /// per-contact log; the contact and the encryption session
+    /// stay). Default OFF. Modelled on Bitchat's triple-tap-the-logo
+    /// panic gesture, scoped to the chat the user is in rather than
+    /// wiping the whole app.
+    ///
+    /// Why we ship it as off-by-default: an accidental triple-tap
+    /// would silently destroy the chat with no undo. A user who
+    /// understands and opts in accepts that trade-off in exchange
+    /// for being able to scrub a chat in the time it takes to land
+    /// three thumb taps.
+    var panicModeEnabled: Bool
     /// Result of the most recent runtime self-test for the
     /// `isSecureTextEntry` workaround that powers the app-wide
     /// screenshot mask. Nil = not yet tested. True = the trick
@@ -328,6 +341,7 @@ struct AppState: Codable, Sendable {
         biometricLockEnabled: Bool = false,
         autoLockTimeout: AutoLockTimeout = .immediately,
         quickLookPreviewEnabled: Bool = false,
+        panicModeEnabled: Bool = false,
         qrBlockEffective: Bool? = nil,
         qrBlockTestedOSVersion: String? = nil
     ) {
@@ -338,6 +352,7 @@ struct AppState: Codable, Sendable {
         self.biometricLockEnabled = biometricLockEnabled
         self.autoLockTimeout = autoLockTimeout
         self.quickLookPreviewEnabled = quickLookPreviewEnabled
+        self.panicModeEnabled = panicModeEnabled
         self.qrBlockEffective = qrBlockEffective
         self.qrBlockTestedOSVersion = qrBlockTestedOSVersion
     }
@@ -350,6 +365,7 @@ struct AppState: Codable, Sendable {
         case biometricLockEnabled
         case autoLockTimeout
         case quickLookPreviewEnabled
+        case panicModeEnabled
         case qrBlockEffective
         case qrBlockTestedOSVersion
     }
@@ -363,6 +379,7 @@ struct AppState: Codable, Sendable {
         biometricLockEnabled = try c.decodeIfPresent(Bool.self, forKey: .biometricLockEnabled) ?? false
         autoLockTimeout = try c.decodeIfPresent(AutoLockTimeout.self, forKey: .autoLockTimeout) ?? .immediately
         quickLookPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .quickLookPreviewEnabled) ?? false
+        panicModeEnabled = try c.decodeIfPresent(Bool.self, forKey: .panicModeEnabled) ?? false
         qrBlockEffective = try c.decodeIfPresent(Bool.self, forKey: .qrBlockEffective)
         qrBlockTestedOSVersion = try c.decodeIfPresent(String.self, forKey: .qrBlockTestedOSVersion)
         // Pre-existing JSON blobs from earlier builds may carry the

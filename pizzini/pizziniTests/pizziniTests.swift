@@ -114,14 +114,22 @@ struct ScreenshotSelfTestCodecTests {
         #expect(s.qrBlockTestedOSVersion == nil)
     }
 
+    @Test("panicModeEnabled defaults off")
+    func panicDefaultOff() {
+        let s = AppState()
+        #expect(s.panicModeEnabled == false)
+    }
+
     @Test("AppState round-trips the self-test result fields")
     func roundTripSelfTestFields() throws {
         let s = AppState(
+            panicModeEnabled: true,
             qrBlockEffective: true,
             qrBlockTestedOSVersion: "26.0",
         )
         let data = try JSONEncoder().encode(s)
         let decoded = try JSONDecoder().decode(AppState.self, from: data)
+        #expect(decoded.panicModeEnabled == true)
         #expect(decoded.qrBlockEffective == true)
         #expect(decoded.qrBlockTestedOSVersion == "26.0")
     }

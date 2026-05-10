@@ -85,6 +85,7 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
     case qrCode
     case screenCapture
     case deviceIntegrity
+    case panicMode
     case noPhoneNumbers
     case pushNotifications
     case mediaStripping
@@ -112,6 +113,8 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             return "Screenshots, screen recording, and AirPlay"
         case .deviceIntegrity:
             return "Device integrity warnings"
+        case .panicMode:
+            return "Panic mode"
         case .noPhoneNumbers:
             return "Why no phone numbers"
         case .pushNotifications:
@@ -364,6 +367,48 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             checks the same way we treat the screenshot-detection \
             notification: a best-effort signal we surface to you \
             honestly, not a security boundary.
+            """
+        case .panicMode:
+            return """
+            Panic mode is an opt-in gesture that lets you destroy a \
+            chat in roughly half a second. Turn it on in Settings → \
+            Panic mode; from then on, three fast taps anywhere on the \
+            chat-content area inside an open chat instantly delete \
+            that chat. A heavy haptic confirms the gesture fired and \
+            the chat is gone — no confirmation dialog, no undo, the \
+            messages cannot be recovered.
+
+            What gets deleted: the per-contact message log only. The \
+            contact entry stays in your contacts list, the encryption \
+            session stays intact, and you can keep talking to that \
+            person — you'll just have an empty chat with them. To \
+            also drop the contact, use the chat's ⋯ menu → Delete \
+            contact, or the Settings → Advanced → Delete all chats / \
+            Reset identity options for broader wipes.
+
+            What does not happen: the gesture does NOT touch your \
+            other chats, your contacts list, your identity, or your \
+            relay configuration. It also does NOT signal anything to \
+            your contact — they don't see a "deleted by you" row, \
+            they don't get notified, and any messages they sent that \
+            you've already received are gone from your phone but \
+            still exist on theirs.
+
+            Why off by default: an accidental triple-tap on a chat \
+            you actually wanted to keep would destroy it silently. \
+            Three fast taps is a deliberate gesture, but it's also \
+            something a child playing with your unlocked phone could \
+            do. We don't ship the toggle on so that the only way to \
+            arm it is to read this paragraph and decide.
+
+            The gesture only works inside an open chat. The contacts \
+            list, settings, the QR sheet, and onboarding all ignore \
+            it. Composer text-input also ignores it (typing involves \
+            taps on the keyboard, which iOS routes separately from \
+            the chat-content area).
+
+            Modelled on the triple-tap-the-logo panic gesture in \
+            Bitchat, scoped per-chat rather than wiping the whole app.
             """
         case .noPhoneNumbers:
             return """

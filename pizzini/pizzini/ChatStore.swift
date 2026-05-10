@@ -993,6 +993,16 @@ final class ChatStore: NSObject {
         Storage.persist(appState: state)
     }
 
+    /// Toggle the per-chat triple-tap panic gesture. Default OFF.
+    /// When ON, three fast taps on the chat-content area inside an
+    /// open chat instantly delete that chat (the per-contact log;
+    /// the contact + the encryption session stay).
+    func setPanicModeEnabled(_ enabled: Bool) {
+        guard state.panicModeEnabled != enabled else { return }
+        state.panicModeEnabled = enabled
+        Storage.persist(appState: state)
+    }
+
     /// True when the app-wide screenshot mask should be applied — i.e.
     /// the runtime self-test for the underlying `isSecureTextEntry`
     /// technique passed on this iOS version. The mask is unconditional
