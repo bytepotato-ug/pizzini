@@ -25,6 +25,34 @@ struct ChatView: View {
         store.state.contacts.first { $0.id == contactID }
     }
 
+    /// True when the user opted into wrapping chat content in the
+    /// `isSecureTextEntry` container AND the runtime self-test for
+    /// the same technique passed on this iOS version. If the test
+    /// failed (`qrBlockEffective == false`), we don't apply the wrap
+    /// here either — the bubbles would silently render inside an
+    /// ineffective container, costing accessibility for no security
+    /// gain.
+    private var shouldShieldChat: Bool {
+        store.state.blockChatScreenshots && store.state.qrBlockEffective != false
+    }
+
+    /// Conditionally wraps `messages(for:)` in `SecureScreenshotShield`
+    /// when the user enabled the chat-block toggle. The composer and
+    /// attachment-preview stay OUTSIDE the wrap because system
+    /// text-selection on the input field is essential — the trick
+    /// would break tap-to-edit, copy/paste, and dictation.
+    @ViewBuilder
+    private func chatContentMaybeShielded(for contact: Contact) -> some View {
+        if shouldShieldChat {
+            SecureScreenshotShield {
+                messages(for: contact)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            messages(for: contact)
+        }
+    }
+
     var body: some View {
         if let contact {
             VStack(spacing: 0) {
@@ -32,7 +60,7 @@ struct ChatView: View {
                     pairingBanner
                     Divider()
                 }
-                messages(for: contact)
+                chatContentMaybeShielded(for: contact)
                 if let draft = attachmentDraft {
                     attachmentPreview(draft: draft)
                     Divider()

@@ -315,6 +315,14 @@ struct AppState: Codable, Sendable {
     /// for VoiceOver / accessibility users; the trick breaks selection
     /// and screen-reader semantics for the wrapped subtree.
     var blockQRScreenshots: Bool
+    /// When true, ChatView wraps its message scroll view in the same
+    /// `isSecureTextEntry` container the QR sheet uses, so the chat
+    /// bubbles also blank out in screenshots / recordings. Default OFF
+    /// because the wrap breaks system text-selection (long-press →
+    /// Copy on a bubble) and VoiceOver inside the wrapped subtree —
+    /// non-trivial accessibility cost. Same effective-gate as the QR:
+    /// only applied when `qrBlockEffective != false`.
+    var blockChatScreenshots: Bool
     /// Result of the most recent runtime self-test for the
     /// `isSecureTextEntry` workaround. Nil = not yet tested. True = the
     /// trick blocked the screenshot pipeline on this iOS version. False
@@ -341,6 +349,7 @@ struct AppState: Codable, Sendable {
         quickLookPreviewEnabled: Bool = false,
         notifyPeerOnScreenshot: Bool = false,
         blockQRScreenshots: Bool = true,
+        blockChatScreenshots: Bool = false,
         qrBlockEffective: Bool? = nil,
         qrBlockTestedOSVersion: String? = nil
     ) {
@@ -353,6 +362,7 @@ struct AppState: Codable, Sendable {
         self.quickLookPreviewEnabled = quickLookPreviewEnabled
         self.notifyPeerOnScreenshot = notifyPeerOnScreenshot
         self.blockQRScreenshots = blockQRScreenshots
+        self.blockChatScreenshots = blockChatScreenshots
         self.qrBlockEffective = qrBlockEffective
         self.qrBlockTestedOSVersion = qrBlockTestedOSVersion
     }
@@ -367,6 +377,7 @@ struct AppState: Codable, Sendable {
         case quickLookPreviewEnabled
         case notifyPeerOnScreenshot
         case blockQRScreenshots
+        case blockChatScreenshots
         case qrBlockEffective
         case qrBlockTestedOSVersion
     }
@@ -382,6 +393,7 @@ struct AppState: Codable, Sendable {
         quickLookPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .quickLookPreviewEnabled) ?? false
         notifyPeerOnScreenshot = try c.decodeIfPresent(Bool.self, forKey: .notifyPeerOnScreenshot) ?? false
         blockQRScreenshots = try c.decodeIfPresent(Bool.self, forKey: .blockQRScreenshots) ?? true
+        blockChatScreenshots = try c.decodeIfPresent(Bool.self, forKey: .blockChatScreenshots) ?? false
         qrBlockEffective = try c.decodeIfPresent(Bool.self, forKey: .qrBlockEffective)
         qrBlockTestedOSVersion = try c.decodeIfPresent(String.self, forKey: .qrBlockTestedOSVersion)
     }

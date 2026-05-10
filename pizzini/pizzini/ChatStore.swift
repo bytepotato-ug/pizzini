@@ -1104,6 +1104,18 @@ final class ChatStore: NSObject {
         Storage.persist(appState: state)
     }
 
+    /// Toggle the chat-content `isSecureTextEntry` wrap. Default OFF —
+    /// turning it on blanks chat bubbles in screenshots / mirrors but
+    /// breaks system text-selection (long-press → Copy) and VoiceOver
+    /// inside the wrapped container. Effective only when the QR-block
+    /// runtime self-test passed (`qrBlockEffective != false`); same
+    /// underlying technique.
+    func setBlockChatScreenshots(_ enabled: Bool) {
+        guard state.blockChatScreenshots != enabled else { return }
+        state.blockChatScreenshots = enabled
+        Storage.persist(appState: state)
+    }
+
     /// Persist the runtime-self-test result for the QR-block trick.
     /// Called by `SecureScreenshotShield.runtimeSelfTest` once on first
     /// launch and again after every iOS major-version change.

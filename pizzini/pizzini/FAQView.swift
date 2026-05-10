@@ -84,6 +84,7 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
     case runYourOwnRelay
     case qrCode
     case screenCapture
+    case deviceIntegrity
     case noPhoneNumbers
     case pushNotifications
     case mediaStripping
@@ -109,6 +110,8 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             return "What’s in your QR code"
         case .screenCapture:
             return "Screenshots, screen recording, and AirPlay"
+        case .deviceIntegrity:
+            return "Device integrity warnings"
         case .noPhoneNumbers:
             return "Why no phone numbers"
         case .pushNotifications:
@@ -297,6 +300,15 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             still opens hidden behind a "Tap to reveal" gesture and \
             re-hides whenever the app deactivates.
 
+            The same technique is available for chat bubbles via \
+            Settings → App lock → "Block screenshots of chats". It is \
+            off by default because the cost is real: long-press → Copy \
+            on a message stops working, and VoiceOver inside the chat \
+            is degraded. Turn it on only if you understand and accept \
+            those costs in exchange for the additional masking. The \
+            same self-test gates this toggle: if the technique fails \
+            on your iOS version, turning the toggle on has no effect.
+
             What none of this defends against:
 
             • A second camera pointed at your screen. Nothing in iOS \
@@ -311,6 +323,51 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             For the highest-risk situations the safest practice is to \
             take the conversation to a place where no screen exists \
             in the first place: hand-to-hand, in person.
+            """
+        case .deviceIntegrity:
+            return """
+            Pizzini runs three lightweight checks on launch to spot \
+            an obviously-compromised iOS environment:
+
+            • Jailbreak indicators — files and folders that only \
+              exist on a jailbroken device (Cydia, Sileo, Substrate \
+              dylibs, /private/var/lib/apt, an SSH server) and a \
+              sandbox-escape canary write outside our container.
+            • Debugger attachment — `sysctl(KERN_PROC)` reports the \
+              `P_TRACED` flag when a debugger is attached. We only \
+              surface this warning on release builds; a development \
+              build with Xcode attached doesn't show the banner.
+            • Hook frameworks — Pizzini scans the loaded dynamic \
+              libraries and looks for the names of common iOS hook \
+              tools (Frida, Cycript, MobileSubstrate, libhooker).
+
+            What the warning means in practice: the encryption is \
+            unaffected. Messages still encrypt and decrypt correctly, \
+            keys still live in the Secure Enclave-backed Keychain, \
+            and the relay still cannot read them. What weakens is \
+            the screen-capture stack: a jailbreak with a kernel-level \
+            screen-recording tweak can capture frames without \
+            triggering iOS's `UIScreen.isCaptured` flag, which is \
+            what our shield reads. The QR-block technique relies on \
+            iOS rendering secure-text-entry containers as blank — a \
+            jailbroken iOS may have that disabled.
+
+            What the warning does NOT mean: Pizzini does not refuse \
+            to run, does not phone home, and does not log who you \
+            are. The detection is local-only; it goes to the system \
+            log for forensic review and to this banner. We \
+            deliberately do not block jailbroken devices because some \
+            users in our threat model use jailbroken phones for good \
+            reasons (research, accessibility, privacy tooling iOS \
+            won't allow), and a "blocked" splash is theatre — anyone \
+            who can jailbreak can patch the splash out.
+
+            All three checks are bypassable. A determined attacker \
+            with a tweak that hides their dylib name and spoofs \
+            `sysctl` will not trigger any of them. We treat the \
+            checks the same way we treat the screenshot-detection \
+            notification: a best-effort signal we surface to you \
+            honestly, not a security boundary.
             """
         case .noPhoneNumbers:
             return """

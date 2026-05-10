@@ -139,6 +139,12 @@ struct ScreenCaptureSettingsTests {
         #expect(s.blockQRScreenshots == true)
     }
 
+    @Test("blockChatScreenshots defaults off")
+    func blockChatDefault() {
+        let s = AppState()
+        #expect(s.blockChatScreenshots == false)
+    }
+
     @Test("qrBlockEffective defaults nil (untested)")
     func qrBlockEffectiveDefault() {
         let s = AppState()
@@ -151,6 +157,7 @@ struct ScreenCaptureSettingsTests {
         let s = AppState(
             notifyPeerOnScreenshot: true,
             blockQRScreenshots: false,
+            blockChatScreenshots: true,
             qrBlockEffective: false,
             qrBlockTestedOSVersion: "26.0",
         )
@@ -158,6 +165,7 @@ struct ScreenCaptureSettingsTests {
         let decoded = try JSONDecoder().decode(AppState.self, from: data)
         #expect(decoded.notifyPeerOnScreenshot == true)
         #expect(decoded.blockQRScreenshots == false)
+        #expect(decoded.blockChatScreenshots == true)
         #expect(decoded.qrBlockEffective == false)
         #expect(decoded.qrBlockTestedOSVersion == "26.0")
     }
@@ -181,6 +189,7 @@ struct ScreenCaptureSettingsTests {
         let decoded = try JSONDecoder().decode(AppState.self, from: json)
         #expect(decoded.notifyPeerOnScreenshot == false)
         #expect(decoded.blockQRScreenshots == true)
+        #expect(decoded.blockChatScreenshots == false)
         #expect(decoded.qrBlockEffective == nil)
         #expect(decoded.qrBlockTestedOSVersion == nil)
         // Pre-existing fields still load.

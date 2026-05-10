@@ -97,6 +97,18 @@ struct SecuritySettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            Toggle(isOn: Binding(
+                get: { store.state.blockChatScreenshots },
+                set: { store.setBlockChatScreenshots($0) }
+            )) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label("Block screenshots of chats", systemImage: "bubble.left.and.bubble.right")
+                    Text("Same technique as the QR block, applied to chat bubbles. Tradeoff is bigger here: long-press → Copy on a message stops working, and VoiceOver inside the chat is degraded. Off by default; turn on only if you accept the accessibility cost.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .disabled(store.state.qrBlockEffective == false)
             if store.state.qrBlockEffective == false {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
