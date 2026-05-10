@@ -13,11 +13,15 @@ struct ContentView: View {
     @State private var store = ChatStore.shared
     @State private var lockManager = LockManager.shared
     @State private var captureMonitor = ScreenCaptureMonitor.shared
+    @State private var integrity = DeviceIntegrityMonitor.shared
     @State private var showScanner = false
     @State private var showMyQR = false
     @State private var showSettings = false
     @State private var pendingCard: ContactCard?
     @State private var pendingName: String = ""
+    /// FAQ deep-link target for the integrity banner's (i) button. Nil
+    /// means no sheet; setting it presents the FAQ at that section.
+    @State private var integrityFAQ: FAQSection?
 
     var body: some View {
         // The body deliberately does NOT depend on `Environment(\.scenePhase)`
@@ -48,8 +52,13 @@ struct ContentView: View {
                     // but doesn't double up on the initError state. The
                     // copy mirrors the audit's recommended message.
                     .safeAreaInset(edge: .top, spacing: 0) {
-                        if store.keychainWriteFailing {
-                            keychainFailureBanner
+                        VStack(spacing: 0) {
+                            if store.keychainWriteFailing {
+                                keychainFailureBanner
+                            }
+                            if integrity.isCompromised {
+                                integrityBanner
+                            }
                         }
                     }
                 }
@@ -133,6 +142,9 @@ struct ContentView: View {
         .sheet(isPresented: $showSettings) {
             SettingsView(store: store, onClose: { showSettings = false })
         }
+        .sheet(item: $integrityFAQ) { anchor in
+            FAQView(initialSection: anchor) { integrityFAQ = nil }
+        }
     }
 
     private func promptForName(decoding raw: String) {
@@ -160,6 +172,59 @@ struct ContentView: View {
                 .padding(.horizontal)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Persistent banner shown when `DeviceIntegrityMonitor` flagged
+    /// the device as compromised (jailbroken, suspicious dylib loaded,
+    /// or — in release builds — a debugger attached). Plain-language
+    /// copy names the consequence ("our protections are weakened")
+    /// rather than the technical signal; (i) deep-links into the FAQ
+    /// for the user who wants to know what was actually detected.
+    private var integrityBanner: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.shield.fill")
+                .foregroundStyle(.white)
+                .imageScale(.large)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(integrityHeadline)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                Text("Pizzini's screen-capture defences are best-effort on a compromised device. The encryption itself is unaffected.")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.95))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            Button {
+                integrityFAQ = .deviceIntegrity
+            } label: {
+                Image(systemName: "info.circle.fill")
+                    .foregroundStyle(.white)
+                    .imageScale(.large)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("More info on this warning")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange)
+    }
+
+    /// First-line headline for the integrity banner — names the most
+    /// load-bearing detected condition. Order: jailbreak > dylib >
+    /// debugger (debugger only surfaces in release per the monitor).
+    private var integrityHeadline: String {
+        if integrity.isJailbroken {
+            return "This device appears jailbroken"
+        }
+        if integrity.hasSuspiciousDylib {
+            return "A debugging or hook framework is loaded"
+        }
+        if integrity.isDebuggerAttached {
+            return "A debugger is attached to Pizzini"
+        }
+        return "Device integrity warning"
     }
 
     /// F-602: persistent banner shown above the nav bar when ChatStore
