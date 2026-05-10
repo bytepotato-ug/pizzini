@@ -666,6 +666,59 @@ extension ChatStore {
         Storage.persist(appState: state)
     }
 
+    /// Re-broadcast our CURRENT sender-key chain to every active
+    /// member, regardless of whether `mySkdmRecipients` says we
+    /// already shipped it. Recovery action when a peer's row is
+    /// stuck on `.pendingSKDM` after our own join — it almost
+    /// always means the original SKDM frame got dropped on the way
+    /// (delivery-token depletion, app backgrounding mid-broadcast,
+    /// dev-relay queue eviction). Differs from
+    /// `rotateMyGroupChain` in that it does NOT mint a fresh
+    /// chain — that would invalidate every peer's installed
+    /// state. Idempotent and safe to call repeatedly.
+    @discardableResult
+    func resendMyKeys(groupId: Data) -> Bool {
+        guard let session, let myCard, let relay,
+              let gIdx = groupIndex(forId: groupId)
+        else { return false }
+        guard let myDist = state.groups[gIdx].myCurrentDistributionId else {
+            // No chain to resend — user hasn't enrolled yet.
+            return false
+        }
+        guard !state.groups[gIdx].pendingInvitation else { return false }
+        let skdm: Data
+        do {
+            skdm = try session.senderKeyDistributionCreate(distributionId: myDist)
+        } catch {
+            NSLog("[pizzini.group] resendMyKeys \(short(groupId)): mint failed — \(error)")
+            return false
+        }
+        persistSession()
+        let recipients = state.groups[gIdx].activeMembers
+            .map(\.peerId)
+            .filter { $0 != myCard.peerId }
+        // Wipe the "already shipped" set so every active member is
+        // re-attempted regardless of prior success.
+        state.groups[gIdx].mySkdmRecipients = []
+        NSLog(
+            "[pizzini.group] resendMyKeys \(short(groupId)):"
+                + " re-broadcasting current SKDM (\(skdm.count) B)"
+                + " to \(recipients.count) member(s)",
+        )
+        for recipient in recipients {
+            broadcastSenderKeyDistribution(
+                groupId: groupId,
+                skdm: skdm,
+                toPeer: recipient,
+                session: session,
+                relay: relay,
+                groupAt: gIdx,
+            )
+        }
+        Storage.persist(appState: state)
+        return true
+    }
+
     private func shouldRotateBeforeSend(groupAt gIdx: Int) -> Bool {
         let g = state.groups[gIdx]
         if g.sentSinceRotation >= ChatGroup.rotationMessageThreshold { return true }

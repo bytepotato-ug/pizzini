@@ -69,10 +69,26 @@ struct GroupSettingsView: View {
                     } label: {
                         Label("Rotate my sender key now", systemImage: "arrow.triangle.2.circlepath")
                     }
+                    if anyMemberPendingSKDM {
+                        Button {
+                            if !store.resendMyKeys(groupId: groupID) {
+                                errorMessage = "Could not resend keys."
+                            } else {
+                                errorMessage = nil
+                            }
+                        } label: {
+                            Label("Resend my key to members waiting",
+                                  systemImage: "paperplane")
+                        }
+                    }
                 } header: {
                     Text("Sender-key hygiene")
                 } footer: {
-                    Text("Generates a fresh chain and broadcasts it to remaining members. Bounds the post-compromise window if you suspect this device is compromised.")
+                    if anyMemberPendingSKDM {
+                        Text("Members with the hourglass haven't received your sender key yet — usually a relay-delivery hiccup. \"Resend\" pushes your current chain again without rotating; \"Rotate\" mints a fresh chain (use this if you suspect this device is compromised).")
+                    } else {
+                        Text("Generates a fresh chain and broadcasts it to remaining members. Bounds the post-compromise window if you suspect this device is compromised.")
+                    }
                 }
             }
             Section {
@@ -121,17 +137,22 @@ struct GroupSettingsView: View {
                 onCancel: { showRenameSheet = false },
             )
         }
-        .confirmationDialog(
+        // `.alert` instead of `.confirmationDialog` because the
+        // dialog's iOS 26 popover-style presentation anchors to the
+        // form's origin point (top of view) rather than the
+        // destructive button at the bottom — the floating sheet
+        // ended up far away from the action that triggered it.
+        // Alerts always center, no anchor surprises.
+        .alert(
             "Leave this group on this device?",
             isPresented: $showLeaveConfirm,
-            titleVisibility: .visible,
         ) {
             Button("Leave group", role: .destructive) {
                 store.leaveGroup(groupId: groupID)
                 // Pop the settings view; `GroupChatView` watches its
                 // group's existence and dismisses itself when the
                 // group disappears, landing the user on the contacts
-                // list. Audit fix HIGH-5.
+                // list.
                 dismiss()
             }
             Button("Cancel", role: .cancel) {}
@@ -163,6 +184,16 @@ struct GroupSettingsView: View {
     private var hasMultipleAdmins: Bool {
         guard let group else { return false }
         return group.activeMembers.filter({ $0.role == .admin }).count > 1
+    }
+
+    /// True when any active non-self member is still in
+    /// `.pendingSKDM` from our point of view — the SKDM round-trip
+    /// hasn't completed yet. Drives the "Resend my key" affordance.
+    private var anyMemberPendingSKDM: Bool {
+        guard let group, let myCard = store.myCard else { return false }
+        return group.activeMembers.contains {
+            $0.peerId != myCard.peerId && $0.status == .pendingSKDM
+        }
     }
 
     private var addCandidates: [Contact] {

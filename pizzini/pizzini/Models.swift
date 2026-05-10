@@ -347,6 +347,14 @@ struct AppState: Codable, Sendable {
     /// to an empty array.
     var groups: [ChatGroup]
 
+    /// When true, the contacts list renders 1:1 contacts ABOVE the
+    /// groups section. Default true because most users open a 1:1
+    /// chat more often than a group, and a long groups section
+    /// pushed the contacts they cared about off the first viewport.
+    /// Toggle exposed in `SettingsView`. Pending invitations always
+    /// pin to the top regardless of this setting.
+    var contactsBeforeGroups: Bool
+
     static let currentVersion = 1
     static let defaultRelayHost = "127.0.0.1"
 
@@ -361,7 +369,8 @@ struct AppState: Codable, Sendable {
         panicModeEnabled: Bool = false,
         qrBlockEffective: Bool? = nil,
         qrBlockTestedOSVersion: String? = nil,
-        groups: [ChatGroup] = []
+        groups: [ChatGroup] = [],
+        contactsBeforeGroups: Bool = true
     ) {
         self.version = version
         self.relayHost = relayHost
@@ -374,6 +383,7 @@ struct AppState: Codable, Sendable {
         self.qrBlockEffective = qrBlockEffective
         self.qrBlockTestedOSVersion = qrBlockTestedOSVersion
         self.groups = groups
+        self.contactsBeforeGroups = contactsBeforeGroups
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -388,6 +398,7 @@ struct AppState: Codable, Sendable {
         case qrBlockEffective
         case qrBlockTestedOSVersion
         case groups
+        case contactsBeforeGroups
     }
 
     init(from decoder: Decoder) throws {
@@ -403,6 +414,7 @@ struct AppState: Codable, Sendable {
         qrBlockEffective = try c.decodeIfPresent(Bool.self, forKey: .qrBlockEffective)
         qrBlockTestedOSVersion = try c.decodeIfPresent(String.self, forKey: .qrBlockTestedOSVersion)
         groups = try c.decodeIfPresent([ChatGroup].self, forKey: .groups) ?? []
+        contactsBeforeGroups = try c.decodeIfPresent(Bool.self, forKey: .contactsBeforeGroups) ?? true
         // Pre-existing JSON blobs from earlier builds may carry the
         // `notifyPeerOnScreenshot`, `blockQRScreenshots`,
         // `blockChatScreenshots`, and `blockAppScreenshots` keys.

@@ -1020,6 +1020,17 @@ final class ChatStore: NSObject {
         Storage.persist(appState: state)
     }
 
+    /// Toggle the contacts-list ordering: contacts above groups vs.
+    /// groups above contacts. Default true (contacts above) because
+    /// 1:1 chats are the more frequently-opened surface for the
+    /// activist threat model and a long groups section pushed them
+    /// off the first viewport.
+    func setContactsBeforeGroups(_ enabled: Bool) {
+        guard state.contactsBeforeGroups != enabled else { return }
+        state.contactsBeforeGroups = enabled
+        Storage.persist(appState: state)
+    }
+
     /// True when the app-wide screenshot mask should be applied — i.e.
     /// the runtime self-test for the underlying `isSecureTextEntry`
     /// technique passed on this iOS version. The mask is unconditional

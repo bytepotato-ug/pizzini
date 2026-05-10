@@ -69,6 +69,19 @@ struct SettingsView: View {
 
             Section {
                 Toggle(isOn: Binding(
+                    get: { store.state.contactsBeforeGroups },
+                    set: { store.setContactsBeforeGroups($0) }
+                )) {
+                    Label("Contacts before groups", systemImage: "list.bullet.indent")
+                }
+            } header: {
+                Text("Chat list")
+            } footer: {
+                Text("On: 1:1 chats appear above groups. Off: groups appear above 1:1 chats. Pending invitations always pin to the top.")
+            }
+
+            Section {
+                Toggle(isOn: Binding(
                     get: { store.state.quickLookPreviewEnabled },
                     set: { store.setQuickLookPreviewEnabled($0) }
                 )) {

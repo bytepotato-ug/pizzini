@@ -142,46 +142,32 @@ struct ContactsListView: View {
 
     private var list: some View {
         List {
-            // Groups first when any exist — they are usually the
-            // active conversations a user opens repeatedly. Within
-            // each section the rows are sorted by `lastMessageAt`
-            // (most recent first) with a stable name fallback.
-            if !store.state.groups.isEmpty {
-                Section("Groups") {
-                    ForEach(sortedGroups) { group in
-                        NavigationLink {
-                            // Pending invitations route to the
-                            // accept/decline view; accepted groups
-                            // route to the chat view. The flag
-                            // resolves at navigation-push time —
-                            // once accepted, the user lands back on
-                            // this list and a fresh tap enters chat.
-                            if group.pendingInvitation {
-                                GroupInvitationView(store: store, groupID: group.id)
-                            } else {
-                                GroupChatView(store: store, groupID: group.id)
-                            }
-                        } label: {
-                            GroupRow(group: group, store: store)
-                        }
+            // 1) Pending invitations always pin to the top — they
+            //    need an explicit user decision before the group
+            //    becomes a normal chat surface. Inline Accept /
+            //    Decline buttons; no nested navigation required.
+            if !pendingInvitations.isEmpty {
+                Section("Invitations") {
+                    ForEach(pendingInvitations) { group in
+                        InvitationRow(group: group, store: store)
                     }
                 }
             }
-            Section(store.state.groups.isEmpty ? "" : "Contacts") {
-                ForEach(store.state.contacts) { contact in
-                    NavigationLink {
-                        ChatView(store: store, contactID: contact.id)
-                    } label: {
-                        ContactRow(contact: contact)
-                    }
-                    .swipeActions(edge: .trailing) {
-                        Button(role: .destructive) {
-                            store.deleteContact(contact)
-                        } label: {
-                            Label("Delete", systemImage: "trash")
-                        }
-                    }
-                }
+
+            // 2) Then contacts and groups, in user-configured order.
+            //    When only one section has rows (and no invitations
+            //    either), render its rows without a header so the
+            //    list doesn't waste a band of empty space at the
+            //    top of the view.
+            let multipleSections = !pendingInvitations.isEmpty
+                || (!store.state.contacts.isEmpty && !acceptedGroups.isEmpty)
+
+            if store.state.contactsBeforeGroups {
+                renderContacts(withHeader: multipleSections)
+                renderGroups(withHeader: multipleSections)
+            } else {
+                renderGroups(withHeader: multipleSections)
+                renderContacts(withHeader: multipleSections)
             }
         }
         .listStyle(.plain)
@@ -190,8 +176,73 @@ struct ContactsListView: View {
         }
     }
 
+    @ViewBuilder
+    private func renderContacts(withHeader: Bool) -> some View {
+        if !store.state.contacts.isEmpty {
+            if withHeader {
+                Section("Contacts") { contactsRows }
+            } else {
+                contactsRows
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func renderGroups(withHeader: Bool) -> some View {
+        if !acceptedGroups.isEmpty {
+            if withHeader {
+                Section("Groups") { groupsRows }
+            } else {
+                groupsRows
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var contactsRows: some View {
+        ForEach(store.state.contacts) { contact in
+            NavigationLink {
+                ChatView(store: store, contactID: contact.id)
+            } label: {
+                ContactRow(contact: contact)
+            }
+            .swipeActions(edge: .trailing) {
+                Button(role: .destructive) {
+                    store.deleteContact(contact)
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var groupsRows: some View {
+        ForEach(sortedGroups) { group in
+            NavigationLink {
+                GroupChatView(store: store, groupID: group.id)
+            } label: {
+                GroupRow(group: group, store: store)
+            }
+        }
+    }
+
+    /// Pending invitations pinned to the top — sorted by group name
+    /// for stable ordering across re-renders.
+    private var pendingInvitations: [ChatGroup] {
+        store.state.groups
+            .filter { $0.pendingInvitation }
+            .sorted { $0.displayName < $1.displayName }
+    }
+
+    /// Groups the user has actually joined — pending invitations
+    /// are filtered out and shown in their dedicated section.
+    private var acceptedGroups: [ChatGroup] {
+        store.state.groups.filter { !$0.pendingInvitation }
+    }
+
     private var sortedGroups: [ChatGroup] {
-        store.state.groups.sorted { lhs, rhs in
+        acceptedGroups.sorted { lhs, rhs in
             switch (lhs.lastMessageAt, rhs.lastMessageAt) {
             case let (l?, r?): return l > r
             case (_?, nil): return true
@@ -326,17 +377,14 @@ private struct GroupRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: group.pendingInvitation
-                  ? "envelope.badge"
-                  : "person.3.fill")
+            Image(systemName: "person.3.fill")
                 .font(.title3)
-                .foregroundStyle(group.pendingInvitation ? Color.orange : Color.accentColor)
+                .foregroundStyle(Color.accentColor)
                 .frame(width: 28)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    if !group.pendingInvitation,
-                       group.activeMembers.contains(where: { $0.status == .pendingSKDM }) {
+                    if group.activeMembers.contains(where: { $0.status == .pendingSKDM }) {
                         Image(systemName: "hourglass")
                             .font(.caption)
                             .foregroundStyle(.orange)
@@ -345,11 +393,7 @@ private struct GroupRow: View {
                     Text(group.displayName)
                         .font(.body.weight(.semibold))
                 }
-                if group.pendingInvitation {
-                    Text("invitation — tap to accept or decline")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                } else if let last = group.log.last {
+                if let last = group.log.last {
                     Text(preview(last))
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -379,5 +423,78 @@ private struct GroupRow: View {
                 return msg.text
             }
         }
+    }
+}
+
+/// Inline accept/decline row for a pending group invitation. Lives
+/// in the contacts list's "Invitations" section so the user doesn't
+/// have to navigate into a detail view to make their choice.
+///
+/// Long-press → context menu with "View members" pushes the
+/// `GroupInvitationView` for users who want a fuller inspection
+/// before deciding (member roster + verification captions).
+private struct InvitationRow: View {
+    let group: ChatGroup
+    let store: ChatStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Image(systemName: "envelope.badge")
+                    .font(.title3)
+                    .foregroundStyle(Color.orange)
+                    .frame(width: 28)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(group.displayName)
+                        .font(.body.weight(.semibold))
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+            }
+            HStack(spacing: 10) {
+                Spacer()
+                Button {
+                    store.declineGroupInvitation(groupId: group.id)
+                } label: {
+                    Text("Decline")
+                        .frame(minWidth: 70)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.red)
+                Button {
+                    store.acceptGroupInvitation(groupId: group.id)
+                } label: {
+                    Text("Accept")
+                        .frame(minWidth: 70)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+        }
+        .padding(.vertical, 4)
+        .contextMenu {
+            NavigationLink {
+                GroupInvitationView(store: store, groupID: group.id)
+            } label: {
+                Label("View members", systemImage: "person.2")
+            }
+        }
+    }
+
+    private var subtitle: String {
+        let memberCount = group.activeMembers.count
+        let memberSuffix = "\(memberCount) member\(memberCount == 1 ? "" : "s")"
+        guard let myCard = store.myCard,
+              let myRow = group.members.first(where: { $0.peerId == myCard.peerId }),
+              let addedBy = myRow.addedBy
+        else { return memberSuffix }
+        if let contact = store.state.contacts.first(where: { $0.identityPub == addedBy }) {
+            return "invited by \(contact.displayName) — \(memberSuffix)"
+        }
+        return memberSuffix
     }
 }
