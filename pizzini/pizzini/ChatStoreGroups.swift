@@ -1683,6 +1683,15 @@ extension ChatStore {
         state.groups[gIdx].log.append(row)
         state.groups[gIdx].lastMessageAt = Date()
         Storage.persist(appState: state)
+        // Same deterministic mark-read shortcut as 1:1: if the user
+        // is provably in this group, fire `markGroupRead`
+        // synchronously instead of relying on SwiftUI's
+        // `.onChange(of: group.log.count)` propagation in
+        // `GroupChatView`. Removes the receipt-drop race during a
+        // relay-state flap.
+        if activeSurface == .group(groupId: groupId) {
+            markGroupRead(groupID: groupId)
+        }
         maybeFireBackgroundHaptic(forIncoming: .group(groupId: groupId))
     }
 

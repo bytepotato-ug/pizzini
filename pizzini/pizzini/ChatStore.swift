@@ -1031,6 +1031,17 @@ final class ChatStore: NSObject {
         guard contact.readReceiptsEnabled,
               let session, let relay
         else { return }
+        // Read receipts are NOT in the outbox retry walk — if we
+        // pop a token + encrypt + hand to a disconnected
+        // NWConnection, the bytes are silently dropped and the
+        // sender's eye glyph never fires. Skip the emit when we
+        // know the relay won't accept it; the next mark-read on
+        // re-connect / chat re-open will retry with a fresh
+        // receipt covering the same (or newer) highest messageId.
+        guard relayState == .connected else {
+            NSLog("[pizzini] deferring read receipt — relay not connected (state=\(relayState))")
+            return
+        }
         guard let token = popDeliveryToken(forContactAt: idx) else {
             NSLog("[pizzini] cannot emit read receipt: out of tokens")
             return
@@ -1326,6 +1337,22 @@ extension ChatStore: RelayClientDelegate {
                 // timer tick. `runRetryWalk` is idempotent — if no
                 // entries are due, it's a no-op.
                 self.runRetryWalk()
+                // Drain any read receipts deferred while the relay
+                // was offline. `emitReadReceipt` skips when
+                // `relayState != .connected` so a missed receive
+                // from a flapping socket doesn't burn a token into
+                // a dead channel; re-firing mark-read here ships a
+                // fresh receipt covering the current latest.
+                switch self.activeSurface {
+                case .oneOnOne(let peerIdentity):
+                    if let cIdx = self.contactIndex(forIdentity: peerIdentity) {
+                        self.emitReadReceiptIfEnabled(forContactAt: cIdx)
+                    }
+                case .group(let groupId):
+                    self.markGroupRead(groupID: groupId)
+                case .none:
+                    break
+                }
             }
         }
     }
@@ -1511,6 +1538,21 @@ extension ChatStore: RelayClientDelegate {
         self.state.contacts[idx].log.append(entry)
         self.state.contacts[idx].lastMessageAt = entry.timestamp
         self.state.contacts[idx].sessionEstablished = true
+        // When the receive lands in the chat the user is provably
+        // in (`activeSurface` matches), fire the read-receipt emit
+        // synchronously instead of waiting for SwiftUI's
+        // `.onChange(of: log.count)` roundtrip in `ChatView`. The
+        // SwiftUI path is a fallback for the "chat re-opened later"
+        // case; the synchronous path here is the deterministic one
+        // and removes the race where a brief relay-state flap
+        // around the same moment as a new message would silently
+        // drop the receipt (read receipts aren't in the outbox
+        // retry walk).
+        if activeSurface == .oneOnOne(peerIdentity: state.contacts[idx].identityPub) {
+            state.contacts[idx].lastSeenAt = Date()
+            emitReadReceiptIfEnabled(forContactAt: idx)
+            refreshAppBadge()
+        }
         maybeFireBackgroundHaptic(
             forIncoming: .oneOnOne(peerIdentity: state.contacts[idx].identityPub),
         )
