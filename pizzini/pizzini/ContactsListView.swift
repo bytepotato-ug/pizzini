@@ -37,18 +37,7 @@ struct ContactsListView: View {
                 }
                 .accessibilityLabel("Show my QR")
             }
-            ToolbarItem(placement: .principal) {
-                relayBadge
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    showSettings = true
-                } label: {
-                    Image(systemName: "gearshape")
-                }
-                .accessibilityLabel("Settings")
-            }
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItem(placement: .topBarLeading) {
                 Button {
                     showAddContactDialog = true
                 } label: {
@@ -73,6 +62,17 @@ struct ContactsListView: View {
                 } message: {
                     Text("Pair by scanning the other person's QR. They need to scan you back too.")
                 }
+            }
+            ToolbarItem(placement: .principal) {
+                relayBadge
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .accessibilityLabel("Settings")
             }
         }
     }
