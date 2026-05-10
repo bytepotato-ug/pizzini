@@ -356,7 +356,13 @@ private struct ContactRow: View {
                             .accessibilityLabel("waiting for handshake")
                     }
                     Text(contact.displayName)
-                        .font(unread > 0 ? .body.weight(.semibold) : .body)
+                        // Always semibold, parity with `GroupRow.displayName`.
+                        // The unread cue isn't lost — `unreadBadge` (the
+                        // accent-coloured capsule with count) on the trailing
+                        // edge still distinguishes unread rows; the bold
+                        // contact name is a hierarchy cue (this row's TITLE)
+                        // rather than a state cue (read / unread).
+                        .font(.body.weight(.semibold))
                 }
                 if let last = contact.log.last {
                     Text(preview(last))
