@@ -146,33 +146,44 @@ enum MetadataStripper {
         }
         try data.write(to: inURL, options: [.atomic])
 
-        let asset = AVAsset(url: inURL)
+        // iOS 18 deprecated `AVAsset(url:)`, `exportAsynchronously(...)`,
+        // `session.error`, and `session.status`. Migrated to the
+        // async `export(to:as:) async throws` and the explicit
+        // `AVURLAsset(url:)` initialiser. The semaphore bridge keeps
+        // the sync facade (callers run on `DispatchQueue.global` and
+        // aren't async themselves) — sync-over-async is a known
+        // anti-pattern, but rewriting every send call-site to async
+        // is out of scope for a deprecation cleanup. Localised here
+        // so the rest of the codebase keeps its current shape.
+        let asset = AVURLAsset(url: inURL)
         guard let session = AVAssetExportSession(
             asset: asset, presetName: AVAssetExportPresetPassthrough
         ) else {
             throw StripError.encodeFailed
         }
-        session.outputURL = outURL
-        session.outputFileType = avFileType(forExt: ext)
         // Empty metadata = exporter writes a fresh container with the
         // a/v tracks but no tags. AVFoundation honours this for the
         // standard Voice Memos / iPhone-camera output formats.
         session.metadata = []
+        let outputFileType = avFileType(forExt: ext)
 
-        // Block the caller. ChatStore dispatches off main before
-        // calling, so this doesn't freeze the UI.
         let semaphore = DispatchSemaphore(value: 0)
         var exportError: Error?
-        session.exportAsynchronously {
-            exportError = session.error
+        let task = Task {
+            do {
+                try await session.export(to: outURL, as: outputFileType)
+            } catch {
+                exportError = error
+            }
             semaphore.signal()
         }
-        _ = semaphore.wait(timeout: .now() + 60)
+        let waitResult = semaphore.wait(timeout: .now() + 60)
+        if waitResult == .timedOut {
+            task.cancel()
+            throw StripError.underlying("AVAssetExportSession export timed out after 60s")
+        }
         if let exportError {
             throw StripError.underlying("\(exportError)")
-        }
-        guard session.status == .completed else {
-            throw StripError.underlying("AVAssetExportSession status \(session.status.rawValue)")
         }
         return try Data(contentsOf: outURL, options: [.mappedIfSafe])
     }
