@@ -567,6 +567,12 @@ extension ChatGroup {
             lastRotatedAt: createdAt,
             mySkdmRecipients: [],
             recentOpDigests: [String(0): opDigest],
+            // Receive-side bootstrap: the user must accept the
+            // invitation before we enrol our chain or render
+            // messages. The host (`createGroup`) flips this back to
+            // false because the creator has already implicitly
+            // accepted by initiating.
+            pendingInvitation: true,
         )
     }
 }

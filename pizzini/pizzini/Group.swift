@@ -122,6 +122,34 @@ struct ChatGroup: Codable, Identifiable, Sendable {
     /// to everyone after every relaunch would burn delivery tokens.
     var mySkdmRecipients: Set<Data>
 
+    /// True for groups we've received a `Create` op (or
+    /// `GroupBootstrap`) for from an admin, but the local user has
+    /// not yet tapped "Join" on the invitation. While pending:
+    ///   - The local user has NOT enrolled their own sender-key
+    ///     chain (`myCurrentDistributionId` stays nil).
+    ///   - We do NOT broadcast SKDMs outward — peers see us as
+    ///     `.pendingSKDM` until we accept.
+    ///   - We DO install incoming SKDMs from peers so the chains
+    ///     are ready immediately on accept; we DO apply incoming
+    ///     ops so the membership / name state stays in sync with
+    ///     the admin's broadcasts.
+    ///   - We do NOT decrypt incoming `groupChat` messages
+    ///     (`handleGroupChat` gates on this flag) and we do NOT
+    ///     allow `sendGroupMessage`.
+    ///
+    /// On accept: the host clears the flag and runs
+    /// `enrolMyChainOnFirstJoin`. On decline: the host deletes the
+    /// local group; remaining members keep showing us as
+    /// `.pendingSKDM` until they manually rotate or remove us
+    /// (consistent with `leaveGroup` — peer-to-peer can't enforce
+    /// removal at the other end).
+    ///
+    /// Optional via `decodeIfPresent`-with-default-false so existing
+    /// on-disk blobs decode cleanly: groups already created before
+    /// the invitation flow shipped continue to behave exactly as
+    /// before (auto-joined).
+    var pendingInvitation: Bool
+
     /// Bounded sliding window of `epoch → digest(signed op)` for the
     /// most recently applied ops. Used to detect equivocation: if we
     /// receive an op at an already-applied epoch with a *different*
@@ -232,7 +260,7 @@ struct ChatGroup: Codable, Identifiable, Sendable {
         case id, displayName, members, createdAt, currentEpoch, lastOpDigest
         case pendingOps, log, lastSeenAt, lastMessageAt
         case myCurrentDistributionId, memberDistributionIds, sentSinceRotation
-        case lastRotatedAt, mySkdmRecipients, recentOpDigests
+        case lastRotatedAt, mySkdmRecipients, recentOpDigests, pendingInvitation
     }
 
     init(from decoder: Decoder) throws {
@@ -253,6 +281,9 @@ struct ChatGroup: Codable, Identifiable, Sendable {
         self.lastRotatedAt = try c.decode(Date.self, forKey: .lastRotatedAt)
         self.mySkdmRecipients = try c.decodeIfPresent(Set<Data>.self, forKey: .mySkdmRecipients) ?? []
         self.recentOpDigests = try c.decode([String: Data].self, forKey: .recentOpDigests)
+        // Default false so groups created before the invitation flow
+        // shipped continue to behave exactly as before (auto-joined).
+        self.pendingInvitation = try c.decodeIfPresent(Bool.self, forKey: .pendingInvitation) ?? false
     }
 
     /// Synthesised-style memberwise init kept explicit because the
@@ -275,7 +306,8 @@ struct ChatGroup: Codable, Identifiable, Sendable {
         sentSinceRotation: UInt32,
         lastRotatedAt: Date,
         mySkdmRecipients: Set<Data> = [],
-        recentOpDigests: [String: Data]
+        recentOpDigests: [String: Data],
+        pendingInvitation: Bool = false
     ) {
         self.id = id
         self.displayName = displayName
@@ -293,6 +325,7 @@ struct ChatGroup: Codable, Identifiable, Sendable {
         self.lastRotatedAt = lastRotatedAt
         self.mySkdmRecipients = mySkdmRecipients
         self.recentOpDigests = recentOpDigests
+        self.pendingInvitation = pendingInvitation
     }
 }
 

@@ -734,7 +734,7 @@ private struct Env {
     enum EnvError: Error { case bootstrapFailed }
 }
 
-private func realSignedCreate(
+func realSignedCreate(
     by signer: Session,
     groupId: Data,
     name: String,
@@ -756,7 +756,7 @@ private func realSignedCreate(
     )
 }
 
-private func realSignedOp(
+func realSignedOp(
     by signer: Session,
     groupId: Data,
     epoch: UInt64,

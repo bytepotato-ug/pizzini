@@ -150,7 +150,17 @@ struct ContactsListView: View {
                 Section("Groups") {
                     ForEach(sortedGroups) { group in
                         NavigationLink {
-                            GroupChatView(store: store, groupID: group.id)
+                            // Pending invitations route to the
+                            // accept/decline view; accepted groups
+                            // route to the chat view. The flag
+                            // resolves at navigation-push time —
+                            // once accepted, the user lands back on
+                            // this list and a fresh tap enters chat.
+                            if group.pendingInvitation {
+                                GroupInvitationView(store: store, groupID: group.id)
+                            } else {
+                                GroupChatView(store: store, groupID: group.id)
+                            }
                         } label: {
                             GroupRow(group: group, store: store)
                         }
@@ -316,14 +326,17 @@ private struct GroupRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: "person.3.fill")
+            Image(systemName: group.pendingInvitation
+                  ? "envelope.badge"
+                  : "person.3.fill")
                 .font(.title3)
-                .foregroundStyle(.tint)
+                .foregroundStyle(group.pendingInvitation ? Color.orange : Color.accentColor)
                 .frame(width: 28)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    if group.activeMembers.contains(where: { $0.status == .pendingSKDM }) {
+                    if !group.pendingInvitation,
+                       group.activeMembers.contains(where: { $0.status == .pendingSKDM }) {
                         Image(systemName: "hourglass")
                             .font(.caption)
                             .foregroundStyle(.orange)
@@ -332,7 +345,11 @@ private struct GroupRow: View {
                     Text(group.displayName)
                         .font(.body.weight(.semibold))
                 }
-                if let last = group.log.last {
+                if group.pendingInvitation {
+                    Text("invitation — tap to accept or decline")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } else if let last = group.log.last {
                     Text(preview(last))
                         .font(.caption)
                         .foregroundStyle(.secondary)

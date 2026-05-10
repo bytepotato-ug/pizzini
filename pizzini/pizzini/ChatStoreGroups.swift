@@ -134,6 +134,10 @@ extension ChatStore {
             signedBytes: signedBytes,
             localIdentityPub: myCard.peerId,
         ) else { return nil }
+        // Creator implicitly accepted by tapping Create — clear the
+        // invitation flag that `ChatGroup.create` defaults to true
+        // for the receive-side bootstrap path.
+        group.pendingInvitation = false
 
         // Mint our local sender-key chain. Failures here would mean
         // libsignal-state corruption — surface as nil so the UI can
@@ -422,6 +426,50 @@ extension ChatStore {
         return true
     }
 
+    // ─── Outbound: invitation accept / decline ──────────────────────
+
+    /// Accept a pending group invitation: clear the
+    /// `pendingInvitation` flag, mint our local sender-key chain,
+    /// and broadcast our SKDM to every active member. From this
+    /// moment on, peers can decrypt our messages and our composer
+    /// is unlocked. No-op if the group isn't pending.
+    @discardableResult
+    func acceptGroupInvitation(groupId: Data) -> Bool {
+        guard let session, let myCard, let relay,
+              let gIdx = groupIndex(forId: groupId)
+        else { return false }
+        guard state.groups[gIdx].pendingInvitation else { return false }
+        // Refuse if the admin already removed us while pending —
+        // the invitation was withdrawn before we accepted.
+        guard state.groups[gIdx].activeMembers.contains(where: { $0.peerId == myCard.peerId }) else {
+            return false
+        }
+        state.groups[gIdx].pendingInvitation = false
+        NSLog(
+            "[pizzini.group] accept \(short(groupId)):"
+                + " enrolling local chain and broadcasting SKDM",
+        )
+        enrolMyChainOnFirstJoin(groupAt: gIdx, session: session, relay: relay)
+        Storage.persist(appState: state)
+        return true
+    }
+
+    /// Decline a pending group invitation: drop the local group
+    /// state. We never enrolled a chain so there's nothing to
+    /// rotate; remaining members keep showing us as `.pendingSKDM`
+    /// until they manually rotate or remove us — the same honesty
+    /// constraint as `leaveGroup` (peer-to-peer can't enforce
+    /// removal at the other end). No-op if the group isn't pending.
+    @discardableResult
+    func declineGroupInvitation(groupId: Data) -> Bool {
+        guard let gIdx = groupIndex(forId: groupId) else { return false }
+        guard state.groups[gIdx].pendingInvitation else { return false }
+        NSLog("[pizzini.group] decline \(short(groupId)): removing local group state")
+        state.groups.remove(at: gIdx)
+        Storage.persist(appState: state)
+        return true
+    }
+
     /// Local-only leave: drop the group from this device. We rotate
     /// our chain first so remaining members can no longer decrypt
     /// our future messages with the chain we abandoned (audit fix
@@ -471,6 +519,14 @@ extension ChatStore {
         guard state.groups[gIdx].activeMembers.contains(where: { $0.peerId == myCard.peerId }) else {
             appendGroupSystem(groupAt: gIdx, "You are no longer a member of this group.")
             Storage.persist(appState: state)
+            return false
+        }
+        // Refuse while the invitation is pending — the user hasn't
+        // tapped Join yet, so no chain has been minted and no SKDM
+        // has been broadcast. The composer in `GroupChatView` is
+        // also disabled in this state; this guard is the runtime
+        // backstop.
+        guard !state.groups[gIdx].pendingInvitation else {
             return false
         }
 
@@ -703,15 +759,19 @@ extension ChatStore {
                 return
             }
             state.groups.append(group)
-            let gIdx = state.groups.count - 1
             NSLog(
                 "[pizzini.group] groupOp ← \(short(sender)):"
-                    + " bootstrapped group \(short(op.groupId)) with \(group.members.count) member(s)",
+                    + " invitation received for \(short(op.groupId)) with \(group.members.count) member(s)"
+                    + " — awaiting user accept/decline",
             )
-            // We are now in a group we didn't initiate — enrol our
-            // own sender-key chain and broadcast SKDM to every other
-            // active member so they can decrypt our future messages.
-            enrolMyChainOnFirstJoin(groupAt: gIdx, session: session, relay: relay)
+            // Receive-side bootstrap is now an INVITATION. We don't
+            // enrol our chain or broadcast SKDMs until the user taps
+            // Join — `enrolMyChainOnFirstJoin` is fired from
+            // `acceptGroupInvitation` instead. We DO leave the group
+            // row in `state.groups` (with `pendingInvitation = true`)
+            // so subsequent op/SKDM frames from the admin can apply
+            // and install chains — accepting later then plugs into a
+            // already-up-to-date snapshot.
             Storage.persist(appState: state)
             return
         }
@@ -796,8 +856,10 @@ extension ChatStore {
     /// when an `AddMember` op alone leaves them stranded (audit fix
     /// HIGH-7). Trust gate: same as Create — sender must be the
     /// operator AND the operator must be in our 1:1 contacts.
+    /// Bootstrapped groups land with `pendingInvitation = true`; the
+    /// local user must tap Join before the chain is enrolled.
     func handleGroupBootstrap(payload: Data, fromPeer sender: Data) {
-        guard let session, let myCard, let relay else { return }
+        guard let myCard else { return }
         guard let parsed = GroupEnvelope.decodeBootstrap(payload) else {
             NSLog("[pizzini.group] bootstrap ← \(short(sender)): malformed body")
             return
@@ -867,13 +929,16 @@ extension ChatStore {
             return
         }
         state.groups.append(group)
-        let gIdx = state.groups.count - 1
         NSLog(
             "[pizzini.group] bootstrap ← \(short(sender)):"
-                + " group \(short(bootstrap.groupId)) bootstrapped at epoch \(bootstrap.currentEpoch)"
-                + " with \(group.members.count) member(s)",
+                + " invitation received for \(short(bootstrap.groupId))"
+                + " at epoch \(bootstrap.currentEpoch)"
+                + " with \(group.members.count) member(s) — awaiting user accept/decline",
         )
-        enrolMyChainOnFirstJoin(groupAt: gIdx, session: session, relay: relay)
+        // Same flow as handleGroupOp Create: do NOT enrol our chain
+        // or broadcast SKDMs until the user taps Join. Subsequent
+        // op/SKDM frames apply against the pending group; on
+        // acceptance the host calls `enrolMyChainOnFirstJoin`.
         Storage.persist(appState: state)
     }
 
@@ -974,6 +1039,24 @@ extension ChatStore {
                 "[pizzini.group] groupChat ← \(short(sender)) for \(short(groupId)):"
                     + " DROPPED — sender is not an active member",
             )
+            return
+        }
+        // Don't render messages while the user hasn't accepted the
+        // invitation. We still consume the ratchet step on
+        // libsignal's side (groupDecrypt advances the chain), but
+        // we drop the plaintext rather than appending it to the
+        // log — accepting later doesn't surface a backlog of
+        // messages from before the user joined.
+        if state.groups[gIdx].pendingInvitation {
+            NSLog(
+                "[pizzini.group] groupChat ← \(short(sender)) for \(short(groupId)):"
+                    + " group is pendingInvitation — message dropped without rendering",
+            )
+            // Still call decrypt to keep our chain state in sync
+            // with the sender's, otherwise a later accept wouldn't
+            // be able to decrypt subsequent messages.
+            _ = try? session.groupDecrypt(senderIdentity: sender, ciphertext: ciphertext)
+            persistSession()
             return
         }
         let plaintext: Data
@@ -1107,6 +1190,14 @@ extension ChatStore {
             // libsignal's store keeps our chain — no FFI to forget
             // it. Cosmetic; we won't use it again because
             // sendGroupMessage gates on activeMember-self.
+            return
+        }
+        // Pending invitations don't enrol or broadcast anything
+        // until the user taps Join — silently skip the SKDM /
+        // rotation hooks. The state machine still applies the op
+        // (so the snapshot stays in sync with the admin's view of
+        // the group); we just don't act on it crypto-wise.
+        if state.groups[gIdx].pendingInvitation {
             return
         }
         // Mandatory rotation on member-remove (HIGH-1).

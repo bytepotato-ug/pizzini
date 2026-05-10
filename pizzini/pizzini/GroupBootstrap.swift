@@ -248,6 +248,9 @@ struct GroupBootstrap: Sendable, Equatable {
             lastRotatedAt: createdAt,
             mySkdmRecipients: [],
             recentOpDigests: [String(currentEpoch): lastOpDigest],
+            // Bootstrap snapshots are an invitation — the user must
+            // accept before we enrol our chain or render messages.
+            pendingInvitation: true,
         )
     }
 }
