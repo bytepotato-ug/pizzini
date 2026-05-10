@@ -242,8 +242,15 @@ struct GroupChatView: View {
             )
                 .textFieldStyle(.roundedBorder)
                 .focused($composerFocused)
-                .submitLabel(.send)
-                .onSubmit(send)
+                // Multi-line composer: return inserts a newline. Don't
+                // override `.submitLabel` to `.send` here — that styles
+                // the keyboard's return key as a blue send glyph and
+                // misleads users into thinking it'll submit (it can't,
+                // axis: .vertical absorbs the keypress for the
+                // newline). The visible send button next to the field
+                // is the only way to send. ChatView's composer is
+                // single-line and keeps `.submitLabel(.send)` because
+                // there return actually submits.
             Button(action: send) {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.title2)
