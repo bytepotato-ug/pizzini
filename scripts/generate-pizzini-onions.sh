@@ -114,21 +114,26 @@ chmod 700 "$OUTDIR"
 ok "Output dir: $OUTDIR (chmod 700)"
 
 # ───── pre-flight: anything already done? ─────────────────────────────
+# Restart-friendly: pre-existing matches in $OUTDIR count, and we only
+# ask mkp224o to search for the prefixes we still need. Without this,
+# mkp224o would keep finding extra matches for already-done prefixes
+# until the completion poll catches up — pure wasted work on resume.
 shopt -s nullglob
-have=0
+remaining=()
 for prefix in "${PREFIXES[@]}"; do
     found=("$OUTDIR/${prefix}"*".onion")
     if (( ${#found[@]} > 0 )); then
-        have=$(( have + 1 ))
         ok "Already have $prefix → ${found[0]##*/}"
+    else
+        remaining+=("$prefix")
     fi
 done
 shopt -u nullglob
-if (( have == ${#PREFIXES[@]} )); then
+if (( ${#remaining[@]} == 0 )); then
     ok "All six prefixes already present. Nothing to do."
     exit 0
 fi
-say "Need to find $(( ${#PREFIXES[@]} - have )) more prefix(es)."
+say "Need to find ${#remaining[@]} more prefix(es): ${remaining[*]}"
 echo
 
 # ───── kick off mkp224o ───────────────────────────────────────────────
@@ -148,7 +153,7 @@ echo
     -t "$THREADS" \
     -S "$STATS_INTERVAL" \
     -s -v \
-    "${PREFIXES[@]}" &
+    "${remaining[@]}" &
 MKP_PID=$!
 
 cleanup() {
