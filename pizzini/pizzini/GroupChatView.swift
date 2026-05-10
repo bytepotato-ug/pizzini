@@ -135,6 +135,17 @@ struct GroupChatView: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                 }
+                .scrollDismissesKeyboard(.interactively)
+                // Single-tap on the chat area dismisses the keyboard,
+                // matching the 1:1 chat. `simultaneousGesture` keeps
+                // attachment-row buttons (Save to Files / Preview)
+                // and bubble text-selection working — they fire
+                // independently of this gesture.
+                .simultaneousGesture(
+                    TapGesture(count: 1).onEnded {
+                        composerFocused = false
+                    }
+                )
                 .onAppear { scrollToBottom(proxy, group: group) }
                 .onChange(of: group.log.count) { _, _ in
                     scrollToBottom(proxy, group: group)

@@ -19,6 +19,7 @@ struct ChatView: View {
     /// on a tier banner — both pre-send and post-receive surfaces use
     /// this to deep-link into FAQView at the right anchor.
     @State private var faqAnchor: FAQSection?
+    @FocusState private var composerFocused: Bool
     @Environment(\.dismiss) private var dismiss
 
     private var contact: Contact? {
@@ -49,6 +50,16 @@ struct ChatView: View {
                             let captured = contact
                             dismiss()
                             store.deleteChat(captured)
+                        }
+                    )
+                    // Single-tap dismisses the keyboard. Same gesture
+                    // recogniser shape as the panic three-tap above —
+                    // both are simultaneous, so a triple-tap also
+                    // dismisses on the first tap (and panic-deletes
+                    // on the third). On a single tap, only this fires.
+                    .simultaneousGesture(
+                        TapGesture(count: 1).onEnded {
+                            composerFocused = false
                         }
                     )
             }
@@ -276,6 +287,7 @@ struct ChatView: View {
                 text: $draft,
             )
                 .textFieldStyle(.roundedBorder)
+                .focused($composerFocused)
                 .submitLabel(.send)
                 .disabled(disabled)
                 .onSubmit { sendDraft(contact: contact) }
