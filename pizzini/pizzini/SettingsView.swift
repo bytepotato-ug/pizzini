@@ -49,6 +49,45 @@ struct SettingsView: View {
 
                 Section {
                     Toggle(isOn: Binding(
+                        get: { store.state.blockAppScreenshots },
+                        set: { store.setBlockAppScreenshots($0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Label("Block screenshots of Pizzini", systemImage: "eye.slash")
+                            Text("On by default. Wraps every screen — chats, QR, settings, all of it — in a secure container so screenshots, screen recording, AirPlay mirroring, and remote-screen-sharing tools see a black frame. iOS doesn't expose an official API for this; the technique is best-effort and tested at every iOS update. Costs: long-press → Copy on a chat bubble stops working, VoiceOver is degraded inside the wrapped views, and dictation may not work on the message composer.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .disabled(store.state.qrBlockEffective == false)
+                    Toggle(isOn: Binding(
+                        get: { store.state.notifyPeerOnScreenshot },
+                        set: { store.setNotifyPeerOnScreenshot($0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Label("Tell my contact when I screenshot", systemImage: "bell.badge")
+                            Text("Off by default. Sends a sealed marker to your contact when you screenshot one of their chats; they see a system row with your name in their copy of the chat (\"<your contact name> took a screenshot.\"). They cannot turn this off on their end once you opt in.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if store.state.qrBlockEffective == false {
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                            Text("On this iOS version, the screenshot-block technique didn't pass our runtime self-test. The screen-recording shield still works (chat content is hidden whenever iOS reports a recording or external display), but a still screenshot will capture what's on screen. We re-test on every iOS update.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("Screen capture")
+                } footer: {
+                    Text("Pizzini also detects screenshots and screen recording: a system row appears in the chat when you screenshot, and chats are hidden during screen recording or AirPlay. iOS does not let any app fully prevent screenshots — system-rendered alerts (camera permission, etc.) cannot be masked.")
+                }
+
+                Section {
+                    Toggle(isOn: Binding(
                         get: { store.state.quickLookPreviewEnabled },
                         set: { store.setQuickLookPreviewEnabled($0) }
                     )) {

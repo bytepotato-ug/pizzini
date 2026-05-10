@@ -1,9 +1,14 @@
 import XCTest
 
-/// Drives Settings → App lock and asserts the new screen-capture
-/// section's accessibility labels render. We don't try to flip iOS's
-/// recording state from a UITest (impossible from inside the sim), but
-/// we verify the user-facing toggles exist and the rows are tappable.
+/// Drives the top-level Settings sheet and asserts the screen-capture
+/// section renders. Previously this section was buried under
+/// Settings → App lock; users couldn't find it. Promoted to its own
+/// top-level Settings section alongside Connection / Security /
+/// Attachments / Help / Advanced.
+///
+/// We don't try to flip iOS's recording state from a UITest
+/// (impossible from inside the sim), but we verify the user-facing
+/// toggles exist and the rows are tappable from the Settings root.
 final class ScreenCaptureSettingsUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -26,42 +31,37 @@ final class ScreenCaptureSettingsUITests: XCTestCase {
     }
 
     @MainActor
-    func test_screenCaptureSection_rendersToggles() throws {
+    func test_screenCaptureSection_rendersAtSettingsRoot() throws {
         let app = XCUIApplication()
         app.launch()
         dismissOnboardingIfPresent(app)
 
-        // Open Settings → App lock from the home toolbar.
+        // Open Settings from the home toolbar.
         let gear = app.navigationBars.buttons["Settings"].firstMatch
         XCTAssertTrue(gear.waitForExistence(timeout: 5))
         gear.tap()
 
-        let appLockRow = app.buttons["App lock"].firstMatch
-        XCTAssertTrue(appLockRow.waitForExistence(timeout: 3))
-        appLockRow.tap()
-
-        // The section header is rendered as static text in the form.
+        // Section header is at the Settings root — no need to navigate
+        // into App lock anymore.
         let header = app.staticTexts["Screen capture"].firstMatch
         XCTAssertTrue(
             header.waitForExistence(timeout: 5),
-            "Screen-capture section should be visible under App lock",
+            "Screen-capture section should be visible at the Settings root",
         )
 
-        // Both toggles surface their label text — the section above can
-        // verify their accessibility labels rendered without us needing
-        // to actually flip them. (Toggling persists state through the
-        // Keychain and leaks across UITest runs; the brief asks for
-        // "rows render the expected accessibility labels", not
-        // round-tripping the state.)
+        // Both toggles surface their label text. The mask toggle is
+        // disabled when the runtime self-test failed (`qrBlockEffective
+        // == false`), but the row still renders, so this assertion
+        // holds either way.
+        let blockToggle = app.switches["Block screenshots of Pizzini"].firstMatch
+        XCTAssertTrue(
+            blockToggle.waitForExistence(timeout: 3),
+            "blockAppScreenshots toggle must render with its label",
+        )
         let notifyToggle = app.switches["Tell my contact when I screenshot"].firstMatch
         XCTAssertTrue(
             notifyToggle.waitForExistence(timeout: 3),
             "notifyPeerOnScreenshot toggle must render with its label",
-        )
-        let blockQRToggle = app.switches["Block screenshots of my QR"].firstMatch
-        XCTAssertTrue(
-            blockQRToggle.waitForExistence(timeout: 3),
-            "blockQRScreenshots toggle must render with its label",
         )
     }
 }
