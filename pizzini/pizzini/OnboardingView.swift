@@ -41,9 +41,10 @@ struct OnboardingView: View {
                 .font(.title.bold())
                 .multilineTextAlignment(.center)
             VStack(alignment: .leading, spacing: 14) {
+                iconRow("⏳", color: .secondary, label: "Waiting — your phone or the relay was offline.")
                 iconRow("✓", color: .secondary, label: "Sent to the relay.")
                 iconRow("✓✓", color: .blue, label: "Your contact's phone got it.")
-                iconRow("⏳", color: .secondary, label: "Waiting — your phone or the relay was offline.")
+                eyeRow(label: "They read it. (Only shows when your contact has read receipts on for you.)")
                 iconRow("✗", color: .red, label: "Expired before reaching them. Try again.")
             }
             .font(.body)
@@ -67,6 +68,20 @@ struct OnboardingView: View {
             Text(glyph)
                 .font(.title2.monospaced())
                 .foregroundStyle(color)
+                .frame(minWidth: 36, alignment: .leading)
+            Text(label)
+        }
+    }
+
+    /// SF-Symbol variant for the eye glyph. Kept separate from
+    /// `iconRow` because the unicode-Text path doesn't render an SF
+    /// Symbol cleanly at the same size; using `Image(systemName:)`
+    /// matches the live chat-row glyph in `ChatView.statusIcon`.
+    private func eyeRow(label: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Image(systemName: "eye.fill")
+                .font(.title2)
+                .foregroundStyle(.blue)
                 .frame(minWidth: 36, alignment: .leading)
             Text(label)
         }

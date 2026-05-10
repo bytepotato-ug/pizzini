@@ -108,10 +108,21 @@ struct GroupChatView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 6) {
-                        ForEach(group.log) { row in
+                        ForEach(Array(group.log.enumerated()), id: \.element.id) { idx, row in
+                            let prior = idx > 0 ? group.log[idx - 1] : nil
                             GroupChatBubble(
                                 message: row,
-                                senderName: senderName(for: row, in: group),
+                                // Dedup the sender name when the
+                                // immediately-prior row is from the same
+                                // peer — adjacent bubbles read as one
+                                // attributed run, matching the standard
+                                // messaging-app cadence (Signal /
+                                // iMessage / WhatsApp). A system row in
+                                // between resets the run because the
+                                // previous-row check is by senderPeerId.
+                                senderName: senderName(
+                                    for: row, in: group, previousRow: prior,
+                                ),
                                 resolveURL: { info in store.attachmentURL(for: info) },
                                 quickLookEnabled: store.state.quickLookPreviewEnabled,
                                 onInfoTap: { section in faqAnchor = section },
@@ -139,7 +150,14 @@ struct GroupChatView: View {
     /// Resolve the display name to render in the bubble's leading
     /// label (peer rows only). Self-attributed and system rows return
     /// nil; `GroupChatBubble` shows them without a "Name:" prefix.
-    private func senderName(for row: PersistedMessage, in group: ChatGroup) -> String? {
+    /// `previousRow` is the row immediately above this one in the log
+    /// — if it's from the same peer, this returns nil too so the
+    /// label appears once per run rather than once per bubble.
+    private func senderName(
+        for row: PersistedMessage,
+        in group: ChatGroup,
+        previousRow: PersistedMessage?,
+    ) -> String? {
         switch row.kind {
         case .system: return nil
         case .preKey, .whisper, .attachment:
@@ -147,6 +165,17 @@ struct GroupChatView: View {
             guard let peerId = row.senderPeerId else {
                 // Pre-MEDIUM-7 row: no senderPeerId stored. Fall back
                 // to whatever the row's text already includes.
+                return nil
+            }
+            // Run-of-same-sender suppression. The check is on
+            // `senderPeerId` rather than `side` so a `.me` row above a
+            // `.peer` row still surfaces the peer's label, and a system
+            // row above resets the run (system rows have nil
+            // senderPeerId and don't match).
+            if let prior = previousRow,
+               prior.side == .peer,
+               prior.kind != .system,
+               prior.senderPeerId == peerId {
                 return nil
             }
             return store.memberDisplayName(peerId, in: group)

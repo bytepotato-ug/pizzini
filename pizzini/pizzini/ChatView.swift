@@ -504,10 +504,7 @@ struct ChatRow: View {
                     .foregroundStyle(.secondary)
             }
             if entry.side == .me, let status, entry.kind != .system {
-                statusIcon(status)
-                if entry.readAt != nil, status == .delivered {
-                    Text("Read").foregroundStyle(.blue)
-                }
+                statusIcon(status, read: entry.readAt != nil)
             }
         }
         .font(.caption2)
@@ -520,15 +517,27 @@ struct ChatRow: View {
     // Glyphs match the explainer in OnboardingView's `.icons` step —
     // change one place and you change the other, otherwise the legend
     // and the live UI drift apart.
+    //
+    // Progression: ⏳ pending → ✓ sent → ✓✓ delivered → 👁 read. The
+    // eye REPLACES the ✓✓ rather than appending — one glyph scale, no
+    // redundant "Read" text. Honours `Contact.readReceiptsEnabled`-off
+    // by default: with no incoming readAt timestamp the eye never
+    // shows, the row stays at ✓✓ delivered.
     @ViewBuilder
-    private func statusIcon(_ status: OutboxEntry.Status) -> some View {
+    private func statusIcon(_ status: OutboxEntry.Status, read: Bool) -> some View {
         switch status {
         case .pending:
             Text("⏳").help("Queued — waiting for the connection")
         case .relayed:
             Text("✓").foregroundStyle(.secondary).help("Sent")
         case .delivered:
-            Text("✓✓").foregroundStyle(.blue).help("Delivered to their phone")
+            if read {
+                Image(systemName: "eye.fill")
+                    .foregroundStyle(.blue)
+                    .help("They read it")
+            } else {
+                Text("✓✓").foregroundStyle(.blue).help("Delivered to their phone")
+            }
         case .failed:
             Text("✗").foregroundStyle(.red).help("Expired before reaching them")
         }
