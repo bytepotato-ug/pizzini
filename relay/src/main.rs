@@ -110,6 +110,7 @@
 //! brings the app forward. On reconnect, the queue drains.
 
 mod apns;
+mod push_token_store;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -123,6 +124,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
 use crate::apns::{ApnsClient, ApnsConfig};
+use crate::push_token_store::PushTokenStore;
 
 const PORT: u16 = 7777;
 /// Protocol v3 adds the F-203 HELLO possession proof. The added fields
@@ -212,9 +214,15 @@ const TOKEN_MAX_FUTURE_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60 + 5 * 60;
 type PeerId = Vec<u8>;
 type Outbox = mpsc::UnboundedSender<Vec<u8>>;
 type Routes = Arc<Mutex<HashMap<PeerId, Outbox>>>;
-/// Lives across reconnects — that's the whole point: we look up the
-/// token when the recipient is *not* currently connected.
-type PushTokens = Arc<Mutex<HashMap<PeerId, Vec<u8>>>>;
+/// Persistent push-token store. Lives across reconnects (the whole
+/// point: we look up the token when the recipient is *not* currently
+/// connected) AND across relay restarts (the recent fix: before this
+/// the in-memory HashMap was wiped on every process bounce, silently
+/// breaking push for every paired device until the iOS app
+/// foregrounded and re-published its APNs token). See
+/// `push_token_store.rs` for the threat-model framing of the
+/// encryption-at-rest + TTL guard-rails.
+type PushTokens = Arc<Mutex<PushTokenStore>>;
 /// Per-recipient delivery-token verify key. Populated by the
 /// recipient's HELLO and refreshed on every successful
 /// `check_delivery_token` lookup. The value's `Instant` is the last
@@ -335,7 +343,26 @@ async fn main() -> std::io::Result<()> {
     };
 
     let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
-    let push_tokens: PushTokens = Arc::new(Mutex::new(HashMap::new()));
+    // Persistent push-token store. Built before the listener starts so
+    // we refuse to come up at all if the state files are corrupt /
+    // tampered (better than silently "recovering" by treating the map
+    // as empty, which would invalidate every paired device's push
+    // registration). The startup line below tells the operator where
+    // state lives and how many tokens survived the TTL purge.
+    let state_dir = PushTokenStore::resolve_state_dir();
+    let store = PushTokenStore::load_or_create(&state_dir).map_err(|e| {
+        eprintln!(
+            "[pizzini-relay] FATAL: could not open push-token store at {}: {e}",
+            state_dir.display(),
+        );
+        e
+    })?;
+    println!(
+        "  push-token store: {} ({} live tokens after TTL purge)",
+        state_dir.display(),
+        store.len(),
+    );
+    let push_tokens: PushTokens = Arc::new(Mutex::new(store));
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
     let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
     let replays: Replays = Arc::new(Mutex::new(HashMap::new()));
@@ -559,20 +586,30 @@ async fn read_loop(
                         continue;
                     }
                 };
-                push_tokens
+                let token_len = token.len();
+                // `insert` updates the in-memory map AND atomically
+                // rewrites the encrypted file on disk. A persistence
+                // error is logged but doesn't drop the connection —
+                // the in-memory copy is still valid for the current
+                // process lifetime, so push works at least until next
+                // restart. Better degradation than refusing the
+                // TOKEN_REGISTER outright and silently breaking push
+                // for this device.
+                match push_tokens
                     .lock()
                     .await
-                    .insert(self_id.to_vec(), token);
-                println!(
-                    "REGISTER_PUSH from {}: token recorded ({} byte token)",
-                    short_hex(self_id),
-                    push_tokens
-                        .lock()
-                        .await
-                        .get(self_id)
-                        .map(|v| v.len())
-                        .unwrap_or(0),
-                );
+                    .insert(self_id.to_vec(), token)
+                {
+                    Ok(()) => println!(
+                        "REGISTER_PUSH from {}: token recorded ({} bytes, persisted)",
+                        short_hex(self_id),
+                        token_len,
+                    ),
+                    Err(e) => eprintln!(
+                        "REGISTER_PUSH from {}: in-memory only — persist failed: {e}",
+                        short_hex(self_id),
+                    ),
+                }
             }
             FRAME_TYPE_SEND | FRAME_TYPE_ACK => {
                 let parsed = match parse_sealed(&frame[1..]) {
@@ -951,7 +988,7 @@ async fn maybe_send_push(
     apns: Option<&Arc<ApnsClient>>,
 ) {
     let Some(client) = apns else { return };
-    let token = match push_tokens.lock().await.get(recipient).cloned() {
+    let token = match push_tokens.lock().await.get_cloned(recipient) {
         Some(t) => t,
         None => return,
     };

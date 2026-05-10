@@ -24,6 +24,13 @@ libsignal-protocol = { git = "https://github.com/signalapp/libsignal.git", tag =
 # First-contact PoW verification on BUNDLE_REQUEST frames. Single hash
 # per request, sub-microsecond.
 blake3 = { version = "1", default-features = false }
+# Encryption-at-rest for the persistent push-token store. ChaCha20-
+# Poly1305 picked over AES-GCM so the relay doesn't depend on AES-NI
+# being present (some VPS / arm targets don't have it, and a software
+# AES fallback runs at a fraction of ChaCha's speed). 96-bit random
+# nonces are safe well past any realistic write count. See
+# `push_token_store.rs` for the threat-model framing of the persistence.
+chacha20poly1305 = "0.10"
 
 [dev-dependencies]
 # Used only by F-203 fix-review unit tests to construct signed HELLO

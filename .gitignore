@@ -41,3 +41,10 @@ target/
 .env
 .env.*
 !.env.example
+
+# Relay persistent state — encrypted push-token store + sibling key file.
+# Default location written by the relay process is the working directory;
+# operators with a different `PIZZINI_RELAY_STATE_DIR` should keep their
+# state outside the repo, but the default path is excluded here as a
+# belt-and-braces guard against an accidental `git add .`.
+pizzini-relay-state/
