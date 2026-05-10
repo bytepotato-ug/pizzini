@@ -64,32 +64,48 @@ struct ScreenCaptureMonitorTests {
         #expect(fired)
     }
 
-    @Test("capturedDidChange does not crash and matches UIScreen.main")
-    func capturedDidChangeMatchesScreen() async {
+    @Test("capturedDidChange does not crash and reflects the active scene's screen")
+    func capturedDidChangeMatchesScene() async {
         let monitor = ScreenCaptureMonitor.shared
         NotificationCenter.default.post(
             name: UIScreen.capturedDidChangeNotification,
             object: UIScreen.main,
         )
         await settle()
-        #expect(monitor.isRecording == UIScreen.main.isCaptured)
+        // Compute the expected value via the same scene-based path
+        // the monitor uses. The unit-test runtime has no foreground
+        // scene, so this gracefully falls back to UIScreen.main —
+        // which is fine, that's exactly the launch-time fallback the
+        // production code documents.
+        let expected = UIScreen.main.isCaptured
+        #expect(monitor.isRecording == expected)
     }
 
-    @Test("screen connect/disconnect drives hasExternalDisplay from UIScreen.screens")
-    func screenConnectDisconnectMatchesCount() async {
+    @Test("scene connect/disconnect drives hasExternalDisplay from connectedScenes")
+    func sceneConnectDisconnectMatchesScenes() async {
         let monitor = ScreenCaptureMonitor.shared
+        // Modern (iOS 16+) scene-lifecycle notifications. These are
+        // the same notifications PrivacyShieldWindow observes; the
+        // legacy UIScreen.didConnect/Disconnect pair was deprecated
+        // in iOS 16 alongside UIScreen.screens.
         NotificationCenter.default.post(
-            name: UIScreen.didConnectNotification,
-            object: UIScreen.main,
+            name: UIScene.willConnectNotification,
+            object: nil,
         )
         await settle()
-        #expect(monitor.hasExternalDisplay == (UIScreen.screens.count > 1))
+        let expectedAfterConnect = UIApplication.shared.connectedScenes.contains {
+            $0.session.role == .windowExternalDisplayNonInteractive
+        }
+        #expect(monitor.hasExternalDisplay == expectedAfterConnect)
         NotificationCenter.default.post(
-            name: UIScreen.didDisconnectNotification,
-            object: UIScreen.main,
+            name: UIScene.didDisconnectNotification,
+            object: nil,
         )
         await settle()
-        #expect(monitor.hasExternalDisplay == (UIScreen.screens.count > 1))
+        let expectedAfterDisconnect = UIApplication.shared.connectedScenes.contains {
+            $0.session.role == .windowExternalDisplayNonInteractive
+        }
+        #expect(monitor.hasExternalDisplay == expectedAfterDisconnect)
     }
 
     @Test("test seams flip flags as expected")
