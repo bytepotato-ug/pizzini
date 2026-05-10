@@ -354,6 +354,48 @@ public final class Session: @unchecked Sendable {
         }
     }
 
+    /// Verify an XEd25519 signature `sig` over `message`, claimed to
+    /// have been produced by the `IdentityKey` whose 33-byte serialized
+    /// public half is `identityPub`. Returns `true` on a valid
+    /// signature, `false` if the signature does not match. Throws
+    /// `CryptoCoreError.invalidArgument` for length / null mismatches.
+    ///
+    /// Used by the Swift host to authenticate signed `GroupOp` log
+    /// entries: the operator's identity-public is embedded in the op
+    /// header and the recipient verifies the signature before applying
+    /// the op or persisting it. Stateless — does not require a live
+    /// `Session` because verification is a public-key operation.
+    public static func verifyIdentitySignature(
+        identityPub: Data,
+        message: Data,
+        signature: Data,
+    ) throws -> Bool {
+        let rc = identityPub.withUnsafeBytes { idPtr -> Int32 in
+            message.withUnsafeBytes { msgPtr -> Int32 in
+                signature.withUnsafeBytes { sigPtr -> Int32 in
+                    pizzini_verify_identity_signature(
+                        idPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        UInt(identityPub.count),
+                        msgPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        UInt(message.count),
+                        sigPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        UInt(signature.count),
+                    )
+                }
+            }
+        }
+        switch rc {
+        case PIZZINI_OK:
+            return true
+        case PIZZINI_ERR_BAD_SIGNATURE:
+            return false
+        case PIZZINI_ERR_INVALID_ARG:
+            throw CryptoCoreError.invalidArgument
+        default:
+            throw CryptoCoreError.internalError
+        }
+    }
+
     /// Mints (or refreshes) the cached SenderCertificate. Production
     /// callers don't need this — `encryptSealed` calls it implicitly —
     /// but it's handy for diagnostics ("can my store actually issue a
@@ -512,6 +554,129 @@ public final class Session: @unchecked Sendable {
         return Data(buf.prefix(Int(len)))
     }
 
+    // ─── Group cipher (libsignal Sender Keys) ────────────────────────
+    //
+    // Wrappers around the four `pizzini_store_*` exports added in
+    // slice 1. Caller responsibilities:
+    //
+    //   1. The `distributionId` is libsignal's per-CHAIN identifier,
+    //      not the public group ID. Each rotation = pick a fresh
+    //      `UUID()`. Old chains stay in the store so late-arriving
+    //      ciphertext still decrypts.
+    //   2. `senderIdentity` is the 33-byte identity-public verified
+    //      via the sealed-sender unwrap. Passing the wrong identity
+    //      surfaces as a generic `internalError` rather than a
+    //      specific signature-mismatch error — the FFI error path
+    //      collapses libsignal's distinctions to keep the surface
+    //      narrow.
+    //   3. The plaintext / ciphertext blobs are the bytes that ride
+    //      INSIDE the `groupChat = 0x06` / `groupKeyDistribution =
+    //      0x07` inner envelopes; the outer sealed-sender wrap is
+    //      handled elsewhere.
+    //
+    // See `crypto-core/tests/group_cipher.rs` for the wire-level
+    // round-trip and persistence tests; the Swift-side tests in
+    // `swift/Tests/PizziniCryptoCoreTests/PizziniCryptoCoreTests.swift`
+    // exercise the same paths through this bridge.
+
+    /// Generate (or recover) the SKDM bytes for our local sender-key
+    /// chain at `distributionId`. Calling twice with the same
+    /// `distributionId` reuses the existing chain — rotation is
+    /// "pick a fresh `UUID` and call again."
+    public func senderKeyDistributionCreate(distributionId: UUID) throws -> Data {
+        guard let handle else { throw CryptoCoreError.invalidArgument }
+        var distBytes = distributionId.distributionIdBytes
+        return try readBlob(initialCap: 256) { handle, buf, cap, len in
+            distBytes.withUnsafeBufferPointer { distPtr in
+                pizzini_store_sender_key_distribution_create(
+                    handle,
+                    distPtr.baseAddress,
+                    buf, cap, len,
+                )
+            }
+        }
+    }
+
+    /// Process a peer's incoming SKDM. `senderIdentity` is the verified
+    /// 33-byte identity-public from the sealed-sender unwrap. Returns
+    /// the `UUID` (distribution_id) embedded in the SKDM so the caller
+    /// can update its `ChatGroup.memberDistributionIds` in lockstep.
+    @discardableResult
+    public func senderKeyDistributionProcess(
+        senderIdentity: Data,
+        skdm: Data,
+    ) throws -> UUID {
+        guard let handle else { throw CryptoCoreError.invalidArgument }
+        var distBytes = [UInt8](repeating: 0, count: 16)
+        let rc = senderIdentity.withUnsafeBytes { senderPtr -> Int32 in
+            skdm.withUnsafeBytes { skdmPtr -> Int32 in
+                distBytes.withUnsafeMutableBufferPointer { distPtr in
+                    pizzini_store_sender_key_distribution_process(
+                        handle,
+                        senderPtr.bindMemory(to: UInt8.self).baseAddress,
+                        UInt(senderIdentity.count),
+                        skdmPtr.bindMemory(to: UInt8.self).baseAddress,
+                        UInt(skdm.count),
+                        distPtr.baseAddress,
+                    )
+                }
+            }
+        }
+        try mapRC(rc)
+        return UUID(distributionIdBytes: distBytes)
+    }
+
+    /// Encrypt `plaintext` for the chain identified by `distributionId`.
+    /// Caller must have called `senderKeyDistributionCreate(distributionId:)`
+    /// first; otherwise libsignal returns `NoSenderKeyState` (mapped to
+    /// `internalError`). The output is the `SenderKeyMessage` body of a
+    /// `groupChat = 0x06` inner envelope — caller prepends the 16-byte
+    /// `groupId` and wraps the result in N pairwise sealed-sender
+    /// envelopes for fan-out.
+    public func groupEncrypt(distributionId: UUID, plaintext: Data) throws -> Data {
+        guard let handle else { throw CryptoCoreError.invalidArgument }
+        var distBytes = distributionId.distributionIdBytes
+        let initial = max(plaintext.count + 256, 1024)
+        return try readBlob(initialCap: initial) { handle, buf, cap, len in
+            distBytes.withUnsafeBufferPointer { distPtr in
+                plaintext.withUnsafeBytes { ptPtr -> Int32 in
+                    pizzini_store_group_encrypt(
+                        handle,
+                        distPtr.baseAddress,
+                        ptPtr.bindMemory(to: UInt8.self).baseAddress,
+                        UInt(plaintext.count),
+                        buf, cap, len,
+                    )
+                }
+            }
+        }
+    }
+
+    /// Decrypt a `SenderKeyMessage` from `senderIdentity`. The
+    /// distribution_id is encoded in the ciphertext header and looked
+    /// up against the SKDM previously processed via
+    /// `senderKeyDistributionProcess(senderIdentity:skdm:)`. Throws
+    /// `internalError` if the chain isn't installed (the host should
+    /// trigger an SKDM exchange) or the signature fails.
+    public func groupDecrypt(senderIdentity: Data, ciphertext: Data) throws -> Data {
+        guard let handle else { throw CryptoCoreError.invalidArgument }
+        let initial = max(ciphertext.count + 256, 1024)
+        return try readBlob(initialCap: initial) { handle, buf, cap, len in
+            senderIdentity.withUnsafeBytes { senderPtr -> Int32 in
+                ciphertext.withUnsafeBytes { ctPtr -> Int32 in
+                    pizzini_store_group_decrypt(
+                        handle,
+                        senderPtr.bindMemory(to: UInt8.self).baseAddress,
+                        UInt(senderIdentity.count),
+                        ctPtr.bindMemory(to: UInt8.self).baseAddress,
+                        UInt(ciphertext.count),
+                        buf, cap, len,
+                    )
+                }
+            }
+        }
+    }
+
     private func mapRC(_ rc: Int32) throws {
         switch rc {
         case PIZZINI_OK: return
@@ -520,6 +685,27 @@ public final class Session: @unchecked Sendable {
         case PIZZINI_ERR_INTERNAL: throw CryptoCoreError.internalError
         default: throw CryptoCoreError.unknown(code: rc)
         }
+    }
+}
+
+private extension UUID {
+    /// 16 raw bytes in libsignal's expected order (the `Uuid::from_bytes`
+    /// input). Foundation's `UUID.uuid` gives us a `uuid_t` tuple in
+    /// the same order, so this is a direct copy.
+    var distributionIdBytes: [UInt8] {
+        let u = self.uuid
+        return [
+            u.0, u.1, u.2, u.3, u.4, u.5, u.6, u.7,
+            u.8, u.9, u.10, u.11, u.12, u.13, u.14, u.15,
+        ]
+    }
+
+    init(distributionIdBytes b: [UInt8]) {
+        precondition(b.count == 16)
+        self.init(uuid: (
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+        ))
     }
 }
 

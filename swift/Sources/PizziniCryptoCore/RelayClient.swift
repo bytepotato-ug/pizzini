@@ -78,6 +78,39 @@ public final class RelayClient: @unchecked Sendable {
         /// frame type because adding a new outer frame would leak chunk
         /// count + total size to the relay; sealed-sender hides them.
         case fileChunk = 0x05
+        /// Group chat (Phase 6). Body: `groupId(16) ‖ SenderKeyMessage`.
+        /// Sender encrypts plaintext once via libsignal `group_encrypt`
+        /// and broadcasts the resulting ciphertext as N independent
+        /// pairwise sealed-sender envelopes, one per group recipient.
+        /// The relay sees N independent 1:1 sends with opaque payloads
+        /// and learns nothing about group membership.
+        case groupChat = 0x06
+        /// Group sender-key distribution (Phase 6). Body:
+        /// `groupId(16) ‖ SenderKeyDistributionMessage`. Shipped 1:1
+        /// from a group member to each recipient when they enrol or
+        /// rotate their sender-key chain. Carries the chain key plus
+        /// the operator's distribution_id; the recipient feeds it to
+        /// `process_sender_key_distribution_message` to install the
+        /// chain and later decrypt that operator's `groupChat` output.
+        case groupKeyDistribution = 0x07
+        /// Signed group operation (Phase 6). Body: the wire bytes of
+        /// a `GroupOp` (op-version-1 header + 64-byte XEd25519
+        /// signature). Broadcast to every current and incoming group
+        /// member so each device's `ChatGroup` can replay the op log
+        /// and converge on the same membership / role / chain-id
+        /// state. See `GroupOp.swift` for the exact wire format.
+        case groupOp = 0x08
+        /// Signed group-state bootstrap (Phase 6, slice 4). Body:
+        /// `groupId(16) ‖ GroupBootstrap bytes`. Sent by an inviting
+        /// admin alongside the `AddMember` op so a newcomer can
+        /// reconstruct local `ChatGroup` state (members, current
+        /// epoch, last digest, name) without replaying the op chain.
+        /// Trust anchor: the receiver verifies (a) the embedded
+        /// signature, (b) the immediate sealed-sender is the bootstrap
+        /// operator (no forwarding), and (c) the operator is in the
+        /// receiver's 1:1 contacts. Without all three, the bootstrap
+        /// is dropped — the same trust gate as the Create op.
+        case groupBootstrap = 0x09
     }
     private static let frameTypeHello: UInt8 = 1
     private static let frameTypeSend: UInt8 = 2

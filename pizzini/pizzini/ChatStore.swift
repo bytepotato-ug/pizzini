@@ -26,7 +26,12 @@ final class ChatStore: NSObject {
 
     // Public, observable.
     var relayState: RelayClient.State = .idle
-    private(set) var state: AppState
+    /// Persisted app state. Module-internal access (the default) so
+    /// extensions in `ChatStoreGroups.swift` can mutate group rows
+    /// directly; the iOS app target is a single module so the UI
+    /// surfaces also see the setter — they drive mutation through
+    /// ChatStore methods by convention rather than language guard.
+    var state: AppState
     private(set) var outbox: OutboxStore
     private(set) var initError: String?
     /// True iff the most recent attempt to persist the libsignal session
@@ -44,9 +49,13 @@ final class ChatStore: NSObject {
         return ContactCard(peerId: myId, host: state.relayHost, port: Self.relayPort)
     }
 
-    // Internal.
-    private var session: Session?
-    private var relay: RelayClient?
+    // Internal — module-level access so extensions
+    // (`ChatStoreGroups.swift`) can drive sealed-sender sends and
+    // sign group ops without re-piping every call through a
+    // proliferation of public methods. Still hidden from any
+    // out-of-module consumer.
+    var session: Session?
+    var relay: RelayClient?
     private var myIdentityPublicCached: Data?
     /// Latest APNs token. Stashed so a relay-host change (which builds
     /// a fresh `RelayClient`) re-publishes the token automatically.
@@ -765,6 +774,14 @@ final class ChatStore: NSObject {
     /// Pop one token from `contact.deliveryTokensForPeer`. Persists.
     /// Returns nil if the stash is empty — caller must trigger a
     /// refill before retrying.
+    /// Pop one delivery token from `state.contacts[idx]`'s stash.
+    /// Internal-not-private so the group fan-out path in
+    /// `ChatStoreGroups.swift` can borrow tokens per-recipient
+    /// without re-implementing the rate-limit + refill logic.
+    func popDeliveryTokenPublic(forContactAt idx: Int) -> Data? {
+        popDeliveryToken(forContactAt: idx)
+    }
+
     private func popDeliveryToken(forContactAt idx: Int) -> Data? {
         guard !state.contacts[idx].deliveryTokensForPeer.isEmpty else { return nil }
         let token = state.contacts[idx].deliveryTokensForPeer.removeFirst()
@@ -1007,20 +1024,19 @@ final class ChatStore: NSObject {
     /// the runtime self-test for the underlying `isSecureTextEntry`
     /// technique passed on this iOS version. The mask is unconditional
     /// when the technique works; there is no user-facing toggle. Read
-    /// from every surface that opts into the mask via the
-    /// `.maskAppContents()` view modifier.
+    /// by `WindowSecureMask` before reparenting a scene's window.
     ///
     /// When the self-test fails (Apple has narrowed the technique on
-    /// this iOS) the mask falls back to no-wrap rather than
-    /// silently leave users with broken accessibility AND no
-    /// protection — that combination is strictly worse than no wrap.
-    /// The fallback is documented in the FAQ.
+    /// this iOS) `WindowSecureMask` skips the reparent rather than
+    /// falsely advertise protection. The degraded state is surfaced
+    /// to the user via the "Screenshot protection — degraded" Settings
+    /// notice and documented in the FAQ.
     var shouldMaskAppContents: Bool {
         state.qrBlockEffective != false
     }
 
     /// Persist the runtime-self-test result for the QR-block trick.
-    /// Called by `SecureScreenshotShield.runtimeSelfTest` once on first
+    /// Called by `SecureScreenshotSelfTest.runIfNeeded` once on first
     /// launch and again after every iOS major-version change.
     func setQRBlockEffective(_ effective: Bool, osVersion: String) {
         state.qrBlockEffective = effective
@@ -1095,7 +1111,16 @@ final class ChatStore: NSObject {
     /// outbound message reuses an already-consumed counter and the peer
     /// rejects with `DuplicatedMessage`. Cheap to call — the blob is
     /// kilobytes and Keychain writes are async.
-    private func persistSession() {
+    /// Flush the libsignal session state to Keychain. Internal so the
+    /// group surface can flush after every group_encrypt /
+    /// senderKeyDistributionCreate / group_decrypt — those advance
+    /// libsignal's internal stores the same way 1:1 ratchet
+    /// operations do.
+    func persistSession() {
+        persistSessionImpl()
+    }
+
+    private func persistSessionImpl() {
         guard let session else { return }
         do {
             try Storage.persist(session: session)
@@ -1311,6 +1336,14 @@ extension ChatStore: RelayClientDelegate {
                 ackId: received.messageId,
                 via: client,
             )
+        case .groupChat:
+            self.handleGroupChat(payload: Data(payload), fromPeer: received.peer)
+        case .groupKeyDistribution:
+            self.handleGroupKeyDistribution(payload: Data(payload), fromPeer: received.peer)
+        case .groupOp:
+            self.handleGroupOp(payload: Data(payload), fromPeer: received.peer)
+        case .groupBootstrap:
+            self.handleGroupBootstrap(payload: Data(payload), fromPeer: received.peer)
         }
         // Defensive: an ACK arriving on the SEND channel would have
         // landed in the chat path above unless its inner-kind byte is
@@ -1692,7 +1725,11 @@ extension ChatStore: RelayClientDelegate {
         }
     }
 
-    private func short(_ data: Data) -> String {
+    /// 4-byte hex fingerprint shorthand for log lines and system rows.
+    /// Internal-not-private so the group surface in
+    /// `ChatStoreGroups.swift` can render the same shorthand without
+    /// duplicating the formatter.
+    func short(_ data: Data) -> String {
         let head = data.prefix(4).map { String(format: "%02x", $0) }.joined()
         return head + "…"
     }

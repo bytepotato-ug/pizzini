@@ -1428,6 +1428,7 @@ dependencies = [
  "libsignal-protocol",
  "rand",
  "sha2",
+ "uuid",
 ]
 
 [[package]]

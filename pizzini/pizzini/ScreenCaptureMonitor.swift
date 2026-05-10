@@ -19,13 +19,13 @@ import UIKit
 ///    `isCaptured` and (1) catches it instead.
 ///
 /// **What we do NOT observe.** `UIApplication.userDidTakeScreenshotNotification`
-/// is unused — Pizzini's screenshot defence is the unconditional
-/// `SecureScreenshotShield` wrap (see `.maskAppContents()`). When the
-/// wrap works, screenshots capture a black frame and there's no
+/// is unused — Pizzini's screenshot defence is the window-level
+/// `WindowSecureMask` reparent (installed from AppDelegate). When the
+/// reparent works, screenshots capture a black frame and there's no
 /// after-the-fact reaction worth taking; when it doesn't (Apple has
 /// closed the gap on this iOS), reacting to the notification doesn't
-/// rebuild the protection. The wrap is the answer; this monitor only
-/// watches the live-recording surface that needs an extra in-body
+/// rebuild the protection. The reparent is the answer; this monitor
+/// only watches the live-recording surface that needs an extra in-body
 /// shield overlay.
 ///
 /// **API choice — why scene-based, not screen-based.** Apple

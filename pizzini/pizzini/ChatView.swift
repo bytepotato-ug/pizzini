@@ -97,7 +97,6 @@ struct ChatView: View {
             // screen with the arrow pointing nowhere.
             .sheet(item: $faqAnchor) { anchor in
                 FAQView(initialSection: anchor) { faqAnchor = nil }
-                    .maskAppContents()
             }
             .sheet(isPresented: $showPhotoPicker) {
                 PhotoVideoPicker(
@@ -109,7 +108,6 @@ struct ChatView: View {
                     },
                     onCancel: { showPhotoPicker = false },
                 )
-                .maskAppContents()
             }
             .sheet(isPresented: $showDocumentPicker) {
                 DocumentPicker(
@@ -121,7 +119,6 @@ struct ChatView: View {
                     },
                     onCancel: { showDocumentPicker = false },
                 )
-                .maskAppContents()
             }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {

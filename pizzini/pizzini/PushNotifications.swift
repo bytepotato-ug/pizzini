@@ -22,6 +22,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // Install before any UI work so the observers are armed before
         // the first scene connection.
         PrivacyShieldWindow.shared.install()
+        // Window-level screenshot mask: reparents each scene's main
+        // window under a secure UITextField's layer, so the entire app
+        // (including pushed views, sheets, full-screen covers — any
+        // surface presented in the same window) is rendered as a black
+        // frame in screenshots / mirroring / AirPlay capture. Layer-
+        // only manipulation, view hierarchy untouched, so SwiftUI safe-
+        // area handling is unaffected. See class doc for caveats.
+        WindowSecureMask.shared.install()
         // Phase 5 self-test for the QR-screenshot-block trick. Runs
         // once on first launch; re-runs whenever the iOS major version
         // changes. Cheap (one offscreen UIView render) and idempotent —

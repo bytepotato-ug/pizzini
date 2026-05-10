@@ -77,14 +77,15 @@ struct ContentView: View {
                 PrivacyShieldView()
             }
         }
-        // App-wide screenshot mask. Wraps the ENTIRE ZStack — including
-        // the contacts UI, the lock overlay, the keychain banner, and
-        // the in-flight privacy shield — in a secure-text-entry
-        // container so screenshots / mirroring / AirPlay capture a
-        // black frame. Sheets and full-screen covers below get their
-        // own .maskAppContents() because SwiftUI presents them outside
-        // this view's hierarchy.
-        .maskAppContents()
+        // App-wide screenshot mask is applied at the window-CALayer
+        // level by `WindowSecureMask` — installed once from
+        // `AppDelegate.application(_:didFinishLaunchingWithOptions:)`
+        // and propagating to every surface presented in the same
+        // window (the contacts UI, sheets, full-screen covers, the
+        // lock overlay). The view hierarchy is left untouched, which
+        // is why Form / `.insetGrouped` List backgrounds extend
+        // through the safe areas correctly. Sheets and covers do NOT
+        // need a per-presentation modifier — they share the window.
         .onReceive(NotificationCenter.default.publisher(for: UIScene.willDeactivateNotification)) { _ in
             lockManager.handleWillDeactivate()
         }
@@ -112,7 +113,6 @@ struct ContentView: View {
             OnboardingView { enableBiometric in
                 store.completeOnboarding(enableBiometric: enableBiometric)
             }
-            .maskAppContents()
         }
         .sheet(isPresented: $showScanner) {
             QRScannerView(
@@ -122,7 +122,6 @@ struct ContentView: View {
                 },
                 onCancel: { showScanner = false }
             )
-            .maskAppContents()
         }
         .alert(
             "Add contact",
@@ -146,11 +145,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showMyQR) {
             MyQRSheet(card: store.myCard, onDone: { showMyQR = false })
-                .maskAppContents()
         }
         .sheet(item: $integrityFAQ) { anchor in
             FAQView(initialSection: anchor) { integrityFAQ = nil }
-                .maskAppContents()
         }
     }
 
@@ -359,10 +356,11 @@ private struct MyQRSheet: View {
                     Button {
                         withAnimation(.easeInOut(duration: 0.15)) { revealed = false }
                     } label: {
-                        // Per-QR `SecureScreenshotShield` removed — the
-                        // entire sheet is now wrapped at presentation
-                        // time via `.maskAppContents()` in ContentView,
-                        // which subsumes this surface.
+                        // The window-level `WindowSecureMask` masks
+                        // every surface in the app's window — sheets,
+                        // covers, this QR — from the screenshot /
+                        // mirroring / AirPlay capture pipeline. No
+                        // per-view shield is required here.
                         ContactQRImage(card: card)
                     }
                     .buttonStyle(.plain)

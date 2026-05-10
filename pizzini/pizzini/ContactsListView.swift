@@ -11,10 +11,14 @@ struct ContactsListView: View {
     /// Confirmation-dialog state for the `+` add-contact action sheet.
     /// Local to the toolbar — no need to plumb up to ContentView.
     @State private var showAddContactDialog = false
+    /// Sheet that lets the user assemble a new group (name + initial
+    /// 1:1 contacts to invite). Local to the list — surfaced via the
+    /// "+" toolbar menu.
+    @State private var showNewGroupSheet = false
 
     var body: some View {
         ZStack {
-            if store.state.contacts.isEmpty {
+            if store.state.contacts.isEmpty, store.state.groups.isEmpty {
                 emptyState
             } else {
                 list
@@ -47,7 +51,7 @@ struct ContactsListView: View {
                 // it as the popover anchor — placing it on the parent
                 // view makes the arrow point at random screen edges.
                 .confirmationDialog(
-                    "Add a contact",
+                    "Add a contact or group",
                     isPresented: $showAddContactDialog,
                     titleVisibility: .visible,
                 ) {
@@ -57,9 +61,13 @@ struct ContactsListView: View {
                             onPasteContact(s)
                         }
                     } label: { Text("Paste from clipboard") }
+                    Button {
+                        showNewGroupSheet = true
+                    } label: { Text("New group…") }
+                        .disabled(store.state.contacts.isEmpty)
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("Pair by scanning the other person's QR. They need to scan you back too.")
+                    Text("Pair contacts via QR. Groups are made up of contacts you've already paired with.")
                 }
             }
             ToolbarItem(placement: .principal) {
@@ -134,22 +142,53 @@ struct ContactsListView: View {
 
     private var list: some View {
         List {
-            ForEach(store.state.contacts) { contact in
-                NavigationLink {
-                    ChatView(store: store, contactID: contact.id)
-                } label: {
-                    ContactRow(contact: contact)
+            // Groups first when any exist — they are usually the
+            // active conversations a user opens repeatedly. Within
+            // each section the rows are sorted by `lastMessageAt`
+            // (most recent first) with a stable name fallback.
+            if !store.state.groups.isEmpty {
+                Section("Groups") {
+                    ForEach(sortedGroups) { group in
+                        NavigationLink {
+                            GroupChatView(store: store, groupID: group.id)
+                        } label: {
+                            GroupRow(group: group, store: store)
+                        }
+                    }
                 }
-                .swipeActions(edge: .trailing) {
-                    Button(role: .destructive) {
-                        store.deleteContact(contact)
+            }
+            Section(store.state.groups.isEmpty ? "" : "Contacts") {
+                ForEach(store.state.contacts) { contact in
+                    NavigationLink {
+                        ChatView(store: store, contactID: contact.id)
                     } label: {
-                        Label("Delete", systemImage: "trash")
+                        ContactRow(contact: contact)
+                    }
+                    .swipeActions(edge: .trailing) {
+                        Button(role: .destructive) {
+                            store.deleteContact(contact)
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
                     }
                 }
             }
         }
         .listStyle(.plain)
+        .sheet(isPresented: $showNewGroupSheet) {
+            NewGroupSheet(store: store, onDismiss: { showNewGroupSheet = false })
+        }
+    }
+
+    private var sortedGroups: [ChatGroup] {
+        store.state.groups.sorted { lhs, rhs in
+            switch (lhs.lastMessageAt, rhs.lastMessageAt) {
+            case let (l?, r?): return l > r
+            case (_?, nil): return true
+            case (nil, _?): return false
+            case (nil, nil): return lhs.displayName < rhs.displayName
+            }
+        }
     }
 
     /// Surface a connection status only when something is wrong.
@@ -255,6 +294,73 @@ private struct ContactRow: View {
                 return "\(prefix)📎 \(name)"
             }
             return "\(prefix)📎 \(name) — \(msg.text)"
+        }
+    }
+}
+
+/// One row for a group on the contacts list. Mirrors `ContactRow`'s
+/// shape so the user reads the two surfaces with the same eye:
+/// title (with optional pending hourglass), one-line preview of the
+/// most-recent log entry. We intentionally do NOT render member
+/// fingerprints / member counts / "online" indicators on the row —
+/// presence and member identity belong on the group's settings
+/// screen, not the list.
+///
+/// Takes a `store` reference so the preview prefix renders the
+/// sender's *current* contact display name (audit MEDIUM-7) — a
+/// rename in the contacts list immediately propagates to every
+/// historical group preview without rewriting `log.text`.
+private struct GroupRow: View {
+    let group: ChatGroup
+    let store: ChatStore
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "person.3.fill")
+                .font(.title3)
+                .foregroundStyle(.tint)
+                .frame(width: 28)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    if group.activeMembers.contains(where: { $0.status == .pendingSKDM }) {
+                        Image(systemName: "hourglass")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .accessibilityLabel("waiting for keys to exchange")
+                    }
+                    Text(group.displayName)
+                        .font(.body.weight(.semibold))
+                }
+                if let last = group.log.last {
+                    Text(preview(last))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    Text("\(group.activeMembers.count) members — no messages yet")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 8)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func preview(_ msg: PersistedMessage) -> String {
+        switch msg.kind {
+        case .system: return msg.text
+        case .preKey, .whisper, .attachment:
+            switch msg.side {
+            case .me:
+                return "you: \(msg.text)"
+            case .peer:
+                if let peerId = msg.senderPeerId {
+                    return "\(store.memberDisplayName(peerId, in: group)): \(msg.text)"
+                }
+                return msg.text
+            }
         }
     }
 }

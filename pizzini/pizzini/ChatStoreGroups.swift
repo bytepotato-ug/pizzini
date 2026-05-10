@@ -1,0 +1,1374 @@
+import Foundation
+import PizziniCryptoCore
+
+/// Group-chat surface on `ChatStore`. Lives in its own file to keep
+/// ChatStore.swift's 1.5K-line core legible while still piggybacking
+/// on its `state`, `session`, `relay`, and outbox plumbing.
+///
+/// Trust gates (audit fixes):
+///
+/// * `handleGroupOp` for `Create` requires the sender to BE the
+///   operator (no forwarding) AND the operator to be in our 1:1
+///   contacts. Same gate applied to `handleGroupBootstrap`.
+///   (CRITICAL-1.)
+/// * `handleGroupChat` decrypts only when the sender is an active
+///   member of the named group. (CRITICAL-2.)
+/// * `handleGroupKeyDistribution` installs a peer's chain only when
+///   the group exists locally AND the peer is an active member of it.
+///   (CRITICAL-3.)
+///
+/// Bidirectional SKDM exchange (HIGH-2): every time the group's
+/// member set or our chain changes, the host calls
+/// `ensureMySKDMReachesActiveMembers` to ship our current SKDM to any
+/// active member who hasn't yet received it. The set of recipients
+/// we've already shipped to lives on `ChatGroup.mySkdmRecipients` and
+/// resets on rotation.
+///
+/// Mandatory rotation on remove (HIGH-1): every remaining active
+/// member rotates their own chain when a `RemoveMember` op lands —
+/// not just the admin who issued it. The state machine sets a
+/// `requestSelfRotation` flag in `ApplySideEffects`; the host fires
+/// one `rotateMyGroupChain` per call (coalesced regardless of how
+/// many removes arrived in the same drain).
+///
+/// Wiring summary:
+///
+/// **Outbound** (this file):
+///   - `createGroup`     — mint groupId, sign Create op, generate
+///                         local sender-key, broadcast op + SKDM to
+///                         every invitee.
+///   - `inviteToGroup`   — admin-only; build AddMember op, ship a
+///                         signed `GroupBootstrap` to the newcomer
+///                         (so they can build local state without an
+///                         op-chain replay), broadcast the AddMember
+///                         to all current members, ship our current
+///                         SKDM to the newcomer.
+///   - `removeFromGroup` — admin-only; build RemoveMember op,
+///                         broadcast, mark our local row as removed,
+///                         then rotate our own chain so the removed
+///                         member can no longer decrypt.
+///   - `renameGroup`     — admin-only; signed Rename op.
+///   - `promoteAdmin` / `demoteAdmin` — admin-only role flips with
+///                         last-admin protection.
+///   - `sendGroupMessage` — encrypt once with our chain, fan out N
+///                          sealed-sender envelopes (one per active
+///                          member except self).
+///   - `rotateMyGroupChain` — mint a fresh dist_id, sign a
+///                            RotateSenderKey op, broadcast op + new
+///                            SKDM to every active member.
+///
+/// **Inbound** (this file too): handlers for the four group inner-
+/// envelope kinds — `handleGroupOp(...)`,
+/// `handleGroupKeyDistribution(...)`, `handleGroupChat(...)`,
+/// `handleGroupBootstrap(...)`.
+extension ChatStore {
+    // ─── Outbound: create / invite / remove / rename / roles ────────
+
+    /// Create a new group with `name` and the given `initialContacts`
+    /// as additional members. The local user is auto-included as the
+    /// admin; `initialContacts` MUST be 1:1-paired contacts (the
+    /// design rule: "you can only be added by someone who has already
+    /// QR-paired with you in person"). Returns the new `ChatGroup.id`,
+    /// or nil if a precondition failed (no session, name empty,
+    /// initialContacts not all paired, or the group would exceed
+    /// `ChatGroup.maxMembers`).
+    @discardableResult
+    func createGroup(name: String, initialContacts: [Contact]) -> Data? {
+        guard let session, let myCard, let relay else { return nil }
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return nil }
+        // Cap is N = local + invitees.
+        guard initialContacts.count + 1 <= ChatGroup.maxMembers else { return nil }
+        // Every invitee must be 1:1-paired. The admin can't bootstrap
+        // a group with someone they've never verified — that's the
+        // load-bearing trust property documented in `Group.swift`.
+        let allPaired = initialContacts.allSatisfy { c in
+            state.contacts.contains(where: { $0.identityPub == c.identityPub })
+        }
+        guard allPaired else { return nil }
+        // No duplicate invitees.
+        let unique = Set(initialContacts.map(\.identityPub))
+        guard unique.count == initialContacts.count else { return nil }
+
+        // 16-byte random group id.
+        var gidBytes = [UInt8](repeating: 0, count: 16)
+        _ = SecRandomCopyBytes(kSecRandomDefault, 16, &gidBytes)
+        let groupId = Data(gidBytes)
+
+        // Build the Create op header. Operator = self; initial
+        // members = [self.admin] + invitees.member.
+        // Self's displayName isn't sent on the wire as the user-
+        // visible label — `memberDisplayName` overrides at render
+        // time. Keep it empty so a recipient who somehow ends up in
+        // the bake-fallback path (peerId not in their contacts) sees
+        // the fingerprint shorthand rather than the misleading "you"
+        // (audit MEDIUM-8).
+        var members: [GroupOpInitialMember] = [
+            GroupOpInitialMember(
+                peerId: myCard.peerId,
+                role: .admin,
+                displayName: "",
+            ),
+        ]
+        for c in initialContacts {
+            members.append(GroupOpInitialMember(
+                peerId: c.identityPub,
+                role: .member,
+                displayName: c.displayName,
+            ))
+        }
+        let kind = GroupOpKind.create(name: trimmedName, initialMembers: members)
+        guard let signedOp = signOp(
+            session: session,
+            groupId: groupId,
+            epoch: 0,
+            parent: GroupOp.zeroParentDigest,
+            operatorIdentity: myCard.peerId,
+            kind: kind,
+        ) else { return nil }
+
+        // Construct local state from the freshly-signed Create op.
+        guard let signedBytes = try? signedOp.encoded() else { return nil }
+        guard var group = ChatGroup.create(
+            fromCreate: signedOp,
+            signedBytes: signedBytes,
+            localIdentityPub: myCard.peerId,
+        ) else { return nil }
+
+        // Mint our local sender-key chain. Failures here would mean
+        // libsignal-state corruption — surface as nil so the UI can
+        // bail out cleanly.
+        let myDist = UUID()
+        guard let mySKDM = try? session.senderKeyDistributionCreate(distributionId: myDist) else {
+            return nil
+        }
+        group.myCurrentDistributionId = myDist
+        group.memberDistributionIds[myCard.peerId] = myDist
+        // The creator's own row goes straight to .active (we have our
+        // own SKDM right here; no exchange needed for ourselves).
+        if let idx = group.members.firstIndex(where: { $0.peerId == myCard.peerId }) {
+            group.members[idx].status = .active
+        }
+        // Persist the libsignal sender-key state to disk.
+        persistSession()
+
+        state.groups.append(group)
+        let gIdx = state.groups.count - 1
+        Storage.persist(appState: state)
+
+        NSLog(
+            "[pizzini.group] createGroup \(short(groupId)) name=\"\(trimmedName)\""
+                + " admin=\(short(myCard.peerId)) inviting \(initialContacts.count) member(s):"
+                + " " + initialContacts.map { short($0.identityPub) }.joined(separator: ", "),
+        )
+        // Broadcast: every invitee gets the signed Create op (0x08)
+        // AND the creator's SKDM (0x07). Order matters only loosely
+        // — both are independent inner envelopes, and the receiver
+        // can apply them in either order (apply Create first, then
+        // process SKDM; or process SKDM first, then apply Create —
+        // libsignal doesn't care).
+        //
+        // Fan-out timing leak (audit LOW-5): N pairwise sends back-
+        // to-back let the relay correlate "one fan-out, group of
+        // size N" by burst timing. Tor's circuit-isolation defaults
+        // and per-recipient delivery jitter are the v2 mitigation.
+        for c in initialContacts {
+            broadcastGroupOp(signedBytes, toPeer: c.identityPub, session: session, relay: relay)
+            broadcastSenderKeyDistribution(
+                groupId: groupId,
+                skdm: mySKDM,
+                toPeer: c.identityPub,
+                session: session,
+                relay: relay,
+                groupAt: gIdx,
+            )
+        }
+        Storage.persist(appState: state)
+        return groupId
+    }
+
+    /// Admin-only: add a 1:1-paired contact to an existing group.
+    /// Builds an `AddMember` op chained from the group's current
+    /// `lastOpDigest`, ships a signed `GroupBootstrap` of the
+    /// post-AddMember state to the newcomer (so they can build local
+    /// state from a single envelope without replaying our op chain),
+    /// broadcasts the op to every active member + the newcomer, and
+    /// ships our current SKDM to the newcomer.
+    @discardableResult
+    func inviteToGroup(groupId: Data, contact: Contact) -> Bool {
+        guard let session, let myCard, let relay,
+              let gIdx = groupIndex(forId: groupId)
+        else { return false }
+        guard state.groups[gIdx].role(of: myCard.peerId) == .admin else { return false }
+        // Must be 1:1-paired.
+        guard state.contacts.contains(where: { $0.identityPub == contact.identityPub }) else {
+            return false
+        }
+        // Cap.
+        guard state.groups[gIdx].activeMembers.count + 1 <= ChatGroup.maxMembers else { return false }
+        // Already in?
+        if state.groups[gIdx].members.contains(where: {
+            $0.peerId == contact.identityPub && $0.status != .removed
+        }) { return false }
+
+        let kind = GroupOpKind.addMember(
+            peerId: contact.identityPub,
+            role: .member,
+            displayName: contact.displayName,
+        )
+        guard let signedOp = signOp(
+            session: session,
+            groupId: groupId,
+            epoch: state.groups[gIdx].currentEpoch + 1,
+            parent: state.groups[gIdx].lastOpDigest,
+            operatorIdentity: myCard.peerId,
+            kind: kind,
+        ) else { return false }
+
+        // Apply locally first so our own state advances even if a
+        // broadcast fails partway through. Capture side effects so
+        // the post-apply hook can ship our SKDM to the newcomer (the
+        // newcomer is now in `newActiveMembers`).
+        var sx = ChatGroup.ApplySideEffects(localIdentityPub: myCard.peerId)
+        if case .applied = state.groups[gIdx].apply(signedOp, sideEffects: &sx) {} else {
+            return false
+        }
+
+        guard let signedBytes = try? signedOp.encoded() else { return false }
+
+        // Ship the GroupBootstrap to the newcomer FIRST so they can
+        // construct a local ChatGroup before any AddMember/SKDM
+        // arrives. This closes audit HIGH-7 (the AddMember-without-
+        // local-group drop path).
+        if let bootstrap = signBootstrap(session: session, group: state.groups[gIdx], operatorIdentity: myCard.peerId) {
+            broadcastGroupBootstrap(
+                bootstrap: bootstrap,
+                toPeer: contact.identityPub,
+                session: session,
+                relay: relay,
+            )
+        }
+
+        // Broadcast the AddMember op to every current active member
+        // (other than us) AND the newcomer.
+        let recipients = state.groups[gIdx].activeMembers
+            .map(\.peerId)
+            .filter { $0 != myCard.peerId }
+        for peer in recipients {
+            broadcastGroupOp(signedBytes, toPeer: peer, session: session, relay: relay)
+        }
+
+        // Reciprocal SKDM exchange (HIGH-2): ship our current SKDM to
+        // the newcomer (and any other active member who hasn't yet
+        // received it). The hook also covers the case where the
+        // newcomer is reached via a state mutation we didn't
+        // initiate.
+        applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session, relay: relay)
+        Storage.persist(appState: state)
+        return true
+    }
+
+    /// Admin-only: remove a member from a group. Local state advances
+    /// immediately; remaining members receive the `RemoveMember` op
+    /// and apply it; the local user then rotates their sender-key
+    /// chain so the removed member can no longer decrypt subsequent
+    /// messages from us. Other remaining members rotate independently
+    /// when they apply the same op (audit fix HIGH-1).
+    @discardableResult
+    func removeFromGroup(groupId: Data, peerIdentity: Data) -> Bool {
+        guard let session, let myCard, let relay,
+              let gIdx = groupIndex(forId: groupId)
+        else { return false }
+        guard state.groups[gIdx].role(of: myCard.peerId) == .admin else { return false }
+        guard state.groups[gIdx].members.contains(where: {
+            $0.peerId == peerIdentity && $0.status != .removed
+        }) else { return false }
+
+        let kind = GroupOpKind.removeMember(peerId: peerIdentity)
+        guard let signedOp = signOp(
+            session: session,
+            groupId: groupId,
+            epoch: state.groups[gIdx].currentEpoch + 1,
+            parent: state.groups[gIdx].lastOpDigest,
+            operatorIdentity: myCard.peerId,
+            kind: kind,
+        ) else { return false }
+
+        var sx = ChatGroup.ApplySideEffects(localIdentityPub: myCard.peerId)
+        if case let .rejectedMalformed(reason) = state.groups[gIdx].apply(signedOp, sideEffects: &sx) {
+            // Last-admin protection (or any other reject) surfaces
+            // here; tell the user instead of silently failing
+            // (audit MEDIUM-4).
+            appendGroupSystem(groupAt: gIdx, "Could not remove member: \(reason).")
+            Storage.persist(appState: state)
+            return false
+        }
+
+        guard let signedBytes = try? signedOp.encoded() else { return false }
+        for member in state.groups[gIdx].activeMembers
+            where member.peerId != myCard.peerId {
+            broadcastGroupOp(signedBytes, toPeer: member.peerId, session: session, relay: relay)
+        }
+        // Mandatory rotation post-remove (slice 4d / audit HIGH-1).
+        // The state machine flagged `requestSelfRotation` if we are
+        // still active; the post-mutation hook fires a single
+        // rotation regardless of how many remove ops applied in this
+        // call.
+        applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session, relay: relay)
+        Storage.persist(appState: state)
+        return true
+    }
+
+    /// Admin-only: rename the group. Surfaces inline errors via a
+    /// system row when the apply rejects (e.g. authorization).
+    @discardableResult
+    func renameGroup(groupId: Data, newName: String) -> Bool {
+        guard let session, let myCard, let relay,
+              let gIdx = groupIndex(forId: groupId)
+        else { return false }
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        guard state.groups[gIdx].role(of: myCard.peerId) == .admin else { return false }
+        guard state.groups[gIdx].displayName != trimmed else { return false }
+
+        let kind = GroupOpKind.rename(newName: trimmed)
+        guard let signedOp = signOp(
+            session: session,
+            groupId: groupId,
+            epoch: state.groups[gIdx].currentEpoch + 1,
+            parent: state.groups[gIdx].lastOpDigest,
+            operatorIdentity: myCard.peerId,
+            kind: kind,
+        ) else { return false }
+
+        var sx = ChatGroup.ApplySideEffects(localIdentityPub: myCard.peerId)
+        if case .applied = state.groups[gIdx].apply(signedOp, sideEffects: &sx) {} else {
+            return false
+        }
+        guard let signedBytes = try? signedOp.encoded() else { return false }
+        for member in state.groups[gIdx].activeMembers
+            where member.peerId != myCard.peerId {
+            broadcastGroupOp(signedBytes, toPeer: member.peerId, session: session, relay: relay)
+        }
+        applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session, relay: relay)
+        Storage.persist(appState: state)
+        return true
+    }
+
+    /// Admin-only: promote a member to admin.
+    @discardableResult
+    func promoteToAdmin(groupId: Data, peerIdentity: Data) -> Bool {
+        signAndBroadcastRoleOp(
+            groupId: groupId,
+            peerIdentity: peerIdentity,
+            kind: .promoteAdmin(peerId: peerIdentity),
+        )
+    }
+
+    /// Admin-only: demote an admin back to member, with last-admin
+    /// protection (apply rejects if it would brick the group).
+    @discardableResult
+    func demoteFromAdmin(groupId: Data, peerIdentity: Data) -> Bool {
+        signAndBroadcastRoleOp(
+            groupId: groupId,
+            peerIdentity: peerIdentity,
+            kind: .demoteAdmin(peerId: peerIdentity),
+        )
+    }
+
+    private func signAndBroadcastRoleOp(
+        groupId: Data,
+        peerIdentity: Data,
+        kind: GroupOpKind,
+    ) -> Bool {
+        guard let session, let myCard, let relay,
+              let gIdx = groupIndex(forId: groupId)
+        else { return false }
+        guard state.groups[gIdx].role(of: myCard.peerId) == .admin else { return false }
+        guard state.groups[gIdx].members.contains(where: {
+            $0.peerId == peerIdentity && $0.status != .removed
+        }) else { return false }
+
+        guard let signedOp = signOp(
+            session: session,
+            groupId: groupId,
+            epoch: state.groups[gIdx].currentEpoch + 1,
+            parent: state.groups[gIdx].lastOpDigest,
+            operatorIdentity: myCard.peerId,
+            kind: kind,
+        ) else { return false }
+
+        var sx = ChatGroup.ApplySideEffects(localIdentityPub: myCard.peerId)
+        switch state.groups[gIdx].apply(signedOp, sideEffects: &sx) {
+        case .applied:
+            break
+        case let .rejectedMalformed(reason):
+            appendGroupSystem(groupAt: gIdx, "Role change failed: \(reason).")
+            Storage.persist(appState: state)
+            return false
+        default:
+            // Auth/duplicate/equiv/sig: silent — these mean our own
+            // local view drifted from the canonical chain, which
+            // shouldn't be possible for an op we just signed.
+            return false
+        }
+        guard let signedBytes = try? signedOp.encoded() else { return false }
+        for member in state.groups[gIdx].activeMembers
+            where member.peerId != myCard.peerId {
+            broadcastGroupOp(signedBytes, toPeer: member.peerId, session: session, relay: relay)
+        }
+        applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session, relay: relay)
+        Storage.persist(appState: state)
+        return true
+    }
+
+    /// Local-only leave: drop the group from this device. We rotate
+    /// our chain first so remaining members can no longer decrypt
+    /// our future messages with the chain we abandoned (audit fix
+    /// LOW-4) — the rotation broadcast doubles as a courtesy "this
+    /// chain is dead" signal even though the group state on remote
+    /// peers still lists us as a member.
+    ///
+    /// To "leave properly" so other members stop sending: ask an
+    /// admin to remove you. This action is the security-conscious
+    /// fallback when that's not possible (e.g. compromised admin,
+    /// urgency, ghosting).
+    @discardableResult
+    func leaveGroup(groupId: Data) -> Bool {
+        guard let gIdx = groupIndex(forId: groupId) else { return false }
+        // Best-effort rotation before we drop the group. If we have
+        // no chain yet (never sent a message) the rotation is a
+        // no-op.
+        if state.groups[gIdx].myCurrentDistributionId != nil {
+            rotateMyGroupChain(groupId: groupId)
+        }
+        // Re-lookup; rotateMyGroupChain may have mutated the array.
+        guard let gIdx2 = groupIndex(forId: groupId) else { return true }
+        state.groups.remove(at: gIdx2)
+        Storage.persist(appState: state)
+        return true
+    }
+
+    // ─── Outbound: send + rotate ────────────────────────────────────
+
+    /// Encrypt `text` with our group sender-key chain and fan out
+    /// sealed-sender envelopes to every active member except self.
+    /// Skips recipients we have no delivery token for (logged as a
+    /// system row on the local group log; outbox+retry pending v2).
+    /// Refuses to send if the local user is no longer an active
+    /// member of the group (audit fix HIGH-3).
+    @discardableResult
+    func sendGroupMessage(groupId: Data, text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        guard let session, let myCard, let relay,
+              let gIdx = groupIndex(forId: groupId)
+        else { return false }
+
+        // HIGH-3: refuse if we're not an active member of the group.
+        // The chain may still be installed in libsignal's store but a
+        // removed member must not be able to keep posting.
+        guard state.groups[gIdx].activeMembers.contains(where: { $0.peerId == myCard.peerId }) else {
+            appendGroupSystem(groupAt: gIdx, "You are no longer a member of this group.")
+            Storage.persist(appState: state)
+            return false
+        }
+
+        // Periodic-rotation gate.
+        if shouldRotateBeforeSend(groupAt: gIdx) {
+            rotateMyGroupChain(groupId: groupId)
+        }
+        guard let myDist = state.groups[gIdx].myCurrentDistributionId else {
+            appendGroupSystem(groupAt: gIdx, "Group encryption not yet ready — waiting for SKDM exchange.")
+            Storage.persist(appState: state)
+            return false
+        }
+        let plaintext = Data(trimmed.utf8)
+        guard let ciphertext = try? session.groupEncrypt(distributionId: myDist, plaintext: plaintext) else {
+            appendGroupSystem(groupAt: gIdx, "Encrypt failed.")
+            Storage.persist(appState: state)
+            return false
+        }
+        persistSession()
+        let body = GroupEnvelope.encodeGroupChat(groupId: groupId, senderKeyMessage: ciphertext)
+        var inner = Data([RelayClient.InnerEnvelopeKind.groupChat.rawValue])
+        inner.append(body)
+        let recipients = state.groups[gIdx].activeMembers
+            .map(\.peerId)
+            .filter { $0 != myCard.peerId }
+        NSLog(
+            "[pizzini.group] sendGroupMessage \(short(groupId)):"
+                + " \(plaintext.count) B plaintext, ciphertext \(ciphertext.count) B,"
+                + " fanning out to \(recipients.count) member(s):"
+                + " " + recipients.map { short($0) }.joined(separator: ", "),
+        )
+        var skipped: [String] = []
+        // Fan-out timing leak (audit LOW-5): tight loop; relay can
+        // correlate. Documented limitation; jitter is v2 work.
+        for recipient in recipients {
+            guard let cIdx = state.contacts.firstIndex(where: { $0.identityPub == recipient }),
+                  let token = popDeliveryTokenPublic(forContactAt: cIdx)
+            else {
+                skipped.append(short(recipient))
+                continue
+            }
+            let messageId = ChatStore.makeGroupMessageId()
+            do {
+                let sealed = try session.encryptSealed(
+                    peer: recipient,
+                    messageId: messageId,
+                    plaintext: inner,
+                )
+                relay.sendSealed(
+                    toPeer: recipient,
+                    sealedCiphertext: sealed,
+                    ttlSeconds: state.contacts[cIdx].ttlSeconds,
+                    token: token,
+                )
+            } catch {
+                NSLog("[pizzini] group fan-out failed for \(short(recipient)): \(error)")
+            }
+        }
+        // Append our own log row. Self-attributed messages render
+        // without the "Name: " prefix in the chat view.
+        state.groups[gIdx].log.append(PersistedMessage(
+            side: .me,
+            text: trimmed,
+            kind: .whisper,
+            bytes: ciphertext.count,
+        ))
+        state.groups[gIdx].lastMessageAt = Date()
+        state.groups[gIdx].sentSinceRotation &+= 1
+        if !skipped.isEmpty {
+            appendGroupSystem(
+                groupAt: gIdx,
+                "Sent to \(recipients.count - skipped.count)/\(recipients.count) members. "
+                    + "No delivery tokens for: \(skipped.joined(separator: ", ")).",
+            )
+        }
+        Storage.persist(appState: state)
+        return true
+    }
+
+    /// Generate a fresh sender-key chain, broadcast a
+    /// `RotateSenderKey` op + the new SKDM to every active member.
+    /// Idempotent — a no-op if the local user isn't an active group
+    /// member (e.g. they've been removed). Resets
+    /// `mySkdmRecipients` so the bidirectional-SKDM hook re-ships to
+    /// everyone.
+    func rotateMyGroupChain(groupId: Data) {
+        guard let session, let myCard, let relay,
+              let gIdx = groupIndex(forId: groupId)
+        else { return }
+        guard state.groups[gIdx].activeMembers.contains(where: { $0.peerId == myCard.peerId }) else {
+            return
+        }
+        let newDist = UUID()
+        guard let newSKDM = try? session.senderKeyDistributionCreate(distributionId: newDist) else {
+            return
+        }
+        let kind = GroupOpKind.rotateSenderKey(newDistributionId: newDist)
+        guard let signedOp = signOp(
+            session: session,
+            groupId: groupId,
+            epoch: state.groups[gIdx].currentEpoch + 1,
+            parent: state.groups[gIdx].lastOpDigest,
+            operatorIdentity: myCard.peerId,
+            kind: kind,
+        ) else { return }
+        var sx = ChatGroup.ApplySideEffects(localIdentityPub: myCard.peerId)
+        if case .applied = state.groups[gIdx].apply(signedOp, sideEffects: &sx) {} else {
+            return
+        }
+        // Update local sender-key state alongside the op apply.
+        state.groups[gIdx].myCurrentDistributionId = newDist
+        state.groups[gIdx].memberDistributionIds[myCard.peerId] = newDist
+        state.groups[gIdx].sentSinceRotation = 0
+        state.groups[gIdx].lastRotatedAt = Date()
+        // Reset the "we shipped our SKDM" set — every active member
+        // must re-receive the new SKDM.
+        state.groups[gIdx].mySkdmRecipients = []
+        persistSession()
+
+        // Broadcast the op + the SKDM to every remaining member.
+        guard let signedBytes = try? signedOp.encoded() else {
+            Storage.persist(appState: state)
+            return
+        }
+        for member in state.groups[gIdx].activeMembers
+            where member.peerId != myCard.peerId {
+            broadcastGroupOp(signedBytes, toPeer: member.peerId, session: session, relay: relay)
+            broadcastSenderKeyDistribution(
+                groupId: groupId,
+                skdm: newSKDM,
+                toPeer: member.peerId,
+                session: session,
+                relay: relay,
+                groupAt: gIdx,
+            )
+        }
+        Storage.persist(appState: state)
+    }
+
+    private func shouldRotateBeforeSend(groupAt gIdx: Int) -> Bool {
+        let g = state.groups[gIdx]
+        if g.sentSinceRotation >= ChatGroup.rotationMessageThreshold { return true }
+        if Date().timeIntervalSince(g.lastRotatedAt) >= ChatGroup.rotationTimeThreshold {
+            return true
+        }
+        return false
+    }
+
+    // ─── Inbound handlers (called from ChatStore receive dispatch) ──
+
+    /// Apply a signed `GroupOp`. Bootstraps a fresh `ChatGroup` from
+    /// a `Create` op (with full trust-anchor checks — audit
+    /// CRITICAL-1), otherwise calls into the apply state machine and
+    /// fires the bidirectional-SKDM / mandatory-rotation post-apply
+    /// hooks.
+    func handleGroupOp(payload: Data, fromPeer sender: Data) {
+        guard let session, let myCard, let relay else { return }
+        guard let op = GroupOp.decode(payload) else {
+            NSLog("[pizzini.group] groupOp ← \(short(sender)): malformed signed bytes")
+            return
+        }
+        NSLog(
+            "[pizzini.group] groupOp ← \(short(sender)): kind=\(opKindLabel(op.kind))"
+                + " group=\(short(op.groupId)) epoch=\(op.epoch)"
+                + " operator=\(short(op.operatorIdentity))",
+        )
+
+        if case .create = op.kind {
+            // Bootstrap path. Audit CRITICAL-1: the trust anchor for
+            // a Create is "the operator is in our 1:1 contacts AND
+            // the immediate sender is the operator" — anything else
+            // and we'd be accepting groups from unverified
+            // identities.
+            guard sender == op.operatorIdentity else {
+                NSLog(
+                    "[pizzini.group] groupOp ← \(short(sender)):"
+                        + " Create rejected — sender \(short(sender))"
+                        + " is forwarding on behalf of \(short(op.operatorIdentity))"
+                        + " (forwarding not allowed for Create)",
+                )
+                return
+            }
+            guard state.contacts.contains(where: { $0.identityPub == op.operatorIdentity }) else {
+                NSLog(
+                    "[pizzini.group] groupOp ← \(short(sender)):"
+                        + " Create rejected — operator \(short(op.operatorIdentity))"
+                        + " is not in our 1:1 contacts",
+                )
+                return
+            }
+            if groupIndex(forId: op.groupId) != nil {
+                NSLog(
+                    "[pizzini.group] groupOp ← \(short(sender)):"
+                        + " Create for existing group \(short(op.groupId)) — ignoring",
+                )
+                return
+            }
+            // Verify the signature before constructing — Create
+            // bypasses the apply state machine's verification path.
+            guard (try? op.verifySignature()) == true else {
+                NSLog(
+                    "[pizzini.group] groupOp ← \(short(sender)):"
+                        + " Create signature INVALID, dropping",
+                )
+                return
+            }
+            // The Create payload must include US in the initial
+            // member list — otherwise we have no business being
+            // bootstrapped into the group.
+            guard case let .create(_, initialMembers) = op.kind,
+                  initialMembers.contains(where: { $0.peerId == myCard.peerId })
+            else {
+                NSLog(
+                    "[pizzini.group] groupOp ← \(short(sender)):"
+                        + " Create rejected — local user not in initialMembers",
+                )
+                return
+            }
+            guard let signedBytes = try? op.encoded(),
+                  let group = ChatGroup.create(
+                      fromCreate: op,
+                      signedBytes: signedBytes,
+                      localIdentityPub: myCard.peerId,
+                  )
+            else {
+                NSLog(
+                    "[pizzini.group] groupOp ← \(short(sender)):"
+                        + " Create rejected (structural) for group \(short(op.groupId))",
+                )
+                return
+            }
+            state.groups.append(group)
+            let gIdx = state.groups.count - 1
+            NSLog(
+                "[pizzini.group] groupOp ← \(short(sender)):"
+                    + " bootstrapped group \(short(op.groupId)) with \(group.members.count) member(s)",
+            )
+            // We are now in a group we didn't initiate — enrol our
+            // own sender-key chain and broadcast SKDM to every other
+            // active member so they can decrypt our future messages.
+            enrolMyChainOnFirstJoin(groupAt: gIdx, session: session, relay: relay)
+            Storage.persist(appState: state)
+            return
+        }
+
+        guard let gIdx = groupIndex(forId: op.groupId) else {
+            // Non-Create op for a group we don't have. Common case:
+            // an AddMember-self op arrives slightly before the
+            // GroupBootstrap that's supposed to set up our local
+            // state. Drop silently — the bootstrap will arrive and
+            // include this op's effects already (the snapshot
+            // reflects post-AddMember state). For ops we genuinely
+            // miss, slice 5 will own a per-group catch-up handshake.
+            NSLog(
+                "[pizzini.group] groupOp ← \(short(sender)):"
+                    + " dropped (no local ChatGroup for \(short(op.groupId)))",
+            )
+            return
+        }
+        // Defensive: log if the op's operator isn't the sender.
+        // Forwarding non-Create ops is legitimate (it's how AddMember
+        // ops reach members who weren't added by us).
+        if op.operatorIdentity != sender {
+            NSLog(
+                "[pizzini.group] groupOp ← \(short(sender)):"
+                    + " forwarding on behalf of \(short(op.operatorIdentity))",
+            )
+        }
+        var sx = ChatGroup.ApplySideEffects(localIdentityPub: myCard.peerId)
+        let outcome = state.groups[gIdx].apply(op, sideEffects: &sx)
+
+        switch outcome {
+        case let .applied(epoch):
+            NSLog(
+                "[pizzini.group] groupOp ← \(short(sender)):"
+                    + " APPLIED \(opKindLabel(op.kind)) at epoch \(epoch),"
+                    + " group now has \(state.groups[gIdx].activeMembers.count) active member(s)",
+            )
+            applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session, relay: relay)
+        case let .queued(epoch):
+            NSLog(
+                "[pizzini.group] groupOp ← \(short(sender)):"
+                    + " queued (epoch \(epoch) > expected \(state.groups[gIdx].currentEpoch + 1))",
+            )
+        case .rejectedDuplicate:
+            NSLog(
+                "[pizzini.group] groupOp ← \(short(sender)):"
+                    + " duplicate, ignored",
+            )
+        case let .rejectedEquivocation(epoch):
+            NSLog(
+                "[pizzini.group] groupOp ← \(short(sender)):"
+                    + " EQUIVOCATION at epoch \(epoch)",
+            )
+            appendGroupSystem(
+                groupAt: gIdx,
+                "Group integrity warning: divergent op observed at epoch \(epoch).",
+            )
+        case .rejectedSignature:
+            NSLog("[pizzini.group] groupOp ← \(short(sender)): signature rejected")
+        case .rejectedAuthorization:
+            NSLog("[pizzini.group] groupOp ← \(short(sender)): unauthorised operator")
+        case let .rejectedMalformed(reason):
+            NSLog("[pizzini.group] groupOp ← \(short(sender)): malformed — \(reason)")
+        }
+        Storage.persist(appState: state)
+    }
+
+    private func opKindLabel(_ kind: GroupOpKind) -> String {
+        switch kind {
+        case .create: "Create"
+        case .addMember: "AddMember"
+        case .removeMember: "RemoveMember"
+        case .rename: "Rename"
+        case .promoteAdmin: "PromoteAdmin"
+        case .demoteAdmin: "DemoteAdmin"
+        case .rotateSenderKey: "RotateSenderKey"
+        }
+    }
+
+    /// Process a signed `GroupBootstrap` (0x09) inner envelope. This
+    /// is how a newly-added member acquires local `ChatGroup` state
+    /// when an `AddMember` op alone leaves them stranded (audit fix
+    /// HIGH-7). Trust gate: same as Create — sender must be the
+    /// operator AND the operator must be in our 1:1 contacts.
+    func handleGroupBootstrap(payload: Data, fromPeer sender: Data) {
+        guard let session, let myCard, let relay else { return }
+        guard let parsed = GroupEnvelope.decodeBootstrap(payload) else {
+            NSLog("[pizzini.group] bootstrap ← \(short(sender)): malformed body")
+            return
+        }
+        let (envelopeGroupId, bootstrapBytes) = parsed
+        guard let bootstrap = GroupBootstrap.decode(bootstrapBytes) else {
+            NSLog("[pizzini.group] bootstrap ← \(short(sender)): malformed bootstrap blob")
+            return
+        }
+        // Body's groupId-prefix MUST match the snapshot's own groupId
+        // — defence against a relay corruption / accidental code mix-up.
+        guard envelopeGroupId == bootstrap.groupId else {
+            NSLog("[pizzini.group] bootstrap ← \(short(sender)): groupId prefix mismatch")
+            return
+        }
+        // Trust anchor #1: forwarding is not allowed for bootstraps.
+        // Trust anchor #2: the issuing operator must be in our 1:1
+        // contacts.
+        guard sender == bootstrap.operatorIdentity else {
+            NSLog(
+                "[pizzini.group] bootstrap ← \(short(sender)):"
+                    + " rejected — sender \(short(sender)) forwarding on behalf of \(short(bootstrap.operatorIdentity))",
+            )
+            return
+        }
+        guard state.contacts.contains(where: { $0.identityPub == bootstrap.operatorIdentity }) else {
+            NSLog(
+                "[pizzini.group] bootstrap ← \(short(sender)):"
+                    + " rejected — operator \(short(bootstrap.operatorIdentity)) not in 1:1 contacts",
+            )
+            return
+        }
+        guard (try? bootstrap.verifySignature()) == true else {
+            NSLog("[pizzini.group] bootstrap ← \(short(sender)): signature INVALID")
+            return
+        }
+        // The issuing operator must be an active admin in their own
+        // snapshot — otherwise they had no business signing it.
+        guard bootstrap.members.contains(where: {
+            $0.peerId == bootstrap.operatorIdentity
+                && $0.role == .admin && $0.status != .removed
+        }) else {
+            NSLog("[pizzini.group] bootstrap ← \(short(sender)): operator not an active admin in snapshot")
+            return
+        }
+        // We must be in the snapshot's member list.
+        guard bootstrap.members.contains(where: { $0.peerId == myCard.peerId }) else {
+            NSLog("[pizzini.group] bootstrap ← \(short(sender)): local user not in snapshot")
+            return
+        }
+        // If we already have the group, this is a no-op. Future-work:
+        // diff the snapshot against local state and surface
+        // discrepancies; for now we trust our existing op-chain
+        // state.
+        if let existing = groupIndex(forId: bootstrap.groupId) {
+            NSLog(
+                "[pizzini.group] bootstrap ← \(short(sender)):"
+                    + " already have group \(short(bootstrap.groupId))"
+                    + " (currentEpoch=\(state.groups[existing].currentEpoch),"
+                    + " snapshot currentEpoch=\(bootstrap.currentEpoch))"
+                    + " — ignoring",
+            )
+            return
+        }
+        guard let group = bootstrap.intoChatGroup(localIdentityPub: myCard.peerId) else {
+            NSLog("[pizzini.group] bootstrap ← \(short(sender)): structural rejection")
+            return
+        }
+        state.groups.append(group)
+        let gIdx = state.groups.count - 1
+        NSLog(
+            "[pizzini.group] bootstrap ← \(short(sender)):"
+                + " group \(short(bootstrap.groupId)) bootstrapped at epoch \(bootstrap.currentEpoch)"
+                + " with \(group.members.count) member(s)",
+        )
+        enrolMyChainOnFirstJoin(groupAt: gIdx, session: session, relay: relay)
+        Storage.persist(appState: state)
+    }
+
+    /// Process a peer's incoming `groupKeyDistribution` (0x07) inner
+    /// envelope. Audit fix CRITICAL-3: only install the chain if we
+    /// have a local `ChatGroup` for the named groupId AND the sender
+    /// is an active member of that group. Otherwise drop silently —
+    /// installing chains for arbitrary groupId/sender pairs widens
+    /// the libsignal store and lets non-members pre-position chains
+    /// for the message-injection attack documented in CRITICAL-2.
+    func handleGroupKeyDistribution(payload: Data, fromPeer sender: Data) {
+        guard let session, let relay else { return }
+        guard let parsed = GroupEnvelope.decodeKeyDistribution(payload) else {
+            NSLog("[pizzini.group] SKDM ← \(short(sender)): malformed body")
+            return
+        }
+        let (groupId, skdm) = parsed
+        guard let gIdx = groupIndex(forId: groupId) else {
+            NSLog(
+                "[pizzini.group] SKDM ← \(short(sender)):"
+                    + " dropped — no local ChatGroup for \(short(groupId))"
+                    + " (CRITICAL-3 gate)",
+            )
+            return
+        }
+        guard state.groups[gIdx].members.contains(where: {
+            $0.peerId == sender && $0.status != .removed
+        }) else {
+            NSLog(
+                "[pizzini.group] SKDM ← \(short(sender)):"
+                    + " dropped — sender is not an active member of \(short(groupId))"
+                    + " (CRITICAL-3 gate)",
+            )
+            return
+        }
+        NSLog(
+            "[pizzini.group] SKDM ← \(short(sender)):"
+                + " group=\(short(groupId)) bytes=\(skdm.count)",
+        )
+        let dist: UUID
+        do {
+            dist = try session.senderKeyDistributionProcess(
+                senderIdentity: sender,
+                skdm: skdm,
+            )
+        } catch {
+            NSLog(
+                "[pizzini.group] SKDM ← \(short(sender)):"
+                    + " install FAILED for \(short(groupId)) — \(error)",
+            )
+            return
+        }
+        persistSession()
+        state.groups[gIdx].memberDistributionIds[sender] = dist
+        // Mark the sender as .active now that we can decrypt them.
+        if let mIdx = state.groups[gIdx].members.firstIndex(where: {
+            $0.peerId == sender && $0.status == .pendingSKDM
+        }) {
+            state.groups[gIdx].members[mIdx].status = .active
+            NSLog(
+                "[pizzini.group] SKDM ← \(short(sender)):"
+                    + " installed, member flipped to .active in \(short(groupId))",
+            )
+        }
+        // Reciprocal SKDM exchange (audit HIGH-2): if we are an
+        // active member of this group, ensure the sender has our
+        // current SKDM so they can decrypt our messages too.
+        let mySxStub = ChatGroup.ApplySideEffects(localIdentityPub: myCard?.peerId)
+        applyPostMutationSideEffects(groupAt: gIdx, sideEffects: mySxStub, session: session, relay: relay)
+        Storage.persist(appState: state)
+    }
+
+    /// Decrypt a `groupChat` (0x06) inner envelope and append to the
+    /// group log. Audit fix CRITICAL-2: only accept messages from
+    /// active members of the named group. Decryption bytes from a
+    /// non-member are dropped — without this gate, any 1:1-paired
+    /// peer who has previously installed a chain with us could
+    /// inject content into any group log they know the ID of.
+    func handleGroupChat(payload: Data, fromPeer sender: Data) {
+        guard let session else { return }
+        guard let parsed = GroupEnvelope.decodeGroupChat(payload) else {
+            NSLog("[pizzini.group] groupChat ← \(short(sender)): malformed body")
+            return
+        }
+        let (groupId, ciphertext) = parsed
+        guard let gIdx = groupIndex(forId: groupId) else {
+            NSLog(
+                "[pizzini.group] groupChat ← \(short(sender)):"
+                    + " unknown group \(short(groupId)), dropping",
+            )
+            return
+        }
+        // CRITICAL-2 membership gate.
+        guard state.groups[gIdx].members.contains(where: {
+            $0.peerId == sender && $0.status != .removed
+        }) else {
+            NSLog(
+                "[pizzini.group] groupChat ← \(short(sender)) for \(short(groupId)):"
+                    + " DROPPED — sender is not an active member",
+            )
+            return
+        }
+        let plaintext: Data
+        do {
+            plaintext = try session.groupDecrypt(senderIdentity: sender, ciphertext: ciphertext)
+        } catch {
+            NSLog(
+                "[pizzini.group] groupChat ← \(short(sender)) for \(short(groupId)):"
+                    + " DECRYPT FAILED — \(error). Likely cause: SKDM never arrived from this sender.",
+            )
+            return
+        }
+        NSLog(
+            "[pizzini.group] groupChat ← \(short(sender)) for \(short(groupId)):"
+                + " decrypted \(plaintext.count) B",
+        )
+        persistSession()
+        let text = String(data: plaintext, encoding: .utf8)
+            ?? "<\(plaintext.count) non-utf8 bytes>"
+        // Render-time member-name resolution (audit MEDIUM-7): store
+        // the sender's peerId on the row so `GroupChatView` resolves
+        // the display name dynamically (rename of a 1:1 contact
+        // propagates to every historical row immediately).
+        let row = PersistedMessage(
+            side: .peer,
+            text: text,
+            kind: .whisper,
+            bytes: ciphertext.count,
+            senderPeerId: sender,
+        )
+        state.groups[gIdx].log.append(row)
+        state.groups[gIdx].lastMessageAt = Date()
+        Storage.persist(appState: state)
+    }
+
+    // ─── Utilities ──────────────────────────────────────────────────
+
+    func groupIndex(forId groupId: Data) -> Int? {
+        state.groups.firstIndex(where: { $0.id == groupId })
+    }
+
+    /// Resolve a member's display name with the local user's
+    /// preferred labelling, NOT the name baked into the original
+    /// `GroupOp` payload.
+    ///
+    /// 1. If `peerId == my own identity-pub` → `"you"`.
+    /// 2. Else if `peerId` is in our 1:1 contacts → that contact's
+    ///    `displayName` (so renames in the contacts list propagate
+    ///    to every group view automatically).
+    /// 3. Else fall back to whatever name the op carried, then the
+    ///    4-byte fingerprint shorthand if that is empty.
+    ///
+    /// All group-rendering surfaces (`GroupChatView`,
+    /// `GroupSettingsView`, `GroupRow`, the inbound `groupChat`
+    /// system-row prefix) route through this so a single edit to a
+    /// 1:1 contact's name updates everywhere.
+    func memberDisplayName(_ peerId: Data, in group: ChatGroup) -> String {
+        if let myCard, peerId == myCard.peerId { return "you" }
+        if let contact = state.contacts.first(where: { $0.identityPub == peerId }) {
+            return contact.displayName
+        }
+        if let baked = group.members.first(where: { $0.peerId == peerId })?.displayName,
+           !baked.isEmpty {
+            return baked
+        }
+        return short(peerId)
+    }
+
+    private func enrolMyChainOnFirstJoin(
+        groupAt gIdx: Int,
+        session: Session,
+        relay: RelayClient,
+    ) {
+        guard let myCard else { return }
+        // Idempotent — only enrol if we haven't already.
+        if state.groups[gIdx].myCurrentDistributionId != nil {
+            NSLog("[pizzini.group] enrol \(short(state.groups[gIdx].id)): already enrolled, skipping")
+            return
+        }
+        let groupId = state.groups[gIdx].id
+        let dist = UUID()
+        let skdm: Data
+        do {
+            skdm = try session.senderKeyDistributionCreate(distributionId: dist)
+        } catch {
+            NSLog("[pizzini.group] enrol \(short(groupId)): SKDM mint failed — \(error)")
+            return
+        }
+        state.groups[gIdx].myCurrentDistributionId = dist
+        state.groups[gIdx].memberDistributionIds[myCard.peerId] = dist
+        if let idx = state.groups[gIdx].members.firstIndex(where: { $0.peerId == myCard.peerId }) {
+            state.groups[gIdx].members[idx].status = .active
+        }
+        // Fresh chain → no recipients yet.
+        state.groups[gIdx].mySkdmRecipients = []
+        persistSession()
+        let recipients = state.groups[gIdx].activeMembers
+            .filter { $0.peerId != myCard.peerId }
+        NSLog(
+            "[pizzini.group] enrol \(short(groupId)): minted dist, broadcasting SKDM (\(skdm.count) B)"
+                + " to \(recipients.count) member(s): "
+                + recipients.map { short($0.peerId) }.joined(separator: ", "),
+        )
+        for member in recipients {
+            broadcastSenderKeyDistribution(
+                groupId: groupId,
+                skdm: skdm,
+                toPeer: member.peerId,
+                session: session,
+                relay: relay,
+                groupAt: gIdx,
+            )
+        }
+    }
+
+    /// Post-apply hook: ship our SKDM to any new active members and
+    /// fire a self-rotation if the apply requested one. Coalesces
+    /// requests across queue-drained cascades — calling this once
+    /// per outer apply call is correct even when many ops drained.
+    private func applyPostMutationSideEffects(
+        groupAt gIdx: Int,
+        sideEffects sx: ChatGroup.ApplySideEffects,
+        session: Session,
+        relay: RelayClient,
+    ) {
+        // Self-chain clear (we got removed).
+        if sx.requestSelfChainClear {
+            state.groups[gIdx].myCurrentDistributionId = nil
+            state.groups[gIdx].mySkdmRecipients = []
+            state.groups[gIdx].sentSinceRotation = 0
+            // libsignal's store keeps our chain — no FFI to forget
+            // it. Cosmetic; we won't use it again because
+            // sendGroupMessage gates on activeMember-self.
+            return
+        }
+        // Mandatory rotation on member-remove (HIGH-1).
+        if sx.requestSelfRotation {
+            let groupId = state.groups[gIdx].id
+            rotateMyGroupChain(groupId: groupId)
+            // rotateMyGroupChain handles its own SKDM broadcast + set
+            // population, so we don't double-broadcast below.
+            return
+        }
+        // Bidirectional SKDM (HIGH-2).
+        ensureMySKDMReachesActiveMembers(groupAt: gIdx, session: session, relay: relay)
+    }
+
+    /// For every active member who isn't us and isn't yet in
+    /// `mySkdmRecipients`, ship our current SKDM. Builds the SKDM
+    /// once, broadcasts, and updates the recipients set. No-op when
+    /// we have no chain (haven't enrolled yet) or no active members
+    /// to ship to.
+    private func ensureMySKDMReachesActiveMembers(
+        groupAt gIdx: Int,
+        session: Session,
+        relay: RelayClient,
+    ) {
+        guard let myCard else { return }
+        guard let myDist = state.groups[gIdx].myCurrentDistributionId else { return }
+        let groupId = state.groups[gIdx].id
+        let needs: [Data] = state.groups[gIdx].activeMembers
+            .map(\.peerId)
+            .filter { $0 != myCard.peerId && !state.groups[gIdx].mySkdmRecipients.contains($0) }
+        guard !needs.isEmpty else { return }
+
+        let skdm: Data
+        do {
+            skdm = try session.senderKeyDistributionCreate(distributionId: myDist)
+        } catch {
+            NSLog(
+                "[pizzini.group] reciprocal SKDM \(short(groupId)):"
+                    + " SKDM mint failed — \(error)",
+            )
+            return
+        }
+        persistSession()
+        for peer in needs {
+            broadcastSenderKeyDistribution(
+                groupId: groupId,
+                skdm: skdm,
+                toPeer: peer,
+                session: session,
+                relay: relay,
+                groupAt: gIdx,
+            )
+        }
+    }
+
+    private func signOp(
+        session: Session,
+        groupId: Data,
+        epoch: UInt64,
+        parent: Data,
+        operatorIdentity: Data,
+        kind: GroupOpKind,
+    ) -> GroupOp? {
+        let now = UInt64(Date().timeIntervalSince1970 * 1000)
+        let unsigned = GroupOp(
+            groupId: groupId,
+            epoch: epoch,
+            parentDigest: parent,
+            operatorIdentity: operatorIdentity,
+            timestampMillis: now,
+            kind: kind,
+            signature: Data(repeating: 0, count: GroupOp.signatureSize),
+        )
+        guard let header = try? unsigned.encodedHeader(),
+              let sig = try? session.identitySign(header)
+        else { return nil }
+        return GroupOp(
+            groupId: unsigned.groupId,
+            epoch: unsigned.epoch,
+            parentDigest: unsigned.parentDigest,
+            operatorIdentity: unsigned.operatorIdentity,
+            timestampMillis: unsigned.timestampMillis,
+            kind: unsigned.kind,
+            signature: sig,
+        )
+    }
+
+    /// Sign a snapshot of the current group state. Returns nil if
+    /// the encode/sign path fails (libsignal-state corruption).
+    private func signBootstrap(
+        session: Session,
+        group: ChatGroup,
+        operatorIdentity: Data,
+    ) -> GroupBootstrap? {
+        let now = UInt64(Date().timeIntervalSince1970 * 1000)
+        let unsigned = GroupBootstrap(
+            groupId: group.id,
+            displayName: group.displayName,
+            members: group.members,
+            currentEpoch: group.currentEpoch,
+            lastOpDigest: group.lastOpDigest,
+            operatorIdentity: operatorIdentity,
+            timestampMillis: now,
+            signature: Data(repeating: 0, count: GroupOp.signatureSize),
+        )
+        guard let header = try? unsigned.encodedHeader(),
+              let sig = try? session.identitySign(header)
+        else { return nil }
+        return GroupBootstrap(
+            groupId: unsigned.groupId,
+            displayName: unsigned.displayName,
+            members: unsigned.members,
+            currentEpoch: unsigned.currentEpoch,
+            lastOpDigest: unsigned.lastOpDigest,
+            operatorIdentity: unsigned.operatorIdentity,
+            timestampMillis: unsigned.timestampMillis,
+            signature: sig,
+        )
+    }
+
+    private func broadcastGroupOp(
+        _ signedBytes: Data,
+        toPeer recipient: Data,
+        session: Session,
+        relay: RelayClient,
+    ) {
+        guard let cIdx = state.contacts.firstIndex(where: { $0.identityPub == recipient }) else {
+            NSLog("[pizzini.group] groupOp → \(short(recipient)): no contact (1:1 unpaired)")
+            return
+        }
+        guard let token = popDeliveryTokenPublic(forContactAt: cIdx) else {
+            NSLog(
+                "[pizzini.group] groupOp → \(short(recipient)): no delivery token "
+                    + "(stash empty); op dropped — outbox+retry pending v2",
+            )
+            return
+        }
+        var inner = Data([RelayClient.InnerEnvelopeKind.groupOp.rawValue])
+        inner.append(signedBytes)
+        let messageId = ChatStore.makeGroupMessageId()
+        do {
+            let sealed = try session.encryptSealed(
+                peer: recipient,
+                messageId: messageId,
+                plaintext: inner,
+            )
+            relay.sendSealed(
+                toPeer: recipient,
+                sealedCiphertext: sealed,
+                ttlSeconds: state.contacts[cIdx].ttlSeconds,
+                token: token,
+            )
+            NSLog("[pizzini.group] groupOp → \(short(recipient)): sealed=\(sealed.count) B, sent")
+        } catch {
+            NSLog("[pizzini.group] groupOp → \(short(recipient)): seal failed — \(error)")
+        }
+    }
+
+    /// Broadcast our SKDM for `groupId` to one peer and record it in
+    /// `mySkdmRecipients` on success so the bidirectional-SKDM hook
+    /// doesn't re-send. `groupAt` is the array index of the group; we
+    /// pass it explicitly to avoid an extra `firstIndex` lookup.
+    private func broadcastSenderKeyDistribution(
+        groupId: Data,
+        skdm: Data,
+        toPeer recipient: Data,
+        session: Session,
+        relay: RelayClient,
+        groupAt gIdx: Int,
+    ) {
+        guard let cIdx = state.contacts.firstIndex(where: { $0.identityPub == recipient }) else {
+            NSLog(
+                "[pizzini.group] SKDM \(short(groupId)) → \(short(recipient)):"
+                    + " no contact (1:1 unpaired) — recipient cannot decrypt our messages",
+            )
+            return
+        }
+        guard let token = popDeliveryTokenPublic(forContactAt: cIdx) else {
+            NSLog(
+                "[pizzini.group] SKDM \(short(groupId)) → \(short(recipient)):"
+                    + " no delivery token (stash empty); SKDM dropped, recipient cannot decrypt",
+            )
+            return
+        }
+        var inner = Data([RelayClient.InnerEnvelopeKind.groupKeyDistribution.rawValue])
+        inner.append(GroupEnvelope.encodeKeyDistribution(groupId: groupId, skdm: skdm))
+        let messageId = ChatStore.makeGroupMessageId()
+        do {
+            let sealed = try session.encryptSealed(
+                peer: recipient,
+                messageId: messageId,
+                plaintext: inner,
+            )
+            relay.sendSealed(
+                toPeer: recipient,
+                sealedCiphertext: sealed,
+                ttlSeconds: state.contacts[cIdx].ttlSeconds,
+                token: token,
+            )
+            // Successful seal → record so the bidirectional hook
+            // doesn't re-fire for this peer until next rotation.
+            state.groups[gIdx].mySkdmRecipients.insert(recipient)
+            NSLog(
+                "[pizzini.group] SKDM \(short(groupId)) → \(short(recipient)):"
+                    + " sealed=\(sealed.count) B, sent",
+            )
+        } catch {
+            NSLog(
+                "[pizzini.group] SKDM \(short(groupId)) → \(short(recipient)):"
+                    + " seal failed — \(error)",
+            )
+        }
+    }
+
+    private func broadcastGroupBootstrap(
+        bootstrap: GroupBootstrap,
+        toPeer recipient: Data,
+        session: Session,
+        relay: RelayClient,
+    ) {
+        guard let bytes = try? bootstrap.encoded() else {
+            NSLog("[pizzini.group] bootstrap → \(short(recipient)): encode failed")
+            return
+        }
+        guard let cIdx = state.contacts.firstIndex(where: { $0.identityPub == recipient }) else {
+            NSLog("[pizzini.group] bootstrap → \(short(recipient)): no contact")
+            return
+        }
+        guard let token = popDeliveryTokenPublic(forContactAt: cIdx) else {
+            NSLog("[pizzini.group] bootstrap → \(short(recipient)): no delivery token")
+            return
+        }
+        var inner = Data([RelayClient.InnerEnvelopeKind.groupBootstrap.rawValue])
+        inner.append(GroupEnvelope.encodeBootstrap(groupId: bootstrap.groupId, bootstrapBytes: bytes))
+        let messageId = ChatStore.makeGroupMessageId()
+        do {
+            let sealed = try session.encryptSealed(
+                peer: recipient,
+                messageId: messageId,
+                plaintext: inner,
+            )
+            relay.sendSealed(
+                toPeer: recipient,
+                sealedCiphertext: sealed,
+                ttlSeconds: state.contacts[cIdx].ttlSeconds,
+                token: token,
+            )
+            NSLog("[pizzini.group] bootstrap → \(short(recipient)): sealed=\(sealed.count) B, sent")
+        } catch {
+            NSLog("[pizzini.group] bootstrap → \(short(recipient)): seal failed — \(error)")
+        }
+    }
+
+    private func appendGroupSystem(groupAt gIdx: Int, _ text: String) {
+        state.groups[gIdx].log.append(
+            PersistedMessage(side: .me, text: text, kind: .system, bytes: 0),
+        )
+    }
+
+    private static func makeGroupMessageId() -> Data {
+        var bytes = [UInt8](repeating: 0, count: 16)
+        _ = SecRandomCopyBytes(kSecRandomDefault, 16, &bytes)
+        return Data(bytes)
+    }
+}

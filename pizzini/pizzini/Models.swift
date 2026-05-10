@@ -60,6 +60,13 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
     /// every other kind. Decoded with `decodeIfPresent` so prior
     /// non-attachment-aware Keychain blobs continue to load.
     var attachment: AttachmentInfo?
+    /// 33-byte identity-public of the sender for `.peer` rows in a
+    /// group chat — drives render-time member-name resolution
+    /// (audit MEDIUM-7) so a 1:1-contact rename propagates to every
+    /// historical group log row immediately. Nil for 1:1 chat rows
+    /// and for `.me` / `.system` rows in a group log (the row is
+    /// implicitly self-attributed or has no sender).
+    let senderPeerId: Data?
 
     init(
         id: UUID = UUID(),
@@ -70,7 +77,8 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
         timestamp: Date = Date(),
         messageId: Data? = nil,
         readAt: Date? = nil,
-        attachment: AttachmentInfo? = nil
+        attachment: AttachmentInfo? = nil,
+        senderPeerId: Data? = nil
     ) {
         self.id = id
         self.side = side
@@ -81,10 +89,11 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
         self.messageId = messageId
         self.readAt = readAt
         self.attachment = attachment
+        self.senderPeerId = senderPeerId
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, side, text, kind, bytes, timestamp, messageId, readAt, attachment
+        case id, side, text, kind, bytes, timestamp, messageId, readAt, attachment, senderPeerId
     }
 
     init(from decoder: Decoder) throws {
@@ -98,6 +107,7 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
         self.messageId = try c.decodeIfPresent(Data.self, forKey: .messageId)
         self.readAt = try c.decodeIfPresent(Date.self, forKey: .readAt)
         self.attachment = try c.decodeIfPresent(AttachmentInfo.self, forKey: .attachment)
+        self.senderPeerId = try c.decodeIfPresent(Data.self, forKey: .senderPeerId)
     }
 }
 
@@ -330,6 +340,13 @@ struct AppState: Codable, Sendable {
     /// every minor would be wasteful.
     var qrBlockTestedOSVersion: String?
 
+    /// Phase 6 group chats. Stored alongside `contacts`. A
+    /// `ChatGroup` and a `Contact` can coexist for the same peerId
+    /// (the contact is the 1:1 channel; the group is a separate
+    /// surface). Pre-Phase-6 JSON blobs lack this field and decode
+    /// to an empty array.
+    var groups: [ChatGroup]
+
     static let currentVersion = 1
     static let defaultRelayHost = "127.0.0.1"
 
@@ -343,7 +360,8 @@ struct AppState: Codable, Sendable {
         quickLookPreviewEnabled: Bool = false,
         panicModeEnabled: Bool = false,
         qrBlockEffective: Bool? = nil,
-        qrBlockTestedOSVersion: String? = nil
+        qrBlockTestedOSVersion: String? = nil,
+        groups: [ChatGroup] = []
     ) {
         self.version = version
         self.relayHost = relayHost
@@ -355,6 +373,7 @@ struct AppState: Codable, Sendable {
         self.panicModeEnabled = panicModeEnabled
         self.qrBlockEffective = qrBlockEffective
         self.qrBlockTestedOSVersion = qrBlockTestedOSVersion
+        self.groups = groups
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -368,6 +387,7 @@ struct AppState: Codable, Sendable {
         case panicModeEnabled
         case qrBlockEffective
         case qrBlockTestedOSVersion
+        case groups
     }
 
     init(from decoder: Decoder) throws {
@@ -382,6 +402,7 @@ struct AppState: Codable, Sendable {
         panicModeEnabled = try c.decodeIfPresent(Bool.self, forKey: .panicModeEnabled) ?? false
         qrBlockEffective = try c.decodeIfPresent(Bool.self, forKey: .qrBlockEffective)
         qrBlockTestedOSVersion = try c.decodeIfPresent(String.self, forKey: .qrBlockTestedOSVersion)
+        groups = try c.decodeIfPresent([ChatGroup].self, forKey: .groups) ?? []
         // Pre-existing JSON blobs from earlier builds may carry the
         // `notifyPeerOnScreenshot`, `blockQRScreenshots`,
         // `blockChatScreenshots`, and `blockAppScreenshots` keys.

@@ -30,6 +30,11 @@ sha2 = "0.10"
 # no C-link delta, also exposed via FFI as a hashcash-prover so iOS can
 # brute-force a nonce without a separate Swift BLAKE3 dep.
 blake3 = { version = "1", default-features = false }
+# Distribution-id type for libsignal's Sender Keys API. Already in
+# libsignal's transitive tree — no supply-chain delta. Used only at the
+# DeviceStore boundary to convert our raw 16-byte FFI argument into
+# libsignal's `Uuid`.
+uuid = { version = "1", default-features = false }
 
 [build-dependencies]
 cbindgen = "0.29"

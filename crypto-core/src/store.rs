@@ -33,10 +33,10 @@
 //! Hand-rolled rather than protobuf to keep the dependency surface minimal —
 //! libsignal does not export a wire-stable bundle encoder.
 //!
-//! Store snapshot wire format (`v2`, big-endian):
+//! Store snapshot wire format (`v3`, big-endian):
 //!
 //! ```text
-//! u8  store_version = 2
+//! u8  store_version = 3
 //! u32 identity_keypair_len + bytes
 //! u32 registration_id
 //! u32 next_pre_key_id
@@ -56,10 +56,18 @@
 //!     u16 peer_identity_pub_len + bytes
 //!     u32 session_record_len + bytes
 //! u32 sender_certificate_len + bytes  (0 if not yet minted)
+//! u32 sender_key_count                (v3+; absent on v1/v2 blobs)
+//!   for each sender_key:
+//!     u16 sender_identity_pub_len + bytes (33)
+//!     [16] distribution_id (raw UUID bytes)
+//!     u32 record_len + bytes  (libsignal SenderKeyRecord.serialize())
 //! ```
 //!
-//! v1 blobs (no trailing sender-certificate) deserialize by treating the
-//! cert as absent — `ensure_sender_certificate` mints fresh on demand.
+//! v1 blobs (no trailing sender-certificate) deserialize by treating
+//! both the cert and the sender-key list as absent — the cert is
+//! mintable on demand, the sender keys are rebuilt as the host
+//! reprocesses incoming SKDMs. v2 blobs deserialize with the cert
+//! present but no sender keys.
 
 use std::time::SystemTime;
 
@@ -69,18 +77,31 @@ use libsignal_protocol::{
     CiphertextMessage, CiphertextMessageType, ContentHint, DeviceId, GenericSignedPreKey,
     IdentityKey, IdentityKeyPair, IdentityKeyStore, InMemSignalProtocolStore, KeyPair,
     KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyRecord, PreKeySignalMessage,
-    PreKeyStore, PrivateKey, ProtocolAddress, PublicKey, SenderCertificate, ServerCertificate,
-    SessionRecord, SessionStore, SignalMessage, SignalProtocolError, SignedPreKeyRecord,
-    SignedPreKeyStore, Timestamp, UnidentifiedSenderMessageContent, kem, message_decrypt,
-    message_encrypt, sealed_sender_decrypt_to_usmc, sealed_sender_encrypt_from_usmc,
-    process_prekey_bundle,
+    PreKeyStore, PrivateKey, ProtocolAddress, PublicKey, SenderCertificate,
+    SenderKeyDistributionMessage, SenderKeyMessage, SenderKeyRecord, SenderKeyStore,
+    ServerCertificate, SessionRecord, SessionStore, SignalMessage, SignalProtocolError,
+    SignedPreKeyRecord, SignedPreKeyStore, Timestamp, UnidentifiedSenderMessageContent,
+    create_sender_key_distribution_message, group_decrypt as libsignal_group_decrypt,
+    group_encrypt as libsignal_group_encrypt, kem, message_decrypt, message_encrypt,
+    process_prekey_bundle, process_sender_key_distribution_message,
+    sealed_sender_decrypt_to_usmc, sealed_sender_encrypt_from_usmc,
 };
+use uuid::Uuid;
 use rand::{Rng, TryRngCore as _, rngs::OsRng};
 use sha2::Sha512;
 
 const BUNDLE_VERSION: u8 = 2;
-const STORE_VERSION: u8 = 2;
+/// Store snapshot version. v1 = pre-Phase-1 (no sender certificate). v2 =
+/// added the trailing sender-certificate field. v3 = appended the
+/// SenderKey state list for libsignal group messaging (Phase 6 group
+/// chat). All older versions deserialize transparently — sender-key
+/// state defaults to empty and is rebuilt as group operations arrive.
+const STORE_VERSION: u8 = 3;
 const DEVICE_ID: u8 = 1;
+/// Distribution-id wire size in our FFI: a 16-byte raw UUID (no hyphen
+/// formatting). Group ID derives directly from this — we feed the bytes
+/// straight into `Uuid::from_bytes`.
+pub const SENDER_KEY_DISTRIBUTION_ID_LEN: usize = 16;
 
 /// Self-signed SenderCertificate validity. Long enough that a peer who
 /// goes offline for a few weeks can still send without a refresh round
@@ -134,6 +155,16 @@ pub struct DeviceStore {
     /// when within `SENDER_CERT_REFRESH_MARGIN_MS` of expiry so an
     /// in-flight envelope never carries a just-lapsed cert.
     sender_certificate: Option<SenderCertificate>,
+    /// (sender_identity_pub_bytes, distribution_id) pairs for every
+    /// SenderKey state libsignal currently holds. `InMemSenderKeyStore`
+    /// is keyed by `(ProtocolAddress, Uuid)` and exposes no iterator,
+    /// so we maintain this index alongside any operation that calls
+    /// `store_sender_key` — `process_sender_key_distribution_message`
+    /// (incoming peer SKDM), `create_sender_key_distribution_message`
+    /// (our own group enrolment), and the implicit re-stores libsignal
+    /// performs on every `group_encrypt` / `group_decrypt`. Used at
+    /// `serialize` time to enumerate persisted records.
+    sender_key_index: Vec<(Vec<u8>, [u8; SENDER_KEY_DISTRIBUTION_ID_LEN])>,
 }
 
 pub struct EncryptResult {
@@ -172,6 +203,7 @@ impl DeviceStore {
             next_kyber_pre_key_id: 1,
             peers: Vec::new(),
             sender_certificate: None,
+            sender_key_index: Vec::new(),
         })
     }
 
@@ -190,6 +222,7 @@ impl DeviceStore {
             next_kyber_pre_key_id: 1,
             peers: Vec::new(),
             sender_certificate: None,
+            sender_key_index: Vec::new(),
         })
     }
 
@@ -402,6 +435,143 @@ impl DeviceStore {
             .session_store
             .store_session(&addr, &SessionRecord::new_fresh())
             .now_or_never();
+    }
+
+    // ───── Sender Keys (libsignal group messaging) ───────────────────
+    //
+    // Pizzini groups use libsignal's Sender Keys: each member, per
+    // group, owns a sender-key chain. To enrol a peer, we generate
+    // (or refresh) our own sender key for the group via
+    // `sender_key_distribution_create`, ship the resulting SKDM 1:1
+    // over the existing sealed-sender envelope, and the peer feeds it
+    // into `sender_key_distribution_process`. To send to the group,
+    // we encrypt once with `group_encrypt` and broadcast the resulting
+    // SenderKeyMessage as N independent sealed-sender envelopes (one
+    // per member); each recipient calls `group_decrypt`.
+    //
+    // Every operation that mutates the underlying SenderKey state
+    // updates `sender_key_index` so `serialize` can enumerate the
+    // records `InMemSenderKeyStore` doesn't expose an iterator for.
+
+    /// Create our local sender-key chain at `distribution_id` and return
+    /// the SKDM bytes the peers in this group need in order to decrypt
+    /// our future `group_encrypt` output for this dist_id. Calling
+    /// twice with the same `distribution_id` reuses the existing chain
+    /// — `distribution_id` is libsignal's *per-chain* identifier, not
+    /// the public group ID. To rotate (e.g. on a member-remove), the
+    /// caller passes a fresh random `distribution_id` and broadcasts
+    /// the resulting SKDM; the new chain is independent of the old.
+    /// Old chains stay in the store so late-arriving ciphertext from
+    /// the prior chain still decrypts.
+    pub fn sender_key_distribution_create(
+        &mut self,
+        distribution_id: [u8; SENDER_KEY_DISTRIBUTION_ID_LEN],
+    ) -> Result<Vec<u8>, SignalProtocolError> {
+        let mut rng = OsRng.unwrap_err();
+        let local_addr = address_for(&self.identity_public_bytes());
+        let uuid = Uuid::from_bytes(distribution_id);
+        let skdm = create_sender_key_distribution_message(
+            &local_addr,
+            uuid,
+            &mut self.inner.sender_key_store,
+            &mut rng,
+        )
+        .now_or_never()
+        .expect("in-mem store is sync")?;
+        self.note_sender_key(&self.identity_public_bytes(), distribution_id);
+        Ok(skdm.serialized().to_vec())
+    }
+
+    /// Process a peer's incoming SKDM. The `sender_identity` is the
+    /// authenticated identity-public from the sealed-sender unwrap;
+    /// the SKDM's distribution_id is the group it announces. After
+    /// this call we can decrypt that peer's `group_encrypt` output for
+    /// the same group.
+    pub fn sender_key_distribution_process(
+        &mut self,
+        sender_identity: &[u8],
+        skdm_bytes: &[u8],
+    ) -> Result<[u8; SENDER_KEY_DISTRIBUTION_ID_LEN], SignalProtocolError> {
+        let skdm = SenderKeyDistributionMessage::try_from(skdm_bytes)?;
+        let distribution_id = skdm.distribution_id()?;
+        let sender_addr = address_for(sender_identity);
+        process_sender_key_distribution_message(
+            &sender_addr,
+            &skdm,
+            &mut self.inner.sender_key_store,
+        )
+        .now_or_never()
+        .expect("in-mem store is sync")?;
+        let dist_bytes: [u8; SENDER_KEY_DISTRIBUTION_ID_LEN] = *distribution_id.as_bytes();
+        self.note_sender_key(sender_identity, dist_bytes);
+        Ok(dist_bytes)
+    }
+
+    /// Encrypt `plaintext` for the group identified by `distribution_id`
+    /// using our local sender-key chain. Caller must have already
+    /// invoked `sender_key_distribution_create` for this id; otherwise
+    /// libsignal returns `NoSenderKeyState`. The returned bytes are a
+    /// `SenderKeyMessage` ready to wrap into per-recipient sealed-
+    /// sender envelopes.
+    pub fn group_encrypt(
+        &mut self,
+        distribution_id: [u8; SENDER_KEY_DISTRIBUTION_ID_LEN],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, SignalProtocolError> {
+        let mut rng = OsRng.unwrap_err();
+        let local_addr = address_for(&self.identity_public_bytes());
+        let uuid = Uuid::from_bytes(distribution_id);
+        let skm = libsignal_group_encrypt(
+            &mut self.inner.sender_key_store,
+            &local_addr,
+            uuid,
+            plaintext,
+            &mut rng,
+        )
+        .now_or_never()
+        .expect("in-mem store is sync")?;
+        Ok(skm.serialized().to_vec())
+    }
+
+    /// Decrypt a `SenderKeyMessage` from `sender_identity`. The
+    /// distribution_id is encoded in the ciphertext header and looked
+    /// up against the SKDM previously processed for this sender.
+    pub fn group_decrypt(
+        &mut self,
+        sender_identity: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, SignalProtocolError> {
+        let sender_addr = address_for(sender_identity);
+        // Surface the distribution_id parsed from the SKM so callers
+        // can audit / cross-check against the inner-envelope group_id.
+        let skm = SenderKeyMessage::try_from(ciphertext)?;
+        let dist_bytes: [u8; SENDER_KEY_DISTRIBUTION_ID_LEN] = *skm.distribution_id().as_bytes();
+        let plaintext =
+            libsignal_group_decrypt(ciphertext, &mut self.inner.sender_key_store, &sender_addr)
+                .now_or_never()
+                .expect("in-mem store is sync")?;
+        // libsignal's group_decrypt re-stores the record with advanced
+        // chain state; the index entry already exists from
+        // sender_key_distribution_process, so noting is a no-op for
+        // this hot path. Belt-and-suspenders: re-record so a hand-
+        // tampered store stays consistent.
+        self.note_sender_key(sender_identity, dist_bytes);
+        Ok(plaintext)
+    }
+
+    fn note_sender_key(
+        &mut self,
+        sender_identity: &[u8],
+        distribution_id: [u8; SENDER_KEY_DISTRIBUTION_ID_LEN],
+    ) {
+        let already = self
+            .sender_key_index
+            .iter()
+            .any(|(s, d)| s.as_slice() == sender_identity && *d == distribution_id);
+        if !already {
+            self.sender_key_index
+                .push((sender_identity.to_vec(), distribution_id));
+        }
     }
 
     pub fn encrypt(
@@ -754,7 +924,7 @@ impl DeviceStore {
     /// Snapshot the entire libsignal store + ratchet state to a versioned
     /// binary blob. Pair with `from_serialized` for full session continuity
     /// across launches. Format documented at the top of this module.
-    pub fn serialize(&self) -> Result<Vec<u8>, SignalProtocolError> {
+    pub fn serialize(&mut self) -> Result<Vec<u8>, SignalProtocolError> {
         let mut out = Vec::with_capacity(8192);
         out.push(STORE_VERSION);
         let id_kp = self.local_identity_keypair();
@@ -855,6 +1025,34 @@ impl DeviceStore {
         };
         write_u32_blob(&mut out, cert_bytes);
 
+        // Sender-key state (v3+). Each tuple: (sender_identity, dist_id,
+        // libsignal-serialized record). The index is the only iteration
+        // path — InMemSenderKeyStore exposes no enumerator.
+        let mut sender_key_entries: Vec<(Vec<u8>, [u8; SENDER_KEY_DISTRIBUTION_ID_LEN], Vec<u8>)> =
+            Vec::with_capacity(self.sender_key_index.len());
+        for (sender_identity, dist_bytes) in &self.sender_key_index {
+            let addr = address_for(sender_identity);
+            let uuid = Uuid::from_bytes(*dist_bytes);
+            if let Some(record) = self
+                .inner
+                .sender_key_store
+                .load_sender_key(&addr, uuid)
+                .now_or_never()
+                .expect("in-mem store is sync")?
+            {
+                let record_bytes = record.serialize()?;
+                if !record_bytes.is_empty() {
+                    sender_key_entries.push((sender_identity.clone(), *dist_bytes, record_bytes));
+                }
+            }
+        }
+        out.extend_from_slice(&(sender_key_entries.len() as u32).to_be_bytes());
+        for (sender_identity, dist_bytes, record_bytes) in &sender_key_entries {
+            write_u16_blob(&mut out, sender_identity);
+            out.extend_from_slice(dist_bytes);
+            write_u32_blob(&mut out, record_bytes);
+        }
+
         Ok(out)
     }
 
@@ -864,9 +1062,10 @@ impl DeviceStore {
         // v1 blobs (no trailing sender-certificate field) are accepted —
         // they pre-date Phase 1, were already in production Keychains,
         // and migrate transparently because the cert is mintable on
-        // demand. Anything past v2 is genuinely from-the-future and
-        // refuses to load.
-        if version != STORE_VERSION && version != 1 {
+        // demand. v2 blobs add the sender-cert field; v3 blobs add the
+        // sender-key state list. Anything past v3 is genuinely from-
+        // the-future and refuses to load.
+        if version != STORE_VERSION && version != 2 && version != 1 {
             return Err(SignalProtocolError::InvalidArgument(format!(
                 "unknown store version {version}"
             )));
@@ -933,7 +1132,7 @@ impl DeviceStore {
                 .expect("in-mem store is sync")?;
         }
 
-        let sender_certificate = if version >= STORE_VERSION && !r.is_empty() {
+        let sender_certificate = if version >= 2 && !r.is_empty() {
             let cert_bytes = r.u32_blob()?;
             if cert_bytes.is_empty() {
                 None
@@ -944,6 +1143,30 @@ impl DeviceStore {
             None
         };
 
+        // Sender-key state (v3+). Older blobs deserialize with an empty
+        // index; the host repopulates by re-processing peers' SKDMs as
+        // they arrive over the existing 1:1 channels.
+        let mut sender_key_index: Vec<(Vec<u8>, [u8; SENDER_KEY_DISTRIBUTION_ID_LEN])> = Vec::new();
+        if version >= 3 && !r.is_empty() {
+            let count = r.u32()? as usize;
+            for _ in 0..count {
+                let sender_identity = r.u16_blob()?.to_vec();
+                let dist_id_slice = r.take(SENDER_KEY_DISTRIBUTION_ID_LEN)?;
+                let mut dist_bytes = [0u8; SENDER_KEY_DISTRIBUTION_ID_LEN];
+                dist_bytes.copy_from_slice(dist_id_slice);
+                let record_bytes = r.u32_blob()?;
+                let record = SenderKeyRecord::deserialize(record_bytes)?;
+                let addr = address_for(&sender_identity);
+                let uuid = Uuid::from_bytes(dist_bytes);
+                store
+                    .sender_key_store
+                    .store_sender_key(&addr, uuid, &record)
+                    .now_or_never()
+                    .expect("in-mem store is sync")?;
+                sender_key_index.push((sender_identity, dist_bytes));
+            }
+        }
+
         Ok(Self {
             inner: store,
             next_pre_key_id,
@@ -951,6 +1174,7 @@ impl DeviceStore {
             next_kyber_pre_key_id,
             peers,
             sender_certificate,
+            sender_key_index,
         })
     }
 }
@@ -1414,7 +1638,7 @@ mod tests {
 
     #[test]
     fn fresh_store_serializes_to_a_minimal_blob() {
-        let s = DeviceStore::fresh().unwrap();
+        let mut s = DeviceStore::fresh().unwrap();
         let blob = s.serialize().unwrap();
         let s2 = DeviceStore::from_serialized(&blob).unwrap();
         assert_eq!(s.identity_keypair_bytes(), s2.identity_keypair_bytes());

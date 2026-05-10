@@ -407,8 +407,10 @@ pub unsafe extern "C" fn pizzini_store_serialize(
     if store.is_null() || out_buf.is_null() || out_len.is_null() {
         return PIZZINI_ERR_INVALID_ARG;
     }
-    // SAFETY: caller asserted preconditions.
-    let s = unsafe { &*store };
+    // SAFETY: caller asserted preconditions. `serialize` requires `&mut`
+    // since v3 — `InMemSenderKeyStore.load_sender_key` is declared with
+    // `&mut self` on the trait, even though it only clones internally.
+    let s = unsafe { &mut *store };
     let bytes = match s.serialize() {
         Ok(b) => b,
         Err(_) => return PIZZINI_ERR_INTERNAL,
@@ -712,6 +714,58 @@ pub unsafe extern "C" fn pizzini_verify_delivery_token(
     }
 }
 
+/// Verify an arbitrary XEd25519 signature `sig` over `message`, claimed
+/// to be produced by the IdentityKey whose 33-byte serialized public
+/// half is `identity_pub`.
+///
+/// Returns `PIZZINI_OK` on a valid signature, `PIZZINI_ERR_BAD_SIGNATURE`
+/// if the signature does not match, or `PIZZINI_ERR_INVALID_ARG` for
+/// length / null mismatches. Used by the Swift host to authenticate
+/// signed `GroupOp` log entries: the signer's identity-public is
+/// embedded in the op header and the recipient verifies the signature
+/// before applying the op.
+///
+/// # Safety
+/// All pointers must be non-null and refer to memory of the declared
+/// sizes. `identity_pub_len` must equal the IdentityKey wire size
+/// (33 bytes — 1-byte DJB type prefix + 32-byte point).
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_verify_identity_signature(
+    identity_pub: *const u8,
+    identity_pub_len: usize,
+    message: *const u8,
+    message_len: usize,
+    signature: *const u8,
+    signature_len: usize,
+) -> i32 {
+    if identity_pub.is_null() || message.is_null() || signature.is_null() {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // 33 bytes is the libsignal-native IdentityKey wire size.
+    if identity_pub_len != 33 {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // 64 bytes is the XEd25519 signature output libsignal's
+    // `IdentityKeyPair::private_key().calculate_signature(...)` produces.
+    if signature_len != 64 {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted slice validity above.
+    let id_bytes = unsafe { std::slice::from_raw_parts(identity_pub, identity_pub_len) };
+    let msg = unsafe { std::slice::from_raw_parts(message, message_len) };
+    let sig = unsafe { std::slice::from_raw_parts(signature, signature_len) };
+
+    let key = match PublicKey::deserialize(id_bytes) {
+        Ok(k) => k,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    if key.verify_signature(msg, sig) {
+        PIZZINI_OK
+    } else {
+        PIZZINI_ERR_BAD_SIGNATURE
+    }
+}
+
 /// Sign `payload` with the local IdentityKey's private half. F-203:
 /// used by the iOS client to attach a possession proof to its HELLO
 /// frame so a network-positioned attacker can't squat someone else's
@@ -910,6 +964,194 @@ pub unsafe extern "C" fn pizzini_store_seal_receive(
         *out_is_duplicate = if received.is_duplicate { 1 } else { 0 };
     }
     PIZZINI_OK
+}
+
+// ───── Group cipher (libsignal Sender Keys) ────────────────────────────
+//
+// Pizzini groups encrypt with libsignal's Sender Keys. Each member
+// owns a per-chain `distribution_id` (a random 16-byte UUID, NOT the
+// public group ID — see `DeviceStore::sender_key_distribution_create`
+// for why). To enrol the group, a member calls
+// `pizzini_store_sender_key_distribution_create(distribution_id)` and
+// ships the SKDM bytes 1:1 over the existing sealed-sender envelope to
+// each peer; the peer feeds the SKDM into
+// `pizzini_store_sender_key_distribution_process(sender, skdm)`.
+// To send to the group, the member calls
+// `pizzini_store_group_encrypt(distribution_id, plaintext)` once and
+// broadcasts the resulting `SenderKeyMessage` as N independent sealed-
+// sender envelopes; each recipient calls
+// `pizzini_store_group_decrypt(sender, ciphertext)`.
+//
+// The four functions below are thin FFI shims around the matching
+// `DeviceStore::*` methods. All caller-supplied buffers follow the
+// "pass cap, get required size, retry if too small" idiom that the
+// rest of the FFI uses; see `copy_or_size_out`.
+
+/// Wire size of a `distribution_id`: a 16-byte raw UUID. The Swift
+/// caller derives this per-chain (e.g. from a random-UUID generator)
+/// and persists the mapping `(group_id, member_peer_id) → distribution_id`
+/// in its own group state model.
+pub const PIZZINI_DISTRIBUTION_ID_LEN: usize = 16;
+
+/// Create our local sender-key chain at `distribution_id` and return
+/// the SKDM bytes. Calling twice with the same `distribution_id` reuses
+/// the existing chain; rotation is "pick a fresh `distribution_id`."
+///
+/// # Safety
+/// `store` and `distribution_id_16` must be non-null;
+/// `distribution_id_16` must point to exactly 16 readable bytes.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_store_sender_key_distribution_create(
+    store: *mut store::DeviceStore,
+    distribution_id_16: *const u8,
+    out_skdm: *mut u8,
+    out_skdm_cap: usize,
+    out_skdm_len: *mut usize,
+) -> i32 {
+    if store.is_null()
+        || distribution_id_16.is_null()
+        || out_skdm.is_null()
+        || out_skdm_len.is_null()
+    {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted preconditions above.
+    let s = unsafe { &mut *store };
+    let id_slice = unsafe { std::slice::from_raw_parts(distribution_id_16, PIZZINI_DISTRIBUTION_ID_LEN) };
+    let mut distribution_id = [0u8; PIZZINI_DISTRIBUTION_ID_LEN];
+    distribution_id.copy_from_slice(id_slice);
+    let skdm = match s.sender_key_distribution_create(distribution_id) {
+        Ok(b) => b,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    // SAFETY: out_skdm/out_skdm_len asserted valid.
+    unsafe { copy_or_size_out(&skdm, out_skdm, out_skdm_cap, out_skdm_len) }
+}
+
+/// Process a peer's incoming SKDM. `sender_identity` is the
+/// authenticated identity-public from the sealed-sender unwrap. On
+/// success, writes the 16-byte distribution_id parsed from the SKDM
+/// to `out_distribution_id_16`, so the caller can match the chain
+/// against its group-state model without re-parsing the SKDM.
+///
+/// # Safety
+/// All pointers must be non-null and refer to memory of the declared
+/// sizes; `out_distribution_id_16` must point to 16 writable bytes.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_store_sender_key_distribution_process(
+    store: *mut store::DeviceStore,
+    sender_identity: *const u8,
+    sender_identity_len: usize,
+    skdm: *const u8,
+    skdm_len: usize,
+    out_distribution_id_16: *mut u8,
+) -> i32 {
+    if store.is_null()
+        || sender_identity.is_null()
+        || skdm.is_null()
+        || out_distribution_id_16.is_null()
+    {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted preconditions.
+    let s = unsafe { &mut *store };
+    let sender = unsafe { std::slice::from_raw_parts(sender_identity, sender_identity_len) };
+    let bytes = unsafe { std::slice::from_raw_parts(skdm, skdm_len) };
+    let dist_id = match s.sender_key_distribution_process(sender, bytes) {
+        Ok(d) => d,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    // SAFETY: caller asserted out_distribution_id_16 has 16 writable bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(dist_id.as_ptr(), out_distribution_id_16, PIZZINI_DISTRIBUTION_ID_LEN);
+    }
+    PIZZINI_OK
+}
+
+/// Encrypt `plaintext` for the chain identified by `distribution_id`.
+/// Caller must have called `sender_key_distribution_create` with the
+/// same `distribution_id` first; otherwise libsignal returns
+/// `NoSenderKeyState` (mapped to `PIZZINI_ERR_INTERNAL`). The output is
+/// a `SenderKeyMessage` ready for fan-out as N pairwise sealed-sender
+/// envelopes.
+///
+/// # Safety
+/// All pointers must be non-null and refer to memory of the declared
+/// sizes; `distribution_id_16` must point to exactly 16 readable bytes.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_store_group_encrypt(
+    store: *mut store::DeviceStore,
+    distribution_id_16: *const u8,
+    plaintext: *const u8,
+    plaintext_len: usize,
+    out_ciphertext: *mut u8,
+    out_ciphertext_cap: usize,
+    out_ciphertext_len: *mut usize,
+) -> i32 {
+    if store.is_null()
+        || distribution_id_16.is_null()
+        || plaintext.is_null()
+        || out_ciphertext.is_null()
+        || out_ciphertext_len.is_null()
+    {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted preconditions.
+    let s = unsafe { &mut *store };
+    let id_slice = unsafe { std::slice::from_raw_parts(distribution_id_16, PIZZINI_DISTRIBUTION_ID_LEN) };
+    let mut distribution_id = [0u8; PIZZINI_DISTRIBUTION_ID_LEN];
+    distribution_id.copy_from_slice(id_slice);
+    let pt = unsafe { std::slice::from_raw_parts(plaintext, plaintext_len) };
+    let ct = match s.group_encrypt(distribution_id, pt) {
+        Ok(b) => b,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    // SAFETY: out_ciphertext/out_ciphertext_len asserted valid.
+    unsafe { copy_or_size_out(&ct, out_ciphertext, out_ciphertext_cap, out_ciphertext_len) }
+}
+
+/// Decrypt a `SenderKeyMessage` from `sender_identity`. The
+/// distribution_id is encoded in the ciphertext header and looked up
+/// against the SKDM previously processed for this sender. Returns
+/// `PIZZINI_ERR_INTERNAL` if the chain isn't installed (caller should
+/// trigger an SKDM exchange) or if the signature verification fails.
+///
+/// # Safety
+/// All pointers must be non-null and refer to memory of the declared
+/// sizes.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_store_group_decrypt(
+    store: *mut store::DeviceStore,
+    sender_identity: *const u8,
+    sender_identity_len: usize,
+    ciphertext: *const u8,
+    ciphertext_len: usize,
+    out_plaintext: *mut u8,
+    out_plaintext_cap: usize,
+    out_plaintext_len: *mut usize,
+) -> i32 {
+    if store.is_null()
+        || sender_identity.is_null()
+        || ciphertext.is_null()
+        || out_plaintext.is_null()
+        || out_plaintext_len.is_null()
+    {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted preconditions.
+    let s = unsafe { &mut *store };
+    let sender = unsafe { std::slice::from_raw_parts(sender_identity, sender_identity_len) };
+    let ct = unsafe { std::slice::from_raw_parts(ciphertext, ciphertext_len) };
+    let pt = match s.group_decrypt(sender, ct) {
+        Ok(b) => b,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    // SAFETY: out_plaintext/out_plaintext_len asserted valid.
+    unsafe { copy_or_size_out(&pt, out_plaintext, out_plaintext_cap, out_plaintext_len) }
 }
 
 #[cfg(test)]

@@ -39,9 +39,24 @@
 #define HASHCASH_FFI_MAX_BITS 26
 
 /**
+ * Wire size of a `distribution_id`: a 16-byte raw UUID. The Swift
+ * caller derives this per-chain (e.g. from a random-UUID generator)
+ * and persists the mapping `(group_id, member_peer_id) → distribution_id`
+ * in its own group state model.
+ */
+#define PIZZINI_DISTRIBUTION_ID_LEN 16
+
+/**
  * Default difficulty: 18 leading zero bits. ~250k expected attempts.
  */
 #define HASHCASH_DEFAULT_BITS 18
+
+/**
+ * Distribution-id wire size in our FFI: a 16-byte raw UUID (no hyphen
+ * formatting). Group ID derives directly from this — we feed the bytes
+ * straight into `Uuid::from_bytes`.
+ */
+#define SENDER_KEY_DISTRIBUTION_ID_LEN 16
 
 /**
  * libsignal-native public-key wire size: 1-byte DJB type prefix + 32-byte
@@ -384,6 +399,30 @@ int32_t pizzini_verify_delivery_token(const uint8_t *verify_key,
                                       uintptr_t token_len);
 
 /**
+ * Verify an arbitrary XEd25519 signature `sig` over `message`, claimed
+ * to be produced by the IdentityKey whose 33-byte serialized public
+ * half is `identity_pub`.
+ *
+ * Returns `PIZZINI_OK` on a valid signature, `PIZZINI_ERR_BAD_SIGNATURE`
+ * if the signature does not match, or `PIZZINI_ERR_INVALID_ARG` for
+ * length / null mismatches. Used by the Swift host to authenticate
+ * signed `GroupOp` log entries: the signer's identity-public is
+ * embedded in the op header and the recipient verifies the signature
+ * before applying the op.
+ *
+ * # Safety
+ * All pointers must be non-null and refer to memory of the declared
+ * sizes. `identity_pub_len` must equal the IdentityKey wire size
+ * (33 bytes — 1-byte DJB type prefix + 32-byte point).
+ */
+int32_t pizzini_verify_identity_signature(const uint8_t *identity_pub,
+                                          uintptr_t identity_pub_len,
+                                          const uint8_t *message,
+                                          uintptr_t message_len,
+                                          const uint8_t *signature,
+                                          uintptr_t signature_len);
+
+/**
  * Sign `payload` with the local IdentityKey's private half. F-203:
  * used by the iOS client to attach a possession proof to its HELLO
  * frame so a network-positioned attacker can't squat someone else's
@@ -474,5 +513,78 @@ int32_t pizzini_store_seal_receive(struct DeviceStore *store,
                                    uintptr_t out_plaintext_cap,
                                    uintptr_t *out_plaintext_len,
                                    uint8_t *out_is_duplicate);
+
+/**
+ * Create our local sender-key chain at `distribution_id` and return
+ * the SKDM bytes. Calling twice with the same `distribution_id` reuses
+ * the existing chain; rotation is "pick a fresh `distribution_id`."
+ *
+ * # Safety
+ * `store` and `distribution_id_16` must be non-null;
+ * `distribution_id_16` must point to exactly 16 readable bytes.
+ */
+int32_t pizzini_store_sender_key_distribution_create(struct DeviceStore *store,
+                                                     const uint8_t *distribution_id_16,
+                                                     uint8_t *out_skdm,
+                                                     uintptr_t out_skdm_cap,
+                                                     uintptr_t *out_skdm_len);
+
+/**
+ * Process a peer's incoming SKDM. `sender_identity` is the
+ * authenticated identity-public from the sealed-sender unwrap. On
+ * success, writes the 16-byte distribution_id parsed from the SKDM
+ * to `out_distribution_id_16`, so the caller can match the chain
+ * against its group-state model without re-parsing the SKDM.
+ *
+ * # Safety
+ * All pointers must be non-null and refer to memory of the declared
+ * sizes; `out_distribution_id_16` must point to 16 writable bytes.
+ */
+int32_t pizzini_store_sender_key_distribution_process(struct DeviceStore *store,
+                                                      const uint8_t *sender_identity,
+                                                      uintptr_t sender_identity_len,
+                                                      const uint8_t *skdm,
+                                                      uintptr_t skdm_len,
+                                                      uint8_t *out_distribution_id_16);
+
+/**
+ * Encrypt `plaintext` for the chain identified by `distribution_id`.
+ * Caller must have called `sender_key_distribution_create` with the
+ * same `distribution_id` first; otherwise libsignal returns
+ * `NoSenderKeyState` (mapped to `PIZZINI_ERR_INTERNAL`). The output is
+ * a `SenderKeyMessage` ready for fan-out as N pairwise sealed-sender
+ * envelopes.
+ *
+ * # Safety
+ * All pointers must be non-null and refer to memory of the declared
+ * sizes; `distribution_id_16` must point to exactly 16 readable bytes.
+ */
+int32_t pizzini_store_group_encrypt(struct DeviceStore *store,
+                                    const uint8_t *distribution_id_16,
+                                    const uint8_t *plaintext,
+                                    uintptr_t plaintext_len,
+                                    uint8_t *out_ciphertext,
+                                    uintptr_t out_ciphertext_cap,
+                                    uintptr_t *out_ciphertext_len);
+
+/**
+ * Decrypt a `SenderKeyMessage` from `sender_identity`. The
+ * distribution_id is encoded in the ciphertext header and looked up
+ * against the SKDM previously processed for this sender. Returns
+ * `PIZZINI_ERR_INTERNAL` if the chain isn't installed (caller should
+ * trigger an SKDM exchange) or if the signature verification fails.
+ *
+ * # Safety
+ * All pointers must be non-null and refer to memory of the declared
+ * sizes.
+ */
+int32_t pizzini_store_group_decrypt(struct DeviceStore *store,
+                                    const uint8_t *sender_identity,
+                                    uintptr_t sender_identity_len,
+                                    const uint8_t *ciphertext,
+                                    uintptr_t ciphertext_len,
+                                    uint8_t *out_plaintext,
+                                    uintptr_t out_plaintext_cap,
+                                    uintptr_t *out_plaintext_len);
 
 #endif  /* PIZZINI_CRYPTO_CORE_H */

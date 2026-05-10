@@ -7,8 +7,8 @@ import SwiftUI
 /// expose it in the app switcher.
 ///
 /// Visual: solid black, no content. Matches `LaunchScreen.storyboard`
-/// and the `SecureScreenshotShield`-masked app, so every privacy-
-/// related cover Pizzini paints looks identical — no Pizzini branding,
+/// and the `WindowSecureMask`-masked app, so every privacy-related
+/// cover Pizzini paints looks identical — no Pizzini branding,
 /// no app-name text, nothing that hints at what the app is even when
 /// the multitasking thumbnail itself is captured. The user still
 /// identifies the app in the switcher via the icon + label iOS
