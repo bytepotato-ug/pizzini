@@ -1674,23 +1674,15 @@ extension ChatStore: RelayClientDelegate {
         }
         let highest = Data(payload)
         let now = Date()
-        // Locate the cutoff timestamp for the message_id the peer claims
-        // to have read up to. Prefer the outbox entry's `sentAt`; fall
-        // back to the chat log's own `timestamp` if the outbox entry has
-        // already been GC'd (terminal entries are dropped 24h after
-        // delivery, so reads more than a day late would otherwise be
-        // silently dropped — F-503).
-        let cutoff: Date
-        if let highestEntry = outbox.entries[highest] {
-            cutoff = highestEntry.sentAt
-        } else if let logEntry = state.contacts[idx]
-            .log
-            .last(where: { $0.side == .me && $0.messageId == highest })
-        {
-            cutoff = logEntry.timestamp
-        } else {
-            return
-        }
+        // Resolve the cutoff via the shared helper which prefers the
+        // log row's timestamp over the outbox entry's sentAt — the
+        // log timestamp is created strictly after sentAt in
+        // `send(_:to:)`, so using sentAt as the cutoff would
+        // silently skip the row the receipt explicitly cites (the
+        // "eye only lights on the previous message" regression).
+        guard let cutoff = OutboxStore.readReceiptCutoff(
+            highest: highest, log: state.contacts[idx].log, outbox: outbox,
+        ) else { return }
         var changed = false
         for i in state.contacts[idx].log.indices {
             let m = state.contacts[idx].log[i]

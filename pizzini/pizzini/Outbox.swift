@@ -263,4 +263,29 @@ struct OutboxStore: Codable, Sendable {
         guard !legs.isEmpty else { return false }
         return legs.allSatisfy { $0.readAt != nil }
     }
+
+    /// Cutoff date for a read receipt covering up to `highest`
+    /// messageId. PREFERS the `.me` log row's `timestamp` over the
+    /// outbox entry's `sentAt` — the log timestamp is created
+    /// strictly after the outbox `sentAt` (sentAt is captured before
+    /// `encryptSealed`; the log row is built post-relay-handoff), so
+    /// using `sentAt` as the cutoff would silently skip the row the
+    /// receipt explicitly cites (regression that showed as "eye
+    /// only lights on the previous message when a new one is sent").
+    /// Falls back to the outbox entry's `sentAt` only when the log
+    /// row has already been GC'd. Returns `nil` when neither source
+    /// has the messageId — the receipt is too late.
+    static func readReceiptCutoff(
+        highest: Data,
+        log: [PersistedMessage],
+        outbox: OutboxStore,
+    ) -> Date? {
+        if let row = log.last(where: { $0.side == .me && $0.messageId == highest }) {
+            return row.timestamp
+        }
+        if let entry = outbox.entries[highest] {
+            return entry.sentAt
+        }
+        return nil
+    }
 }

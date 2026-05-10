@@ -239,6 +239,83 @@ struct ChatGroupSendGateTests {
     }
 }
 
+@Suite("OutboxStore.readReceiptCutoff (regression: eye-on-latest-message bug)")
+struct OutboxReadReceiptCutoffTests {
+    /// Pin the fix for the "eye only flips on the previous message
+    /// when a newer one is sent" bug. `send(_:to:)` captures
+    /// `OutboxEntry.sentAt = Date()` BEFORE `encryptSealed`, then
+    /// builds the `.me` log row AFTERWARDS with its own `Date()`
+    /// timestamp at row-init. The log row's timestamp is therefore
+    /// strictly >= the outbox entry's sentAt, and the original
+    /// `m.timestamp <= cutoff` walk with `cutoff = outbox.sentAt`
+    /// silently dropped the row the receipt explicitly cited — the
+    /// row would only flip to 👁 once a NEWER outbox.sentAt moved
+    /// the cutoff past its log timestamp.
+    @Test("cutoff prefers log timestamp over outbox sentAt for the cited row")
+    func cutoffPrefersLogTimestamp() {
+        let mid = Data(repeating: 0xA1, count: 16)
+        let outboxSentAt = Date(timeIntervalSinceReferenceDate: 1)
+        let logTimestamp = Date(timeIntervalSinceReferenceDate: 2)
+        let row = PersistedMessage(
+            side: .me, text: "x", kind: .whisper, bytes: 1,
+            timestamp: logTimestamp, messageId: mid,
+        )
+        var store = OutboxStore.empty
+        store.entries[mid] = OutboxEntry(
+            messageId: mid,
+            recipientPeerId: Data(repeating: 0xBB, count: 33),
+            sealedCiphertext: Data(),
+            token: Data(),
+            ttl: 1,
+            sentAt: outboxSentAt,
+            retries: 0,
+            deliveredAt: nil,
+            failedAt: nil,
+            relayedAt: nil,
+        )
+        let cutoff = OutboxStore.readReceiptCutoff(
+            highest: mid, log: [row], outbox: store,
+        )
+        #expect(cutoff == logTimestamp,
+                "cutoff must be the log row's timestamp so the cited row's `m.timestamp <= cutoff` check succeeds")
+        #expect(cutoff != outboxSentAt,
+                "outbox.sentAt is created PRE-encrypt → strictly earlier; using it as cutoff is the bug")
+    }
+
+    @Test("falls back to outbox sentAt when the log row has been GC'd")
+    func fallbackToOutboxWhenLogGCd() {
+        let mid = Data(repeating: 0xA2, count: 16)
+        let outboxSentAt = Date(timeIntervalSinceReferenceDate: 5)
+        var store = OutboxStore.empty
+        store.entries[mid] = OutboxEntry(
+            messageId: mid,
+            recipientPeerId: Data(repeating: 0xBB, count: 33),
+            sealedCiphertext: Data(),
+            token: Data(),
+            ttl: 1,
+            sentAt: outboxSentAt,
+            retries: 0,
+            deliveredAt: nil,
+            failedAt: nil,
+            relayedAt: nil,
+        )
+        let cutoff = OutboxStore.readReceiptCutoff(
+            highest: mid, log: [], outbox: store,
+        )
+        #expect(cutoff == outboxSentAt,
+                "log empty (row GC'd) → fall back to outbox sentAt rather than dropping the receipt entirely")
+    }
+
+    @Test("returns nil when neither source has the messageId")
+    func nilWhenAbsent() {
+        let cutoff = OutboxStore.readReceiptCutoff(
+            highest: Data(repeating: 0x99, count: 16),
+            log: [], outbox: OutboxStore.empty,
+        )
+        #expect(cutoff == nil)
+    }
+}
+
 @Suite("OutboxStore.groupMessageStatus rollup (Phase 7)")
 struct OutboxGroupRollupTests {
     private func leg(
