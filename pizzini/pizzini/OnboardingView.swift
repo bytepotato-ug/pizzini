@@ -14,16 +14,18 @@ struct OnboardingView: View {
     @State private var step: Step = .welcome
     @State private var authError: String?
     @State private var authInFlight = false
+    @State private var notificationsInFlight = false
 
-    private enum Step { case welcome, icons, biometric }
+    private enum Step { case welcome, icons, notifications, biometric }
 
     var body: some View {
         NavigationStack {
             VStack {
                 switch step {
-                case .welcome:    welcomeStep
-                case .icons:      iconsStep
-                case .biometric:  biometricStep
+                case .welcome:        welcomeStep
+                case .icons:          iconsStep
+                case .notifications:  notificationsStep
+                case .biometric:      biometricStep
                 }
             }
             .padding(.horizontal, 24)
@@ -50,7 +52,7 @@ struct OnboardingView: View {
             .padding(.top, 8)
             Spacer()
             Button {
-                step = .biometric
+                step = .notifications
             } label: {
                 Text("Continue")
                     .font(.headline)
@@ -59,6 +61,64 @@ struct OnboardingView: View {
             }
             .buttonStyle(.borderedProminent)
             .padding(.bottom, 24)
+        }
+    }
+
+    /// Permission step #1 of 2 — notifications. Shown after the icons
+    /// legend so the user understands what's being unlocked before
+    /// the iOS prompt fires. Two buttons (Enable / Skip) so the
+    /// system alert only appears in response to a deliberate tap;
+    /// the old design fired the alert automatically at first launch.
+    private var notificationsStep: some View {
+        VStack(spacing: 18) {
+            Spacer()
+            Image(systemName: "bell.badge.fill")
+                .font(.system(size: 64))
+                .foregroundStyle(.tint)
+            Text("Get notified of new messages")
+                .font(.title.bold())
+                .multilineTextAlignment(.center)
+            Text("When a contact messages you while Pizzini is closed, your phone wakes you up. The notification doesn't leak any content — it only says \"New message\". Names, previews, and the message itself stay sealed until you open Pizzini.")
+                .font(.body)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Spacer()
+            VStack(spacing: 12) {
+                Button {
+                    enableNotifications()
+                } label: {
+                    Label("Enable notifications", systemImage: "bell.fill")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(notificationsInFlight)
+                Button {
+                    step = .biometric
+                } label: {
+                    Text("Skip — I'll enable in Settings later")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                }
+                .buttonStyle(.bordered)
+                .disabled(notificationsInFlight)
+            }
+            .padding(.bottom, 24)
+        }
+    }
+
+    private func enableNotifications() {
+        notificationsInFlight = true
+        Task { @MainActor in
+            defer { notificationsInFlight = false }
+            // The result (granted or denied) doesn't change the
+            // onboarding flow — we always advance after the user
+            // has answered the iOS prompt. If they deny, the rest
+            // of the app works fine; they just won't get push
+            // wake-ups until they enable it in iOS Settings.
+            _ = await AppDelegate.shared?.requestAuthorizationAndRegister()
+            step = .biometric
         }
     }
 

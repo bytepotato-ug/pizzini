@@ -12,10 +12,18 @@ import UserNotifications
 /// connection that the token needs to be published over. We bridge by
 /// calling `ChatStore.shared.publishPushToken(_:)`.
 final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+    /// Captured at `application(_:didFinishLaunchingWithOptions:)`
+    /// time so non-AppDelegate code (the onboarding "Enable
+    /// notifications" button) can reach the live instance to
+    /// trigger `requestAuthorizationAndRegister`. `weak` because
+    /// the system owns the lifecycle via `@UIApplicationDelegateAdaptor`.
+    nonisolated(unsafe) static weak var shared: AppDelegate?
+
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        Self.shared = self
         // Open the SQLCipher store + run the one-shot Keychain →
         // SQLCipher migration before any other init code constructs
         // `ChatStore.shared`. Storage methods on the SQLite-backed
@@ -51,7 +59,13 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         Task { @MainActor in
             SecureScreenshotSelfTest.runIfNeeded(store: ChatStore.shared)
         }
-        Task { await requestAuthorizationAndRegister() }
+        // Notification permission is NOT requested here. Onboarding
+        // owns that decision — the user gets one clear "Enable
+        // notifications?" page with an Enable/Skip pair of buttons,
+        // not a system alert bombing them at first launch. After the
+        // initial onboarding the iOS Settings app is the path to
+        // re-prompt (UNUserNotificationCenter caches the first
+        // decision; you can only re-prompt via the OS settings).
         return true
     }
 
@@ -82,19 +96,28 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         completionHandler([.banner, .sound, .badge])
     }
 
-    private func requestAuthorizationAndRegister() async {
+    /// Public so the onboarding's "Enable notifications" button can
+    /// trigger the system prompt at a moment the user expects it.
+    /// Returns `true` if the user granted authorization. Calling this
+    /// after a previous decision is a no-op at the iOS level — the
+    /// cached state stands; the user has to go to iOS Settings to
+    /// change it.
+    @discardableResult
+    func requestAuthorizationAndRegister() async -> Bool {
         do {
             let granted = try await UNUserNotificationCenter.current()
                 .requestAuthorization(options: [.alert, .sound, .badge])
             guard granted else {
                 NSLog("[pizzini] notification authorization not granted")
-                return
+                return false
             }
             await MainActor.run {
                 UIApplication.shared.registerForRemoteNotifications()
             }
+            return true
         } catch {
             NSLog("[pizzini] requestAuthorization failed: \(error)")
+            return false
         }
     }
 }
