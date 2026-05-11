@@ -1,0 +1,79 @@
+#!/usr/sbin/nft -f
+#
+# Pizzini relay nftables ruleset. Drop-by-default on input and
+# forward; output is whitelist of what the relay + Tor + apt + NTP
+# legitimately need. Uses the `inet` family so a single chain pair
+# covers IPv4 and IPv6.
+#
+# The relay binds 127.0.0.1:7777 only — there is NO inbound rule for
+# 7777 because no outside packet should ever reach that port. Tor's
+# HiddenServicePort forwards the .onion address to the loopback
+# listener; that traffic is loopback by the time it hits the filter
+# hook and the `iif lo accept` rule lets it through.
+#
+# Outbound 9001/9030 covers Tor relay-to-relay + directory traffic
+# on the "well-known" ports. 80/443 covers the bulk of Tor guards
+# that listen on web ports + apt + APNs. 53/123 cover DNS + NTP.
+# Anything else gets dropped with rate-limited logging so the
+# journal doesn't blow up under a scan.
+
+flush ruleset
+
+table inet pizzini {
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        # Accept anything that's part of an already-established
+        # connection — saves us from listing return ports.
+        ct state { established, related } accept
+        ct state invalid drop
+
+        # Loopback. Tor → relay traffic arrives here.
+        iif lo accept
+
+        # ICMP / ICMPv6 control traffic the kernel actually needs.
+        # IPv6 needs neighbor discovery just to talk on the LAN.
+        ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } limit rate 20/second accept
+        ip6 nexthdr icmpv6 icmpv6 type { echo-request, destination-unreachable, packet-too-big, time-exceeded, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept
+
+        # SSH — the only inbound application port.
+        tcp dport 22 ct state new limit rate 10/minute accept
+
+        # Anything else: log (rate-limited so a port scan can't fill
+        # the disk), then drop via the chain's default policy.
+        limit rate 5/minute log prefix "nft-input-drop: " level info
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy drop;
+
+        ct state { established, related } accept
+        oif lo accept
+
+        # DNS — needed for everything that follows.
+        udp dport 53 accept
+        tcp dport 53 accept
+
+        # NTP.
+        udp dport 123 accept
+
+        # HTTP/HTTPS for apt, APNs (api{,.sandbox}.push.apple.com:443),
+        # and a sizeable fraction of Tor guards that accept on web
+        # ports to be reachable from restrictive networks.
+        tcp dport { 80, 443 } accept
+
+        # Tor relay/directory "well-known" ports.
+        tcp dport { 9001, 9030 } accept
+
+        # Outbound ICMP for diagnostic — restrict like input.
+        ip protocol icmp icmp type echo-request accept
+        ip6 nexthdr icmpv6 icmpv6 type { echo-request, nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit } accept
+
+        # Log + drop the rest.
+        limit rate 5/minute log prefix "nft-output-drop: " level info
+    }
+}

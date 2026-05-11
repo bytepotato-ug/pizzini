@@ -1,0 +1,45 @@
+[Unit]
+Description=Pizzini relay (Tor onion-service backend)
+Documentation=https://github.com/bytepotato-ug/pizzini
+After=network-online.target tor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pizzini-relay
+Group=pizzini-relay
+WorkingDirectory=/var/lib/pizzini-relay
+EnvironmentFile=/etc/pizzini-relay/env
+ExecStart=/usr/local/bin/pizzini-relay
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=16384
+
+# Sandbox profile. The relay opens a loopback TCP listener, reads
+# /etc/pizzini-relay/apns-auth.p8, writes encrypted state to
+# /var/lib/pizzini-relay, and makes outbound HTTPS to APNs. It needs
+# nothing else — every directive below denies a capability the relay
+# was never going to exercise.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/pizzini-relay
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

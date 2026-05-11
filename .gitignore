@@ -71,3 +71,17 @@ pizzini-relay-state/
 # tree. Leaving local-only copies excluded.
 operator-keys/
 transparency-log.ndjson
+
+# Tor v3 onion-service directories. The directory name is the .onion
+# address itself, and the directory contains `hs_ed25519_secret_key`
+# — the private key that proves ownership of the onion. Committing
+# this would let anyone impersonate the relay. We exclude the whole
+# folder shape regardless of where in the tree it lands.
+*.onion/
+*.onion
+
+# Rendered (not template) relay env file with real APNs Team/Key IDs
+# pointing at the .p8 path. Stays out of the repo even when copied
+# locally for staging.
+scripts/deploy/env
+scripts/deploy/env.rendered
