@@ -394,7 +394,7 @@ private struct RenameGroupSheet: View {
             Form {
                 Section("New name") {
                     TextField("Group name", text: $draft)
-                        .textInputAutocapitalization(.words)
+                        .hardenedTextInput(autocap: .words)
                 }
             }
             .navigationTitle("Rename group")

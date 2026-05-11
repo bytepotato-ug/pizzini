@@ -37,19 +37,21 @@ struct ChatGroupInvitationTests {
         let aliceId = try alice.identityPublic()
         let bob = try Session()
         let bobId = try bob.identityPublic()
+        let bootstrapMembers = [
+            GroupMember(peerId: aliceId, displayName: "A", role: .admin,
+                        joinedAtEpoch: 0, status: .active, addedBy: aliceId),
+            GroupMember(peerId: bobId, displayName: "B", role: .member,
+                        joinedAtEpoch: 0, status: .pendingSKDM, addedBy: aliceId),
+        ]
         let bootstrap = GroupBootstrap(
             groupId: Data(repeating: 0xAA, count: 16),
             displayName: "g",
-            members: [
-                GroupMember(peerId: aliceId, displayName: "A", role: .admin,
-                            joinedAtEpoch: 0, status: .active, addedBy: aliceId),
-                GroupMember(peerId: bobId, displayName: "B", role: .member,
-                            joinedAtEpoch: 0, status: .pendingSKDM, addedBy: aliceId),
-            ],
+            members: bootstrapMembers,
             currentEpoch: 0,
             lastOpDigest: Data(repeating: 0xBB, count: 32),
             operatorIdentity: aliceId,
             timestampMillis: 1,
+            memberSetRoot: ChatGroup.memberSetRoot(of: bootstrapMembers),
             signature: Data(repeating: 0, count: GroupOp.signatureSize))
         let group = try #require(bootstrap.intoChatGroup(localIdentityPub: bobId))
         #expect(group.pendingInvitation == true)
@@ -143,7 +145,8 @@ struct ChatGroupInvitationTests {
         let addCarol = try realSignedOp(
             by: alice, groupId: groupId,
             epoch: group.currentEpoch + 1, parent: group.lastOpDigest,
-            kind: .addMember(peerId: carolId, role: .member, displayName: "C"))
+            kind: .addMember(peerId: carolId, role: .member, displayName: "C"),
+            priorMemberSetRoot: group.memberSetRoot)
         if case .applied = group.apply(addCarol) {} else {
             Issue.record("AddMember apply on pending group failed")
         }
@@ -176,7 +179,8 @@ struct ChatGroupInvitationTests {
         let removeOp = try realSignedOp(
             by: alice, groupId: groupId,
             epoch: group.currentEpoch + 1, parent: group.lastOpDigest,
-            kind: .removeMember(peerId: bobId))
+            kind: .removeMember(peerId: bobId),
+            priorMemberSetRoot: group.memberSetRoot)
         var sx = ChatGroup.ApplySideEffects(localIdentityPub: bobId)
         if case .applied = group.apply(removeOp, sideEffects: &sx) {} else {
             Issue.record("RemoveMember apply failed")

@@ -52,6 +52,11 @@ use std::path::{Path, PathBuf};
 const PENDING_FILE_NAME: &str = "pending.bin";
 const KEY_FILE_NAME: &str = "pending.key";
 
+/// Per-store AAD. F-NEW-206: domain-separates this store's
+/// ciphertext from siblings'. Bumping the version suffix triggers a
+/// one-shot legacy decrypt on the next load.
+const AAD: &[u8] = b"pizzini.relay.pending.v1";
+
 /// One queued routing frame. Mirrors the previous in-memory
 /// `PendingFrame` but with `expires_at_unix` (wall-clock seconds)
 /// instead of `Instant` so it survives serialization. `Instant` is
@@ -154,7 +159,11 @@ impl PendingStore {
 
         let queues = match fs::read(&pending_path) {
             Ok(bytes) => {
-                let plaintext = encrypted_file::decrypt(&key, &bytes)?;
+                // Domain-AAD decrypt with legacy-no-AAD fallback for
+                // files written before F-NEW-206. The next persist
+                // rewrites with the AAD path.
+                let plaintext = encrypted_file::decrypt_with_aad(&key, &bytes, AAD)
+                    .or_else(|_| encrypted_file::decrypt(&key, &bytes))?;
                 let doc: StoreDoc = serde_json::from_slice(&plaintext).map_err(io::Error::other)?;
                 drop_expired(doc, encrypted_file::unix_now())
             }
@@ -252,7 +261,7 @@ impl PendingStore {
                 .insert(encrypted_file::hex_encode(peer_id), queue.clone());
         }
         let plaintext = serde_json::to_vec(&doc).map_err(io::Error::other)?;
-        let ciphertext = encrypted_file::encrypt(&self.key, &plaintext)?;
+        let ciphertext = encrypted_file::encrypt_with_aad(&self.key, &plaintext, AAD)?;
         encrypted_file::write_atomic(&self.pending_path, &ciphertext)
     }
 }

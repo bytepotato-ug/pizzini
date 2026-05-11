@@ -54,24 +54,26 @@ public final class Database {
         }
         self.handle = dbHandle
 
-        // Provide the raw 32-byte key in SQLCipher's documented hex
-        // "x'...'" form. SQLCipher treats a 64-character hex string
-        // bracketed by `x'…'` as a raw cipher key and bypasses its
-        // internal PBKDF2 derivation entirely — exactly what we want
-        // since the key is already stretched upstream by Argon2id
-        // with production parameters. The alternative
-        // (`sqlite3_key_v2` raw bytes + `PRAGMA cipher_default_kdf_iter = 0`)
-        // is documented but fragile in practice — the pragma
-        // doesn't always interact correctly with WAL on iOS sim;
-        // the hex form is the canonical fast-path.
+        // SQLCipher's "raw key" path requires the `x'<64-hex>'`
+        // wrapping — `sqlite3_key_v2` with bare 32 bytes routes
+        // through PBKDF2 and produces a DIFFERENT cipher key than
+        // the hex-PRAGMA form would. The two forms are NOT
+        // interchangeable; any existing database keyed via PRAGMA
+        // would become un-decryptable if opened via the bare-bytes
+        // path. F-NEW-301 fix uses the C API + hex form so the SQL
+        // never reaches `sqlite3_exec` (and can't be captured into
+        // a thrown `DatabaseError.executeFailed.sql` that an NSLog
+        // caller would dump to the unified log). The hex string
+        // lives only on the local Swift stack for the duration of
+        // this call.
         let hexKey = rawKey.map { String(format: "%02x", $0) }.joined()
-        // Single-quote escaping is not needed for a hex string,
-        // but quote the whole literal so the value parses inside
-        // `sqlite3_exec`. The pragma is run, not bound — there's
-        // no way to parameterise PRAGMA in SQLite, hence the
-        // string-build. The hex string is pure ASCII derived from
-        // a Data we control, so there's no injection surface.
-        try execute("PRAGMA key = \"x'\(hexKey)'\";")
+        let xHexKey = "x'\(hexKey)'"
+        let keyingRC: Int32 = xHexKey.withCString { cstr in
+            sqlite3_key_v2(dbHandle, nil, cstr, Int32(strlen(cstr)))
+        }
+        guard keyingRC == SQLITE_OK else {
+            throw DatabaseError.keyingFailed(code: keyingRC)
+        }
 
         // PRAGMAs in order: cipher hardening first, then app-side
         // durability + integrity. Memory security on first so the
@@ -107,6 +109,40 @@ public final class Database {
         sqlite3_close_v2(handle)
     }
 
+    /// Re-encrypt the entire database under `newRawKey`. Used by
+    /// USP #8 (timed key erasure) — the host derives a fresh
+    /// 32-byte key from a fresh Argon2id salt on a weekly cadence
+    /// and calls this to rotate the at-rest encryption. After a
+    /// successful `rekey` followed by `VACUUM`, the previous key
+    /// can no longer decrypt any persisted page; an attacker who
+    /// recovers the *current* key only reads data written since
+    /// the most recent rotation.
+    ///
+    /// Same `x'<hex>'` discipline as the constructor — bare-bytes
+    /// `sqlite3_rekey_v2` would route through PBKDF2 and produce
+    /// a different cipher key than the hex form, leaving the DB
+    /// in a permanently-un-openable state. The hex string lives
+    /// only on the stack for the duration of this call.
+    ///
+    /// `newRawKey` must be exactly 32 bytes (a `kSecRandomDefault`-
+    /// quality output of the same shape as `DBKey.deriveKey`).
+    /// Returns on success; throws `DatabaseError.keyingFailed`
+    /// with the SQLite return code if SQLCipher refused the rekey
+    /// — the DB is then in an indeterminate state and the caller
+    /// must close + re-open with the old key, never with the new
+    /// one.
+    public func rekey(newRawKey: Data) throws {
+        precondition(newRawKey.count == 32, "rekey requires a 32-byte key")
+        let hexKey = newRawKey.map { String(format: "%02x", $0) }.joined()
+        let xHexKey = "x'\(hexKey)'"
+        let rc: Int32 = xHexKey.withCString { cstr in
+            sqlite3_rekey_v2(handle, nil, cstr, Int32(strlen(cstr)))
+        }
+        guard rc == SQLITE_OK else {
+            throw DatabaseError.keyingFailed(code: rc)
+        }
+    }
+
     /// Run a single statement with no parameters and no result
     /// iteration. Used for DDL, PRAGMA, and one-shot DML. Throws
     /// `DatabaseError.executeFailed` carrying the SQLite error
@@ -117,7 +153,7 @@ public final class Database {
         if rc != SQLITE_OK {
             let message = errMsg.flatMap { String(cString: $0) } ?? "unknown"
             if let errMsg { sqlite3_free(errMsg) }
-            throw DatabaseError.executeFailed(code: rc, sql: sql, message: message)
+            throw DatabaseError.executeFailed(code: rc, sql: redactSensitiveSQL(sql), message: message)
         }
     }
 
@@ -133,11 +169,31 @@ public final class Database {
             if let stmt { sqlite3_finalize(stmt) }
             throw DatabaseError.prepareFailed(
                 code: rc,
-                sql: sql,
+                sql: redactSensitiveSQL(sql),
                 message: String(cString: sqlite3_errmsg(handle)),
             )
         }
         return Statement(stmt: stmt)
+    }
+
+    /// Defense-in-depth redaction for the `sql` field of thrown
+    /// `DatabaseError`s. The raw key is no longer built into a SQL
+    /// string (see `init`'s `sqlite3_key_v2` path) but a future
+    /// regression could re-introduce one, and the error gets
+    /// `String(describing:)`-ed by NSLog callers. Substituting
+    /// "<redacted>" for any SQL whose first non-space tokens look
+    /// like a keying / rekeying PRAGMA closes that future window.
+    private func redactSensitiveSQL(_ sql: String) -> String {
+        let trimmed = sql.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // Match "pragma key", "pragma rekey", "pragma cipher_..." —
+        // anything that touches the encryption key gets redacted.
+        if trimmed.hasPrefix("pragma key")
+            || trimmed.hasPrefix("pragma rekey")
+            || trimmed.hasPrefix("pragma cipher_")
+        {
+            return "<redacted: keying PRAGMA>"
+        }
+        return sql
     }
 
     /// Run `body` inside a `BEGIN IMMEDIATE` … `COMMIT` /

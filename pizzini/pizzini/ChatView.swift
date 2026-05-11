@@ -32,6 +32,11 @@ struct ChatView: View {
     @State private var showPhotoPicker = false
     @State private var showDocumentPicker = false
     @State private var attachmentDraft: AttachmentDraft?
+    /// Presents the symmetric safety-number comparison sheet. Driven
+    /// either from the ⋯ menu's "Safety number" entry or from a tap on
+    /// the `VerificationBanner` shown above the message list whenever
+    /// the contact's `verificationState` is not `.verified`.
+    @State private var showSafetyNumber = false
     /// Set to a non-nil section when the user taps an (i) info button
     /// on a tier banner — both pre-send and post-receive surfaces use
     /// this to deep-link into FAQView at the right anchor.
@@ -79,6 +84,13 @@ struct ChatView: View {
                 if !contact.sessionEstablished {
                     pairingBanner
                     Divider()
+                }
+                // Above the message list so the user sees the warning
+                // every time they open the chat — not buried in a menu
+                // they may never tap. Self-hides once `verifiedAt` is
+                // set; no separate dismiss state to manage.
+                VerificationBanner(contact: contact) {
+                    showSafetyNumber = true
                 }
                 messages(for: contact)
                     // Bitchat-style panic gesture: three fast taps on
@@ -231,6 +243,16 @@ struct ChatView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Button {
+                            showSafetyNumber = true
+                        } label: {
+                            switch contact.verificationState {
+                            case .verified:
+                                Label("Safety number (verified)", systemImage: "checkmark.seal.fill")
+                            case .scannedUnverified, .pastedUnverified:
+                                Label("Verify safety number", systemImage: "checkmark.shield")
+                            }
+                        }
+                        Button {
                             renameDraft = contact.displayName
                             renaming = true
                         } label: { Label("Rename", systemImage: "pencil") }
@@ -269,9 +291,12 @@ struct ChatView: View {
                     }
                 }
             }
+            .sheet(isPresented: $showSafetyNumber) {
+                SafetyNumberView(store: store, contactID: contactID)
+            }
             .alert("Rename contact", isPresented: $renaming) {
                 TextField("name", text: $renameDraft)
-                    .textInputAutocapitalization(.words)
+                    .hardenedTextInput(autocap: .words)
                 Button("Cancel", role: .cancel) {}
                 Button("Save") {
                     store.rename(contact, to: renameDraft)
@@ -319,8 +344,7 @@ struct ChatView: View {
                     .textFieldStyle(.plain)
                     .focused($searchFocused)
                     .submitLabel(.search)
-                    .autocorrectionDisabled(true)
-                    .textInputAutocapitalization(.never)
+                    .hardenedTextInput()
                 if !searchQuery.isEmpty {
                     Button {
                         searchQuery = ""
@@ -460,6 +484,13 @@ struct ChatView: View {
                 attachmentDraft == nil ? "type a message" : "add a caption (optional)",
                 text: $draft,
             )
+                // F-NEW-801: harden the 1:1 composer — the single
+                // highest-volume sensitive-content input in the app.
+                // Without these flags every message trains
+                // ~/Library/Keyboard/dynamic-text.dat. `.sentences`
+                // autocap keeps the first-letter UX nicety without
+                // re-enabling autocorrect.
+                .hardenedTextInput(autocap: .sentences)
                 .textFieldStyle(.roundedBorder)
                 .focused($composerFocused)
                 .submitLabel(.send)
@@ -1210,6 +1241,13 @@ extension View {
                     isPresented.wrappedValue = false
                 }
                 .ignoresSafeArea()
+                // F-NEW-709 follow-on: QLPreviewController runs in-
+                // process, so the window-level secure mask DOES cover
+                // it in screenshots. But live screen-recording is
+                // a separate pipeline (the `isCaptured` flag) — apply
+                // `screenCaptureShielded()` so recording mid-preview
+                // blanks the attachment content too.
+                .screenCaptureShielded()
             } else {
                 Text("Attachment is no longer available on this device.")
                     .padding()

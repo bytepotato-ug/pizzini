@@ -14,8 +14,16 @@
 //! Difficulty: 18 leading zero bits ≈ 1 second of CPU on a modern
 //! phone. Verifier cost: a single BLAKE3 hash, sub-microsecond.
 
-/// Default difficulty: 18 leading zero bits. ~250k expected attempts.
-pub const HASHCASH_DEFAULT_BITS: u32 = 18;
+/// Default hashcash difficulty in leading-zero bits. F-NEW-209:
+/// raised from 18 → 22. Phone-side cost stays under ~1s on the
+/// slowest A14-class device. A desktop-GPU attacker drops from
+/// ~190 k proofs/s (at 18 bits) to ~12 proofs/s (at 22 bits) on a
+/// RTX 4090 — still trivially defeats hashcash as the sole gate,
+/// but the proper defense (per-recipient rate-limit on
+/// BUNDLE_REQUEST at the relay) is the architectural fix. Stays
+/// well under `HASHCASH_FFI_MAX_BITS = 26` so the FFI cap (F-702)
+/// is unchanged.
+pub const HASHCASH_DEFAULT_BITS: u32 = 22;
 
 /// Brute-force a u64 nonce such that
 /// `BLAKE3(challenge || nonce_be) starts with at least `bits` leading

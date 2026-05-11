@@ -95,6 +95,7 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
     case blockedTypes
     case executableWarning
     case wipingData
+    case duressPasscode
     case notYetShipped
 
     var id: String { rawValue }
@@ -133,6 +134,8 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             return "Files marked “executable” on receive"
         case .wipingData:
             return "What each delete option does"
+        case .duressPasscode:
+            return "The duress passcode (silent wipe)"
         case .notYetShipped:
             return "What Pizzini doesn’t do yet"
         }
@@ -318,6 +321,25 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
               wrap relies on Apple's screenshot pipeline honouring \
               secure-text-entry; a kernel-level capture bypasses \
               that pipeline entirely.
+            • The iOS Photo Picker and iOS Document Picker. When you \
+              tap "Send photo" or "Send file" inside a chat, iOS \
+              shows its own picker UI to choose what to attach. That \
+              picker runs in a separate iOS process and is composited \
+              into Pizzini's window — so the secure-text-entry wrap \
+              (which operates inside Pizzini's process) does NOT \
+              extend into the picker. A screenshot taken while the \
+              picker is open captures the picker's contents — your \
+              photo library thumbnails, or the Files app browser. \
+              The same is true of "Open in..." sheets and the iOS \
+              share sheet. While any of these are up, treat the \
+              screen as fully visible.
+            • The screenshot-protection banner says the protection \
+              is degraded. If you see "Screenshot protection \
+              degraded" at the top of the chat list, this iOS \
+              version no longer hides Pizzini's content in \
+              screenshots or mirroring. Encryption is unaffected; \
+              treat the screen itself as visible until the next iOS \
+              update restores the protection.
 
             For the highest-risk situations the safest practice is to \
             take the conversation to a place where no screen exists \
@@ -569,6 +591,58 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             None of these actions are recoverable. There is no \
             “undelete”.
             """
+        case .duressPasscode:
+            return """
+            The duress passcode is a SECOND passcode you can set up in \
+            Settings → Security → Set duress passcode. It exists so \
+            that if someone forces you to unlock Pizzini, you can hand \
+            over a passcode that LOOKS like an unlock — but actually \
+            wipes every chat, every contact, every key, before the lock \
+            screen drops. The person watching sees an empty app, \
+            indistinguishable from a fresh install.
+
+            How to use it:
+
+            • Pick a passcode different from your real one. Six \
+              characters minimum. Pick something you can type quickly \
+              under pressure.
+            • To enter it from the lock screen: long-press and hold for \
+              about a second anywhere on the lock screen. A passcode \
+              entry sheet appears. Type your duress passcode and tap \
+              Unlock. (The same gesture also lets you enter your real \
+              passcode as a fallback when Face ID is not available.)
+            • After the wipe, you’ll be routed through the onboarding \
+              flow again — fresh-install presentation. The relay host \
+              you previously configured is preserved so the device \
+              doesn’t look unusually empty.
+
+            What it wipes:
+
+            • Every chat log (1:1 and group).
+            • Every contact and every libsignal session — even the \
+              long-term identity key. You will have a new identity on \
+              next launch.
+            • Every received attachment file on disk, including those \
+              you saved to Files via Pizzini.
+            • The SQLCipher database file and its WAL/SHM sidecars.
+            • The Secure Enclave wrap, the Argon2id salt, the wrapped \
+              seed, and BOTH passcode slots (real and duress).
+            • The APNs push token under the old identity (a new token \
+              is minted when you re-register through onboarding).
+
+            What it does NOT cover (be aware):
+
+            • If someone has already taken a flash-level forensic image \
+              of your phone BEFORE the wipe, the wipe cannot undo that.
+            • Messages already in flight at other relays cannot be \
+              recalled.
+            • If you photographed your QR or sent it via another app, \
+              those copies still link your old identity to you.
+
+            The duress feature exists to defeat a real-time coercer who \
+            hands you back your phone and demands you unlock it. It is \
+            not retroactive cover for prior leaks.
+            """
         case .notYetShipped:
             return """
             Pizzini is in active development. A few things are not \
@@ -577,12 +651,6 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             • Production Tor onion service for the relay (the current \
               relay binds to plain TCP on your LAN — fine for testing, \
               not yet what you’d use on the real internet).
-            • SQLCipher-backed storage. Your contacts, chats, and \
-              outbox currently sit in iOS Keychain JSON, which works \
-              for daily use but isn’t designed for very large or \
-              long-offline message logs.
-            • Duress passphrase + cryptographic erasure (a separate \
-              passphrase that wipes everything when entered).
             • App Attest + ATS-strict transport policy.
             • Reproducible build script.
             • First independent security audit.

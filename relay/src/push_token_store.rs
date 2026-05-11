@@ -54,6 +54,12 @@ pub const DEFAULT_STATE_DIR: &str = "./pizzini-relay-state";
 const TOKENS_FILE_NAME: &str = "push_tokens.bin";
 const KEY_FILE_NAME: &str = "push_tokens.key";
 
+/// Per-store AAD. F-NEW-206: domain-separates this store's
+/// ciphertext from siblings' even when keys collide. The version
+/// suffix is bumped if the inner JSON shape ever changes
+/// incompatibly.
+const AAD: &[u8] = b"pizzini.relay.push-tokens.v1";
+
 /// Maximum time we'll keep a token alive without a refresh.
 /// 30 days picked to be longer than typical APNs token-rotation
 /// cadence (Apple doesn't publish a number, but device tokens are
@@ -147,7 +153,13 @@ impl PushTokenStore {
 
         let map = match fs::read(&tokens_path) {
             Ok(bytes) => {
-                let plaintext = encrypted_file::decrypt(&key, &bytes)?;
+                // Try the domain-AAD decrypt first; on failure (pre-
+                // F-NEW-206 file written without AAD), fall back to
+                // the no-AAD decrypt. Either way, the next persist
+                // writes the file back with AAD so subsequent reads
+                // take the fast path.
+                let plaintext = encrypted_file::decrypt_with_aad(&key, &bytes, AAD)
+                    .or_else(|_| encrypted_file::decrypt(&key, &bytes))?;
                 let doc: StoreDoc = serde_json::from_slice(&plaintext).map_err(io::Error::other)?;
                 purge_stale(doc, MAX_TOKEN_AGE)
             }
@@ -180,6 +192,23 @@ impl PushTokenStore {
         self.persist()
     }
 
+    /// Drop entries whose `last_refreshed_unix` is older than
+    /// `max_age` from now. Persists if any were dropped. Returns the
+    /// count of dropped entries for logging. F-NEW-208 — the previous
+    /// design only purged on load, so a long-running relay
+    /// accumulated tokens indefinitely between restarts.
+    pub fn gc_expired(&mut self, max_age: Duration) -> io::Result<usize> {
+        let now = encrypted_file::unix_now();
+        let cutoff = now.saturating_sub(max_age.as_secs());
+        let before = self.map.len();
+        self.map.retain(|_, (_, ts)| *ts > cutoff);
+        let removed = before - self.map.len();
+        if removed > 0 {
+            self.persist()?;
+        }
+        Ok(removed)
+    }
+
     /// Look up a token by peer-id. Returns a cloned `Vec<u8>`
     /// because the relay's send-push path needs an owned copy to
     /// hand to the APNs client running on a different task — a
@@ -205,7 +234,7 @@ impl PushTokenStore {
             );
         }
         let plaintext = serde_json::to_vec(&doc).map_err(io::Error::other)?;
-        let ciphertext = encrypted_file::encrypt(&self.key, &plaintext)?;
+        let ciphertext = encrypted_file::encrypt_with_aad(&self.key, &plaintext, AAD)?;
         encrypted_file::write_atomic(&self.tokens_path, &ciphertext)
     }
 }

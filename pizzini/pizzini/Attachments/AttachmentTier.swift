@@ -101,12 +101,27 @@ enum AttachmentTierClassifier {
         "iwa", "pages", "numbers", "key", "epub",
     ]
 
-    /// Tier-3: strip + warn. Common mobile-camera output formats plus
-    /// the audio formats Voice Memos / WhatsApp / Signal default to.
+    /// Tier-3: strip + warn. ONLY formats for which `MetadataStripper`
+    /// has a real strip pipeline. Adding a format to this set without
+    /// also adding it to `MetadataStripper.imageExtensions` or
+    /// `audioVideoExtensions` would cause the UI banner ("Pizzini
+    /// removed location and camera info") to lie — the user would be
+    /// told their EXIF was stripped when the bytes shipped untouched.
+    ///
+    /// The image set matches `MetadataStripper.imageExtensions`
+    /// (ImageIO with EXIF/TIFF/GPS/IPTC/Aux dicts → kCFNull).
+    /// The audio/video set matches `MetadataStripper.audioVideoExtensions`
+    /// (AVAssetExportSession `metadata = []`).
+    ///
+    /// Formats removed from this set on 2026-05-11 because no strip
+    /// pipeline existed for them: gif, avi, webm, ogg, flac, opus,
+    /// amr. They classify as `.textFamily` now — Pizzini's pass-
+    /// through default — with no false "we stripped this" banner.
     private static let mediaExtensions: Set<String> = [
-        "jpg", "jpeg", "heic", "heif", "png", "webp", "gif", "tiff", "tif",
-        "mp4", "mov", "m4v", "avi", "webm",
-        "mp3", "m4a", "wav", "aac", "ogg", "flac", "opus", "amr",
+        // image — ImageIO strip path
+        "jpg", "jpeg", "heic", "heif", "png", "webp", "tiff", "tif",
+        // av — AVAssetExportSession strip path
+        "mp4", "mov", "m4v", "mp3", "m4a", "wav", "aac",
     ]
 
     /// Tier-2: archives. No stripping; risk lives in contents.

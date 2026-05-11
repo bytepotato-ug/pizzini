@@ -146,8 +146,17 @@ struct DocumentPicker: UIViewControllerRepresentable {
     ///     Shortcuts.
     ///   - `.svg` (UTType.svg) — Quick Look opens via WebKit which can
     ///     execute inline scripts.
-    /// These are blocked at the `AttachmentTierClassifier.isBlockedAtSend`
-    /// level too as belt-and-suspenders.
+    ///
+    /// **`.data` is deliberately NOT in this list.** `UTType.data` is
+    /// the root of the data hierarchy — `.svg`, `.mobileconfig`, and
+    /// `.shortcut` all conform to it. Including `.data` would surface
+    /// those types in the picker (the runtime
+    /// `isBlockedAtSend` check would catch them at send, but the
+    /// picker should refuse to show them in the first place so the
+    /// user isn't lured into tapping a file they then can't send).
+    /// Users who need to attach an exotic file type missing from this
+    /// allowlist can convert to one of the supported types — Pizzini
+    /// doesn't want to be a transport for arbitrary opaque blobs.
     private static let allowedTypes: [UTType] = {
         var types: [UTType] = [
             .image, .movie, .audio,
@@ -155,19 +164,18 @@ struct DocumentPicker: UIViewControllerRepresentable {
             .plainText, .text, .sourceCode, .json, .xml, .commaSeparatedText,
             .archive, .zip, .gzip,
             // Office. UTType has no built-in for Office types, but we
-            // accept them via dynamic identifiers.
-            UTType("com.microsoft.word.doc") ?? .data,
-            UTType("org.openxmlformats.wordprocessingml.document") ?? .data,
-            UTType("com.microsoft.excel.xls") ?? .data,
-            UTType("org.openxmlformats.spreadsheetml.sheet") ?? .data,
-            UTType("com.microsoft.powerpoint.ppt") ?? .data,
-            UTType("org.openxmlformats.presentationml.presentation") ?? .data,
-            // Generic data fallback so Files-app shows everything not
-            // in the explicit list — the runtime tier check catches
-            // anything that slipped through.
-            .data,
+            // accept them via dynamic identifiers. Fall back to
+            // `.content` (not `.data`) if the dynamic UTType lookup
+            // fails — `.content` is narrower than `.data` and doesn't
+            // pull in `.svg` / `.mobileconfig` / `.shortcut`.
+            UTType("com.microsoft.word.doc") ?? .content,
+            UTType("org.openxmlformats.wordprocessingml.document") ?? .content,
+            UTType("com.microsoft.excel.xls") ?? .content,
+            UTType("org.openxmlformats.spreadsheetml.sheet") ?? .content,
+            UTType("com.microsoft.powerpoint.ppt") ?? .content,
+            UTType("org.openxmlformats.presentationml.presentation") ?? .content,
         ]
-        // De-dup (.data may collide with .archive on some iOS versions).
+        // De-dup.
         var seen = Set<String>()
         types = types.filter { seen.insert($0.identifier).inserted }
         return types

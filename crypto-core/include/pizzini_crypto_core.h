@@ -28,6 +28,20 @@
 #define PIZZINI_MSG_TYPE_WHISPER 1
 
 /**
+ * Wire size of one IdentityKey public half: 1-byte DJB type prefix +
+ * 32-byte Curve25519 point. The SAS derivation rejects any input that
+ * is not exactly this many bytes, on either side.
+ */
+#define SAFETY_NUMBER_IDENTITY_LEN 33
+
+/**
+ * Length of the rendered safety number in ASCII digits (no spaces).
+ * Caller formats the spacing (typically `XXXXX XXXXX ... XXXXX` —
+ * twelve groups of five) at the display layer.
+ */
+#define SAFETY_NUMBER_DIGIT_LEN 60
+
+/**
  * FFI ceiling on `bits` to prevent an untrusted caller from wedging
  * the host thread. 26 is well above the protocol's
  * `HASHCASH_DEFAULT_BITS = 18` (which costs ~1s on a modern phone),
@@ -83,9 +97,17 @@
 #define PIZZINI_DISTRIBUTION_ID_LEN 16
 
 /**
- * Default difficulty: 18 leading zero bits. ~250k expected attempts.
+ * Default hashcash difficulty in leading-zero bits. F-NEW-209:
+ * raised from 18 → 22. Phone-side cost stays under ~1s on the
+ * slowest A14-class device. A desktop-GPU attacker drops from
+ * ~190 k proofs/s (at 18 bits) to ~12 proofs/s (at 22 bits) on a
+ * RTX 4090 — still trivially defeats hashcash as the sole gate,
+ * but the proper defense (per-recipient rate-limit on
+ * BUNDLE_REQUEST at the relay) is the architectural fix. Stays
+ * well under `HASHCASH_FFI_MAX_BITS = 26` so the FFI cap (F-702)
+ * is unchanged.
  */
-#define HASHCASH_DEFAULT_BITS 18
+#define HASHCASH_DEFAULT_BITS 22
 
 /**
  * Distribution-id wire size in our FFI: a 16-byte raw UUID (no hyphen
@@ -389,6 +411,28 @@ int32_t pizzini_store_mint_delivery_token(struct DeviceStore *store,
 int32_t pizzini_blake3_hash(const uint8_t *input, uintptr_t input_len, uint8_t *out_hash_32);
 
 /**
+ * Derive the symmetric Pizzini safety number for the pair of identity
+ * keys `(peer_a, peer_b)`. Order is normalized internally — either
+ * caller order produces the same 60 digits.
+ *
+ * Writes exactly `SAFETY_NUMBER_DIGIT_LEN = 60` ASCII bytes (each in
+ * `b'0'..=b'9'`) to `out_buf` on success. Returns
+ * `PIZZINI_ERR_INVALID_ARG` for null pointers, wrong-length identity
+ * inputs, or `out_buf_cap < 60`.
+ *
+ * # Safety
+ * `peer_a` must point to `peer_a_len` readable bytes;
+ * `peer_b` must point to `peer_b_len` readable bytes;
+ * `out_buf` must point to `out_buf_cap` writable bytes.
+ */
+int32_t pizzini_safety_number_derive(const uint8_t *peer_a,
+                                     uintptr_t peer_a_len,
+                                     const uint8_t *peer_b,
+                                     uintptr_t peer_b_len,
+                                     uint8_t *out_buf,
+                                     uintptr_t out_buf_cap);
+
+/**
  * BLAKE3 hashcash prover. Brute-forces a u64 nonce such that
  * `BLAKE3(challenge || nonce_be) has at least `bits` leading zero
  * bits`. Used by iOS to compute the proof attached to a
@@ -492,6 +536,28 @@ int32_t pizzini_verify_identity_signature(const uint8_t *identity_pub,
                                           uintptr_t signature_len);
 
 /**
+ * F-NEW-101: domain-separated identity signature verify. The signed
+ * bytes the verifier reconstructs are
+ * `u16_be(context_tag_len) || context_tag || message`. A caller that
+ * forgets to pass the tag — or passes a different tag than the
+ * signer — gets `PIZZINI_ERR_BAD_SIGNATURE`. The tag MUST be
+ * non-empty; empty tags collapse to the unsafe legacy contract.
+ *
+ * # Safety
+ * `identity_pub` (33 bytes), `context_tag` (`context_tag_len`),
+ * `message` (`message_len`), and `signature` (64 bytes) must point
+ * at readable buffers of the stated sizes.
+ */
+int32_t pizzini_verify_identity_signature_v2(const uint8_t *identity_pub,
+                                             uintptr_t identity_pub_len,
+                                             const uint8_t *context_tag,
+                                             uintptr_t context_tag_len,
+                                             const uint8_t *message,
+                                             uintptr_t message_len,
+                                             const uint8_t *signature,
+                                             uintptr_t signature_len);
+
+/**
  * Sign `payload` with the local IdentityKey's private half. F-203:
  * used by the iOS client to attach a possession proof to its HELLO
  * frame so a network-positioned attacker can't squat someone else's
@@ -514,6 +580,28 @@ int32_t pizzini_store_identity_sign(struct DeviceStore *store,
                                     uint8_t *out_sig,
                                     uintptr_t out_cap,
                                     uintptr_t *out_len);
+
+/**
+ * F-NEW-101: domain-separated identity sign. Signs
+ * `u16_be(context_tag_len) || context_tag || payload`. The tag MUST
+ * be non-empty; passing an empty tag returns `PIZZINI_ERR_INVALID_ARG`
+ * to prevent a misuse path from silently producing legacy-format
+ * signatures.
+ *
+ * # Safety
+ * `store` must point to a live `DeviceStore`. `context_tag`
+ * (`context_tag_len`) and `payload` (`payload_len`) must point to
+ * readable buffers. `out_sig` must be writable for `out_cap` bytes;
+ * `out_len` writable for one `usize`.
+ */
+int32_t pizzini_store_identity_sign_v2(struct DeviceStore *store,
+                                       const uint8_t *context_tag,
+                                       uintptr_t context_tag_len,
+                                       const uint8_t *payload,
+                                       uintptr_t payload_len,
+                                       uint8_t *out_sig,
+                                       uintptr_t out_cap,
+                                       uintptr_t *out_len);
 
 /**
  * Pull the issuer's `delivery_token_verify_key` (33 bytes) out of a

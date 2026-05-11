@@ -1,4 +1,5 @@
 import Foundation
+import PizziniCryptoCore
 
 /// One Pizzini group. The group ID is a stable random 16-byte value
 /// generated at creation; it is NOT derived from the member list, so
@@ -60,7 +61,8 @@ struct ChatGroup: Codable, Identifiable, Sendable {
     /// integrity, so persisting the raw blob is both safe and simpler
     /// than threading `Codable` conformance through `GroupOpKind`'s
     /// associated-value cases. Decode + verify on each application
-    /// attempt; drop after `ChatGroup.pendingOpRetention`.
+    /// attempt; drop after `ChatGroup.pendingOpRetention` (F-NEW-501
+    /// fix — the retention is now actually enforced by `replayPending`).
     var pendingOps: [Data]
 
     /// Chat history for this group. Same shape as `Contact.log` so the
@@ -235,11 +237,98 @@ struct ChatGroup: Codable, Identifiable, Sendable {
     /// legitimate gap (a member offline catching up).
     static let pendingOpsCap: Int = 1024
 
+    /// Per-operator sub-cap on `pendingOps` (F-NEW-501). Each admin
+    /// can occupy at most this many queue slots; the global cap
+    /// (`pendingOpsCap`) bounds the total. Without the sub-cap, one
+    /// compromised admin could fill the queue with future-epoch ops
+    /// and pin legitimate ops from every other admin out forever.
+    /// 64 leaves ~16 admins worth of room before we trip the global
+    /// cap, which is well above the realistic admin count for a
+    /// healthy group.
+    static let pendingOpsPerOperatorCap: Int = 64
+
     /// Convenience accessor: the active members (excluding `.removed`
     /// rows we keep around for op-log integrity).
     var activeMembers: [GroupMember] {
         members.filter { $0.status != .removed }
     }
+
+    /// Domain-separated canonical hash of the current member set
+    /// (USP #5: verifiable group membership). Stable across every
+    /// participant's local view of the same group state — feed it
+    /// into the next outgoing `GroupOp.priorMemberSetRoot` so the
+    /// receiver's `apply` step can detect equivocation (a "ghost
+    /// member" silently added on the sender's side will not appear
+    /// in the receiver's local computation, and the apply rejects).
+    var memberSetRoot: Data {
+        ChatGroup.memberSetRoot(of: members)
+    }
+
+    /// Pure form — accepts any member list. Used by tests, by the
+    /// bootstrap snapshot codec (which carries its own `members`),
+    /// and by `apply` when checking against an op's witness root.
+    ///
+    /// Encoding (BLAKE3 input, fixed-width per member so the output
+    /// is order-independent of every field but `peerId`):
+    ///
+    /// ```text
+    /// domain_tag        ("pizzini.group.member-set.v1")
+    /// u32_be(count)
+    /// for each member, sorted ascending by peerId bytes:
+    ///   [33] peerId
+    ///   u8   role.wireByte        (0 = member, 1 = admin)
+    ///   u64_be joinedAtEpoch
+    ///   u8   status.canonicalRootByte  (0 = removed, 1 otherwise)
+    ///   [33] addedBy              (all-zero if nil)
+    /// ```
+    ///
+    /// `displayName` is intentionally absent — receivers may override
+    /// the display name locally (audit notes around `GroupMember`),
+    /// which would diverge the root across views. Likewise
+    /// `pendingSKDM` collapses to `active` (transient SKDM
+    /// handshake state that doesn't reach the signed-op log).
+    static func memberSetRoot(of members: [GroupMember]) -> Data {
+        let domainTag = Data("pizzini.group.member-set.v1".utf8)
+        let sorted = members.sorted { a, b in
+            byteLexLess(a.peerId, b.peerId)
+        }
+        var input = Data(capacity: domainTag.count + 4 + sorted.count * 76)
+        input.append(domainTag)
+        input.appendBigEndian(UInt32(sorted.count))
+        let zeroAddedBy = Data(repeating: 0, count: GroupOp.identityKeySize)
+        for m in sorted {
+            // peerId is the trust anchor — every legitimate member row
+            // carries exactly 33 bytes. Guard at the encoder so a
+            // corrupted on-disk row surfaces as a different (still
+            // deterministic) root rather than a silent hash mismatch
+            // with somebody else's view.
+            precondition(
+                m.peerId.count == GroupOp.identityKeySize,
+                "GroupMember.peerId must be \(GroupOp.identityKeySize) bytes"
+            )
+            input.append(m.peerId)
+            input.append(m.role.wireByte)
+            input.appendBigEndian(m.joinedAtEpoch)
+            input.append(m.status.canonicalRootByte)
+            if let added = m.addedBy {
+                if added.count == GroupOp.identityKeySize {
+                    input.append(added)
+                } else {
+                    // A corrupted `addedBy` (wrong length) shouldn't
+                    // panic the chat list — fall back to the "not
+                    // recorded" zero block. The local view's root
+                    // will still be self-consistent; if the row was
+                    // genuinely tampered the equivocation check
+                    // surfaces the divergence.
+                    input.append(zeroAddedBy)
+                }
+            } else {
+                input.append(zeroAddedBy)
+            }
+        }
+        return Blake3.hash(input)
+    }
+
 
     /// Role of `identityPub` in this group, if they are an active
     /// member. The local user's role is derived from this by passing
@@ -462,6 +551,23 @@ struct GroupMember: Codable, Identifiable, Sendable, Equatable {
 enum GroupRole: String, Codable, Sendable {
     case admin
     case member
+}
+
+/// Strict byte-lexicographic less-than over two `Data` slices.
+/// Used to sort members by `peerId` when computing the canonical
+/// member-set root — Swift's default `Data` `<` operator is not
+/// defined for general byte arrays, and we need a stable order
+/// across platforms / architectures (the relay and Rust core hash
+/// the same encoding in a separate fork-proof check, so iOS-side
+/// sort stability is the only correctness lever here).
+func byteLexLess(_ a: Data, _ b: Data) -> Bool {
+    let n = min(a.count, b.count)
+    for i in 0..<n {
+        let ai = a[a.startIndex + i]
+        let bi = b[b.startIndex + i]
+        if ai != bi { return ai < bi }
+    }
+    return a.count < b.count
 }
 
 enum MemberStatus: String, Codable, Sendable {

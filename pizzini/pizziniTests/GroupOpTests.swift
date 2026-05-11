@@ -39,6 +39,7 @@ struct GroupOpCodecTests {
             parentDigest: GroupOp.zeroParentDigest,
             operatorIdentity: alice,
             timestampMillis: 1_700_000_000_000,
+            priorMemberSetRoot: Data(repeating: 0xAB, count: GroupOp.memberSetRootSize),
             kind: kind,
             signature: Data(repeating: 0x77, count: GroupOp.signatureSize),
         )
@@ -123,6 +124,99 @@ struct GroupOpCodecTests {
     }
 }
 
+@Suite("ChatGroup.memberSetRoot (USP #5 canonical hash)")
+struct MemberSetRootTests {
+    @Test("the empty member set has a well-defined deterministic root")
+    func emptySetIsDeterministic() {
+        let r1 = ChatGroup.memberSetRoot(of: [])
+        let r2 = ChatGroup.memberSetRoot(of: [])
+        #expect(r1 == r2)
+        #expect(r1.count == 32)
+    }
+
+    @Test("the same member set in different orders hashes to the same root")
+    func orderIndependent() {
+        let alice = makeMember(peerSeed: 0x11, role: .admin, joined: 0)
+        let bob = makeMember(peerSeed: 0x22, role: .member, joined: 1)
+        let carol = makeMember(peerSeed: 0x33, role: .member, joined: 2)
+        let r1 = ChatGroup.memberSetRoot(of: [alice, bob, carol])
+        let r2 = ChatGroup.memberSetRoot(of: [carol, alice, bob])
+        let r3 = ChatGroup.memberSetRoot(of: [bob, carol, alice])
+        #expect(r1 == r2)
+        #expect(r1 == r3)
+    }
+
+    @Test("changing any structural field changes the root")
+    func sensitiveToStructuralFields() {
+        let base = makeMember(peerSeed: 0x11, role: .member, joined: 0)
+        let baseRoot = ChatGroup.memberSetRoot(of: [base])
+
+        var withRoleChange = base
+        withRoleChange.role = .admin
+        #expect(ChatGroup.memberSetRoot(of: [withRoleChange]) != baseRoot)
+
+        var withJoinChange = base
+        withJoinChange.joinedAtEpoch = 99
+        #expect(ChatGroup.memberSetRoot(of: [withJoinChange]) != baseRoot)
+
+        var withStatusChange = base
+        withStatusChange.status = .removed
+        #expect(ChatGroup.memberSetRoot(of: [withStatusChange]) != baseRoot)
+
+        var withAddedByChange = base
+        withAddedByChange.addedBy = Data(repeating: 0xAB, count: 33)
+        #expect(ChatGroup.memberSetRoot(of: [withAddedByChange]) != baseRoot)
+    }
+
+    @Test("changing displayName does NOT change the root (cosmetic, can diverge per view)")
+    func cosmeticFieldsIgnored() {
+        let base = makeMember(peerSeed: 0x11, role: .member, joined: 0)
+        let baseRoot = ChatGroup.memberSetRoot(of: [base])
+        var renamed = base
+        renamed.displayName = "totally different"
+        #expect(ChatGroup.memberSetRoot(of: [renamed]) == baseRoot)
+    }
+
+    @Test("pendingSKDM collapses to active for root purposes (transient SKDM state must not diverge views)")
+    func pendingSkdmCollapsesToActive() {
+        var active = makeMember(peerSeed: 0x11, role: .member, joined: 0)
+        active.status = .active
+        var pending = active
+        pending.status = .pendingSKDM
+        #expect(
+            ChatGroup.memberSetRoot(of: [active]) ==
+                ChatGroup.memberSetRoot(of: [pending])
+        )
+    }
+
+    @Test("adding or removing a member changes the root")
+    func membershipChangesChangeRoot() {
+        let a = makeMember(peerSeed: 0x11, role: .admin, joined: 0)
+        let b = makeMember(peerSeed: 0x22, role: .member, joined: 1)
+        let smaller = ChatGroup.memberSetRoot(of: [a])
+        let bigger = ChatGroup.memberSetRoot(of: [a, b])
+        #expect(smaller != bigger)
+    }
+}
+
+private func makeMember(
+    peerSeed: UInt8,
+    role: GroupRole,
+    joined: UInt64,
+) -> GroupMember {
+    var peer = Data(count: 33)
+    peer[0] = 0x05
+    for i in 1..<33 { peer[i] = peerSeed &+ UInt8(i) }
+    return GroupMember(
+        peerId: peer,
+        displayName: "name-\(peerSeed)",
+        role: role,
+        joinedAtEpoch: joined,
+        status: .active,
+        addedBy: nil,
+    )
+}
+
 @Suite("GroupOp signature verification")
 struct GroupOpSignatureTests {
     @Test("a real signature verifies against the signer's identity-public")
@@ -194,6 +288,7 @@ struct GroupOpDigestTests {
             parentDigest: GroupOp.zeroParentDigest,
             operatorIdentity: identity,
             timestampMillis: 1_700_000_000_000,
+            priorMemberSetRoot: Data(repeating: 0xCD, count: GroupOp.memberSetRootSize),
             kind: .rename(newName: "v1"),
             signature: Data(repeating: 0, count: GroupOp.signatureSize),
         )
@@ -203,6 +298,7 @@ struct GroupOpDigestTests {
             parentDigest: baseOp.parentDigest,
             operatorIdentity: baseOp.operatorIdentity,
             timestampMillis: baseOp.timestampMillis,
+            priorMemberSetRoot: baseOp.priorMemberSetRoot,
             kind: baseOp.kind,
             signature: baseOp.signature,
         )
@@ -254,6 +350,7 @@ private func signedOp(
         parentDigest: parentDigest,
         operatorIdentity: identityKey(seed: 0xA1),
         timestampMillis: 1_700_000_000_000,
+        priorMemberSetRoot: Data(repeating: 0xEF, count: GroupOp.memberSetRootSize),
         kind: kind,
         signature: Data(repeating: 0x77, count: GroupOp.signatureSize),
     )
@@ -266,6 +363,7 @@ private func realSignedOp(
     kind: GroupOpKind,
     epoch: UInt64,
     parentDigest: Data = GroupOp.zeroParentDigest,
+    priorMemberSetRoot: Data = Data(repeating: 0, count: GroupOp.memberSetRootSize),
 ) throws -> GroupOp {
     let identity = try signer.identityPublic()
     let unsigned = GroupOp(
@@ -274,18 +372,20 @@ private func realSignedOp(
         parentDigest: parentDigest,
         operatorIdentity: identity,
         timestampMillis: 1_700_000_000_000,
+        priorMemberSetRoot: priorMemberSetRoot,
         kind: kind,
         // Placeholder; replaced after we sign the header.
         signature: Data(repeating: 0, count: GroupOp.signatureSize),
     )
     let header = try unsigned.encodedHeader()
-    let sig = try signer.identitySign(header)
+    let sig = try signer.identitySign(header, contextTag: Session.SignatureContext.groupOp)
     return GroupOp(
         groupId: unsigned.groupId,
         epoch: unsigned.epoch,
         parentDigest: unsigned.parentDigest,
         operatorIdentity: unsigned.operatorIdentity,
         timestampMillis: unsigned.timestampMillis,
+        priorMemberSetRoot: unsigned.priorMemberSetRoot,
         kind: unsigned.kind,
         signature: sig,
     )
@@ -305,17 +405,19 @@ private func makeOpClaimingDifferentSigner(
         parentDigest: GroupOp.zeroParentDigest,
         operatorIdentity: claimedIdentity,
         timestampMillis: 1_700_000_000_000,
+        priorMemberSetRoot: Data(repeating: 0, count: GroupOp.memberSetRootSize),
         kind: kind,
         signature: Data(repeating: 0, count: GroupOp.signatureSize),
     )
     let headerBytes = try header.encodedHeader()
-    let sig = try actualSigner.identitySign(headerBytes)
+    let sig = try actualSigner.identitySign(headerBytes, contextTag: Session.SignatureContext.groupOp)
     return GroupOp(
         groupId: header.groupId,
         epoch: header.epoch,
         parentDigest: header.parentDigest,
         operatorIdentity: header.operatorIdentity,
         timestampMillis: header.timestampMillis,
+        priorMemberSetRoot: header.priorMemberSetRoot,
         kind: header.kind,
         signature: sig,
     )

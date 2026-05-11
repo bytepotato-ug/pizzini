@@ -43,6 +43,43 @@ struct DatabaseTests {
         }
     }
 
+    @Test("USP #8: rekey rotates the encryption key + previous key fails afterwards")
+    func rekeyRotatesKey() throws {
+        let path = NSTemporaryDirectory() + "pizzini-test-\(UUID()).db"
+        defer {
+            try? FileManager.default.removeItem(atPath: path)
+            try? FileManager.default.removeItem(atPath: path + "-wal")
+            try? FileManager.default.removeItem(atPath: path + "-shm")
+        }
+        let oldKey = Data(repeating: 0x11, count: 32)
+        let newKey = Data(repeating: 0x22, count: 32)
+
+        do {
+            let db = try Database(path: path, rawKey: oldKey)
+            try db.execute("CREATE TABLE secrets (s TEXT NOT NULL);")
+            try db.prepare("INSERT INTO secrets (s) VALUES (?);").bindAll("classified").run()
+            // Rotate to the new key + vacuum to purge orphaned
+            // pages (matches the production rotation flow in
+            // DBKey.rotateKeyMaterial).
+            try db.rekey(newRawKey: newKey)
+            try db.execute("VACUUM;")
+        }
+
+        // New key opens successfully + reads the row back.
+        do {
+            let db = try Database(path: path, rawKey: newKey)
+            let q = try db.prepare("SELECT s FROM secrets;")
+            #expect(try q.step())
+            #expect(q.columnText(0) == "classified")
+        }
+
+        // Old key is now useless. SQLCipher refuses to decrypt;
+        // the constructor's smoke-read throws keyingFailed.
+        #expect(throws: DatabaseError.self) {
+            _ = try Database(path: path, rawKey: oldKey)
+        }
+    }
+
     @Test("wrong key on reopen throws keyingFailed")
     func wrongKeyRejected() throws {
         let path = NSTemporaryDirectory() + "pizzini-test-\(UUID()).db"

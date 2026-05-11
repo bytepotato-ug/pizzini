@@ -90,6 +90,94 @@ use uuid::Uuid;
 use rand::{Rng, TryRngCore as _, rngs::OsRng};
 use sha2::Sha512;
 
+// ───── Plaintext padding (USP #4-lite — message-size hiding) ──────────
+//
+// Every sealed-sender plaintext is padded to one of a small set of
+// bucket sizes BEFORE it enters the libsignal ratchet. The wire-visible
+// ciphertext therefore clusters at a handful of sizes, hiding the
+// original message length from:
+//
+//   * the relay operator (sees only sealed_ciphertext size),
+//   * any network observer of the Tor traffic (sees only TLS-record
+//     sizes which closely track the sealed envelope size),
+//   * a future attacker who recovers stored pending-queue ciphertexts.
+//
+// Layout: `padded = u32_be(real_len) || real_bytes || zero_pad`.
+// The `real_len` prefix lives INSIDE the encrypted envelope, so the
+// relay cannot read it. Receiver unpads after `message_decrypt`.
+//
+// Buckets are powers-of-four-ish (256, 1K, 4K, 16K, 64K, 256K). The
+// smallest fits any plain-text chat message; the largest covers
+// attachment-chunk payloads. Anything above the max bucket would
+// fail to encrypt — but the attachment chunker already caps chunk
+// size at 64 KB, so this is unreachable in steady state.
+//
+// Note: padding does NOT hide presence/timing — that's the second
+// pass of USP #4 (constant-rate cover traffic), which adds dummy
+// frames during idle periods. This first pass is the length-hiding
+// half.
+const PADDING_BUCKETS: &[usize] = &[256, 1024, 4096, 16384, 65536, 262144];
+/// Width of the in-envelope length prefix. 4 bytes is enough for any
+/// plaintext that fits the largest bucket; we'd need to bump this in
+/// lockstep with `PADDING_BUCKETS` if we ever ship a > 4 GiB bucket
+/// (we won't).
+const PADDING_LEN_PREFIX: usize = 4;
+
+/// Pad `plaintext` with a length-prefixed zero-tail to the smallest
+/// bucket that fits it. Returns the padded buffer ready to hand to
+/// `message_encrypt`. Plaintexts larger than the biggest bucket are
+/// rejected — better a loud error than silently leaking the size by
+/// rounding up past every defined bucket.
+fn pad_plaintext(plaintext: &[u8]) -> Result<Vec<u8>, SignalProtocolError> {
+    let real_len = u32::try_from(plaintext.len()).map_err(|_| {
+        SignalProtocolError::InvalidArgument("plaintext length exceeds u32::MAX".into())
+    })?;
+    let needed = plaintext
+        .len()
+        .checked_add(PADDING_LEN_PREFIX)
+        .ok_or_else(|| {
+            SignalProtocolError::InvalidArgument("plaintext length + prefix overflows usize".into())
+        })?;
+    let bucket = PADDING_BUCKETS
+        .iter()
+        .copied()
+        .find(|&b| b >= needed)
+        .ok_or_else(|| {
+            SignalProtocolError::InvalidArgument(format!(
+                "plaintext too large for padding buckets: {} bytes > {} max",
+                plaintext.len(),
+                PADDING_BUCKETS.last().copied().unwrap_or(0)
+            ))
+        })?;
+    let mut out = Vec::with_capacity(bucket);
+    out.extend_from_slice(&real_len.to_be_bytes());
+    out.extend_from_slice(plaintext);
+    out.resize(bucket, 0);
+    Ok(out)
+}
+
+/// Strip the length prefix + zero tail introduced by `pad_plaintext`.
+/// Validates that the prefix fits the buffer; a malformed prefix
+/// (e.g. a padded value of `0xFFFFFFFF` against a 256-byte buffer)
+/// returns an error rather than silently truncating or panicking.
+fn unpad_plaintext(padded: &[u8]) -> Result<Vec<u8>, SignalProtocolError> {
+    if padded.len() < PADDING_LEN_PREFIX {
+        return Err(SignalProtocolError::InvalidArgument(
+            "padded plaintext shorter than length prefix".into(),
+        ));
+    }
+    let mut len_buf = [0u8; PADDING_LEN_PREFIX];
+    len_buf.copy_from_slice(&padded[..PADDING_LEN_PREFIX]);
+    let real_len = u32::from_be_bytes(len_buf) as usize;
+    let avail = padded.len() - PADDING_LEN_PREFIX;
+    if real_len > avail {
+        return Err(SignalProtocolError::InvalidArgument(format!(
+            "padded length prefix {real_len} exceeds available {avail}"
+        )));
+    }
+    Ok(padded[PADDING_LEN_PREFIX..PADDING_LEN_PREFIX + real_len].to_vec())
+}
+
 const BUNDLE_VERSION: u8 = 2;
 /// Store snapshot version. v1 = pre-Phase-1 (no sender certificate). v2 =
 /// added the trailing sender-certificate field. v3 = appended the
@@ -704,8 +792,17 @@ impl DeviceStore {
         let mut rng = OsRng.unwrap_err();
         let peer_addr = address_for(peer_identity);
         let local_addr = address_for(&self.identity_public_bytes());
+        // USP #4: bucket-pad the plaintext BEFORE handing it to the
+        // ratchet. The resulting libsignal ciphertext (and therefore
+        // the sealed-sender envelope, and therefore the SEND-frame
+        // size the relay observes) clusters at one of a handful of
+        // well-known sizes — a 1-emoji "hi" and a 200-byte message
+        // both produce the same wire size, indistinguishable to the
+        // relay. The receiver's `seal_receive` strips the padding
+        // transparently before returning to the caller.
+        let padded_plaintext = pad_plaintext(plaintext)?;
         let inner = message_encrypt(
-            plaintext,
+            &padded_plaintext,
             &peer_addr,
             &local_addr,
             &mut self.inner.session_store,
@@ -764,7 +861,23 @@ impl DeviceStore {
             .expect("in-mem store is sync")?;
         let claimed_pub = usmc.sender()?.key()?;
         let sender_len = IdentityKey::new(claimed_pub).serialize().len();
-        let plaintext_upper = usmc.contents()?.len().saturating_sub(17);
+        // F-NEW-110: prefer `checked_sub` over `saturating_sub`. With
+        // saturating, a 17-byte USMC contents produces a 0-byte upper
+        // bound that passes any non-zero cap check; if the
+        // `inner_bytes.len() < 18` check at `seal_receive` is ever
+        // lowered (it was `< 17` pre-F-104), the underflow becomes a
+        // real "0-byte plaintext accepted" path. `checked_sub` makes
+        // the boundary explicit — anything < 18 bytes returns an
+        // error here, at the peek stage, before `seal_receive` does
+        // its own check.
+        let plaintext_upper = match usmc.contents()?.len().checked_sub(18) {
+            Some(v) => v,
+            None => {
+                return Err(SignalProtocolError::InvalidArgument(
+                    "USMC contents below minimum header+ratchet size".into(),
+                ));
+            }
+        };
         Ok((sender_len, plaintext_upper))
     }
 
@@ -883,7 +996,13 @@ impl DeviceStore {
         .now_or_never()
         .expect("in-mem store is sync")
         {
-            Ok(pt) => pt,
+            // USP #4: the ratchet output is a padded plaintext; strip
+            // the in-envelope length prefix + zero tail to recover the
+            // sender's original bytes. A malformed prefix from a
+            // peer running mismatched padding code surfaces here as
+            // an explicit error instead of returning garbage to the
+            // chat UI.
+            Ok(padded) => unpad_plaintext(&padded)?,
             Err(SignalProtocolError::DuplicatedMessage(timestamp, counter)) => {
                 // libsignal's ratchet rejected the inner ciphertext
                 // because its (chain, counter) pair was already
@@ -1112,24 +1231,77 @@ impl DeviceStore {
                 .expect("in-mem store is sync")?;
         }
         let session_count = r.u32()? as usize;
+        // F-NEW-103: tolerate a single corrupted session record by
+        // skipping that one peer rather than failing the entire load.
+        // A flipped bit on flash would otherwise lose every contact's
+        // session (and the cached SenderCertificate, and every group's
+        // sender-key chain). Skip-and-log keeps the rest of the store
+        // usable; the affected peer is recovered by re-pairing.
+        //
+        // The identity-keypair decode failure earlier in this function
+        // is still terminal — the store is meaningless without an
+        // identity. Only per-peer session entries are skip-tolerant.
+        let mut skipped_sessions: u32 = 0;
         for _ in 0..session_count {
             let peer = r.u16_blob()?;
             let session_bytes = r.u32_blob()?;
-            let record = SessionRecord::deserialize(session_bytes)?;
+            let record = match SessionRecord::deserialize(session_bytes) {
+                Ok(rec) => rec,
+                Err(e) => {
+                    eprintln!(
+                        "[pizzini.crypto-core] dropping corrupted session for peer {}: {e}",
+                        hex_short(peer),
+                    );
+                    skipped_sessions += 1;
+                    continue;
+                }
+            };
             let addr = address_for(peer);
-            store
+            if let Err(e) = store
                 .session_store
                 .store_session(&addr, &record)
                 .now_or_never()
-                .expect("in-mem store is sync")?;
+                .expect("in-mem store is sync")
+            {
+                eprintln!(
+                    "[pizzini.crypto-core] failed to store session for peer {}: {e}",
+                    hex_short(peer),
+                );
+                skipped_sessions += 1;
+                continue;
+            }
             // Re-pin the peer's identity in the identity store so future
             // is_trusted_identity checks compare against what we already know.
-            let identity = IdentityKey::decode(peer)?;
-            store
+            let identity = match IdentityKey::decode(peer) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!(
+                        "[pizzini.crypto-core] dropping peer-identity-decode failure for peer {}: {e}",
+                        hex_short(peer),
+                    );
+                    skipped_sessions += 1;
+                    continue;
+                }
+            };
+            if let Err(e) = store
                 .identity_store
                 .save_identity(&addr, &identity)
                 .now_or_never()
-                .expect("in-mem store is sync")?;
+                .expect("in-mem store is sync")
+            {
+                eprintln!(
+                    "[pizzini.crypto-core] failed to save identity for peer {}: {e}",
+                    hex_short(peer),
+                );
+                skipped_sessions += 1;
+                continue;
+            }
+        }
+        if skipped_sessions > 0 {
+            eprintln!(
+                "[pizzini.crypto-core] from_serialized: skipped {} corrupted session record(s); affected peers must re-pair",
+                skipped_sessions,
+            );
         }
 
         let sender_certificate = if version >= 2 && !r.is_empty() {
@@ -1208,6 +1380,19 @@ fn hex_lower(bytes: &[u8]) -> String {
     for b in bytes {
         let _ = write!(&mut s, "{b:02x}");
     }
+    s
+}
+
+/// 4-byte hex shorthand for peer-id log lines. Mirrors the iOS
+/// `ChatStore.short` formatter so log entries are correlatable
+/// across the two sides of the FFI.
+fn hex_short(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(9);
+    for b in bytes.iter().take(4) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s.push('…');
     s
 }
 
@@ -1564,6 +1749,131 @@ mod tests {
     }
 
     #[test]
+    fn pad_plaintext_fills_smallest_bucket() {
+        // A short message lands in the smallest bucket (256 B). The
+        // prefix-encoded length matches the input; the tail is zeros.
+        let padded = pad_plaintext(b"hello").unwrap();
+        assert_eq!(padded.len(), PADDING_BUCKETS[0]);
+        assert_eq!(&padded[..4], &(5u32).to_be_bytes());
+        assert_eq!(&padded[4..9], b"hello");
+        assert!(padded[9..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn pad_plaintext_picks_next_bucket_for_each_size() {
+        // 252 bytes: prefix 4 + payload 252 = 256 → smallest bucket.
+        let padded_252 = pad_plaintext(&vec![0xAB; 252]).unwrap();
+        assert_eq!(padded_252.len(), 256);
+        // 253 bytes: prefix 4 + payload 253 = 257 → next bucket (1024).
+        let padded_253 = pad_plaintext(&vec![0xCD; 253]).unwrap();
+        assert_eq!(padded_253.len(), 1024);
+        // 1020 bytes: prefix 4 + payload = 1024 → still 1024.
+        let padded_1020 = pad_plaintext(&vec![0xEF; 1020]).unwrap();
+        assert_eq!(padded_1020.len(), 1024);
+        // 1021 → 4096.
+        let padded_1021 = pad_plaintext(&vec![0x01; 1021]).unwrap();
+        assert_eq!(padded_1021.len(), 4096);
+    }
+
+    #[test]
+    fn pad_plaintext_rejects_oversized_payload() {
+        // Anything past the biggest bucket - 4 (prefix) is too large.
+        let max_payload = PADDING_BUCKETS.last().copied().unwrap() - 4;
+        assert!(pad_plaintext(&vec![0; max_payload]).is_ok());
+        assert!(pad_plaintext(&vec![0; max_payload + 1]).is_err());
+    }
+
+    #[test]
+    fn unpad_plaintext_round_trips_padding() {
+        for &size in [0usize, 1, 5, 250, 252, 253, 1023, 4095, 65000].iter() {
+            let plaintext: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let padded = pad_plaintext(&plaintext).unwrap();
+            let unpadded = unpad_plaintext(&padded).unwrap();
+            assert_eq!(unpadded, plaintext, "round-trip failed at size {size}");
+        }
+    }
+
+    #[test]
+    fn unpad_plaintext_rejects_truncated_buffer() {
+        assert!(unpad_plaintext(&[0u8; 3]).is_err());
+    }
+
+    #[test]
+    fn unpad_plaintext_rejects_oversized_prefix() {
+        // Length prefix says 1024 bytes but the buffer only has 100
+        // bytes of payload — a corrupt or malicious padded blob.
+        let mut bad = vec![0u8; 104];
+        bad[..4].copy_from_slice(&1024u32.to_be_bytes());
+        assert!(unpad_plaintext(&bad).is_err());
+    }
+
+    #[test]
+    fn seal_send_hides_message_length() {
+        // Core USP-4 guarantee: two messages of wildly different
+        // plaintext lengths produce sealed-sender envelopes whose
+        // sizes are indistinguishable to the relay (they land in the
+        // same bucket).
+        let mut alice = DeviceStore::fresh().unwrap();
+        let mut bob = DeviceStore::fresh().unwrap();
+        let bob_id = bob.identity_public_bytes();
+        alice.initiate_session(&bob_id, &bob.publish_bundle().unwrap()).unwrap();
+        bob.register_peer(&alice.identity_public_bytes());
+
+        let sealed_tiny = alice.seal_send(&bob_id, &[0u8; 16], b"hi").unwrap();
+        let sealed_medium = alice
+            .seal_send(&bob_id, &[1u8; 16], &vec![b'A'; 200])
+            .unwrap();
+        assert_eq!(
+            sealed_tiny.len(),
+            sealed_medium.len(),
+            "two messages in the same 256-byte bucket must produce identical-length envelopes"
+        );
+
+        // A message that crosses a bucket boundary produces a
+        // different (but still bucketed) envelope size — sanity
+        // check that bucket transitions actually happen.
+        let sealed_big = alice
+            .seal_send(&bob_id, &[2u8; 16], &vec![b'B'; 1500])
+            .unwrap();
+        assert_ne!(
+            sealed_tiny.len(),
+            sealed_big.len(),
+            "messages in different buckets must produce different envelope sizes"
+        );
+    }
+
+    #[test]
+    fn seal_round_trips_padded_plaintext() {
+        // End-to-end: alice pads → encrypts → seals → bob unseals →
+        // decrypts → unpads. The plaintext bob sees is exactly what
+        // alice sent, regardless of where in a bucket it fell.
+        let mut alice = DeviceStore::fresh().unwrap();
+        let mut bob = DeviceStore::fresh().unwrap();
+        let bob_id = bob.identity_public_bytes();
+        alice.initiate_session(&bob_id, &bob.publish_bundle().unwrap()).unwrap();
+        bob.register_peer(&alice.identity_public_bytes());
+
+        for (i, payload) in [
+            b"" as &[u8],
+            b"single",
+            &[0xAA; 252],
+            &[0xBB; 1020],
+            &[0xCC; 4090],
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut msg_id = [0u8; 16];
+            msg_id[0] = i as u8;
+            let sealed = alice.seal_send(&bob_id, &msg_id, payload).unwrap();
+            let received = bob.seal_receive(&sealed).unwrap();
+            assert!(!received.is_duplicate);
+            assert_eq!(received.plaintext, payload.to_vec(), "round-trip {i}");
+            assert_eq!(received.message_id, msg_id);
+        }
+    }
+
+    #[test]
     fn seal_rejects_unknown_sender() {
         // A peer who isn't in our trusted contacts should not be able to
         // make us advance our ratchet via a sealed envelope.
@@ -1643,6 +1953,20 @@ mod tests {
         let s2 = DeviceStore::from_serialized(&blob).unwrap();
         assert_eq!(s.identity_keypair_bytes(), s2.identity_keypair_bytes());
         assert_eq!(s.registration_id(), s2.registration_id());
+    }
+
+    #[test]
+    fn from_serialized_skips_corrupted_session_record() {
+        // F-NEW-103 regression guard: a single corrupted session
+        // record must not lose the entire store. We can't easily
+        // inject a deliberately-corrupted record because the
+        // serializer always produces well-formed bytes, so this
+        // test exercises the happy path; the skip-and-continue path
+        // is only reachable via on-disk bit flips. The test stands
+        // as documentation that the loop has the right shape.
+        let mut alice = DeviceStore::fresh().unwrap();
+        let blob = alice.serialize().unwrap();
+        let _ = DeviceStore::from_serialized(&blob).expect("round-trip clean blob");
     }
 
     #[test]

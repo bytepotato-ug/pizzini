@@ -35,6 +35,7 @@ struct GroupBootstrapCodecTests {
             lastOpDigest: Data(repeating: 0xBB, count: 32),
             operatorIdentity: aliceId,
             timestampMillis: 1_700_000_000_000,
+            memberSetRoot: ChatGroup.memberSetRoot(of: members),
             signature: Data(repeating: 0x00, count: GroupOp.signatureSize),
         )
         let bytes = try bootstrap.encoded()
@@ -59,6 +60,7 @@ struct GroupBootstrapCodecTests {
             groupId: groupId, displayName: "g", members: members,
             currentEpoch: 5, lastOpDigest: Data(repeating: 0xBB, count: 32),
             operatorIdentity: aliceId, timestampMillis: 1,
+            memberSetRoot: ChatGroup.memberSetRoot(of: members),
             signature: Data(repeating: 0, count: GroupOp.signatureSize))
         let decoded = try #require(GroupBootstrap.decode(try bootstrap.encoded()))
         #expect(decoded.members[0].addedBy == aliceId)
@@ -98,6 +100,7 @@ struct GroupBootstrapCodecTests {
             displayName: "g", members: members,
             currentEpoch: 0, lastOpDigest: Data(repeating: 0xBB, count: 32),
             operatorIdentity: aliceId, timestampMillis: 1,
+            memberSetRoot: ChatGroup.memberSetRoot(of: members),
             signature: Data(repeating: 0x77, count: GroupOp.signatureSize))
     }
 }
@@ -137,23 +140,75 @@ struct GroupBootstrapSignatureTests {
         let bob = try Session()
         let bobId = try bob.identityPublic()
         // Build a bootstrap header claiming Bob, sign with Alice.
+        let bobMembers = [GroupMember(peerId: bobId, displayName: "B", role: .admin,
+                                       joinedAtEpoch: 0, status: .active)]
         let unsigned = GroupBootstrap(
             groupId: Data(repeating: 0xAA, count: 16),
             displayName: "g",
-            members: [GroupMember(peerId: bobId, displayName: "B", role: .admin,
-                                  joinedAtEpoch: 0, status: .active)],
+            members: bobMembers,
             currentEpoch: 0, lastOpDigest: Data(repeating: 0xBB, count: 32),
             operatorIdentity: bobId, timestampMillis: 1,
+            memberSetRoot: ChatGroup.memberSetRoot(of: bobMembers),
             signature: Data(repeating: 0, count: GroupOp.signatureSize))
         let header = try unsigned.encodedHeader()
-        let aliceSig = try alice.identitySign(header)
+        let aliceSig = try alice.identitySign(header, contextTag: Session.SignatureContext.groupBootstrap)
         let tampered = GroupBootstrap.signed(
             groupId: unsigned.groupId, displayName: unsigned.displayName,
             members: unsigned.members, currentEpoch: unsigned.currentEpoch,
             lastOpDigest: unsigned.lastOpDigest,
             operatorIdentity: unsigned.operatorIdentity,
-            timestampMillis: unsigned.timestampMillis, signature: aliceSig)
+            timestampMillis: unsigned.timestampMillis,
+            memberSetRoot: unsigned.memberSetRoot,
+            signature: aliceSig)
         #expect(try tampered.verifySignature() == false)
+    }
+}
+
+@Suite("GroupBootstrap memberSetRoot self-consistency")
+struct GroupBootstrapMemberSetRootTests {
+    @Test("USP #5: verifyMemberSetRoot returns true when admin's claim matches the members list")
+    func consistentBootstrapPasses() throws {
+        let alice = try Session()
+        let aliceId = try alice.identityPublic()
+        let bootstrap = try realSignedBootstrap(
+            by: alice, members: [(aliceId, .admin, .active)])
+        #expect(bootstrap.verifyMemberSetRoot() == true)
+    }
+
+    @Test("USP #5: verifyMemberSetRoot returns false when the admin shipped a ghost-member list")
+    func ghostedBootstrapFails() throws {
+        let alice = try Session()
+        let aliceId = try alice.identityPublic()
+        let bob = try Session()
+        let bobId = try bob.identityPublic()
+        // Admin's claimed root reflects the honest member set
+        // {Alice, Bob}, but they ship a `members[]` that secretly
+        // includes a third ghost member — a real-world ghost-member
+        // bootstrap attack.
+        let honest: [GroupMember] = [
+            GroupMember(peerId: aliceId, displayName: "A", role: .admin,
+                        joinedAtEpoch: 0, status: .active, addedBy: aliceId),
+            GroupMember(peerId: bobId, displayName: "B", role: .member,
+                        joinedAtEpoch: 0, status: .active, addedBy: aliceId),
+        ]
+        let withGhost = honest + [
+            GroupMember(peerId: Data(repeating: 0xEE, count: 33),
+                        displayName: "ghost", role: .member,
+                        joinedAtEpoch: 0, status: .active, addedBy: aliceId),
+        ]
+        let tampered = GroupBootstrap(
+            groupId: Data(repeating: 0xAA, count: 16),
+            displayName: "g",
+            members: withGhost,
+            currentEpoch: 0,
+            lastOpDigest: Data(repeating: 0xBB, count: 32),
+            operatorIdentity: aliceId,
+            timestampMillis: 1,
+            // Root reflects honest set; members[] has the ghost.
+            memberSetRoot: ChatGroup.memberSetRoot(of: honest),
+            signature: Data(repeating: 0, count: GroupOp.signatureSize),
+        )
+        #expect(tampered.verifyMemberSetRoot() == false)
     }
 }
 
@@ -212,13 +267,16 @@ private func realSignedBootstrap(
         groupId: groupId, displayName: "g", members: members,
         currentEpoch: 0, lastOpDigest: Data(repeating: 0xBB, count: 32),
         operatorIdentity: signerId, timestampMillis: 1_700_000_000_000,
+        memberSetRoot: ChatGroup.memberSetRoot(of: members),
         signature: Data(repeating: 0, count: GroupOp.signatureSize))
     let header = try unsigned.encodedHeader()
-    let sig = try signer.identitySign(header)
+    let sig = try signer.identitySign(header, contextTag: Session.SignatureContext.groupBootstrap)
     return GroupBootstrap.signed(
         groupId: unsigned.groupId, displayName: unsigned.displayName,
         members: unsigned.members, currentEpoch: unsigned.currentEpoch,
         lastOpDigest: unsigned.lastOpDigest,
         operatorIdentity: unsigned.operatorIdentity,
-        timestampMillis: unsigned.timestampMillis, signature: sig)
+        timestampMillis: unsigned.timestampMillis,
+        memberSetRoot: unsigned.memberSetRoot,
+        signature: sig)
 }

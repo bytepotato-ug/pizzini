@@ -27,6 +27,30 @@ final class ChatStore: NSObject {
 
     // Public, observable.
     var relayState: RelayClient.State = .idle
+    /// USP #1: most-recent self-attestation snapshot from the relay
+    /// (binary SHA-256, git commit, dirty bit, crate version).
+    /// Refreshed on every successful (re)connect; rendered in
+    /// Settings → Relay info so users can compare the running
+    /// binary against the operator-published transparency-log
+    /// entry. `nil` until the first STATUS_RESPONSE lands.
+    var relayStatus: RelayStatus?
+    /// USP #1 second half: cached transparency-log entries loaded
+    /// from disk on launch and refreshed in the background on
+    /// every successful relay (re)connect. Reads pass through
+    /// `TransparencyLog.contains(binarySha256Hex:in:)` to drive
+    /// the Settings → Relay attestation badge. Empty if the
+    /// operator hasn't configured a log URL, or if the cache is
+    /// empty pre-first-fetch.
+    var transparencyLog: [TransparencyLog.SignedEntry] = []
+    /// Wall-clock of the last successful transparency-log fetch.
+    /// Surfaced in Settings → Relay attestation so the user can
+    /// tell stale cache from fresh. `nil` if no fetch has ever
+    /// succeeded.
+    var transparencyLogLastFetched: Date?
+    /// Last error from the transparency-log fetcher, if any.
+    /// `nil` when the most recent fetch (or the lack of one,
+    /// when no URL is configured) is in the expected state.
+    var transparencyLogError: TransparencyLog.FetchError?
     /// Persisted app state. Module-internal access (the default) so
     /// extensions in `ChatStoreGroups.swift` can mutate group rows
     /// directly; the iOS app target is a single module so the UI
@@ -150,6 +174,11 @@ final class ChatStore: NSObject {
     override init() {
         self.state = Storage.loadAppState()
         self.outbox = Storage.loadOutbox()
+        // USP #1 second half: pre-load any previously-cached
+        // transparency-log entries so the Settings panel can
+        // render an immediate answer without waiting for the
+        // first reconnect to repopulate.
+        self.transparencyLog = TransparencyLog.loadCachedLog()
         super.init()
         do {
             let s = try Storage.loadOrCreateSession()
@@ -160,6 +189,42 @@ final class ChatStore: NSObject {
             self.initError = String(describing: error)
         }
         refreshAppBadge()
+    }
+
+    /// USP #1 second half: refresh the transparency log from the
+    /// operator's configured public URL. Idempotent — safe to
+    /// call on every reconnect plus a manual button. Network
+    /// failures and rollback rejections surface via
+    /// `transparencyLogError` so the UI can render an explicit
+    /// state.
+    ///
+    /// Runs as a detached task because the call site is the
+    /// MainActor-isolated `relayClient(_:didChange:)` handler;
+    /// we don't want the HTTP round-trip blocking the UI.
+    func refreshTransparencyLog() {
+        guard TransparencyLogConfig.logURL != nil else {
+            // No URL configured — leave the cached log + error
+            // state alone; the UI's "not configured" branch
+            // covers this case explicitly.
+            return
+        }
+        Task { @MainActor in
+            do {
+                let fresh = try await TransparencyLog.fetchAndCache()
+                self.transparencyLog = fresh
+                self.transparencyLogLastFetched = Date()
+                self.transparencyLogError = nil
+                NSLog(
+                    "[pizzini.translog] refreshed: \(fresh.count) entries, \(TransparencyLog.verifiedCount(in: fresh)) verified",
+                )
+            } catch let err as TransparencyLog.FetchError {
+                self.transparencyLogError = err
+                NSLog("[pizzini.translog] fetch failed: \(err)")
+            } catch {
+                self.transparencyLogError = .http(error.localizedDescription)
+                NSLog("[pizzini.translog] fetch failed (unexpected): \(error)")
+            }
+        }
     }
 
     /// Outbox entry for `messageId`, if any. Used by the chat row to
@@ -204,7 +269,15 @@ final class ChatStore: NSObject {
             myIdentity: myId,
             myDeliveryTokenVerifyKey: verifyKey,
             signer: { payload in
-                try? signingSession.identitySign(payload)
+                // F-NEW-101: HELLO signatures are domain-separated
+                // by the `hello` context tag. RelayClient passes the
+                // payload (peer_id || verify_key || ts || nonce);
+                // the FFI internally prepends `u16(tag_len) || tag`
+                // and signs that.
+                try? signingSession.identitySign(
+                    payload,
+                    contextTag: Session.SignatureContext.hello,
+                )
             },
         )
         client.delegate = self
@@ -298,11 +371,19 @@ final class ChatStore: NSObject {
     /// pairing time. Empty/whitespace falls back to the fingerprint
     /// default so the row is still distinguishable.
     ///
+    /// `source` records how the identity bytes reached the device.
+    /// Mandatory at the call site — UI shows different verification
+    /// affordances for `.qrScan` vs `.pastedText`. The value is fixed
+    /// on first insert and *not* updated on re-add: re-scanning a
+    /// previously-pasted contact would otherwise quietly upgrade
+    /// trust without the safety-number step (see upsertContact in
+    /// SQLiteStorage).
+    ///
     /// Note: `card.host` is *informational* — it's the address the peer
     /// uses to reach the relay. We never adopt it as our own relay host;
     /// scanning a sim's `127.0.0.1` QR from a real iPhone would otherwise
     /// silently break our connection.
-    func addContact(card: ContactCard, displayName: String?) {
+    func addContact(card: ContactCard, displayName: String?, source: ContactSource) {
         guard let session else { return }
         if state.contacts.contains(where: { $0.identityPub == card.peerId }) {
             requestBundleWithHashcash(fromPeer: card.peerId)
@@ -310,7 +391,7 @@ final class ChatStore: NSObject {
         }
         let trimmed = (displayName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let name = trimmed.isEmpty ? Contact.defaultName(for: card.peerId) : trimmed
-        let contact = Contact(identityPub: card.peerId, displayName: name)
+        let contact = Contact(identityPub: card.peerId, displayName: name, addedVia: source)
         state.contacts.append(contact)
         try? session.registerPeer(peerIdentity: card.peerId)
         Storage.upsertContact(contact)
@@ -319,6 +400,40 @@ final class ChatStore: NSObject {
         if relayState == .connected {
             requestBundleWithHashcash(fromPeer: card.peerId)
         }
+    }
+
+    /// Mark a contact as out-of-band verified — the user has compared
+    /// the symmetric safety number with the peer over a channel an
+    /// attacker on the original sharing path cannot impersonate (in
+    /// person, voice call). Idempotent; calling on an already-verified
+    /// contact updates the timestamp.
+    func markVerified(contactId: UUID, at when: Date = Date()) {
+        guard let idx = state.contacts.firstIndex(where: { $0.id == contactId }) else { return }
+        state.contacts[idx].verifiedAt = when
+        Storage.upsertContact(state.contacts[idx])
+    }
+
+    /// Reverse the verification, e.g. the user pressed "doesn't match"
+    /// on the SAS screen, or chose to revoke trust after the fact.
+    /// Leaves `addedVia` alone — provenance is permanent.
+    func clearVerification(contactId: UUID) {
+        guard let idx = state.contacts.firstIndex(where: { $0.id == contactId }) else { return }
+        state.contacts[idx].verifiedAt = nil
+        Storage.upsertContact(state.contacts[idx])
+    }
+
+    /// Symmetric 60-digit safety number for the (local, peer) identity
+    /// pair, grouped for display. Returns nil only if our local
+    /// identity hasn't loaded yet (relay-host swap mid-launch, init
+    /// failure) — in normal operation this resolves the moment the
+    /// chat screen is reachable.
+    ///
+    /// Pure derivation: stable across calls, independent of which side
+    /// computes it. Both peers see the same string if no MITM is in
+    /// their session.
+    func safetyNumber(for contact: Contact) -> String? {
+        guard let myId = myIdentityPublicCached else { return nil }
+        return SafetyNumber.derive(localIdentity: myId, peerIdentity: contact.identityPub)
     }
 
     /// Compute the BLAKE3 hashcash on a background queue (~1s on a
@@ -375,6 +490,32 @@ final class ChatStore: NSObject {
     /// 1860 to absorb future tweaks below detection. Token batch size
     /// is `Contact.initialIssuance × 84` = 86016 bytes.
     private static let decoyBundleSize = 1860
+
+    /// Per-unknown-peer cooldown on the decoy emission. Mirrors the
+    /// `Contact.refillCooldown` on the recognised-peer branch so the
+    /// timing asymmetry between known and unknown is preserved only
+    /// for the FIRST request in a cooldown window. Subsequent
+    /// requests in the same cooldown silently drop on BOTH branches
+    /// (the recognised-peer branch already early-returns at line
+    /// `lastBundleServedAt < cooldown` — we add the symmetric
+    /// short-circuit on the decoy branch here).
+    private static let decoyPerPeerCooldown: TimeInterval = 6 * 60 * 60
+
+    /// Aggregate cap on ALL decoy emissions per minute, across all
+    /// unknown-peer ids. Defends against the attacker who rotates
+    /// `from_id` every request to defeat the per-peer cooldown
+    /// (F-NEW-202): even if every iteration uses a fresh peer-id,
+    /// no more than `decoyAggregateBudgetPerMinute` decoys ever
+    /// leave the device per minute.
+    private static let decoyAggregateBudgetPerMinute: Int = 1
+
+    /// In-memory state for the decoy cooldown. Process-lifetime
+    /// (resets across cold launches). The TTL of an entry is
+    /// `decoyPerPeerCooldown`; pruned lazily on access.
+    private var decoyLastEmitByPeer: [Data: Date] = [:]
+    /// Timestamps of recent decoy emissions for the aggregate-budget
+    /// check. Pruned to entries newer than 60s on access.
+    private var decoyAggregateRecent: [Date] = []
     /// Pacing budget for the real BUNDLE_RESPONSE + TOKEN_ISSUE path on
     /// a modern phone — kyber1024 keygen + 1024 XEd25519 signatures
     /// runs ~1s. Decoy waits within this window before emitting so the
@@ -384,6 +525,35 @@ final class ChatStore: NSObject {
 
     @MainActor
     private func emitBundleResponseDecoy(toFakePeer fromPeer: Data, via client: RelayClient) {
+        // F-NEW-202 cooldown — TWO gates, both required to ship a decoy:
+        //
+        // (a) Per-unknown-peer cooldown. Prevents a single attacker
+        //     identity from sustaining a stream of ~88 KB outbound
+        //     decoys against the victim by re-shipping BUNDLE_REQUEST
+        //     under the same `from_id`.
+        // (b) Aggregate budget across ALL unknown peers. Defends
+        //     against the rotating-`from_id` attacker who otherwise
+        //     defeats (a) by minting a fresh peer-id per iteration.
+        //
+        // The COMBINATION is what bounds the leak: an attacker who
+        // rotates ids is rate-limited by (b); an attacker who reuses
+        // an id is rate-limited by (a). Either way, sustained
+        // outbound is bounded to ~88 KB per (decoyAggregateBudget /
+        // minute) ≈ 88 KB/min worst case rather than 88 KB/iteration.
+        let now = Date()
+        if let last = decoyLastEmitByPeer[fromPeer],
+           now.timeIntervalSince(last) < ChatStore.decoyPerPeerCooldown {
+            NSLog("[pizzini] BUNDLE_REQUEST decoy from \(short(fromPeer)) suppressed by per-peer cooldown")
+            return
+        }
+        // Prune aggregate window to entries in the last 60s.
+        decoyAggregateRecent.removeAll { now.timeIntervalSince($0) >= 60 }
+        if decoyAggregateRecent.count >= ChatStore.decoyAggregateBudgetPerMinute {
+            NSLog("[pizzini] BUNDLE_REQUEST decoy from \(short(fromPeer)) suppressed by aggregate budget")
+            return
+        }
+        decoyLastEmitByPeer[fromPeer] = now
+        decoyAggregateRecent.append(now)
         // Capture the client and target before we go async — the iOS
         // app may reset identity / swap the relay before our delay
         // fires; if so, drop silently rather than ship to a stale
@@ -1260,6 +1430,14 @@ final class ChatStore: NSObject {
         teardownRelay()
         session = nil
         myIdentityPublicCached = nil
+        // Drop the APNs device token under the OLD identity. iOS mints
+        // a fresh device token on the next registerForRemoteNotifications
+        // call — so a relay-adjacent adversary who recorded the
+        // pre-duress (peer-id, APNs token) tuple cannot correlate it
+        // with a post-duress (fresh peer-id, fresh APNs token) tuple.
+        // The next onboarding pass (which the duress wipe routes the
+        // user through, by clearing `onboardingCompleted`) re-registers.
+        UIApplication.shared.unregisterForRemoteNotifications()
         Storage.eraseAndReinitialize(preserving: snapshot, clearPasscodes: true)
         state = Storage.loadAppState()
         outbox = Storage.loadOutbox()
@@ -1270,7 +1448,14 @@ final class ChatStore: NSObject {
             let s = try Storage.loadOrCreateSession()
             session = s
             myIdentityPublicCached = try s.identityPublic()
-            connectRelay()
+            // Deliberately do NOT auto-reconnect to the relay here.
+            // The post-wipe state has `onboardingCompleted == false`,
+            // so the user is routed through onboarding on next
+            // foreground; the relay registration happens there with
+            // the fresh APNs token. Reconnecting here under the new
+            // identity but the same APNs registration would let a
+            // relay operator correlate (old peer-id, push-token) →
+            // (new peer-id, same push-token) and infer duress.
         } catch {
             initError = String(describing: error)
         }
@@ -1421,6 +1606,18 @@ extension ChatStore: RelayClientDelegate {
                 // timer tick. `runRetryWalk` is idempotent — if no
                 // entries are due, it's a no-op.
                 self.runRetryWalk()
+                // USP #1: ask the relay which build it's running.
+                // The response lands at `didReceiveStatus` and gets
+                // cached on `self.relayStatus` for the Settings panel.
+                // Re-issuing on every reconnect catches operator
+                // redeploys without a client restart.
+                client.requestStatus()
+                // USP #1 second half: refresh the transparency log
+                // from the operator's pinned URL alongside the
+                // relay-attestation refresh. The UI's match badge
+                // depends on both — pulling them together keeps
+                // the rendered state internally consistent.
+                self.refreshTransparencyLog()
                 // Drain any read receipts deferred while the relay
                 // was offline. `emitReadReceipt` skips when
                 // `relayState != .connected` so a missed receive
@@ -1456,21 +1653,41 @@ extension ChatStore: RelayClientDelegate {
         }
     }
 
+    nonisolated func relayClient(_ client: RelayClient, didReceiveStatus status: RelayStatus) {
+        // USP #1: cache the latest relay attestation so the
+        // Settings panel can read it synchronously when the user
+        // opens the relay-info row. Also a useful diagnostic line
+        // in NSLog — the operator's published transparency-log
+        // SHA must match `binarySha256` for the running relay
+        // to be considered the audited build.
+        Task { @MainActor in
+            self.relayStatus = status
+            NSLog(
+                "[pizzini] relay attest: v\(status.crateVersion) commit=\(status.gitSha)"
+                    + " dirty=\(status.gitDirty) sha256=\(self.hex(status.binarySha256))",
+            )
+        }
+    }
+
     nonisolated func relayClient(
         _ client: RelayClient,
         didReceiveTokenIssueFrom fromPeer: Data,
         tokens: [Data]
     ) {
-        Task { @MainActor in
-            guard let idx = self.contactIndex(forIdentity: fromPeer) else {
-                NSLog("[pizzini] dropped TOKEN_ISSUE from unknown peer \(self.short(fromPeer))")
-                return
-            }
-            // F-202/F-401: authenticate the batch end-to-end against the
-            // peer's bundle-published verify_key before any token enters
-            // the stash. A malicious relay could otherwise swap legitimate
-            // tokens for relay-forged ones and wedge our send path.
-            guard let verifyKey = self.state.contacts[idx].peerVerifyKey else {
+        // F-NEW-204: run the per-token XEd25519 verify loop OFF the
+        // main actor. At ~75 µs per verify a malicious paired peer
+        // shipping a max-size frame (~12 482 tokens) would otherwise
+        // freeze MainActor for ~940 ms, repeatable indefinitely.
+        // Detached priority-userInitiated keeps the verifies snappy
+        // without blocking UI; the verified-stash append jumps back
+        // onto MainActor at the end.
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            // Read the peer's verify_key under MainActor isolation,
+            // do the verifies off-actor, then re-enter MainActor for
+            // the stash update.
+            let verifyKey: Data? = await self.peerVerifyKey(forIdentity: fromPeer)
+            guard let verifyKey else {
                 NSLog(
                     "[pizzini] dropped TOKEN_ISSUE from \(self.short(fromPeer)): no peerVerifyKey on contact (re-pair to refresh)"
                 )
@@ -1495,27 +1712,46 @@ extension ChatStore: RelayClientDelegate {
                     return
                 }
             }
-            // F-206: cap stash size, but trim from the BACK (newest first)
-            // rather than the front. Combined with verify above this is
-            // belt-and-suspenders — fabricated tokens never enter — but a
-            // peer that legitimately issues lots of refills shouldn't be
-            // able to push older trusted tokens off the queue either.
-            let cap = 2 * Contact.initialIssuance
-            var stash = self.state.contacts[idx].deliveryTokensForPeer
-            stash.append(contentsOf: verified)
-            if stash.count > cap {
-                stash.removeLast(stash.count - cap)
-            }
-            self.state.contacts[idx].deliveryTokensForPeer = stash
-            Storage.replaceDeliveryTokens(
-                contactId: self.state.contacts[idx].id,
-                tokens: stash,
-            )
-            self.persistContactSlice(at: idx)
-            NSLog(
-                "[pizzini] received \(verified.count) verified tokens from \(self.short(fromPeer)); stash now \(stash.count)"
-            )
+            // Hop back to MainActor for the stash mutation.
+            await self.acceptVerifiedTokens(fromPeer: fromPeer, verified: verified)
         }
+    }
+
+    /// MainActor helper for the off-actor TOKEN_ISSUE verify loop —
+    /// reads the cached peer verify_key without blocking on the
+    /// per-token verify cost.
+    @MainActor
+    private func peerVerifyKey(forIdentity peerIdentity: Data) -> Data? {
+        guard let idx = contactIndex(forIdentity: peerIdentity) else { return nil }
+        return state.contacts[idx].peerVerifyKey
+    }
+
+    /// MainActor helper used by the off-actor verify path to append
+    /// verified tokens. Contains the F-206 cap-and-trim logic that
+    /// previously lived inline in the delegate.
+    @MainActor
+    private func acceptVerifiedTokens(fromPeer: Data, verified: [Data]) {
+        guard let idx = contactIndex(forIdentity: fromPeer) else { return }
+        // F-206: cap stash size, but trim from the BACK (newest first)
+        // rather than the front. Combined with verify above this is
+        // belt-and-suspenders — fabricated tokens never enter — but a
+        // peer that legitimately issues lots of refills shouldn't be
+        // able to push older trusted tokens off the queue either.
+        let cap = 2 * Contact.initialIssuance
+        var stash = state.contacts[idx].deliveryTokensForPeer
+        stash.append(contentsOf: verified)
+        if stash.count > cap {
+            stash.removeLast(stash.count - cap)
+        }
+        state.contacts[idx].deliveryTokensForPeer = stash
+        Storage.replaceDeliveryTokens(
+            contactId: state.contacts[idx].id,
+            tokens: stash,
+        )
+        persistContactSlice(at: idx)
+        NSLog(
+            "[pizzini] received \(verified.count) verified tokens from \(short(fromPeer)); stash now \(stash.count)"
+        )
     }
 
     @MainActor
@@ -2037,9 +2273,18 @@ extension ChatStore: RelayClientDelegate {
     /// 4-byte hex fingerprint shorthand for log lines and system rows.
     /// Internal-not-private so the group surface in
     /// `ChatStoreGroups.swift` can render the same shorthand without
-    /// duplicating the formatter.
-    func short(_ data: Data) -> String {
+    /// duplicating the formatter. `nonisolated` so detached tasks
+    /// (e.g. the off-actor TOKEN_ISSUE verify loop) can format peer
+    /// ids without hopping back through MainActor.
+    nonisolated func short(_ data: Data) -> String {
         let head = data.prefix(4).map { String(format: "%02x", $0) }.joined()
         return head + "…"
+    }
+
+    /// Full lowercase hex. Used by the USP #1 relay-info logging /
+    /// Settings row to render binary SHA-256s the operator can
+    /// match against a transparency-log entry.
+    nonisolated func hex(_ data: Data) -> String {
+        data.map { String(format: "%02x", $0) }.joined()
     }
 }

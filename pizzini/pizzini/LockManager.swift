@@ -47,11 +47,20 @@ final class LockManager {
 
     /// True when the lock overlay should be shown. Read by `ContentView`.
     private(set) var isLocked: Bool = false
-    /// True when the privacy shield should cover everything — i.e. the
-    /// scene is not currently active *or* we're in the middle of the
-    /// foreground transition and haven't decided whether to show the
-    /// lock overlay yet. Cleared only by `handleDidActivate`, which
-    /// runs after `handleWillEnterForeground` has set `isLocked`.
+    /// True when the in-body `PrivacyShieldView` overlay should mount.
+    /// Covers the gap between `didActivate` (when `PrivacyShieldWindow`
+    /// hides) and the lock overlay's first paint — a brief window
+    /// where chat content would otherwise render in-tree.
+    ///
+    /// **NOTE on multitasking snapshot defense.** The MULTITASKING
+    /// SNAPSHOT defense is `PrivacyShieldWindow`, NOT this flag.
+    /// SwiftUI re-renders are async (next runloop tick), so flipping
+    /// `isShielded` inside `willDeactivate` cannot guarantee an
+    /// overlay frame paints before iOS captures the snapshot. The
+    /// `PrivacyShieldWindow` is a separate UIWindow shown
+    /// synchronously inside the willDeactivate handler — that's what
+    /// the snapshot sees. The in-body `isShielded` overlay is a
+    /// belt-and-suspenders cover for the activate→render gap.
     private(set) var isShielded: Bool = false
     /// True while a `LAContext.evaluatePolicy` call is in flight, so the
     /// UI can disable the "Unlock" button.
@@ -66,6 +75,15 @@ final class LockManager {
     /// of `PasscodeEntryView`. Cleared when the sheet is dismissed
     /// or when a passcode entry succeeds.
     var isPasscodeSheetPresented: Bool = false
+
+    /// True between a duress passcode being recognised and the wipe +
+    /// re-bootstrap completing. While set, `submitPasscode` rejects
+    /// re-entries with `.wrong` so a panicked second tap can't race
+    /// the in-flight wipe and submit against the freshly-emptied
+    /// Keychain (which would otherwise expose the fresh-install
+    /// gate-less UI). Set by the lock-overlay coordinator; cleared
+    /// by `unlockAfterDuress`.
+    private(set) var wipeInFlight: Bool = false
 
     private var backgroundedAt: Date?
 
@@ -130,7 +148,19 @@ final class LockManager {
             backgroundedAt = nil
             return
         }
-        guard let backgroundedAt else { return }
+        // **Fail closed.** If `backgroundedAt` is nil — which can
+        // happen on a scene reattach without an intervening
+        // didEnterBackground (Stage Manager bring-back, watchdog
+        // termination + scene-restoration path, etc.) — default to
+        // locking. A security tool must not silently skip the lock
+        // because the bookkeeping flag wasn't set. The user pays one
+        // unnecessary biometric prompt in that edge case; the
+        // alternative is exposing chat content to whoever picked up
+        // the device.
+        guard let backgroundedAt else {
+            isLocked = true
+            return
+        }
         let elapsed = Date().timeIntervalSince(backgroundedAt)
         let timeout = ChatStore.shared.state.autoLockTimeout.seconds
         if elapsed >= timeout {
@@ -221,6 +251,15 @@ final class LockManager {
         lastError = nil
     }
 
+    /// Mark a duress wipe as in flight. The lock overlay's duress
+    /// handler MUST call this BEFORE invoking
+    /// `ChatStore.shared.duressWipe()` so any racing passcode entry
+    /// (e.g. a panicked double-tap) gets `.wrong` instead of
+    /// re-triggering on the freshly-emptied state.
+    func beginDuressWipe() {
+        wipeInFlight = true
+    }
+
     /// Drop the lock after a duress wipe. The caller (the lock
     /// overlay's duress handler) MUST have already invoked
     /// `ChatStore.shared.duressWipe()` so the UI underneath
@@ -229,6 +268,7 @@ final class LockManager {
         isLocked = false
         isPasscodeSheetPresented = false
         lastError = nil
+        wipeInFlight = false
     }
 
     // MARK: - Passcode entry
@@ -259,6 +299,15 @@ final class LockManager {
     /// `.wrong`, the lock stays up; the caller surfaces an error
     /// to the user.
     func submitPasscode(_ entry: String) -> PasscodeOutcome {
+        // If a duress wipe is already in flight (set by the lock
+        // overlay before it calls duressWipe), every subsequent
+        // submission is bounced as `.wrong` until the wipe completes
+        // and `unlockAfterDuress` clears the flag. Defends against
+        // the rapid-double-tap race where the second tap could land
+        // after the first has cleared the Keychain.
+        if wipeInFlight {
+            return .wrong
+        }
         switch AppPasscode.check(entry) {
         case .real:
             isLocked = false

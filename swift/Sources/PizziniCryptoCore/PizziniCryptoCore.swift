@@ -240,40 +240,54 @@ public final class Session: @unchecked Sendable {
         }
     }
 
-    /// Sign `payload` with the local IdentityKey's private half. F-203:
-    /// the iOS RelayClient calls this to attach a possession proof to
-    /// every HELLO so a network-positioned attacker can't squat someone
-    /// else's peer_id (peer_id IS the IdentityKey wire form, so the
-    /// relay can verify against it without a separate key registry).
+    /// Sign `payload` with the local IdentityKey's private half,
+    /// domain-separated by `contextTag`.
+    ///
+    /// **F-NEW-101**: the tag is MANDATORY and non-empty. The signed
+    /// bytes are `u16_be(tag.count) || tag || payload` — a verifier
+    /// reconstructing the same bytes can confirm the signature was
+    /// produced for that specific context. A caller that passes a
+    /// tag different from the verifier's would get a verify failure
+    /// rather than a cross-context-reusable signature.
+    ///
     /// Returns the 64-byte Ed25519 signature.
-    public func identitySign(_ payload: Data) throws -> Data {
+    public func identitySign(_ payload: Data, contextTag: Data) throws -> Data {
         guard let handle else { throw CryptoCoreError.invalidArgument }
+        guard !contextTag.isEmpty else { throw CryptoCoreError.invalidArgument }
         var buf = [UInt8](repeating: 0, count: 128)
         var len: UInt = 0
-        var rc = payload.withUnsafeBytes { pPtr -> Int32 in
-            buf.withUnsafeMutableBufferPointer { outPtr in
-                pizzini_store_identity_sign(
-                    handle,
-                    pPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                    UInt(payload.count),
-                    outPtr.baseAddress,
-                    UInt(outPtr.count),
-                    &len,
-                )
-            }
-        }
-        if rc == PIZZINI_ERR_BUFFER_TOO_SMALL {
-            buf = [UInt8](repeating: 0, count: Int(len))
-            rc = payload.withUnsafeBytes { pPtr -> Int32 in
+        var rc = contextTag.withUnsafeBytes { tPtr -> Int32 in
+            payload.withUnsafeBytes { pPtr -> Int32 in
                 buf.withUnsafeMutableBufferPointer { outPtr in
-                    pizzini_store_identity_sign(
+                    pizzini_store_identity_sign_v2(
                         handle,
+                        tPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                        UInt(contextTag.count),
                         pPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
                         UInt(payload.count),
                         outPtr.baseAddress,
                         UInt(outPtr.count),
                         &len,
                     )
+                }
+            }
+        }
+        if rc == PIZZINI_ERR_BUFFER_TOO_SMALL {
+            buf = [UInt8](repeating: 0, count: Int(len))
+            rc = contextTag.withUnsafeBytes { tPtr -> Int32 in
+                payload.withUnsafeBytes { pPtr -> Int32 in
+                    buf.withUnsafeMutableBufferPointer { outPtr in
+                        pizzini_store_identity_sign_v2(
+                            handle,
+                            tPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            UInt(contextTag.count),
+                            pPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            UInt(payload.count),
+                            outPtr.baseAddress,
+                            UInt(outPtr.count),
+                            &len,
+                        )
+                    }
                 }
             }
         }
@@ -369,18 +383,24 @@ public final class Session: @unchecked Sendable {
         identityPub: Data,
         message: Data,
         signature: Data,
+        contextTag: Data,
     ) throws -> Bool {
+        guard !contextTag.isEmpty else { throw CryptoCoreError.invalidArgument }
         let rc = identityPub.withUnsafeBytes { idPtr -> Int32 in
-            message.withUnsafeBytes { msgPtr -> Int32 in
-                signature.withUnsafeBytes { sigPtr -> Int32 in
-                    pizzini_verify_identity_signature(
-                        idPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                        UInt(identityPub.count),
-                        msgPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                        UInt(message.count),
-                        sigPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                        UInt(signature.count),
-                    )
+            contextTag.withUnsafeBytes { tagPtr -> Int32 in
+                message.withUnsafeBytes { msgPtr -> Int32 in
+                    signature.withUnsafeBytes { sigPtr -> Int32 in
+                        pizzini_verify_identity_signature_v2(
+                            idPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            UInt(identityPub.count),
+                            tagPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            UInt(contextTag.count),
+                            msgPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            UInt(message.count),
+                            sigPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                            UInt(signature.count),
+                        )
+                    }
                 }
             }
         }
@@ -394,6 +414,34 @@ public final class Session: @unchecked Sendable {
         default:
             throw CryptoCoreError.internalError
         }
+    }
+
+    /// Canonical domain-separation tags. Adding a new use-site MUST
+    /// add a new tag here rather than reusing an existing one — that
+    /// is the entire point of the F-NEW-101 fix.
+    public enum SignatureContext {
+        /// HELLO possession proof — included for completeness even
+        /// though `RelayClient` constructs the literal directly.
+        public static let hello: Data = Data("pizzini.hello.v3".utf8)
+        /// `GroupOp` signature (Create / AddMember / RemoveMember /
+        /// RotateSenderKey / GroupChat / Rename).
+        // v2: GroupOp wire format gained the 32-byte
+        // `priorMemberSetRoot` field (USP #5: verifiable group
+        // membership). Bumping the tag in lockstep with the wire
+        // bump ensures any in-flight v1 signature fails verification
+        // under v2 — no downgrade-attack path that lets a v1 op
+        // slip through a v2 verifier.
+        public static let groupOp: Data = Data("pizzini.group.op.v2".utf8)
+        /// `GroupBootstrap` snapshot signature.
+        // v2: GroupBootstrap wire format gained the 32-byte
+        // `memberSetRoot` field (USP #5: self-consistency check the
+        // joiner runs against the admin's `members[]` list).
+        // Lockstep bump with the v1 → v2 wire change ensures
+        // pre-v2 snapshots fail signature verification on a v2
+        // joiner — closes the downgrade path.
+        public static let groupBootstrap: Data = Data("pizzini.group.bootstrap.v2".utf8)
+        /// Device-rekey ed25519 signature used by `ChatStore.requestBundleWithHashcash`.
+        public static let deviceRekey: Data = Data("pizzini.device.rekey.v1".utf8)
     }
 
     /// Mints (or refreshes) the cached SenderCertificate. Production
@@ -726,6 +774,75 @@ public enum Blake3 {
         }
         precondition(rc == PIZZINI_OK, "pizzini_blake3_hash never fails with valid args")
         return Data(out)
+    }
+}
+
+/// Symmetric, human-comparable "safety number" derived from two
+/// IdentityKey publics. Both peers see the same 60-digit code when
+/// no MITM is in their session; substitution of either identity by
+/// a network attacker changes the digits.
+///
+/// Compared out of band (voice call, in person) once after pairing to
+/// promote a contact from `addedVia` (medium/low trust) to verified.
+/// Derivation lives in the Rust core — see `pizzini_safety_number_derive`
+/// for the exact domain-separated BLAKE3 input — so the iOS host
+/// cannot disagree with itself across builds, and a future Rust-side
+/// change to the SAS format requires a domain-tag bump.
+public enum SafetyNumber {
+    /// Length of one IdentityKey public in bytes (DJB prefix + 32-byte
+    /// point). The derivation FFI rejects any other size, so we
+    /// mirror the constant Swift-side to catch caller mistakes
+    /// (truncated peer ids, raw 32-byte points) at the call site.
+    public static let identityLength = 33
+    /// Number of decimal digits in a rendered safety number, before
+    /// any formatting / grouping is applied.
+    public static let digitCount = 60
+    /// Display layout: twelve groups of five digits, single-space
+    /// separated. Matches the screen reader rhythm of "five-five-five".
+    public static let groupSize = 5
+
+    /// Derives the 60-digit safety number for the pair
+    /// `(localIdentity, peerIdentity)`. Order is normalised in the
+    /// core; either argument order produces identical output. The
+    /// returned string is the grouped display form
+    /// (`"XXXXX XXXXX … XXXXX"`, 12 groups of 5).
+    public static func derive(localIdentity: Data, peerIdentity: Data) -> String {
+        precondition(
+            localIdentity.count == identityLength && peerIdentity.count == identityLength,
+            "safety number requires 33-byte serialized IdentityKey publics on both sides"
+        )
+        var out = [UInt8](repeating: 0, count: digitCount)
+        let rc: Int32 = localIdentity.withUnsafeBytes { aRaw in
+            peerIdentity.withUnsafeBytes { bRaw in
+                out.withUnsafeMutableBufferPointer { o in
+                    pizzini_safety_number_derive(
+                        aRaw.bindMemory(to: UInt8.self).baseAddress,
+                        UInt(localIdentity.count),
+                        bRaw.bindMemory(to: UInt8.self).baseAddress,
+                        UInt(peerIdentity.count),
+                        o.baseAddress,
+                        UInt(o.count)
+                    )
+                }
+            }
+        }
+        precondition(
+            rc == PIZZINI_OK,
+            "pizzini_safety_number_derive never fails when args meet the precondition above"
+        )
+        let digits = String(decoding: Data(out), as: UTF8.self)
+        var formatted = ""
+        formatted.reserveCapacity(digitCount + (digitCount / groupSize) - 1)
+        var idx = digits.startIndex
+        var first = true
+        while idx < digits.endIndex {
+            if !first { formatted.append(" ") }
+            first = false
+            let end = digits.index(idx, offsetBy: groupSize)
+            formatted.append(contentsOf: digits[idx..<end])
+            idx = end
+        }
+        return formatted
     }
 }
 

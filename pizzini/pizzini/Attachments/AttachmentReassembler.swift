@@ -72,6 +72,24 @@ final class AttachmentReassembler {
     /// in 24h won't arrive after.
     static let partialTTL: TimeInterval = 24 * 60 * 60
 
+    /// Per-peer cap on simultaneous in-flight attachments. A paired
+    /// peer that opens N distinct attachmentIds and ships one chunk
+    /// each could otherwise pin N directory inodes + chunk files on
+    /// disk for 24 hours. The multi-select picker is hard-capped at
+    /// 1 attachment per send (AttachmentPicker), so legitimate use
+    /// never approaches this number; 32 is generous and bounds the
+    /// damage to ~32 × 64 MiB worst-case per peer.
+    static let perPeerPendingCap: Int = 32
+
+    /// Receive-side memoisation of attachmentIds whose assembled file
+    /// already exists on disk. Defends against the same-attachmentId-
+    /// replay attack where a sender re-ships chunks under the same
+    /// `attachmentId` after the receiver removed the pending entry on
+    /// completion — without this guard the second transfer would
+    /// truncate-overwrite the existing assembled file, swapping the
+    /// bytes behind a chat row the user already accepted.
+    private var completedAttachmentIds: Set<Data> = []
+
     /// Map key: `peer + attachmentId` (49 bytes for a libsignal IdentityKey).
     /// Don't key on attachmentId alone: a malicious paired peer A could
     /// otherwise try to confuse a separate peer B's reassembly by
@@ -86,8 +104,28 @@ final class AttachmentReassembler {
     func feed(envelope: FileChunkEnvelope, fromPeer peer: Data) -> FeedResult {
         let key = peer + envelope.attachmentId
 
+        // **Replay defense (F-NEW-602).** If we've previously
+        // completed this attachmentId, reject every subsequent chunk
+        // — the sender can't legitimately re-open the same id, and
+        // accepting the chunk would truncate-overwrite the existing
+        // assembled file on disk that an already-inserted chat row
+        // points at. Bytes "behind" a row the user already accepted
+        // would silently change.
+        if completedAttachmentIds.contains(envelope.attachmentId) {
+            return .rejected(.duplicateChunk)
+        }
+
         // First-chunk-of-attachment: set up the disk dir + record.
         if pending[key] == nil {
+            // **Per-peer in-flight cap (F-NEW-603).** Refuse to accept
+            // a new attachmentId for this peer if they're already at
+            // the cap. The reaper's 24h TTL will free slots; until
+            // then a malicious sender can't pin unbounded disk by
+            // opening millions of distinct one-chunk attachments.
+            let inFlightForPeer = pending.values.filter { $0.peer == peer }.count
+            if inFlightForPeer >= Self.perPeerPendingCap {
+                return .rejected(.writeFailed)
+            }
             let now = Date()
             let entry = Pending(
                 attachmentId: envelope.attachmentId,
@@ -161,6 +199,13 @@ final class AttachmentReassembler {
             switch finalize(entry) {
             case .success(let completion):
                 pending.removeValue(forKey: key)
+                // Mark this attachmentId as completed so a subsequent
+                // re-send under the same id is rejected (F-NEW-602).
+                // The 24h reaper clears stale entries; on a duress
+                // wipe `AttachmentSandbox.eraseEverything()` clears
+                // the on-disk files and a fresh ChatStore drops the
+                // set with the rest of in-memory state.
+                completedAttachmentIds.insert(completion.attachmentId)
                 return .complete(completion)
             case .failure(let reason):
                 // Cleanup partial state on a finalisation failure so
@@ -224,6 +269,16 @@ final class AttachmentReassembler {
         // Concatenate chunk-{i}.bin → {safeName}, byte-counted to
         // verify total_size.
         let outURL = dir.appending(path: safeName, directoryHint: .notDirectory)
+        // Defense in depth on top of FilenameSanitizer: assert outURL
+        // resolves inside `dir`. The sanitizer now refuses `.` / `..`
+        // explicitly, but a future iOS version's URL standardization
+        // could still produce surprising results — bail before we
+        // create the file rather than after.
+        do {
+            try AttachmentSandbox.assertContained(url: outURL, in: dir)
+        } catch {
+            return .failure(.writeFailed)
+        }
         FileManager.default.createFile(atPath: outURL.path, contents: nil, attributes: [
             .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication,
         ])

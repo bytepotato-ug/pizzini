@@ -17,19 +17,51 @@
 
 set -euo pipefail
 
-# Pinned upstream tag. Current stable as of 2026-05: v4.6.1.
+# Pinned upstream tag AND commit SHA. F-NEW-1001: a tag alone is
+# mutable; an attacker who compromises the Zetetic GitHub account (or
+# a TLS intermediary on the fetch) can force-push the tag and silently
+# poison the next regeneration. The commit SHA below is the
+# authoritative pin; the tag is documentary.
+#
 # Bump deliberately — every bump is a re-audit of the C source.
+# Procedure for bumping:
+#   1. Update SQLCIPHER_TAG below.
+#   2. Run the script with SQLCIPHER_PIN_SHA=auto to discover the new SHA.
+#   3. Commit the script change AND the regenerated amalgamation.
+#   4. CI re-runs the script and asserts the SHA matches.
 SQLCIPHER_TAG="${SQLCIPHER_TAG:-v4.6.1}"
 SQLCIPHER_GIT="${SQLCIPHER_GIT:-https://github.com/sqlcipher/sqlcipher.git}"
+# Full 40-char commit SHA that `v4.6.1` resolved to at audit time.
+# Hard-coded so the build refuses to proceed against a moved tag.
+SQLCIPHER_PIN_SHA="${SQLCIPHER_PIN_SHA:-c6f709fca81c910ba133aaf6330c28e01ccfe5f8}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="$REPO_ROOT/swift/Sources/PizziniSQLCipher"
 WORK_DIR="$(mktemp -d -t pizzini-sqlcipher.XXXXXX)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-echo "==> SQLCipher $SQLCIPHER_TAG → $OUT_DIR"
+echo "==> SQLCipher $SQLCIPHER_TAG ($SQLCIPHER_PIN_SHA) → $OUT_DIR"
 
-git clone --depth 1 --branch "$SQLCIPHER_TAG" "$SQLCIPHER_GIT" "$WORK_DIR/src"
+git clone --branch "$SQLCIPHER_TAG" "$SQLCIPHER_GIT" "$WORK_DIR/src"
+
+# F-NEW-1001 sha pin verification: refuse to proceed if the tag has
+# moved relative to the recorded SHA. `SQLCIPHER_PIN_SHA=auto` skips
+# the check and prints the resolved SHA — used only when bumping the
+# pin.
+ACTUAL_SHA="$(git -C "$WORK_DIR/src" rev-parse HEAD)"
+if [ "$SQLCIPHER_PIN_SHA" = "auto" ]; then
+    echo "==> auto-pin mode: tag $SQLCIPHER_TAG resolves to $ACTUAL_SHA"
+    echo "    update SQLCIPHER_PIN_SHA in this script and re-run without auto"
+elif [ "$ACTUAL_SHA" != "$SQLCIPHER_PIN_SHA" ]; then
+    echo "FATAL: tag $SQLCIPHER_TAG resolves to $ACTUAL_SHA" >&2
+    echo "       expected pinned SHA $SQLCIPHER_PIN_SHA" >&2
+    echo "       refusing to build — tag may have been force-pushed" >&2
+    exit 1
+fi
+# Detach to the pinned SHA explicitly so even if the local clone is
+# somehow ahead of the tag, the amalgamation comes from the exact
+# committed source.
+git -C "$WORK_DIR/src" -c advice.detachedHead=false checkout "$ACTUAL_SHA" >/dev/null 2>&1
 
 cd "$WORK_DIR/src"
 
@@ -79,11 +111,17 @@ cat >"$OUT_DIR/include/PizziniSQLCipher.h" <<EOF
 EOF
 
 # Module map so Swift code can `import PizziniSQLCipher` and call
-# `sqlite3_open_v2`, `sqlite3_key_v2`, etc. directly.
+# `sqlite3_open_v2`, `sqlite3_key_v2`, etc. directly. F-NEW-1010:
+# the `link "z"` directive used to pull in libz unconditionally even
+# though the amalgamation doesn't call `inflate`/`deflate` — dead
+# weight + needlessly broadens the iOS binary's dynamic dependency
+# set. SQLCipher's compress/decompress hooks require explicit
+# build flags (`SQLITE_ENABLE_COMPRESS`, etc.) which we don't set,
+# so the link is removable. If a future build flag pulls zlib in,
+# re-add `link "z"` and document the use-site here.
 cat >"$OUT_DIR/include/module.modulemap" <<'EOF'
 module PizziniSQLCipher [system] {
     umbrella header "PizziniSQLCipher.h"
-    link "z"
     export *
 }
 EOF
@@ -91,6 +129,22 @@ EOF
 # Stamp the version we vendored so reviewers can diff against
 # upstream without rerunning git log.
 echo "$SQLCIPHER_TAG" > "$OUT_DIR/VERSION"
+# Also stamp the resolved commit SHA so reviewers can verify which
+# upstream commit produced this amalgamation without re-running git.
+echo "$ACTUAL_SHA" > "$OUT_DIR/COMMIT_SHA"
+
+# F-NEW-1007: sha256 sidecar for the regenerated `.c` file so CI can
+# refuse a PR that ships a tampered amalgamation under the same
+# VERSION string. The expected pattern: every PR that bumps
+# SQLCipher commits both `pizzini_sqlcipher.c` AND
+# `pizzini_sqlcipher.c.sha256`, and CI fails if they don't match.
+if command -v shasum >/dev/null 2>&1; then
+    (cd "$OUT_DIR" && shasum -a 256 pizzini_sqlcipher.c > pizzini_sqlcipher.c.sha256)
+elif command -v sha256sum >/dev/null 2>&1; then
+    (cd "$OUT_DIR" && sha256sum pizzini_sqlcipher.c > pizzini_sqlcipher.c.sha256)
+else
+    echo "WARN: neither shasum nor sha256sum available — sha256 sidecar not generated" >&2
+fi
 
 echo "==> Done. Vendored:"
 ls -la "$OUT_DIR"

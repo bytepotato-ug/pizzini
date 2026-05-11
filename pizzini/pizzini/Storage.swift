@@ -84,7 +84,9 @@ enum Storage {
     // MARK: - Device store (libsignal blob)
 
     static func loadOrCreateSession() throws -> Session {
-        let store = SQLiteStorage.shared!
+        guard let store = SQLiteStorage.shared else {
+            throw StorageError.databaseWriteFailed(detail: "storage not bootstrapped")
+        }
         if let blob = try store.loadDeviceStore() {
             return try Session(serialized: blob)
         }
@@ -98,7 +100,9 @@ enum Storage {
 
     @discardableResult
     static func persist(session: Session) throws -> Bool {
-        let store = SQLiteStorage.shared!
+        guard let store = SQLiteStorage.shared else {
+            throw StorageError.databaseWriteFailed(detail: "storage not bootstrapped")
+        }
         do {
             let blob = try session.serialize()
             try store.saveDeviceStore(blob)
@@ -287,53 +291,120 @@ enum Storage {
 
     /// **Cryptographic erasure** — the primitive behind the duress
     /// passphrase flow. Wipes the SQLCipher database file AND the key
-    /// material that decrypts it, in this order:
+    /// material that decrypts it.
     ///
-    ///   1. Close the open `Database` and delete the `.sqlite` + WAL
-    ///      sidecars from Application Support.
-    ///   2. Delete the Secure-Enclave private key (so the wrapped
-    ///      seed in Keychain becomes ECIES-undecryptable).
-    ///   3. Delete the Argon2id salt + params + wrapped seed slots
-    ///      from Keychain.
-    ///   4. Re-bootstrap a fresh, empty SQLCipher store with new
-    ///      key material.
+    /// Ordering matters for crash-safety. If the process is killed
+    /// mid-wipe, the on-disk state must NOT be forensically
+    /// distinguishable from a fresh install — otherwise a coercer who
+    /// power-cuts the device mid-wipe knows duress was triggered.
     ///
-    /// Optionally preserves the caller-supplied `AppState` settings
-    /// (relay host, lock posture, UX prefs) in the post-wipe state.
-    /// The duress flow uses this so the post-wipe app looks lived-in
-    /// rather than freshly installed (design Q2 → option b).
+    /// Therefore:
+    ///
+    ///   1. Wipe the attachment sandbox tree (plaintext bytes go
+    ///      first — they're useless without the DB rows that name
+    ///      them anyway, but they're also useless to a coercer once
+    ///      gone).
+    ///   2. Close the open `Database` and unlink `.sqlite` + WAL +
+    ///      SHM. After this point the encrypted DB file is gone; an
+    ///      interruption here leaves the wrap+salt+SE-key intact
+    ///      pointing at no DB → on next launch `bootstrap()` sees
+    ///      "keys present, no DB" and treats it as an orphan-wipe
+    ///      recovery, re-rolling everything fresh.
+    ///   3. Erase the SE key + Keychain wrap + salt + params (so
+    ///      even the orphan-DB-file (in case unlink failed) is
+    ///      undecryptable).
+    ///   4. Erase the AppPasscode slots if requested (duress path).
+    ///   5. Re-bootstrap a fresh SQLCipher store with new keys.
+    ///
+    /// Optionally preserves a subset of `AppState` settings (relay
+    /// host + UX prefs) in the post-wipe state. **Onboarding flags
+    /// and lock-gate flags are NOT preserved** on the duress path —
+    /// the post-wipe UI deliberately routes through onboarding so
+    /// the user (or coercer) is presented with a fresh-install
+    /// experience indistinguishable from a clean app install.
     ///
     /// `clearPasscodes: true` (the duress path) also wipes the
-    /// `AppPasscode` slots so the next launch has no real/duress
-    /// passcode set at all — matches a "fresh install" presentation
-    /// to a coercer. The `false` default leaves them in place for
-    /// the existing `resetEverything` callers.
+    /// `AppPasscode` slots and the cross-process shared unread-count
+    /// snapshot.
     static func eraseAndReinitialize(
         preserving snapshot: AppState? = nil,
         clearPasscodes: Bool = false,
     ) {
+        // 1. Attachment sandbox — every received photo/video/PDF the
+        //    user exchanged goes here first. The chat rows that
+        //    reference these files are wiped in step 2; clearing the
+        //    bytes first means even an interrupted wipe leaves no
+        //    plaintext readable by `find`.
+        AttachmentSandbox.eraseEverything()
+        // 2. Unlink the SQLCipher database BEFORE touching key
+        //    material. An interruption between steps 2 and 3 leaves
+        //    "no DB, fresh keys" which the next bootstrap detects via
+        //    the orphan check and recovers from.
+        SQLiteStorage.unlinkDatabaseFiles()
+        // 3. Key material — wrap, salt, params, SE key.
+        DBKey.eraseKeyMaterial()
+        // 4. Passcode slots (duress path only). Cleared after key
+        //    material so an interruption at this boundary still
+        //    presents as fresh-install on next launch.
         if clearPasscodes {
             AppPasscode.eraseAll()
+            // Cross-process unread-count snapshot. The NSE writes
+            // here while the app is dead; the value sits in
+            // plaintext in the App Group container's plist (atomic
+            // rewrites, but historical generations can be recovered
+            // from flash). Clear it explicitly on duress.
+            SharedAppGroup.defaults?.removeObject(forKey: SharedAppGroup.unreadCountKey)
         }
-        DBKey.eraseKeyMaterial()
+        // 5. Re-bootstrap fresh state.
         do {
-            try SQLiteStorage.wipeAndReopen()
+            try SQLiteStorage.bootstrap()
             try StorageMigration.run(storage: SQLiteStorage.shared)
             if let snapshot {
-                _ = persist(appState: AppState(
-                    relayHost: snapshot.relayHost,
-                    contacts: [],
-                    onboardingCompleted: snapshot.onboardingCompleted,
-                    biometricLockEnabled: snapshot.biometricLockEnabled,
-                    autoLockTimeout: snapshot.autoLockTimeout,
-                    quickLookPreviewEnabled: snapshot.quickLookPreviewEnabled,
-                    panicModeEnabled: snapshot.panicModeEnabled,
-                    qrBlockEffective: snapshot.qrBlockEffective,
-                    qrBlockTestedOSVersion: snapshot.qrBlockTestedOSVersion,
-                    groups: [],
-                    contactsBeforeGroups: snapshot.contactsBeforeGroups,
-                    inAppHapticsEnabled: snapshot.inAppHapticsEnabled,
-                ))
+                // Duress preserves a narrow slice: just the relay
+                // host and the inAppHaptics setting, so the post-wipe
+                // app doesn't look like every other fresh install.
+                // Onboarding flags + biometric/passcode/lock posture
+                // are explicitly RESET on the duress path so the user
+                // (and any coercer browsing the wiped device) is
+                // presented with a fresh-install experience that
+                // gates the empty contacts list behind onboarding.
+                let preserved: AppState
+                if clearPasscodes {
+                    preserved = AppState(
+                        relayHost: snapshot.relayHost,
+                        contacts: [],
+                        onboardingCompleted: false,
+                        biometricLockEnabled: false,
+                        autoLockTimeout: .immediately,
+                        quickLookPreviewEnabled: false,
+                        panicModeEnabled: false,
+                        qrBlockEffective: snapshot.qrBlockEffective,
+                        qrBlockTestedOSVersion: snapshot.qrBlockTestedOSVersion,
+                        groups: [],
+                        contactsBeforeGroups: true,
+                        inAppHapticsEnabled: false,
+                    )
+                } else {
+                    // Non-duress reset path (Settings → "Reset
+                    // everything"): preserve the user's existing
+                    // posture so an accidental tap doesn't strand
+                    // them in a re-onboarding loop.
+                    preserved = AppState(
+                        relayHost: snapshot.relayHost,
+                        contacts: [],
+                        onboardingCompleted: snapshot.onboardingCompleted,
+                        biometricLockEnabled: snapshot.biometricLockEnabled,
+                        autoLockTimeout: snapshot.autoLockTimeout,
+                        quickLookPreviewEnabled: snapshot.quickLookPreviewEnabled,
+                        panicModeEnabled: snapshot.panicModeEnabled,
+                        qrBlockEffective: snapshot.qrBlockEffective,
+                        qrBlockTestedOSVersion: snapshot.qrBlockTestedOSVersion,
+                        groups: [],
+                        contactsBeforeGroups: snapshot.contactsBeforeGroups,
+                        inAppHapticsEnabled: snapshot.inAppHapticsEnabled,
+                    )
+                }
+                _ = persist(appState: preserved)
             }
         } catch {
             NSLog("[pizzini.storage] eraseAndReinitialize failed: \(error)")

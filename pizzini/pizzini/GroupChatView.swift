@@ -56,6 +56,7 @@ struct GroupChatView: View {
     @State private var searchQuery = ""
     @State private var searchActive = false
     @State private var currentMatchID: UUID?
+    @FocusState private var searchFocused: Bool
     /// iOS 18 ScrollPosition binding for the group log. Mirrors the
     /// 1:1 `ChatView.scrollPosition` — opens at-bottom via
     /// `.defaultScrollAnchor(.bottom, for: .initialOffset)`, and
@@ -66,6 +67,15 @@ struct GroupChatView: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
+        VStack(spacing: 0) {
+            if searchActive {
+                customSearchBar
+            }
+            logSection
+        }
+    }
+
+    private var logSection: some View {
         log
             // Bitchat-style panic gesture, parity with `ChatView`:
             // three fast taps on the chat-content area instantly
@@ -133,25 +143,23 @@ struct GroupChatView: View {
             }
             .background(.bar)
         }
-        // In-chat find. Parity with `ChatView` — `.searchable` with
-        // the `isPresented` binding so the magnifying-glass toolbar
-        // button + the global-search deep-link can both programmatically
-        // open the search field, and the system Cancel button binds
-        // back to false on dismissal.
-        .searchable(
-            text: $searchQuery,
-            isPresented: $searchActive,
-            placement: .navigationBarDrawer(displayMode: .always),
-            prompt: Text("Find in this chat"),
-        )
-        .autocorrectionDisabled(true)
-        .textInputAutocapitalization(.never)
+        // In-chat find — F-NEW-802: custom inline search bar instead
+        // of `.searchable`. The drawer mount of `.searchable` left the
+        // last-typed term visible across nav back-then-forward; the
+        // inline bar is mounted only when `searchActive == true` and
+        // explicitly cleared on Cancel. Matches the 1:1 `ChatView`
+        // pattern from commit 52ac407.
         .navigationTitle(group?.displayName ?? "Group")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
-                    searchActive.toggle()
+                    if searchActive {
+                        cancelInlineSearch()
+                    } else {
+                        searchActive = true
+                        searchFocused = true
+                    }
                 } label: {
                     Image(systemName: "magnifyingglass")
                 }
@@ -514,6 +522,49 @@ struct GroupChatView: View {
         }
     }
 
+    /// Custom inline search bar — mirror of `ChatView.customSearchBar`.
+    /// Mounted only when `searchActive == true`; Cancel button clears
+    /// the query state so a re-open opens with an empty field.
+    private var customSearchBar: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Find in this chat", text: $searchQuery)
+                    .textFieldStyle(.plain)
+                    .focused($searchFocused)
+                    .submitLabel(.search)
+                    .hardenedTextInput()
+                if !searchQuery.isEmpty {
+                    Button {
+                        searchQuery = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityLabel("Clear search")
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color(.secondarySystemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            Button("Cancel") {
+                cancelInlineSearch()
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color(.systemBackground))
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
+    private func cancelInlineSearch() {
+        searchActive = false
+        searchQuery = ""
+        searchFocused = false
+    }
+
     private var composer: some View {
         HStack(spacing: 8) {
             Button {
@@ -540,6 +591,12 @@ struct GroupChatView: View {
                 text: $draft,
                 axis: .vertical,
             )
+                // F-NEW-801 + F-NEW-802 fix: explicit hardening on the
+                // composer, not inherited from the (removed) parent
+                // `.searchable` modifier's side effect. Survives the
+                // search bar's lifecycle and keeps the strict posture
+                // even if a future refactor moves the modifier up.
+                .hardenedTextInput(autocap: .sentences)
                 .textFieldStyle(.roundedBorder)
                 .focused($composerFocused)
                 // Multi-line composer: return inserts a newline. Don't

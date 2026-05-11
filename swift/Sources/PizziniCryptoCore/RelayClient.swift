@@ -9,6 +9,32 @@
 import Foundation
 import Network
 
+/// USP #1: snapshot of the running relay binary's identity.
+/// Returned by `RelayClient.requestStatus()` and delivered to the
+/// host via `relayClient(_:didReceiveStatus:)`. The host shows it
+/// in Settings and (eventually) compares against an
+/// operator-signed transparency-log entry.
+public struct RelayStatus: Sendable, Equatable {
+    /// Protocol version the relay implements. Must match the
+    /// client's `HELLO` signing tag major version — a divergence
+    /// means a relay upgrade hasn't shipped to clients yet.
+    public let protocolVersion: UInt8
+    /// "Was the working tree dirty when this binary was built?"
+    /// 0 = clean (reproducible-build eligible), 1 = dirty (dev
+    /// build), 2 = unknown (built outside a git checkout).
+    public let gitDirty: UInt8
+    /// `CARGO_PKG_VERSION` from the build, e.g. `"0.0.0"`.
+    public let crateVersion: String
+    /// Hex SHA of the source commit. 40 chars in a normal build;
+    /// `"unknown"` when the relay was built outside a git checkout.
+    public let gitSha: String
+    /// SHA-256 of the running binary, computed by the relay at
+    /// startup. 32 bytes. Compare against
+    /// `sha256sum target/release/pizzini-relay` from
+    /// `scripts/build-relay-release.sh`.
+    public let binarySha256: Data
+}
+
 public protocol RelayClientDelegate: AnyObject, Sendable {
     /// Connection state crossed a meaningful threshold.
     func relayClient(_ client: RelayClient, didChange state: RelayClient.State)
@@ -37,6 +63,16 @@ public protocol RelayClientDelegate: AnyObject, Sendable {
         didReceiveTokenIssueFrom fromPeer: Data,
         tokens: [Data]
     )
+    /// USP #1: relay answered our `requestStatus()` with the
+    /// running binary's self-attestation snapshot.
+    func relayClient(_ client: RelayClient, didReceiveStatus status: RelayStatus)
+}
+
+/// Default no-op so existing delegate implementations don't have
+/// to handle the new STATUS callback until they're ready. The
+/// host can override to surface the snapshot in Settings.
+public extension RelayClientDelegate {
+    func relayClient(_ client: RelayClient, didReceiveStatus status: RelayStatus) {}
 }
 
 public final class RelayClient: @unchecked Sendable {
@@ -52,13 +88,17 @@ public final class RelayClient: @unchecked Sendable {
     /// Protocol v3 added the F-203 HELLO possession proof — every HELLO
     /// frame now carries `timestamp_be_u64 || u16 nonce_len + nonce16
     /// || u16 sig_len + sig64`, where `sig` is the IdentityKey's Ed25519
-    /// signature over `b"pizzini.hello.v1" || peer_id || verify_key ||
+    /// signature over `b"pizzini.hello.v3" || peer_id || verify_key ||
     /// timestamp_be || nonce`. Relay verifies against the IdentityKey
     /// extracted from `peer_id`.
     public static let protocolVersion: UInt8 = 3
     /// Domain-separation tag for the HELLO signing payload. MUST match
     /// `HELLO_SIGNING_TAG` in `relay/src/main.rs`.
-    private static let helloSigningTag = Data("pizzini.hello.v1".utf8)
+    /// Domain-separated HELLO signing tag. F-NEW-205: includes the
+    /// protocol version so a captured signature can't be reinterpreted
+    /// under a different wire version. Must match
+    /// `HELLO_SIGNING_TAG` in `relay/src/main.rs`.
+    private static let helloSigningTag = Data("pizzini.hello.v3".utf8)
     private static let helloNonceLen = 16
 
     /// Inner-plaintext type byte. Sealed envelope contents always start
@@ -134,6 +174,35 @@ public final class RelayClient: @unchecked Sendable {
     private static let frameTypeRegisterPush: UInt8 = 5
     private static let frameTypeAck: UInt8 = 6
     private static let frameTypeTokenIssue: UInt8 = 7
+    /// USP #1: client → relay "what build are you running?". Empty
+    /// payload (just the frame type). Match `FRAME_TYPE_STATUS_REQUEST`
+    /// in `relay/src/main.rs`.
+    private static let frameTypeStatusRequest: UInt8 = 8
+    /// Relay → client response carrying crate version, git SHA,
+    /// dirty bit, and binary SHA-256. Match
+    /// `FRAME_TYPE_STATUS_RESPONSE` in `relay/src/main.rs`.
+    private static let frameTypeStatusResponse: UInt8 = 9
+    /// Width of the binary SHA-256 the relay reports. Locked at 32
+    /// bytes; the relay sends a length byte preceding the digest
+    /// so a future hash bump (e.g. SHA-512) lands without
+    /// disturbing this client.
+    private static let statusBinHashLen: Int = 32
+    /// USP #4 (pacing pass): cover-traffic frame. Body is exactly
+    /// `coverPayloadLen` random bytes. The relay receives + drops.
+    /// Match `FRAME_TYPE_COVER` in `relay/src/main.rs`.
+    private static let frameTypeCover: UInt8 = 10
+    /// Body length of a COVER frame. Sized to roughly match the
+    /// smallest padded sealed_ciphertext bucket so a passive
+    /// observer can't trivially distinguish covers from short
+    /// real SENDs at the cell-counting granularity.
+    private static let coverPayloadLen: Int = 256
+    /// Maximum gap between any two outgoing frames on a connected
+    /// session before we emit a cover frame to fill the silence.
+    /// 30 s balances battery / data overhead (~700 KB / day idle)
+    /// against the timing-mask quality — short enough that an
+    /// observer can't infer "the user is composing a message"
+    /// from a multi-minute lull followed by a burst.
+    private static let coverInterval: TimeInterval = 30
     private static let maxFrameBytes: UInt32 = 1024 * 1024
     /// Hard ceiling on the per-message TTL the sender can request; the
     /// relay clamps to this server-side too. 7 days.
@@ -151,6 +220,15 @@ public final class RelayClient: @unchecked Sendable {
             queue.async {
                 delegate?.relayClient(client, didChange: snapshot)
             }
+            // USP #4 (pacing pass): cover-traffic timer follows
+            // connection state. Started when we transition into
+            // `.connected`, torn down on any other state so the
+            // timer can't fire against a dead socket.
+            if state == .connected {
+                startCoverTimer()
+            } else {
+                stopCoverTimer()
+            }
         }
     }
 
@@ -167,6 +245,15 @@ public final class RelayClient: @unchecked Sendable {
     private let signer: HelloSigner
     private var connection: NWConnection?
     private var readBuffer = Data()
+    /// USP #4: wall-clock of the last outgoing frame (real OR
+    /// cover). The cover timer skips emission if a real frame
+    /// has happened within `coverInterval` — active conversations
+    /// produce no overhead.
+    private var lastFrameSentAt = Date()
+    /// USP #4: repeating timer driving cover emission. Lives on
+    /// `queue` so all reads/writes against `lastFrameSentAt` and
+    /// the connection happen on the same serial queue.
+    private var coverTimer: DispatchSourceTimer?
     /// Latest APNs device token. Cached so we automatically re-register
     /// after a reconnect (the relay's push-token map is in-memory; a
     /// relay restart wipes it).
@@ -320,6 +407,21 @@ public final class RelayClient: @unchecked Sendable {
         writeFrame(payload, on: connection)
     }
 
+    /// USP #1: ask the relay which build it is running. The relay
+    /// replies asynchronously via `didReceiveStatus`. The query is
+    /// idempotent — issuing it on every reconnect is the recommended
+    /// pattern (the Settings panel reads the latest snapshot).
+    public func requestStatus() {
+        guard let connection, state == .connected else { return }
+        var payload = Data()
+        payload.append(Self.frameTypeStatusRequest)
+        // Empty body — frame-type byte is the entire payload. The
+        // relay tolerates trailing bytes for forward compatibility;
+        // we don't send any so an older relay implementation can't
+        // be fed a length-prefix that desynchronises its parser.
+        writeFrame(payload, on: connection)
+    }
+
     /// Publishes our APNs device token so the relay can wake us when a
     /// SEND lands while we're disconnected. Token is cached and
     /// re-sent automatically after a reconnect.
@@ -347,8 +449,11 @@ public final class RelayClient: @unchecked Sendable {
         _ = nonce.withUnsafeMutableBytes { buf in
             SecRandomCopyBytes(kSecRandomDefault, buf.count, buf.baseAddress!)
         }
+        // F-NEW-101: the `signer` closure now signs via the domain-
+        // separated v2 FFI, which prepends `u16_be(tag_len) || tag`
+        // to the payload internally. The relay's verify reconstructs
+        // the same bytes via `build_hello_signing_payload`.
         var signingPayload = Data()
-        signingPayload.append(Self.helloSigningTag)
         signingPayload.append(myIdentity)
         signingPayload.append(myDeliveryTokenVerifyKey)
         var tsBE = timestampSecs.bigEndian
@@ -378,11 +483,70 @@ public final class RelayClient: @unchecked Sendable {
         let len = UInt32(payload.count).bigEndian
         withUnsafeBytes(of: len) { frame.append(contentsOf: $0) }
         frame.append(payload)
+        // USP #4: every outgoing frame — real or cover — pushes
+        // `lastFrameSentAt` forward so the cover timer skips
+        // emission for at least `coverInterval` afterwards.
+        lastFrameSentAt = Date()
         connection.send(content: frame, completion: .contentProcessed { [weak self] error in
             if let error {
                 self?.state = .failed("\(error)")
             }
         })
+    }
+
+    // ─── USP #4: cover-traffic pacing ─────────────────────────────────
+
+    private func startCoverTimer() {
+        // Idempotent re-arm. Reconnect → state cycles through
+        // .connecting → .connected; the second entry must not stack
+        // a duplicate timer.
+        stopCoverTimer()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        // Half-interval cadence so a real send that lands just
+        // before the next deadline doesn't push the next cover by
+        // an extra full interval. With check-and-skip semantics,
+        // this gives an effective worst-case gap of
+        // `coverInterval + coverInterval/2` between any two
+        // outgoing frames — close enough to "uniform" for the
+        // timing-mask purpose.
+        let cadence = max(1, Int(Self.coverInterval / 2))
+        timer.schedule(
+            deadline: .now() + .seconds(cadence),
+            repeating: .seconds(cadence),
+        )
+        timer.setEventHandler { [weak self] in
+            self?.maybeSendCover()
+        }
+        timer.resume()
+        coverTimer = timer
+    }
+
+    private func stopCoverTimer() {
+        coverTimer?.cancel()
+        coverTimer = nil
+    }
+
+    /// Called on the cover-timer cadence. Emits a COVER frame only
+    /// when the channel has been silent for at least
+    /// `coverInterval`, so an active conversation produces zero
+    /// cover-traffic overhead.
+    private func maybeSendCover() {
+        guard state == .connected, let connection else { return }
+        let elapsed = Date().timeIntervalSince(lastFrameSentAt)
+        guard elapsed >= Self.coverInterval else { return }
+        var payload = Data(capacity: 1 + Self.coverPayloadLen)
+        payload.append(Self.frameTypeCover)
+        // Random body. SecRandomCopyBytes returns errSecSuccess on
+        // every supported iOS device; a hypothetical failure is
+        // benign — we'd just send a zero-filled frame, which the
+        // relay accepts (it doesn't validate the body), and the
+        // timing-mask property still holds.
+        var random = Data(count: Self.coverPayloadLen)
+        _ = random.withUnsafeMutableBytes { buf in
+            SecRandomCopyBytes(kSecRandomDefault, buf.count, buf.baseAddress!)
+        }
+        payload.append(random)
+        writeFrame(payload, on: connection)
     }
 
     private func scheduleRead() {
@@ -462,10 +626,46 @@ public final class RelayClient: @unchecked Sendable {
             DispatchQueue.main.async {
                 delegate?.relayClient(client, didReceiveBundleFrom: from, bundle: bundle)
             }
+        case Self.frameTypeStatusResponse:
+            // USP #1. Payload after frame-type byte:
+            //   u8  protocol_version
+            //   u8  git_dirty                  (0 clean / 1 dirty / 2 unknown)
+            //   u16 crate_version_len + bytes
+            //   u16 git_sha_len + bytes
+            //   u8  binary_sha256_len          (always statusBinHashLen)
+            //   [N] binary_sha256
+            guard let protocolVersion = cursor.u8() else { return }
+            guard let gitDirty = cursor.u8() else { return }
+            guard let crateBytes = cursor.u16Blob() else { return }
+            guard let shaBytes = cursor.u16Blob() else { return }
+            guard let hashLen = cursor.u8(), Int(hashLen) == Self.statusBinHashLen else { return }
+            guard let binarySha256 = cursor.take(Int(hashLen)) else { return }
+            // Parsing is intentionally strict — a truncated /
+            // malformed STATUS_RESPONSE is a relay implementation
+            // bug, not a value the host should attempt to display.
+            let status = RelayStatus(
+                protocolVersion: protocolVersion,
+                gitDirty: gitDirty,
+                crateVersion: String(data: crateBytes, encoding: .utf8) ?? "",
+                gitSha: String(data: shaBytes, encoding: .utf8) ?? "",
+                binarySha256: binarySha256,
+            )
+            DispatchQueue.main.async {
+                delegate?.relayClient(client, didReceiveStatus: status)
+            }
         case Self.frameTypeTokenIssue:
             guard cursor.u16Blob() != nil else { return }
             guard let from = cursor.u16Blob() else { return }
             guard let count = cursor.u32() else { return }
+            // **Cap `count` against the actual remaining buffer**
+            // before `reserveCapacity` (F-NEW-201). The wire field
+            // is a u32; a malicious relay (or paired peer) can ship
+            // `count = u32::MAX` in a 79-byte frame and we'd attempt
+            // a ~64 GiB allocation, crashing the app via iOS jetsam.
+            // Each token is `deliveryTokenLen` bytes, so the maximum
+            // valid `count` is bounded by `cursor.buf.count / 84`.
+            let maxValidCount = cursor.buf.count / Self.deliveryTokenLen
+            guard Int(count) <= maxValidCount else { return }
             var tokens: [Data] = []
             tokens.reserveCapacity(Int(count))
             for _ in 0..<count {

@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import MachO
+import os.log
 import SwiftUI
 import UIKit
 
@@ -74,6 +75,25 @@ final class DeviceIntegrityMonitor {
 
     private init() {
         runChecks()
+        // F-NEW-901: re-poll on every scene activation, not just at
+        // launch. A user who unlocks the app, attaches Frida mid-
+        // session via USB, then returns to a backgrounded Pizzini
+        // would otherwise never see the banner — the first-launch
+        // snapshot is stale forever. Re-running the three syscalls
+        // on activation is ~free. Use a separate hop so Swift's
+        // strict-concurrency checker accepts the self-capture: the
+        // observer closure is `@Sendable`, the Task body runs on
+        // MainActor where `self` is reachable.
+        let monitor = self
+        NotificationCenter.default.addObserver(
+            forName: UIScene.didActivateNotification,
+            object: nil,
+            queue: nil,
+        ) { _ in
+            Task { @MainActor in
+                monitor.runChecks()
+            }
+        }
     }
 
     /// Run all three checks and update the published flags. Idempotent
@@ -104,8 +124,24 @@ final class DeviceIntegrityMonitor {
             shouldLog = false
         }
         if shouldLog {
-            NSLog(
-                "[pizzini] device integrity flags — jailbroken=\(jb) debugger=\(dbg) suspiciousDylib=\(dylib)"
+            // F-NEW-905: use os_log at .debug level rather than
+            // NSLog. os_log .debug is dropped on release devices
+            // unless logging is explicitly enabled, so a coercer
+            // who later reads sysdiagnose can't confirm "RASP fired
+            // on this device" from the public log stream. The
+            // banner + Settings notice are still visible to the
+            // user — the forensic post-mortem use-case the audit
+            // mentions is preserved for anyone who explicitly
+            // enables debug logging via Console.app, but not for
+            // an opportunistic attacker.
+            let log = OSLog(subsystem: "app.pizzini.security", category: "integrity")
+            os_log(
+                "device integrity flags — jailbroken=%{public}d debugger=%{public}d suspiciousDylib=%{public}d",
+                log: log,
+                type: .debug,
+                jb ? 1 : 0,
+                dbg ? 1 : 0,
+                dylib ? 1 : 0,
             )
         }
     }
@@ -151,6 +187,14 @@ final class DeviceIntegrityMonitor {
             "/etc/ssh/sshd_config",
             "/bin/bash",
             "/bin/sh",
+            // F-NEW-902: rootless-jailbreak paths (palera1n, Dopamine
+            // 2.x, etc.). Modern jailbreaks relocate the entire
+            // tree under `/var/jb/` to leave `/` mount-read-only and
+            // pass Apple's signature checks more easily. The cost
+            // of three more fileExists checks is negligible.
+            "/var/jb/Applications/Sileo.app",
+            "/var/jb/usr/bin/sshd",
+            "/var/jb/Library/MobileSubstrate/MobileSubstrate.dylib",
         ]
         for p in paths where FileManager.default.fileExists(atPath: p) {
             return true

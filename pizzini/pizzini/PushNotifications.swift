@@ -43,6 +43,16 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // Install before any UI work so the observers are armed before
         // the first scene connection.
         PrivacyShieldWindow.shared.install()
+        // **Run the screenshot-mask self-test SYNCHRONOUSLY**, before
+        // `WindowSecureMask.install()` so the mask decision is final
+        // before the first scene activates. Previously the self-test
+        // ran inside a Task, racing scene activation — the first
+        // frame on a brand-new iOS major could paint OPTIMISTICALLY
+        // (`shouldMaskAppContents` returns true when `qrBlockEffective`
+        // is nil) and leak to a screenshot taken in that ~1-2 frame
+        // window. One offscreen UIView render is cheap; running it
+        // inline here closes that window.
+        SecureScreenshotSelfTest.runIfNeeded(store: ChatStore.shared)
         // Window-level screenshot mask: reparents each scene's main
         // window under a secure UITextField's layer, so the entire app
         // (including pushed views, sheets, full-screen covers — any
@@ -51,14 +61,6 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // only manipulation, view hierarchy untouched, so SwiftUI safe-
         // area handling is unaffected. See class doc for caveats.
         WindowSecureMask.shared.install()
-        // Phase 5 self-test for the QR-screenshot-block trick. Runs
-        // once on first launch; re-runs whenever the iOS major version
-        // changes. Cheap (one offscreen UIView render) and idempotent —
-        // the runIfNeeded gate skips work when the result is already
-        // cached for the current OS major.
-        Task { @MainActor in
-            SecureScreenshotSelfTest.runIfNeeded(store: ChatStore.shared)
-        }
         // Notification permission is NOT requested here. Onboarding
         // owns that decision — the user gets one clear "Enable
         // notifications?" page with an Enable/Skip pair of buttons,

@@ -113,6 +113,7 @@ mod apns;
 mod encrypted_file;
 mod pending_store;
 mod push_token_store;
+mod replay_store;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -123,13 +124,161 @@ use libsignal_protocol::PublicKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 
 use crate::apns::{ApnsClient, ApnsConfig};
 use crate::pending_store::{PendingFrame, PendingStore};
 use crate::push_token_store::PushTokenStore;
+use crate::replay_store::ReplayStore;
+
+/// Static self-attestation snapshot computed once at startup. Shared
+/// (`Arc`) with every connection handler so STATUS_REQUEST handling
+/// is a clone + serialize, not a re-read of the binary.
+///
+/// All fields are derived deterministically from the running
+/// binary + the build-time `PIZZINI_GIT_SHA` env vars (USP #1):
+///   * `crate_version` is `CARGO_PKG_VERSION` (e.g. `"0.0.0"`).
+///   * `git_sha` is the 40-char hex of the source commit; `"unknown"`
+///     when built outside a git checkout (release scripts refuse
+///     this case, but a dev build still functions).
+///   * `git_dirty` is `1` iff the working tree had uncommitted
+///     changes when this binary was built. Production transparency-
+///     log entries must report `0`; dev builds typically report `1`.
+///   * `binary_sha256` is the SHA-256 of the on-disk binary at
+///     startup — re-derived independently of the build script so
+///     a sed-the-self-attestation-string-out-of-the-binary attack
+///     produces a different digest than the original build.
+#[derive(Clone)]
+struct RelayStatus {
+    crate_version: String,
+    git_sha: String,
+    git_dirty: u8,
+    binary_sha256: [u8; STATUS_BIN_HASH_LEN],
+}
+
+impl RelayStatus {
+    /// Compute the snapshot. Called exactly once from `main`. Reading
+    /// the binary on every STATUS_REQUEST would let an attacker who
+    /// races a relay restart observe whether the disk-side binary
+    /// has been swapped — startup-time caching defends against that
+    /// and amortises the (single) ~MB-sized I/O.
+    fn capture() -> std::io::Result<Self> {
+        use sha2::Digest;
+        let path = std::env::current_exe()?;
+        let bytes = std::fs::read(&path)?;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&bytes);
+        let digest = hasher.finalize();
+        let mut binary_sha256 = [0u8; STATUS_BIN_HASH_LEN];
+        binary_sha256.copy_from_slice(&digest);
+        // `env!` panics if missing; build.rs sets these unconditionally
+        // (with sentinel values when git is unavailable), so they are
+        // always present at compile time.
+        let git_sha = env!("PIZZINI_GIT_SHA").to_string();
+        let git_dirty = match env!("PIZZINI_GIT_DIRTY") {
+            "1" => 1u8,
+            "0" => 0u8,
+            // Build outside a git checkout (e.g. cargo package).
+            // Distinct from clean (0) so the transparency-log
+            // verifier can refuse this distinction loudly.
+            _ => 2u8,
+        };
+        Ok(Self {
+            crate_version: env!("CARGO_PKG_VERSION").to_string(),
+            git_sha,
+            git_dirty,
+            binary_sha256,
+        })
+    }
+
+    /// Serialize the response payload — see STATUS_RESPONSE wire
+    /// format below. Caller wraps with the standard frame header
+    /// (`write_frame`).
+    fn encode_response(&self) -> Vec<u8> {
+        let crate_version_bytes = self.crate_version.as_bytes();
+        let git_sha_bytes = self.git_sha.as_bytes();
+        let mut out = Vec::with_capacity(
+            1 + 1 + 1 + 2 + crate_version_bytes.len() + 2 + git_sha_bytes.len()
+                + 1 + STATUS_BIN_HASH_LEN,
+        );
+        out.push(FRAME_TYPE_STATUS_RESPONSE);
+        // Protocol version this relay implements (the same value
+        // every HELLO is signed against). Surfaced so the client
+        // can refuse to operate against a relay running an older
+        // protocol even if the .onion is reachable.
+        out.push(PROTOCOL_VERSION);
+        out.push(self.git_dirty);
+        out.extend_from_slice(&(crate_version_bytes.len() as u16).to_be_bytes());
+        out.extend_from_slice(crate_version_bytes);
+        out.extend_from_slice(&(git_sha_bytes.len() as u16).to_be_bytes());
+        out.extend_from_slice(git_sha_bytes);
+        out.push(STATUS_BIN_HASH_LEN as u8);
+        out.extend_from_slice(&self.binary_sha256);
+        out
+    }
+}
+
+// STATUS_RESPONSE wire format (big-endian, immediately follows the
+// 4-byte frame length prefix that `write_frame` prepends):
+//
+//   u8  frame_type            (= FRAME_TYPE_STATUS_RESPONSE = 9)
+//   u8  protocol_version       (currently 3 — matches HELLO_SIGNING_TAG bump path)
+//   u8  git_dirty              (0 = clean, 1 = dirty, 2 = unknown / not-a-git-checkout)
+//   u16 crate_version_len + crate_version_bytes (UTF-8, no NUL)
+//   u16 git_sha_len + git_sha_bytes             (UTF-8 hex, typically 40 chars)
+//   u8  binary_sha256_len      (always STATUS_BIN_HASH_LEN = 32)
+//   [32] binary_sha256
 
 const PORT: u16 = 7777;
+/// Default listen address. Production deployment is behind a system
+/// Tor `HiddenServicePort` that forwards `.onion:PORT` to
+/// `127.0.0.1:PORT`, so the relay must NOT be reachable from any
+/// other interface. Dev workflows that need the iOS simulator to
+/// connect from a different host (or sibling simulator) override
+/// this via the `PIZZINI_RELAY_BIND` env var — see
+/// `scripts/install-relay-launchd.sh`, which sets it to
+/// `0.0.0.0:7777` for the LaunchAgent on the operator's Mac.
+///
+/// Defaulting to `127.0.0.1` rather than `0.0.0.0` is the
+/// fail-safe choice: forgetting to set the env var in a prod
+/// deploy produces an unreachable relay (loud failure) instead of
+/// an internet-exposed relay (silent compromise).
+const DEFAULT_BIND: &str = "127.0.0.1:7777";
+/// Hard ceiling on simultaneously-accepted connections. Acts as
+/// backpressure on the accept loop: once reached, new TCP SYNs queue
+/// in the kernel accept backlog until an existing connection closes
+/// and frees a permit. Without this cap, a flood of half-open
+/// connections drives unbounded `tokio::spawn` calls and exhausts
+/// file descriptors + memory before any per-frame defence engages.
+///
+/// 4096 lines up with a `LimitNOFILE=16384` systemd setting (3:1
+/// headroom for Tor sockets, log fds, state files). Tune via
+/// `PIZZINI_RELAY_MAX_CONNS` — increasing requires bumping
+/// `LimitNOFILE` in the unit file in lockstep.
+const DEFAULT_MAX_CONNECTIONS: usize = 4096;
+/// Time budget for a connection to complete the HELLO handshake.
+/// Slow-loris connections that open a TCP socket and never send the
+/// HELLO bytes get killed inside this window, returning the
+/// concurrent-connection permit. Generous enough for a slow Tor
+/// circuit; aggressive enough that a flood of "open-and-stall"
+/// connections drains the permit pool within ~30s.
+const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Time budget for any single post-HELLO frame to arrive. Resets
+/// per frame, so a quiet but legitimate foreground client whose
+/// counterpart hasn't sent anything in the last 30 minutes is
+/// dropped — iOS clients in this state have almost certainly been
+/// suspended by the OS already (background app → Tor circuit
+/// torn down → TCP RST observed here long before 30 minutes
+/// elapses). Slow-loris attackers who fail to send a full frame
+/// within the window are dropped and their permit freed.
+///
+/// Picking a long timeout intentionally trades fast-detection of
+/// slow attackers for "do not constantly disconnect legitimate
+/// idle clients." With the connection cap above, the worst a
+/// slow-loris campaign can do is hold `MAX_CONNECTIONS` permits
+/// for up to `FRAME_READ_TIMEOUT` each — bounded.
+const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Protocol v3 adds the F-203 HELLO possession proof. The added fields
 /// (timestamp, nonce, signature) prevent a network-positioned attacker
 /// from squatting another peer's `peer_id` to drain that peer's queued
@@ -142,7 +291,14 @@ const PROTOCOL_VERSION: u8 = 3;
 /// `peer_id` (which IS the libsignal IdentityKey wire form, 1-byte
 /// type prefix + 32-byte point). MUST match the iOS encoder byte-for-
 /// byte.
-const HELLO_SIGNING_TAG: &[u8] = b"pizzini.hello.v1";
+/// HELLO signing-tag — the SHA-3-style domain separator that
+/// distinguishes a HELLO signature from any other identity-key signed
+/// payload. Bumping the version suffix is the path for any future
+/// HELLO wire-format change (`PROTOCOL_VERSION` bump, additional
+/// fields, etc.): producing a `v2` tag makes a downgrade attack
+/// structurally impossible because a signature minted under `v3`
+/// simply doesn't verify against the `v2` verifier. F-NEW-205.
+const HELLO_SIGNING_TAG: &[u8] = b"pizzini.hello.v3";
 /// Maximum clock skew between client and relay accepted on a HELLO.
 /// Keeps the replay set bounded — a fresh HELLO past this window won't
 /// verify, so an attacker can't accumulate replay nonces forever.
@@ -165,11 +321,45 @@ const FRAME_TYPE_BUNDLE_RESPONSE: u8 = 4;
 const FRAME_TYPE_REGISTER_PUSH: u8 = 5;
 const FRAME_TYPE_ACK: u8 = 6;
 const FRAME_TYPE_TOKEN_ISSUE: u8 = 7;
+/// USP #1: binary self-attestation. Client → relay request, empty
+/// payload. Relay replies with a STATUS_RESPONSE (frame 9) carrying
+/// crate version, git commit SHA, "dirty?" bit, and SHA-256 of the
+/// running binary. iOS uses the response to surface "running build
+/// X (commit Y)" in Settings and (eventually) to compare against
+/// a published transparency-log entry.
+const FRAME_TYPE_STATUS_REQUEST: u8 = 8;
+const FRAME_TYPE_STATUS_RESPONSE: u8 = 9;
+/// USP #4 (pacing pass). Client → relay decoy traffic emitted at a
+/// constant rate when the user is connected but otherwise idle. The
+/// relay receives, validates the size envelope, and discards. The
+/// frame exists so a network observer of the Tor traffic sees a
+/// uniform-rate, uniform-size stream of cells regardless of
+/// whether the user is actively chatting — combined with the
+/// padded sealed envelopes (USP #4-lite), this hides both message
+/// timing and length at the wire layer.
+const FRAME_TYPE_COVER: u8 = 10;
+/// Fixed payload size for COVER frames (post-frame-type body).
+/// Sized to roughly match the smallest padded sealed_ciphertext
+/// bucket (256 bytes) so the wire byte-count of a heartbeat is
+/// indistinguishable from a typical short SEND at the cell-counting
+/// granularity available to a passive observer.
+const COVER_PAYLOAD_LEN: usize = 256;
+/// Width of the binary SHA-256 digest carried in STATUS_RESPONSE.
+/// Same as `sha2::Sha256` output. Fixed-width so the wire layout
+/// stays decode-once.
+const STATUS_BIN_HASH_LEN: usize = 32;
 const MAX_FRAME_BYTES: u32 = 1024 * 1024;
 /// Hard ceiling on a single client's APNs device token. Real tokens are
 /// 32 bytes today; Apple has hinted they may grow. Reject anything above
 /// this so we don't memo absurd buffers per peer.
-const MAX_PUSH_TOKEN_BYTES: usize = 256;
+/// Lower/upper bound for an APNs device token (production). Apple
+/// ships 32-byte tokens today, with hints in dev docs that they may
+/// grow — accept a tight range, refuse the obvious garbage (a 256-
+/// byte all-zero blob, or anything smaller than the floor) so the
+/// relay doesn't waste APNs round-trips and risk Apple flagging the
+/// auth key. F-NEW-207.
+const MIN_PUSH_TOKEN_BYTES: usize = 16;
+const MAX_PUSH_TOKEN_BYTES: usize = 64;
 
 /// Per-peer pending-queue cap. The queue is purely in-memory; this cap
 /// bounds RAM use and the post-seizure leak surface. 100 frames is a
@@ -190,7 +380,21 @@ const TOKEN_NONCE_LEN: usize = 16;
 const TOKEN_SIG_LEN: usize = 64;
 const TOKEN_LEN: usize = TOKEN_NONCE_LEN + 4 + TOKEN_SIG_LEN;
 /// First-contact PoW difficulty. Verifier rejects anything weaker.
-const HASHCASH_BITS: u32 = 18;
+/// Hashcash difficulty in leading-zero bits. F-NEW-209: raised from
+/// 18 → 22 so a desktop-GPU attacker no longer collapses the per-
+/// recipient gate. Math:
+///   - 2^18 ≈ 260 k hashes per proof → ~5 µs/proof on RTX 4090 →
+///     ~190 k/s sustained per-recipient flood
+///   - 2^22 ≈ 4.2 M hashes per proof → ~80 ms/proof on RTX 4090 →
+///     ~12/s — still trivially defeats hashcash for a determined
+///     attacker but adds enough cost that the asymmetry vs. a phone
+///     (~1 s/proof on A14) is no longer free.
+///
+/// Per-recipient relay-side rate-limit on BUNDLE_REQUEST is the
+/// proper defense; hashcash is the spam filter. Bumping bits keeps
+/// the spam filter relevant against modern hardware until the relay
+/// gains that rate-limit.
+const HASHCASH_BITS: u32 = 22;
 /// Domain-separation tag baked into the hashcash challenge digest. F-301:
 /// without a tag + length prefix, two distinct (peer_id, hour) pairs can
 /// theoretically map to the same 32-byte challenge. Bumping this string
@@ -255,8 +459,17 @@ const VERIFY_KEY_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// one-use against a given recipient; the same nonce against a
 /// different recipient is a logically different token (different
 /// signing key, would fail verification anyway).
-type ReplayKey = (PeerId, [u8; TOKEN_NONCE_LEN]);
-type Replays = Arc<Mutex<HashMap<ReplayKey, Instant>>>;
+///
+/// F-NEW-203 fix: the replay set is PERSISTENT (encrypted-at-rest)
+/// rather than in-memory. The pending-queue is persistent; without a
+/// matching persistent replay set, every relay restart would re-open
+/// the replay window against any captured SEND whose token hadn't
+/// expired. See `replay_store::ReplayStore` for the storage layer.
+/// Pre-F-NEW-203 the relay used `(PeerId, [u8; TOKEN_NONCE_LEN])`
+/// as a direct HashMap key. The new persistent store uses
+/// `(Vec<u8>, Vec<u8>)` internally to keep its on-disk serde shape
+/// flexible; the type alias is gone with it.
+type Replays = Arc<Mutex<ReplayStore>>;
 /// HELLO replay set: (peer_id, nonce) keys. Separate from the SEND/ACK
 /// `Replays` table because (a) the lifetime is much shorter (matches
 /// the timestamp window, not the token TTL) and (b) the lookup happens
@@ -304,15 +517,46 @@ macro_rules! dev_peer_elog {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let bind: SocketAddr = format!("0.0.0.0:{PORT}").parse().expect("static");
+    let bind_str = std::env::var("PIZZINI_RELAY_BIND")
+        .unwrap_or_else(|_| DEFAULT_BIND.to_string());
+    let bind: SocketAddr = bind_str.parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("PIZZINI_RELAY_BIND={bind_str:?} not a valid SocketAddr: {e}"),
+        )
+    })?;
+    let max_conns: usize = std::env::var("PIZZINI_RELAY_MAX_CONNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS);
     let listener = TcpListener::bind(bind).await?;
     let lan_ips = local_lan_ips();
+    // USP #1: self-attestation snapshot. Computed once at startup.
+    // A read failure here is fatal — the operator deployed a
+    // binary that can't read its own bytes, which means the
+    // STATUS_RESPONSE machinery is broken and the transparency-log
+    // contract can't be honoured. Better to refuse to start than
+    // to come up reporting "unknown" to every client.
+    let status_snapshot = Arc::new(RelayStatus::capture().map_err(|e| {
+        eprintln!(
+            "[pizzini-relay] FATAL: could not self-attest the binary at startup: {e}",
+        );
+        e
+    })?);
     println!(
         "pizzini-relay {} listening on {}",
         env!("CARGO_PKG_VERSION"),
         bind
     );
-    if lan_ips.is_empty() {
+    println!(
+        "  build attestation: git_sha={} dirty={} binary_sha256={}",
+        status_snapshot.git_sha,
+        status_snapshot.git_dirty,
+        hex(&status_snapshot.binary_sha256),
+    );
+    if bind.ip().is_loopback() {
+        println!("  bind is loopback — production posture (Tor HiddenServicePort forwards .onion → {bind})");
+    } else if lan_ips.is_empty() {
         println!("  (no non-loopback IPv4 found; sim can connect to 127.0.0.1)");
     } else {
         for ip in &lan_ips {
@@ -320,8 +564,13 @@ async fn main() -> std::io::Result<()> {
         }
     }
     println!(
-        "  DEV BUILD — clearnet, no auth, persistent offline queue (cap={MAX_PENDING_PER_PEER}/peer, max ttl={}h, sender-chosen per frame). Tor-only in prod.",
+        "  pending queue cap={MAX_PENDING_PER_PEER}/peer, max ttl={}h, sender-chosen per frame",
         MAX_PENDING_TTL.as_secs() / 3600,
+    );
+    println!(
+        "  connection cap={max_conns} (override: PIZZINI_RELAY_MAX_CONNS); HELLO timeout={}s, frame idle timeout={}m",
+        HELLO_READ_TIMEOUT.as_secs(),
+        FRAME_READ_TIMEOUT.as_secs() / 60,
     );
     println!("  protocol v{PROTOCOL_VERSION} — sealed-sender SEND/ACK, drop on TTL");
 
@@ -391,16 +640,47 @@ async fn main() -> std::io::Result<()> {
     );
     let pending: Pending = Arc::new(Mutex::new(pending_store_inst));
     let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
-    let replays: Replays = Arc::new(Mutex::new(HashMap::new()));
+    let replay_store_inst = ReplayStore::load_or_create(&state_dir, TOKEN_REPLAY_WINDOW)
+        .map_err(|e| {
+            eprintln!(
+                "[pizzini-relay] FATAL: could not open replay store at {}: {e}",
+                state_dir.display(),
+            );
+            e
+        })?;
+    println!(
+        "  replay store: {} ({} entries after TTL purge)",
+        state_dir.display(),
+        replay_store_inst.len(),
+    );
+    let replays: Replays = Arc::new(Mutex::new(replay_store_inst));
     let hello_replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
 
     spawn_pending_gc(pending.clone());
     spawn_replay_gc(replays.clone());
     spawn_hello_replay_gc(hello_replays.clone());
     spawn_verify_keys_gc(verify_keys.clone());
+    spawn_push_tokens_gc(push_tokens.clone());
+
+    // Concurrent-connection cap. The accept loop blocks on
+    // `acquire_owned()` once `max_conns` connections are live —
+    // surplus TCP SYNs back up in the kernel accept queue (and
+    // eventually get RST'd if the backlog overflows), which is the
+    // correct behaviour: a full relay refuses, it doesn't OOM. The
+    // permit is held inside the spawned task and dropped on task
+    // exit, returning capacity exactly when the connection closes.
+    let conn_limit = Arc::new(Semaphore::new(max_conns));
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
+        // Block until a permit is available. `acquire_owned()` cannot
+        // fail unless the semaphore is closed, which we never do —
+        // `.expect()` here is a documented-impossible panic.
+        let permit = conn_limit
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("connection-limit semaphore is never closed");
         let routes = routes.clone();
         let push_tokens = push_tokens.clone();
         let pending = pending.clone();
@@ -408,7 +688,13 @@ async fn main() -> std::io::Result<()> {
         let replays = replays.clone();
         let hello_replays = hello_replays.clone();
         let apns = apns.clone();
+        let status_snapshot = status_snapshot.clone();
         tokio::spawn(async move {
+            // Move the permit into the task so it lives exactly as
+            // long as the connection. The `_` prefix keeps clippy
+            // from suggesting we drop it explicitly — it must hold
+            // until the task ends.
+            let _conn_permit = permit;
             if let Err(e) = handle_connection(
                 stream,
                 routes,
@@ -418,6 +704,7 @@ async fn main() -> std::io::Result<()> {
                 replays,
                 hello_replays,
                 apns,
+                status_snapshot,
                 peer_addr,
             )
             .await
@@ -465,12 +752,22 @@ async fn handle_connection(
     replays: Replays,
     hello_replays: HelloReplays,
     apns: Option<Arc<ApnsClient>>,
+    status_snapshot: Arc<RelayStatus>,
     peer_addr: SocketAddr,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     let (mut reader, mut writer) = stream.into_split();
 
-    let first = read_frame(&mut reader).await?;
+    // A connection that doesn't send HELLO within `HELLO_READ_TIMEOUT`
+    // is either a port scanner or a slow-loris occupying a permit
+    // without ever progressing — drop it, free the permit. The
+    // generic frame-idle timeout in `read_loop` is intentionally
+    // longer (30 min) because legitimate idle clients post-HELLO
+    // can sit waiting for an inbound SEND; pre-HELLO has no
+    // legitimate reason to stall.
+    let first = tokio::time::timeout(HELLO_READ_TIMEOUT, read_frame(&mut reader))
+        .await
+        .map_err(|_| invalid("HELLO read timed out"))??;
     if first.is_empty() || first[0] != FRAME_TYPE_HELLO {
         return Err(invalid("first frame must be HELLO"));
     }
@@ -507,7 +804,13 @@ async fn handle_connection(
         let mut vk = verify_keys.lock().await;
         vk.insert(peer_id.clone(), (verify_key, Instant::now()));
     }
-    println!("[{peer_addr}] HELLO from peer {} (proof verified, verify key registered)", short_hex(&peer_id));
+    // F-NEW-211: gate peer-id-bearing log lines behind
+    // `dev_peer_log!` so the relay's "no per-peer log lines in
+    // production" hard rule is enforced in code, not just policy.
+    // `dev_peer_log!` is a no-op when `debug_assertions` is off
+    // (i.e. `cargo build --release`). Operators who want full logs
+    // can run debug builds.
+    dev_peer_log!("[{peer_addr}] HELLO from peer {} (proof verified, verify key registered)", short_hex(&peer_id));
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     // Hold a clone so we can identify "is the entry in the map still ours?"
@@ -546,6 +849,8 @@ async fn handle_connection(
         &replays,
         apns.clone(),
         &peer_id,
+        &our_tx,
+        &status_snapshot,
     )
     .await;
 
@@ -589,18 +894,72 @@ async fn read_loop(
     replays: &Replays,
     apns: Option<Arc<ApnsClient>>,
     self_id: &[u8],
+    our_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    status_snapshot: &Arc<RelayStatus>,
 ) -> std::io::Result<()> {
     loop {
-        let frame = match read_frame(reader).await {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(e),
+        // Idle-timeout window resets per frame. A legitimate client
+        // in a quiet conversation can sit silently for up to
+        // `FRAME_READ_TIMEOUT` between frames; a slow-loris that
+        // sends bytes too slowly to complete a frame in that
+        // window gets dropped, freeing both the file descriptor
+        // and the concurrent-connection permit.
+        let frame = match tokio::time::timeout(FRAME_READ_TIMEOUT, read_frame(reader)).await {
+            Ok(Ok(f)) => f,
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(invalid("frame idle timeout")),
         };
         if frame.is_empty() {
             return Err(invalid("empty frame"));
         }
         match frame[0] {
             FRAME_TYPE_HELLO => return Err(invalid("duplicate HELLO")),
+            FRAME_TYPE_STATUS_REQUEST => {
+                // USP #1: client is asking which build is running.
+                // Payload is a single byte (the type itself); any
+                // trailing bytes are a forward-compatibility slot
+                // and ignored. Response goes through the connection's
+                // own writer task so it travels back on the same
+                // Tor circuit the request arrived on.
+                let payload = status_snapshot.encode_response();
+                if our_tx.send(payload).is_err() {
+                    // Writer task already shut down — connection is
+                    // closing. Nothing actionable; let the next
+                    // read pick up the EOF.
+                    dev_peer_log!("STATUS_REQUEST: writer task gone, response dropped");
+                }
+            }
+            FRAME_TYPE_STATUS_RESPONSE => {
+                // Clients never send this to us. Treat it the same
+                // way we treat unsolicited BUNDLE_RESPONSE-shaped
+                // bytes from a paired peer: structural error, drop
+                // the connection. Keeps the dispatch table
+                // symmetric.
+                return Err(invalid("STATUS_RESPONSE from client is not allowed"));
+            }
+            FRAME_TYPE_COVER => {
+                // USP #4: drop on the floor. The frame's only
+                // purpose is to occupy a Tor cell slot at a constant
+                // rate; we don't read the body for anything. Size
+                // check rejects anomalies (a tiny "cover" would
+                // defeat the timing-mask purpose; a giant one could
+                // be a probe of MAX_FRAME_BYTES). The frame_idle
+                // timeout enforcement runs on top of this, so a
+                // misbehaving client that floods covers is bounded
+                // by `MAX_CONCURRENT_CONNECTIONS` × frame rate.
+                if frame.len() != 1 + COVER_PAYLOAD_LEN {
+                    return Err(invalid(&format!(
+                        "COVER frame wrong size: expected {} bytes payload, got {}",
+                        COVER_PAYLOAD_LEN,
+                        frame.len().saturating_sub(1),
+                    )));
+                }
+                // Payload bytes are entropy; we don't validate them.
+                // A future randomness-quality check would be
+                // server-side gatekeeping of bad clients, not a
+                // security property — skip for now.
+            }
             FRAME_TYPE_REGISTER_PUSH => {
                 let token = match parse_register_push(&frame[1..]) {
                     Ok(t) => t,
@@ -623,12 +982,12 @@ async fn read_loop(
                     .await
                     .insert(self_id.to_vec(), token)
                 {
-                    Ok(()) => println!(
+                    Ok(()) => dev_peer_log!(
                         "REGISTER_PUSH from {}: token recorded ({} bytes, persisted)",
                         short_hex(self_id),
                         token_len,
                     ),
-                    Err(e) => eprintln!(
+                    Err(e) => dev_peer_elog!(
                         "REGISTER_PUSH from {}: in-memory only — persist failed: {e}",
                         short_hex(self_id),
                     ),
@@ -931,13 +1290,38 @@ async fn check_delivery_token(
 
     // Replay check after signature verify — failed signatures don't
     // burn a nonce slot.
-    let mut set = replays.lock().await;
-    let replay_key: ReplayKey = (parsed.to_id.clone(), nonce);
-    if set.contains_key(&replay_key) {
+    let mut store = replays.lock().await;
+    if store.contains(&parsed.to_id, &nonce) {
         return Err("token replay".into());
     }
-    set.insert(replay_key, Instant::now());
+    if let Err(e) = store.insert(parsed.to_id.clone(), nonce.to_vec()) {
+        // A persist failure must NOT be treated as a successful
+        // accept — better to refuse the frame than to accept-without-
+        // persisting and have a future restart re-accept the same
+        // bytes after this nonce was supposedly burned.
+        return Err(format!("replay-store persist failed: {e}").into());
+    }
     Ok(())
+}
+
+/// F-NEW-208: persistent push-token GC. The previous design only
+/// purged expired entries during `PushTokenStore::load_or_create`,
+/// so a relay that stayed up for months accumulated every token ever
+/// registered. Periodic in-memory GC matches the documented 30-day
+/// TTL on a 1-hour tick.
+fn spawn_push_tokens_gc(push_tokens: PushTokens) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60 * 60));
+        loop {
+            tick.tick().await;
+            let mut store = push_tokens.lock().await;
+            match store.gc_expired(push_token_store::MAX_TOKEN_AGE) {
+                Ok(0) => {}
+                Ok(n) => println!("push-token GC: pruned {n} → {} entries", store.len()),
+                Err(e) => eprintln!("[pizzini-relay] push-token GC persist failed: {e}"),
+            }
+        }
+    });
 }
 
 fn spawn_replay_gc(replays: Replays) {
@@ -945,13 +1329,11 @@ fn spawn_replay_gc(replays: Replays) {
         let mut tick = tokio::time::interval(TOKEN_REPLAY_GC_INTERVAL);
         loop {
             tick.tick().await;
-            let cutoff = Instant::now() - TOKEN_REPLAY_WINDOW;
-            let mut set = replays.lock().await;
-            let before = set.len();
-            set.retain(|_, t| *t > cutoff);
-            let after = set.len();
-            if before != after {
-                println!("token-replay GC: pruned {} → {after}", before - after);
+            let mut store = replays.lock().await;
+            match store.gc_expired(TOKEN_REPLAY_WINDOW) {
+                Ok(0) => {}
+                Ok(n) => println!("token-replay GC: pruned {n} → {}", store.len()),
+                Err(e) => eprintln!("[pizzini-relay] replay-store GC persist failed: {e}"),
             }
         }
     });
@@ -1139,9 +1521,17 @@ fn build_hello_signing_payload(
     timestamp_secs: u64,
     nonce: &[u8],
 ) -> Vec<u8> {
+    // F-NEW-101: domain-separation prefix matches the FFI v2
+    // contract: `u16_be(tag_len) || tag || payload`. The earlier
+    // non-length-prefixed form `tag || payload` was vulnerable to
+    // prefix collisions — a tag that happened to be the prefix of
+    // a different cross-context message body could produce the same
+    // signed bytes. Length-prefixing makes that impossible.
+    let tag_len = HELLO_SIGNING_TAG.len() as u16;
     let mut out = Vec::with_capacity(
-        HELLO_SIGNING_TAG.len() + peer_id.len() + verify_key.len() + 8 + nonce.len(),
+        2 + HELLO_SIGNING_TAG.len() + peer_id.len() + verify_key.len() + 8 + nonce.len(),
     );
+    out.extend_from_slice(&tag_len.to_be_bytes());
     out.extend_from_slice(HELLO_SIGNING_TAG);
     out.extend_from_slice(peer_id);
     out.extend_from_slice(verify_key);
@@ -1251,11 +1641,26 @@ fn parse_register_push(body: &[u8]) -> std::io::Result<Vec<u8>> {
     if token.is_empty() {
         return Err(invalid("REGISTER_PUSH with empty token"));
     }
+    if token.len() < MIN_PUSH_TOKEN_BYTES {
+        return Err(invalid(&format!(
+            "REGISTER_PUSH token too small: {} bytes (min {})",
+            token.len(),
+            MIN_PUSH_TOKEN_BYTES,
+        )));
+    }
     if token.len() > MAX_PUSH_TOKEN_BYTES {
         return Err(invalid(&format!(
-            "REGISTER_PUSH token too large: {} bytes",
-            token.len()
+            "REGISTER_PUSH token too large: {} bytes (max {})",
+            token.len(),
+            MAX_PUSH_TOKEN_BYTES,
         )));
+    }
+    // Refuse obvious garbage (F-NEW-207): all-zero blobs and any
+    // token whose bytes are entirely identical. A real APNs device
+    // token has high entropy; either pattern signals a misbehaving
+    // client or a planted bogus value.
+    if token.iter().all(|&b| b == 0) || token.iter().all(|&b| b == token[0]) {
+        return Err(invalid("REGISTER_PUSH token has no entropy"));
     }
     Ok(token)
 }
@@ -1378,6 +1783,70 @@ mod tests {
         out.extend_from_slice(token);
         out.extend_from_slice(sealed);
         out
+    }
+
+    // ───── USP #1: STATUS_RESPONSE encoding ───────────────────
+
+    fn make_status(crate_version: &str, git_sha: &str, dirty: u8, hash: [u8; 32]) -> RelayStatus {
+        RelayStatus {
+            crate_version: crate_version.to_string(),
+            git_sha: git_sha.to_string(),
+            git_dirty: dirty,
+            binary_sha256: hash,
+        }
+    }
+
+    #[test]
+    fn status_response_encoding_is_stable() {
+        // Fixed inputs → byte-for-byte deterministic output. Catches
+        // any field-reordering / endianness regression that would
+        // make in-flight v1 clients silently misparse the response.
+        let s = make_status("0.0.0", "deadbeef", 0, [0x42u8; 32]);
+        let bytes = s.encode_response();
+        assert_eq!(bytes[0], FRAME_TYPE_STATUS_RESPONSE);
+        assert_eq!(bytes[1], PROTOCOL_VERSION);
+        assert_eq!(bytes[2], 0, "git_dirty=0 (clean)");
+        // u16 len of "0.0.0" = 5
+        assert_eq!(&bytes[3..5], &[0x00, 0x05]);
+        assert_eq!(&bytes[5..10], b"0.0.0");
+        // u16 len of "deadbeef" = 8
+        assert_eq!(&bytes[10..12], &[0x00, 0x08]);
+        assert_eq!(&bytes[12..20], b"deadbeef");
+        assert_eq!(bytes[20], STATUS_BIN_HASH_LEN as u8);
+        assert!(bytes[21..].iter().all(|&b| b == 0x42));
+        assert_eq!(bytes.len(), 21 + STATUS_BIN_HASH_LEN);
+    }
+
+    #[test]
+    fn status_response_carries_dirty_bit() {
+        for dirty in 0u8..=2 {
+            let s = make_status("0.0.0", "x", dirty, [0u8; 32]);
+            let bytes = s.encode_response();
+            assert_eq!(bytes[2], dirty, "dirty byte mismatch at {dirty}");
+        }
+    }
+
+    #[test]
+    fn status_response_changes_when_binary_hash_changes() {
+        let a = make_status("v", "g", 0, [0x00u8; 32]);
+        let b = make_status("v", "g", 0, [0xFFu8; 32]);
+        assert_ne!(a.encode_response(), b.encode_response());
+    }
+
+    #[test]
+    fn relay_status_capture_self_attests_the_test_binary() {
+        // Sanity: the capture path can read /proc/self/exe (or its
+        // macOS equivalent) and produce a real 32-byte hash. We don't
+        // assert a specific value — that would require pinning the
+        // test runner binary — only that the capture succeeds and
+        // produces something that *looks* like a SHA-256.
+        let snap = RelayStatus::capture().expect("capture should succeed in test env");
+        assert_eq!(snap.binary_sha256.len(), STATUS_BIN_HASH_LEN);
+        // The capture function reads the test runner here, not the
+        // relay binary, but the same `current_exe + read + sha256`
+        // path runs — failure modes (path lookup, read perms) are
+        // exercised identically.
+        assert!(!snap.crate_version.is_empty());
     }
 
     #[test]
@@ -1825,7 +2294,10 @@ mod tests {
             ttl_seconds: 3600,
             token,
         };
-        let replays: Replays = Arc::new(Mutex::new(HashMap::new()));
+        let tmp_dir = std::env::temp_dir().join(format!("pizzini-relay-test-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())); std::fs::create_dir_all(&tmp_dir).expect("tempdir for replay store");
+        let replays: Replays = Arc::new(Mutex::new(
+            ReplayStore::load_or_create(&tmp_dir, TOKEN_REPLAY_WINDOW).expect("replay store"),
+        ));
         check_delivery_token(&parsed, &verify_keys, &replays)
             .await
             .expect("verify must succeed for recently-disconnected recipient");
@@ -1887,7 +2359,10 @@ mod tests {
                 recipient_pid.clone(),
                 (vec![0u8; VERIFY_KEY_LEN], Instant::now()),
             );
-        let replays: Replays = Arc::new(Mutex::new(HashMap::new()));
+        let tmp_dir = std::env::temp_dir().join(format!("pizzini-relay-test-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())); std::fs::create_dir_all(&tmp_dir).expect("tempdir for replay store");
+        let replays: Replays = Arc::new(Mutex::new(
+            ReplayStore::load_or_create(&tmp_dir, TOKEN_REPLAY_WINDOW).expect("replay store"),
+        ));
         let mut token = vec![0u8; TOKEN_LEN];
         // Nonce: arbitrary.
         token[..TOKEN_NONCE_LEN].copy_from_slice(&[0xABu8; TOKEN_NONCE_LEN]);

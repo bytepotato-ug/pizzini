@@ -100,6 +100,76 @@ struct SQLiteStorageTests {
         #expect(lc.deliveryTokensForPeer.count == 2)
     }
 
+    @Test("contact provenance + verification round-trip via v2 columns")
+    func contactVerificationRoundTrip() throws {
+        let store = try freshStore()
+        let when = Date(timeIntervalSince1970: 1_700_000_000)
+        // 1) Pasted, unverified — most exposed case from the SAS feature.
+        let pasted = Contact(
+            identityPub: Data(repeating: 0x11, count: 33),
+            displayName: "Pasted Alice",
+            addedAt: when,
+            addedVia: .pastedText,
+            verifiedAt: nil,
+        )
+        // 2) QR-scanned, then SAS-verified — the green-checkmark case.
+        let verified = Contact(
+            identityPub: Data(repeating: 0x22, count: 33),
+            displayName: "Verified Bob",
+            addedAt: when,
+            addedVia: .qrScan,
+            verifiedAt: when,
+        )
+        try store.upsertContact(pasted)
+        try store.upsertContact(verified)
+
+        let loaded = try store.loadContacts().sorted(by: { $0.displayName < $1.displayName })
+        #expect(loaded.count == 2)
+        let p = try #require(loaded.first { $0.displayName == "Pasted Alice" })
+        let v = try #require(loaded.first { $0.displayName == "Verified Bob" })
+        #expect(p.addedVia == .pastedText)
+        #expect(p.verifiedAt == nil)
+        #expect(p.verificationState == .pastedUnverified)
+        #expect(v.addedVia == .qrScan)
+        #expect(v.verifiedAt != nil)
+        #expect(v.verificationState == .verified)
+
+        // Re-upsert pasted with verifiedAt set — provenance must NOT
+        // silently upgrade to `qr_scan`; `verified_at` must accept the
+        // new value. This guards the deliberate omission of
+        // `added_via` from the ON CONFLICT UPDATE list in upsertContact.
+        var nowVerifiedPasted = p
+        nowVerifiedPasted.verifiedAt = when
+        // Simulate a future re-add path that mistakenly passes `.qrScan`
+        // for an already-pasted row by reusing the existing UUID with
+        // the new value; addedVia is `let` on Contact so we have to go
+        // via a fresh model with the same id.
+        let attemptedUpgrade = Contact(
+            id: p.id,
+            identityPub: p.identityPub,
+            displayName: p.displayName,
+            sessionEstablished: p.sessionEstablished,
+            log: p.log,
+            lastMessageAt: p.lastMessageAt,
+            lastSeenAt: p.lastSeenAt,
+            addedAt: p.addedAt,
+            deliveryTokensForPeer: p.deliveryTokensForPeer,
+            lastRefillRequestSentAt: p.lastRefillRequestSentAt,
+            lastRefillRequestHandledAt: p.lastRefillRequestHandledAt,
+            ttlSeconds: p.ttlSeconds,
+            readReceiptsEnabled: p.readReceiptsEnabled,
+            peerVerifyKey: p.peerVerifyKey,
+            lastBundleServedAt: p.lastBundleServedAt,
+            addedVia: .qrScan,
+            verifiedAt: when,
+        )
+        try store.upsertContact(attemptedUpgrade)
+        let reloaded = try store.loadContacts()
+        let pAfter = try #require(reloaded.first { $0.id == p.id })
+        #expect(pAfter.addedVia == .pastedText, "provenance must be sticky on re-upsert")
+        #expect(pAfter.verifiedAt == when, "verifiedAt must be writable on update")
+    }
+
     @Test("popDeliveryToken returns FIFO")
     func tokenFIFO() throws {
         let store = try freshStore()

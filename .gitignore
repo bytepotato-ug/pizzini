@@ -33,11 +33,21 @@ target/
 *.swp
 *.swo
 
-# Secrets — never commit
+# Secrets — never commit. F-NEW-1002: extra specificity to defeat
+# accidental `git add -f` autocomplete on common secret filename
+# shapes. AuthKey_*.p8 (APNs auth keys) and assorted private-key
+# variants get explicit names so even a wildcard-disabling shell
+# alias can't slip them through.
 *.p12
 *.p8
 *.mobileprovision
 *.cer
+*.pem
+AuthKey_*.p8
+AuthKey_*
+*_secret.*
+*_credential.*
+*credentials*
 .env
 .env.*
 !.env.example
@@ -48,3 +58,16 @@ target/
 # state outside the repo, but the default path is excluded here as a
 # belt-and-braces guard against an accidental `git add .`.
 pizzini-relay-state/
+
+# Local-only audit / security-review notes. Internal documents that
+# describe vulnerabilities, untested-claims, or per-surface findings
+# must never land in the public repo — keep them out of version
+# control entirely.
+.audit-*/
+
+# Operator transparency-log signing keys + the signed log file. The
+# signing key MUST NEVER enter the repo; the published log is hosted
+# elsewhere (GitHub Pages / IPFS / a static site), not in the source
+# tree. Leaving local-only copies excluded.
+operator-keys/
+transparency-log.ndjson

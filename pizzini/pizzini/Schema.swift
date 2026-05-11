@@ -21,7 +21,7 @@ enum Schema {
     /// Current schema version — read by SQLiteStorage at open time
     /// to decide whether the migration runner needs to fire. Bump
     /// when adding a new migration; never decrease.
-    static let currentVersion: Int32 = 1
+    static let currentVersion: Int32 = 2
 
     /// All migrations, ordered. Index `i` is `from version i`.
     /// Migration 0 → 1 is the initial schema; subsequent entries
@@ -29,15 +29,18 @@ enum Schema {
     /// migration; always append.
     static let migrations: [Migration] = [
         Migration(from: 0, to: 1, sql: v1InitialSchema),
+        Migration(from: 1, to: 2, sql: v2ContactProvenanceAndVerification),
     ]
 
     private static let v1InitialSchema = """
-    -- 1. meta: key/value store read alongside the database. Holds
-    --    schema_version + the Argon2id parameters under which the
-    --    current database was keyed. Keeping the params here (rather
-    --    than only in Keychain) lets a future hardware-aware upgrade
-    --    re-derive under stronger params and PRAGMA rekey without
-    --    forgetting what the original was.
+    -- 1. meta: key/value store for schema versioning + migration
+    --    markers + any future "after we open the DB, where do we
+    --    record this" needs. Argon2id parameters CANNOT live here
+    --    because we need them BEFORE the DB opens (they're an input
+    --    to the key derivation that produces the DB key). They
+    --    therefore live in Keychain — see `DBKey.loadStoredParams`,
+    --    which validates the loaded params against a minimum-strength
+    --    floor to defend against pre-planted weak parameters.
     CREATE TABLE meta (
         key   TEXT PRIMARY KEY NOT NULL,
         value BLOB NOT NULL
@@ -205,6 +208,37 @@ enum Schema {
     CREATE INDEX idx_outbox_recipient  ON outbox(recipient_peer_id);
     CREATE INDEX idx_outbox_attachment ON outbox(attachment_id)    WHERE attachment_id    IS NOT NULL;
     CREATE INDEX idx_outbox_group      ON outbox(group_message_id) WHERE group_message_id IS NOT NULL;
+    """
+
+    /// v2 — Pizzini safety-number verification.
+    ///
+    /// Two new contact columns track the provenance of the identity
+    /// and whether the user has compared the symmetric 60-digit
+    /// safety number with the peer out-of-band:
+    ///
+    ///   * `added_via` — how the row entered the contact list. One of
+    ///     'qr_scan' (camera scanned the QR in person), 'pasted_text'
+    ///     (URL pasted from clipboard, no guarantee about the channel
+    ///     that carried it), or 'unknown' (pre-v2 row whose provenance
+    ///     was not recorded). The column is `NOT NULL` so future code
+    ///     never has to handle a three-valued logic on this axis.
+    ///     Existing rows backfill to 'qr_scan' because v1 only ever
+    ///     materialised contacts through the in-person QR scanner —
+    ///     marking them 'unknown' would falsely downgrade users who
+    ///     had verified in person before the verification UI shipped.
+    ///
+    ///   * `verified_at` — wall-clock epoch (ms) when the user clicked
+    ///     "matches" on the safety-number screen. NULL means
+    ///     unverified. Setting / unsetting this is the only authority
+    ///     on the green-checkmark badge across the app.
+    ///
+    /// Both columns are independent: a `pasted_text` row CAN reach
+    /// `verified_at != NULL` (and is then full-trust); a `qr_scan` row
+    /// stays "scanned but not SAS-verified" until the user does the
+    /// out-of-band comparison.
+    private static let v2ContactProvenanceAndVerification = """
+    ALTER TABLE contacts ADD COLUMN added_via TEXT NOT NULL DEFAULT 'qr_scan';
+    ALTER TABLE contacts ADD COLUMN verified_at INTEGER;
     """
 }
 

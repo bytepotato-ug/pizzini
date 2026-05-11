@@ -88,11 +88,32 @@ pub fn load_or_create_key(key_path: &Path, kind_for_error: &str) -> io::Result<[
 /// call. Random nonces are safe well past any realistic write count
 /// for this relay's scale (birthday bound on a 96-bit nonce is
 /// ~2^48 writes — single-digit-user persistence will never hit that).
+///
+/// The single-arg `encrypt` form is a back-compat shim that passes an
+/// empty AAD. New call sites should prefer `encrypt_with_aad` and
+/// pass a per-store domain string (`b"pizzini.relay.replay.v1"`,
+/// `b"pizzini.relay.pending.v1"`, etc.) so the AEAD itself enforces
+/// domain separation between sibling stores (F-NEW-206 defense in
+/// depth against a future key-rotation bug that produces matching
+/// keys for two stores).
+#[allow(dead_code)] // Back-compat shim; new callers use `encrypt_with_aad`.
 pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> io::Result<Vec<u8>> {
+    encrypt_with_aad(key, plaintext, &[])
+}
+
+pub fn encrypt_with_aad(
+    key: &[u8; KEY_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> io::Result<Vec<u8>> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let payload = chacha20poly1305::aead::Payload {
+        msg: plaintext,
+        aad,
+    };
     let ciphertext = cipher
-        .encrypt(&nonce, plaintext)
+        .encrypt(&nonce, payload)
         .map_err(|_| io::Error::other("ChaCha20-Poly1305 encrypt failed"))?;
     let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     out.extend_from_slice(nonce.as_slice());
@@ -105,6 +126,14 @@ pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> io::Result<Vec<u8>> {
 /// envelope is truncated, the tag doesn't verify (wrong key /
 /// tampered file), or the AEAD primitive fails.
 pub fn decrypt(key: &[u8; KEY_LEN], bytes: &[u8]) -> io::Result<Vec<u8>> {
+    decrypt_with_aad(key, bytes, &[])
+}
+
+pub fn decrypt_with_aad(
+    key: &[u8; KEY_LEN],
+    bytes: &[u8],
+    aad: &[u8],
+) -> io::Result<Vec<u8>> {
     if bytes.len() < NONCE_LEN {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
@@ -113,7 +142,11 @@ pub fn decrypt(key: &[u8; KEY_LEN], bytes: &[u8]) -> io::Result<Vec<u8>> {
     }
     let (nonce_bytes, ct) = bytes.split_at(NONCE_LEN);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    cipher.decrypt(Nonce::from_slice(nonce_bytes), ct).map_err(|_| {
+    let payload = chacha20poly1305::aead::Payload {
+        msg: ct,
+        aad,
+    };
+    cipher.decrypt(Nonce::from_slice(nonce_bytes), payload).map_err(|_| {
         io::Error::other(
             "encrypted file failed to decrypt — wrong key file, or file tampered with",
         )

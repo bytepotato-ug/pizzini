@@ -133,6 +133,11 @@ struct SettingsView: View {
                 } label: {
                     SettingsRow(icon: "stethoscope", title: "Diagnostics")
                 }
+                NavigationLink {
+                    RelayAttestationView(store: store)
+                } label: {
+                    SettingsRow(icon: "checkmark.seal", title: "Relay attestation")
+                }
             }
 
             Section {
@@ -189,8 +194,7 @@ private struct RelayHostScreen: View {
         Form {
             Section {
                 TextField("host (e.g. 192.168.x.x)", text: $draft)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
+                    .hardenedTextInput()
                     .keyboardType(.URL)
             } header: {
                 Text("Host")

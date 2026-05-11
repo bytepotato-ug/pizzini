@@ -27,16 +27,22 @@ import PizziniCryptoCore
 /// "no history replay when re-added"). Future ops apply normally
 /// from the snapshot's `currentEpoch + 1`.
 ///
-/// **Wire format (`bootstrap_version = 1`, big-endian):**
+/// **Wire format (`bootstrap_version = 2`, big-endian):**
 ///
 /// ```text
 /// header (covered by signature):
-///   u8   bootstrap_version = 1
+///   u8   bootstrap_version = 2
 ///   [16] groupId
 ///   u64  currentEpoch
 ///   [32] lastOpDigest
 ///   [33] operatorIdentityPub          (the issuing admin)
 ///   u64  timestampMillis
+///   [32] memberSetRoot                (USP #5: canonical hash of the
+///                                        `members` array below. New joiner
+///                                        recomputes against the parsed
+///                                        list and rejects if the admin
+///                                        shipped a list that doesn't
+///                                        hash to its own claim.)
 ///   u16  nameLen + nameBytes (UTF-8)
 ///   u8   memberCount                  (≤ ChatGroup.maxMembers)
 ///   for each member:
@@ -51,6 +57,13 @@ import PizziniCryptoCore
 ///   [64] signature                    (XEd25519 over the header bytes
 ///                                        by operatorIdentityPub)
 /// ```
+///
+/// **v1 → v2 break.** v2 added the `memberSetRoot` field so the
+/// joining device can self-verify the admin's `members` list
+/// before constructing the local `ChatGroup`. Signing-context tag
+/// bumped in lockstep (`pizzini.group.bootstrap.v1 → .v2`) so an
+/// in-flight v1 snapshot fails signature verification on a v2
+/// receiver — no downgrade-attack path.
 struct GroupBootstrap: Sendable, Equatable {
     let groupId: Data
     let displayName: String
@@ -59,9 +72,18 @@ struct GroupBootstrap: Sendable, Equatable {
     let lastOpDigest: Data
     let operatorIdentity: Data
     let timestampMillis: UInt64
+    /// USP #5: canonical BLAKE3 root of `members` at the time the
+    /// admin signed the snapshot. The receiver recomputes
+    /// `ChatGroup.memberSetRoot(of: members)` and refuses to
+    /// bootstrap on mismatch — defends against a malicious admin
+    /// shipping a member list that doesn't actually match the
+    /// state they claim ("ghost member" at bootstrap time, which
+    /// the per-op verification in `GroupApply` would only catch on
+    /// the NEXT op).
+    let memberSetRoot: Data
     let signature: Data
 
-    static let bootstrapVersion: UInt8 = 1
+    static let bootstrapVersion: UInt8 = 2
 
     /// Encode the full signed wire bytes (header + signature). Used by
     /// the issuing admin to seal into the inner-envelope `0x09` body.
@@ -91,6 +113,9 @@ struct GroupBootstrap: Sendable, Equatable {
         guard members.count <= ChatGroup.maxMembers else {
             throw GroupBootstrapError.malformed("member count exceeds maxMembers (\(ChatGroup.maxMembers))")
         }
+        guard memberSetRoot.count == GroupOp.memberSetRootSize else {
+            throw GroupBootstrapError.malformed("memberSetRoot must be \(GroupOp.memberSetRootSize) bytes")
+        }
 
         var out = Data(capacity: 256 + members.count * 90)
         out.append(GroupBootstrap.bootstrapVersion)
@@ -99,6 +124,7 @@ struct GroupBootstrap: Sendable, Equatable {
         out.append(lastOpDigest)
         out.append(operatorIdentity)
         out.appendBigEndian(timestampMillis)
+        out.append(memberSetRoot)
         try writeUTF8U16LenBlob(&out, displayName)
         out.append(UInt8(members.count))
         for m in members {
@@ -134,6 +160,7 @@ struct GroupBootstrap: Sendable, Equatable {
         lastOpDigest: Data,
         operatorIdentity: Data,
         timestampMillis: UInt64,
+        memberSetRoot: Data,
         signature: Data,
     ) -> GroupBootstrap {
         GroupBootstrap(
@@ -144,6 +171,7 @@ struct GroupBootstrap: Sendable, Equatable {
             lastOpDigest: lastOpDigest,
             operatorIdentity: operatorIdentity,
             timestampMillis: timestampMillis,
+            memberSetRoot: memberSetRoot,
             signature: signature,
         )
     }
@@ -159,6 +187,7 @@ struct GroupBootstrap: Sendable, Equatable {
             identityPub: operatorIdentity,
             message: header,
             signature: signature,
+            contextTag: Session.SignatureContext.groupBootstrap,
         )
     }
 
@@ -172,6 +201,7 @@ struct GroupBootstrap: Sendable, Equatable {
         guard let lastOpDigest = c.read(GroupOp.parentDigestSize) else { return nil }
         guard let operatorIdentity = c.read(GroupOp.identityKeySize) else { return nil }
         guard let timestampMillis: UInt64 = c.readBigEndian() else { return nil }
+        guard let memberSetRoot = c.read(GroupOp.memberSetRootSize) else { return nil }
         guard let displayName = readUTF8U16LenBlob(&c) else { return nil }
         guard let memberCount: UInt8 = c.read(1)?.first else { return nil }
         guard Int(memberCount) <= ChatGroup.maxMembers else { return nil }
@@ -215,8 +245,22 @@ struct GroupBootstrap: Sendable, Equatable {
             lastOpDigest: lastOpDigest,
             operatorIdentity: operatorIdentity,
             timestampMillis: timestampMillis,
+            memberSetRoot: memberSetRoot,
             signature: signature,
         )
+    }
+
+    /// USP #5: structural self-consistency check. Computes
+    /// `ChatGroup.memberSetRoot(of: members)` and compares to the
+    /// `memberSetRoot` field stamped by the issuing admin. A
+    /// mismatch means the admin's signed `members` list doesn't
+    /// hash to their own claimed root — refuse the snapshot.
+    /// Callers MUST invoke this in addition to `verifySignature()`;
+    /// the signature alone proves the bytes came from the admin,
+    /// not that the admin's claim about their own state is
+    /// internally consistent.
+    func verifyMemberSetRoot() -> Bool {
+        ChatGroup.memberSetRoot(of: members) == memberSetRoot
     }
 
     /// Project the snapshot into a freshly-constructed `ChatGroup`.
@@ -260,23 +304,12 @@ enum GroupBootstrapError: Error, Equatable, Sendable {
 }
 
 // ─── Wire helpers ────────────────────────────────────────────────────
-
-private extension GroupRole {
-    var wireByte: UInt8 {
-        switch self {
-        case .member: 0x00
-        case .admin: 0x01
-        }
-    }
-
-    init?(wireByte: UInt8) {
-        switch wireByte {
-        case 0x00: self = .member
-        case 0x01: self = .admin
-        default: return nil
-        }
-    }
-}
+//
+// `GroupRole.wireByte` / `init?(wireByte:)` lived as a fileprivate
+// helper here before USP #5 (verifiable group membership) needed it
+// from `Group.swift::memberSetRoot`. The definition was promoted to
+// module-internal in `GroupOp.swift`; this file now relies on that
+// single source of truth.
 
 extension MemberStatus {
     var wireByte: UInt8 {

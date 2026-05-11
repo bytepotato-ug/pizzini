@@ -220,17 +220,19 @@ struct ChatGroupApplyRejectionTests {
             parentDigest: env.group.lastOpDigest,
             operatorIdentity: env.aliceId,
             timestampMillis: env.now,
+            priorMemberSetRoot: env.group.memberSetRoot,
             kind: .rename(newName: "fake"),
             signature: Data(repeating: 0, count: GroupOp.signatureSize),
         )
         let header = try unsigned.encodedHeader()
-        let bobSig = try env.bob.identitySign(header)
+        let bobSig = try env.bob.identitySign(header, contextTag: Session.SignatureContext.groupOp)
         let op = GroupOp(
             groupId: unsigned.groupId,
             epoch: unsigned.epoch,
             parentDigest: unsigned.parentDigest,
             operatorIdentity: unsigned.operatorIdentity,
             timestampMillis: unsigned.timestampMillis,
+            priorMemberSetRoot: unsigned.priorMemberSetRoot,
             kind: unsigned.kind,
             signature: bobSig,
         )
@@ -245,6 +247,48 @@ struct ChatGroupApplyRejectionTests {
         // Bob is not an admin (Env makes Alice the only admin).
         let op = try env.bobSign(kind: .addMember(peerId: daveId, role: .member, displayName: "Dave"))
         #expect(env.group.apply(op) == .rejectedAuthorization)
+    }
+
+    @Test("USP #5: ghost-member op (wrong priorMemberSetRoot) is rejected with rejectedMemberSetMismatch")
+    func ghostMemberOpIsRejected() throws {
+        var env = try Env.bootstrap()
+        // Simulate the ghost-member attack: an admin's local view
+        // *thinks* it has an extra (attacker-controlled) member
+        // that nobody else sees. The op they sign witnesses that
+        // ghosted view via `priorMemberSetRoot`. From the bob/carol
+        // side, the local view is the honest member list, so the
+        // root mismatch surfaces and the op is refused.
+        let ghost = Data(repeating: 0xEE, count: 33)
+        var ghostedMembers = env.group.members
+        ghostedMembers.append(GroupMember(
+            peerId: ghost,
+            displayName: "ghost",
+            role: .member,
+            joinedAtEpoch: 0,
+            status: .active,
+            addedBy: env.aliceId,
+        ))
+        let ghostRoot = ChatGroup.memberSetRoot(of: ghostedMembers)
+        // Sanity: ghost-rooted hash differs from the honest local one.
+        #expect(ghostRoot != env.group.memberSetRoot)
+        let op = try realSignedOp(
+            by: env.alice,
+            groupId: env.group.id,
+            epoch: env.group.currentEpoch + 1,
+            parent: env.group.lastOpDigest,
+            kind: .rename(newName: "ghost-issued"),
+            priorMemberSetRoot: ghostRoot,
+        )
+        switch env.group.apply(op) {
+        case let .rejectedMemberSetMismatch(local, claimed):
+            #expect(local == env.group.memberSetRoot)
+            #expect(claimed == ghostRoot)
+        default:
+            Issue.record("expected rejectedMemberSetMismatch")
+        }
+        // Group state unchanged — the op did not advance the epoch.
+        #expect(env.group.currentEpoch == 0)
+        #expect(env.group.displayName != "ghost-issued")
     }
 
     @Test("a parentDigest mismatch at the next epoch is equivocation")
@@ -475,7 +519,8 @@ struct ChatGroupPostAuditTests {
         let removed = try sessions[0].identityPublic()
         let removeOp = try realSignedOp(
             by: alice, groupId: groupId, epoch: group.currentEpoch + 1,
-            parent: group.lastOpDigest, kind: .removeMember(peerId: removed))
+            parent: group.lastOpDigest, kind: .removeMember(peerId: removed),
+            priorMemberSetRoot: group.memberSetRoot)
         if case .applied = group.apply(removeOp) {} else {
             Issue.record("remove failed")
         }
@@ -487,7 +532,8 @@ struct ChatGroupPostAuditTests {
         let addOp = try realSignedOp(
             by: alice, groupId: groupId, epoch: group.currentEpoch + 1,
             parent: group.lastOpDigest,
-            kind: .addMember(peerId: newId, role: .member, displayName: "fresh"))
+            kind: .addMember(peerId: newId, role: .member, displayName: "fresh"),
+            priorMemberSetRoot: group.memberSetRoot)
         if case .applied = group.apply(addOp) {} else {
             Issue.record("add fresh failed")
         }
@@ -497,7 +543,8 @@ struct ChatGroupPostAuditTests {
         let readdOp = try realSignedOp(
             by: alice, groupId: groupId, epoch: group.currentEpoch + 1,
             parent: group.lastOpDigest,
-            kind: .addMember(peerId: removed, role: .member, displayName: "M0-redux"))
+            kind: .addMember(peerId: removed, role: .member, displayName: "M0-redux"),
+            priorMemberSetRoot: group.memberSetRoot)
         if case let .rejectedMalformed(reason) = group.apply(readdOp) {
             #expect(reason.contains("cap"))
         } else {
@@ -687,6 +734,7 @@ private struct Env {
             epoch: group.currentEpoch + 1,
             parent: group.lastOpDigest,
             kind: kind,
+            priorMemberSetRoot: group.memberSetRoot,
         )
     }
 
@@ -697,6 +745,7 @@ private struct Env {
             epoch: group.currentEpoch + 1,
             parent: group.lastOpDigest,
             kind: kind,
+            priorMemberSetRoot: group.memberSetRoot,
         )
     }
 
@@ -712,6 +761,7 @@ private struct Env {
             epoch: epoch,
             parent: parent,
             kind: kind,
+            priorMemberSetRoot: group.memberSetRoot,
         )
     }
 
@@ -753,9 +803,17 @@ func realSignedCreate(
         parent: GroupOp.zeroParentDigest,
         kind: .create(name: name, initialMembers: initialMembers),
         operatorIdentity: identity,
+        // Create op witnesses an empty pre-state — the group does
+        // not exist yet.
+        priorMemberSetRoot: ChatGroup.memberSetRoot(of: []),
     )
 }
 
+/// USP #5: `priorMemberSetRoot` defaults to the empty-set root,
+/// which works for codec-only tests that never run the op through
+/// `apply`. Tests that exercise the apply path MUST pass the
+/// current `group.memberSetRoot` explicitly; otherwise the apply
+/// will fail with `.rejectedMemberSetMismatch` — by design.
 func realSignedOp(
     by signer: Session,
     groupId: Data,
@@ -763,6 +821,7 @@ func realSignedOp(
     parent: Data,
     kind: GroupOpKind,
     operatorIdentity: Data? = nil,
+    priorMemberSetRoot: Data = ChatGroup.memberSetRoot(of: []),
 ) throws -> GroupOp {
     let identity = try operatorIdentity ?? signer.identityPublic()
     let unsigned = GroupOp(
@@ -771,17 +830,19 @@ func realSignedOp(
         parentDigest: parent,
         operatorIdentity: identity,
         timestampMillis: 1_700_000_000_000,
+        priorMemberSetRoot: priorMemberSetRoot,
         kind: kind,
         signature: Data(repeating: 0, count: GroupOp.signatureSize),
     )
     let header = try unsigned.encodedHeader()
-    let sig = try signer.identitySign(header)
+    let sig = try signer.identitySign(header, contextTag: Session.SignatureContext.groupOp)
     return GroupOp(
         groupId: unsigned.groupId,
         epoch: unsigned.epoch,
         parentDigest: unsigned.parentDigest,
         operatorIdentity: unsigned.operatorIdentity,
         timestampMillis: unsigned.timestampMillis,
+        priorMemberSetRoot: unsigned.priorMemberSetRoot,
         kind: unsigned.kind,
         signature: sig,
     )

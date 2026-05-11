@@ -210,4 +210,46 @@ struct PizziniCryptoCoreTests {
             )
         }
     }
+
+    @Test("safety number is 60 digits formatted as 12 × 5 groups")
+    func safetyNumberShape() throws {
+        let alice = try Session()
+        let bob = try Session()
+        let sas = SafetyNumber.derive(
+            localIdentity: try alice.identityPublic(),
+            peerIdentity: try bob.identityPublic()
+        )
+        // 60 digits + 11 single-space separators = 71 chars.
+        #expect(sas.count == 71)
+        let groups = sas.split(separator: " ")
+        #expect(groups.count == 12)
+        for g in groups {
+            #expect(g.count == 5)
+            #expect(g.allSatisfy { $0.isASCII && $0.isNumber })
+        }
+    }
+
+    @Test("safety number is order-independent")
+    func safetyNumberSymmetric() throws {
+        let alice = try Session()
+        let bob = try Session()
+        let aId = try alice.identityPublic()
+        let bId = try bob.identityPublic()
+        let a = SafetyNumber.derive(localIdentity: aId, peerIdentity: bId)
+        let b = SafetyNumber.derive(localIdentity: bId, peerIdentity: aId)
+        #expect(a == b, "Alice and Bob must compute the same SAS regardless of side")
+    }
+
+    @Test("safety number changes when either identity is substituted")
+    func safetyNumberDetectsSubstitution() throws {
+        let alice = try Session()
+        let bob = try Session()
+        let mallory = try Session()
+        let aId = try alice.identityPublic()
+        let bId = try bob.identityPublic()
+        let mId = try mallory.identityPublic()
+        let real = SafetyNumber.derive(localIdentity: aId, peerIdentity: bId)
+        let mitm = SafetyNumber.derive(localIdentity: aId, peerIdentity: mId)
+        #expect(real != mitm, "If MITM swapped Bob for themselves, SAS must diverge")
+    }
 }

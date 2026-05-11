@@ -31,6 +31,15 @@ blake3 = { version = "1", default-features = false }
 # nonces are safe well past any realistic write count. See
 # `push_token_store.rs` for the threat-model framing of the persistence.
 chacha20poly1305 = "0.10"
+# SHA-256 of the running relay binary, computed once at startup and
+# returned via the STATUS_RESPONSE frame (USP #1: reproducible
+# builds + binary self-attestation). SHA-256 (not BLAKE3, which the
+# rest of the relay uses) is the convention every release
+# announcement and external `sha256sum` invocation speaks, so users
+# can compare the relay-reported digest against an
+# operator-published transparency-log entry without translating
+# hash families.
+sha2 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 # Used only by F-203 fix-review unit tests to construct signed HELLO

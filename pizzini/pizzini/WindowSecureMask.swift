@@ -74,6 +74,19 @@ final class WindowSecureMask: NSObject {
             name: UIScene.didActivateNotification,
             object: nil,
         )
+        // Stage Manager off-stage transitions disconnect scenes; on
+        // reconnect iOS may hand back a new UIWindow instance with a
+        // different ObjectIdentifier. Without cleanup, the `masked`
+        // and `fields` dictionaries leak old keys + retain old
+        // text-field instances forever. Observe disconnect and clean
+        // up so re-application on the new window starts from a clean
+        // bookkeeping state.
+        nc.addObserver(
+            self,
+            selector: #selector(sceneDidDisconnect(_:)),
+            name: UIScene.didDisconnectNotification,
+            object: nil,
+        )
         // If scenes are already connected (SwiftUI typically bootstraps
         // its first scene before AppDelegate finishes), apply to each
         // immediately rather than waiting for the next activation tick.
@@ -87,6 +100,18 @@ final class WindowSecureMask: NSObject {
     @objc private func sceneDidActivate(_ note: Notification) {
         guard let scene = note.object as? UIWindowScene else { return }
         applyToScene(scene)
+    }
+
+    @objc private func sceneDidDisconnect(_ note: Notification) {
+        guard let scene = note.object as? UIWindowScene else { return }
+        // Drop entries for any window owned by this scene. We don't
+        // hold a back-pointer from key → window, so we walk the
+        // scene's known windows and remove their identifiers.
+        for window in scene.windows {
+            let key = ObjectIdentifier(window)
+            masked.remove(key)
+            fields.removeValue(forKey: key)
+        }
     }
 
     private func applyToScene(_ scene: UIWindowScene) {
@@ -107,7 +132,22 @@ final class WindowSecureMask: NSObject {
 
     private func applyToWindow(_ window: UIWindow) {
         let key = ObjectIdentifier(window)
-        guard !masked.contains(key) else { return }
+        // If we already applied to this window AND the layer chain is
+        // still intact, no-op. iOS Stage Manager bring-back of the
+        // same UIWindow can leave our reparented field intact OR
+        // discard it depending on the transition; re-validate the
+        // parentage so we re-wire if needed rather than trusting the
+        // bookkeeping.
+        if masked.contains(key) {
+            if let field = fields[key],
+               field.layer.sublayers?.last?.sublayers?.contains(window.layer) == true {
+                return
+            }
+            // Layer chain is broken — clear bookkeeping and fall
+            // through to re-apply.
+            masked.remove(key)
+            fields.removeValue(forKey: key)
+        }
         // Two preconditions for the reparent to land:
         //   1. window.layer.superlayer must already exist — that's the
         //      slot we hand the secure field's layer into.

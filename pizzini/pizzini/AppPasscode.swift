@@ -11,33 +11,49 @@ import Security
 ///   silently wipes every chat / contact / outbox / message / key
 ///   the app holds and re-opens to an "empty installed" state.
 ///
-/// Both are stored as Argon2id hashes in Keychain (separate slots,
-/// distinct salts). The salts are 32 random bytes per slot; the
-/// hashes are 32-byte Argon2id outputs under the
+/// Both are stored as Argon2id hashes in Keychain (one row per slot;
+/// each row contains `salt || hash` atomically so the two cannot
+/// desync via a torn write). The salts are 32 random bytes per slot;
+/// the hashes are 32-byte Argon2id outputs under the
 /// `Argon2id.Params.production` preset (M=64 MiB, T=3, P=1 — ~250 ms
 /// on iPhone 12). Verification re-derives with the stored salt and
 /// constant-time-compares against the stored hash, so an attacker
 /// with Keychain read access still has to brute-force the passcode
 /// at full Argon2id cost per guess.
 ///
+/// **Constant wall-clock verification.** `check(_:)` ALWAYS runs two
+/// Argon2id derivations, one against each slot. If a slot is unset,
+/// the derivation runs against a deterministic dummy salt so the
+/// wall-clock cost is identical to "slot is set, didn't match". A
+/// coercer with a stopwatch cannot tell from latency which path was
+/// taken (real / duress / neither).
+///
 /// Importantly: **the database encryption key is NOT derived from
 /// these passcodes**. The DB key is the Secure-Enclave-wrapped seed
 /// stretched by Argon2id in `DBKey`; that derivation runs even when
 /// no app-level passcode is set. This module is an *access gate*
-/// (and the duress trigger), not the cryptographic key source. A
-/// future v2 could fold the passcode into the DB key derivation so
-/// "forgetting the duress passcode" becomes irrecoverable on every
-/// dimension — for now the SE-wrap is the primary defence against
-/// off-device attacks and the passcode is the on-device coercion
-/// gate.
+/// (and the duress trigger), not the cryptographic key source.
 @MainActor
 enum AppPasscode {
     // MARK: - Keychain slot names
 
-    static let realHashAccount = "app-passcode-hash"
-    static let realSaltAccount = "app-passcode-salt"
-    static let duressHashAccount = "duress-passcode-hash"
-    static let duressSaltAccount = "duress-passcode-salt"
+    /// Single atomic Keychain row holding `salt || hash` for the real
+    /// passcode. Atomic-write semantics: the two halves can never
+    /// desync, which used to be possible with the prior two-row design
+    /// (crash between salt-write and hash-write would permanently lock
+    /// the user out of a passcode they typed correctly).
+    static let realSlotAccount = "app-passcode-slot"
+    /// Sibling row for the duress passcode.
+    static let duressSlotAccount = "duress-passcode-slot"
+
+    /// Legacy Keychain slot names — written by the pre-atomic-slot
+    /// versions of this module. Read once on the first access path
+    /// after upgrade, migrated to the atomic layout, then wiped. Kept
+    /// `static let` so unit tests can also exercise the migration.
+    static let legacyRealHashAccount = "app-passcode-hash"
+    static let legacyRealSaltAccount = "app-passcode-salt"
+    static let legacyDuressHashAccount = "duress-passcode-hash"
+    static let legacyDuressSaltAccount = "duress-passcode-salt"
 
     enum PasscodeError: Error {
         case derivationFailed
@@ -54,6 +70,21 @@ enum AppPasscode {
     /// floor.
     static let minLength: Int = 6
 
+    /// Fixed sizes for the atomic slot blob layout: `salt(32) || hash(32)`.
+    private static let saltLen = 32
+    private static let hashLen = 32
+    private static let slotLen = saltLen + hashLen
+
+    /// Deterministic dummy slot used when the corresponding real /
+    /// duress slot is unset. The dummy salt is a fixed, all-zero
+    /// 32-byte value; the dummy hash is a fixed, all-zero 32-byte
+    /// value. The dummy derivation runs at full Argon2id cost. The
+    /// expected-hash will never equal the dummy hash for any real
+    /// passcode, so the constant-time-compare always returns false
+    /// for unset slots — without revealing which slot is unset.
+    private static let dummySalt = Data(repeating: 0, count: saltLen)
+    private static let dummyHash = Data(repeating: 0, count: hashLen)
+
     /// One result from `check(_:)`. Three states because "neither"
     /// (typo) must be distinguishable from "duress" (wipe) at the
     /// LockManager layer.
@@ -66,13 +97,11 @@ enum AppPasscode {
     // MARK: - State accessors
 
     static var isPasscodeSet: Bool {
-        Keychain.read(account: realHashAccount) != nil
-            && Keychain.read(account: realSaltAccount) != nil
+        readSlot(realSlotAccount) != nil
     }
 
     static var isDuressPasscodeSet: Bool {
-        Keychain.read(account: duressHashAccount) != nil
-            && Keychain.read(account: duressSaltAccount) != nil
+        readSlot(duressSlotAccount) != nil
     }
 
     // MARK: - Setters
@@ -83,11 +112,7 @@ enum AppPasscode {
     /// real one (and vice versa) at the UI layer — that check uses
     /// `check(_:)`.
     static func setPasscode(_ passcode: String) throws {
-        try setPasscodeIntoSlots(
-            passcode,
-            hashAccount: realHashAccount,
-            saltAccount: realSaltAccount,
-        )
+        try setPasscodeIntoSlot(passcode, account: realSlotAccount)
     }
 
     /// Set or replace the duress passcode. Same shape as `setPasscode`.
@@ -98,11 +123,7 @@ enum AppPasscode {
         if verifyPasscode(passcode) {
             throw PasscodeError.sameAsExisting
         }
-        try setPasscodeIntoSlots(
-            passcode,
-            hashAccount: duressHashAccount,
-            saltAccount: duressSaltAccount,
-        )
+        try setPasscodeIntoSlot(passcode, account: duressSlotAccount)
     }
 
     /// Remove the real passcode. Used when the user disables app-
@@ -110,15 +131,12 @@ enum AppPasscode {
     /// fallback isn't worth the friction). Returns silently if no
     /// passcode is set.
     static func clearPasscode() {
-        Keychain.delete(account: realHashAccount)
-        Keychain.delete(account: realSaltAccount)
+        secureDelete(account: realSlotAccount)
     }
 
-    /// Remove the duress passcode. Q3 in the design discussion lands
-    /// at "removable in Settings" — this is the entry point.
+    /// Remove the duress passcode.
     static func clearDuressPasscode() {
-        Keychain.delete(account: duressHashAccount)
-        Keychain.delete(account: duressSaltAccount)
+        secureDelete(account: duressSlotAccount)
     }
 
     // MARK: - Verification
@@ -126,37 +144,70 @@ enum AppPasscode {
     /// Verify `entry` against the real passcode. Returns false if no
     /// passcode is set OR `entry` doesn't match.
     static func verifyPasscode(_ entry: String) -> Bool {
-        guard let salt = Keychain.read(account: realSaltAccount),
-              let stored = Keychain.read(account: realHashAccount)
-        else {
+        guard let (salt, expected) = readSlotSplit(realSlotAccount) else {
             return false
         }
-        return verify(entry: entry, salt: salt, expected: stored)
+        return verify(entry: entry, salt: salt, expected: expected)
     }
 
     /// Verify `entry` against the duress passcode.
     static func verifyDuressPasscode(_ entry: String) -> Bool {
-        guard let salt = Keychain.read(account: duressSaltAccount),
-              let stored = Keychain.read(account: duressHashAccount)
-        else {
+        guard let (salt, expected) = readSlotSplit(duressSlotAccount) else {
             return false
         }
-        return verify(entry: entry, salt: salt, expected: stored)
+        return verify(entry: entry, salt: salt, expected: expected)
     }
 
     /// Composite check: does `entry` match real, duress, or neither?
-    /// **Duress is checked first** — the constant-time compare makes
-    /// both verifications take roughly the same wall-clock time, so
-    /// an attacker timing the response can't tell which path was
-    /// taken. (The real defence against timing is in the Argon2id
-    /// cost dominating, ~250 ms; the order is belt-and-suspenders.)
+    ///
+    /// **Always runs both Argon2id derivations, in a fixed order, at
+    /// full production cost.** If a slot is unset, the derivation runs
+    /// against `dummySalt`/`dummyHash` so wall-clock cost is identical
+    /// to "set but didn't match". The result of each derivation is
+    /// constant-time-compared against the corresponding expected hash;
+    /// match flags are folded WITHOUT short-circuiting and the priority
+    /// (duress beats real) is applied via masked selection.
+    ///
+    /// A stopwatch-equipped coercer cannot distinguish `.real`,
+    /// `.duress`, or `.neither` by latency — the wall-clock is
+    /// `2 × Argon2id.production` for all three cases.
     static func check(_ entry: String) -> Match {
-        if isDuressPasscodeSet, verifyDuressPasscode(entry) {
-            return .duress
-        }
-        if isPasscodeSet, verifyPasscode(entry) {
-            return .real
-        }
+        let (realSalt, realExpected, realSet) =
+            slotMaterial(account: realSlotAccount)
+        let (duressSalt, duressExpected, duressSet) =
+            slotMaterial(account: duressSlotAccount)
+
+        // Run both derivations, in a fixed order. Both run at full
+        // production cost — the result of the unset-slot derivation
+        // is discarded.
+        let entryBytes = Data(entry.utf8)
+        let realDerived = (try? Argon2id.derive(
+            passphrase: entryBytes,
+            salt: realSalt,
+            params: .production,
+            outputLength: hashLen,
+        )) ?? Data(repeating: 0xFF, count: hashLen)
+        let duressDerived = (try? Argon2id.derive(
+            passphrase: entryBytes,
+            salt: duressSalt,
+            params: .production,
+            outputLength: hashLen,
+        )) ?? Data(repeating: 0xFF, count: hashLen)
+
+        // Constant-time byte equality, both checks unconditional.
+        let realEq = constantTimeEquals(realDerived, realExpected)
+        let duressEq = constantTimeEquals(duressDerived, duressExpected)
+
+        // A match only counts if the corresponding slot was actually
+        // set — for unset slots the expected hash is `dummyHash` and
+        // can never match any real passcode (entropy assumption).
+        let realMatch = realEq && realSet && !entry.isEmpty
+        let duressMatch = duressEq && duressSet && !entry.isEmpty
+
+        // Duress takes priority over real (if a user accidentally set
+        // identical passcodes, the safer side wipes).
+        if duressMatch { return .duress }
+        if realMatch { return .real }
         return .neither
     }
 
@@ -164,22 +215,21 @@ enum AppPasscode {
     /// successful match — after the database is reset, the passcodes
     /// go too so the post-wipe state is a true clean slate.
     static func eraseAll() {
-        clearPasscode()
-        clearDuressPasscode()
+        secureDelete(account: realSlotAccount)
+        secureDelete(account: duressSlotAccount)
     }
 
     // MARK: - Argon2id glue
 
-    private static func setPasscodeIntoSlots(
+    private static func setPasscodeIntoSlot(
         _ passcode: String,
-        hashAccount: String,
-        saltAccount: String,
+        account: String,
     ) throws {
         guard !passcode.isEmpty else { throw PasscodeError.empty }
         guard passcode.count >= minLength else {
             throw PasscodeError.tooShort(minimum: minLength)
         }
-        var saltBytes = [UInt8](repeating: 0, count: 32)
+        var saltBytes = [UInt8](repeating: 0, count: saltLen)
         let rc = SecRandomCopyBytes(kSecRandomDefault, saltBytes.count, &saltBytes)
         guard rc == errSecSuccess else { throw PasscodeError.derivationFailed }
         let salt = Data(saltBytes)
@@ -189,14 +239,18 @@ enum AppPasscode {
                 passphrase: Data(passcode.utf8),
                 salt: salt,
                 params: .production,
-                outputLength: 32,
+                outputLength: hashLen,
             )
         } catch {
             throw PasscodeError.derivationFailed
         }
-        guard Keychain.write(salt, account: saltAccount),
-              Keychain.write(hash, account: hashAccount)
-        else {
+        // Atomic write: salt + hash in one Keychain row. A torn write
+        // is now impossible — the prior two-row design could leave a
+        // new salt next to an old hash on crash.
+        var slot = Data(capacity: slotLen)
+        slot.append(salt)
+        slot.append(hash)
+        guard Keychain.write(slot, account: account) else {
             throw PasscodeError.keychainWriteFailed
         }
     }
@@ -214,17 +268,114 @@ enum AppPasscode {
         return constantTimeEquals(derived, expected)
     }
 
-    /// Constant-time byte comparison. Standard pattern: XOR every byte
-    /// pair into an accumulator and return `accumulator == 0`. Branches
-    /// don't depend on the data so a timing attacker can't learn how
-    /// many leading bytes matched.
-    private static func constantTimeEquals(_ a: Data, _ b: Data) -> Bool {
-        guard a.count == b.count else { return false }
-        var diff: UInt8 = 0
-        for i in 0..<a.count {
-            diff |= a[a.index(a.startIndex, offsetBy: i)]
-                ^ b[b.index(b.startIndex, offsetBy: i)]
+    /// Read the atomic slot blob and split into (salt, expectedHash).
+    /// Returns nil if no row exists or the row is malformed. Also
+    /// migrates legacy two-row (`-hash` + `-salt`) layouts into the
+    /// atomic single-row layout on first access — so users upgrading
+    /// from a build that wrote the old slot pair don't get silently
+    /// locked out.
+    private static func readSlot(_ account: String) -> Data? {
+        if let data = Keychain.read(account: account), data.count == slotLen {
+            return data
         }
-        return diff == 0
+        return migrateLegacySlot(into: account)
+    }
+
+    /// Read the (hash, salt) pair from the legacy two-row layout if
+    /// present, write the atomic blob under `account`, and remove the
+    /// legacy rows. Returns the migrated slot blob or nil if no
+    /// legacy data exists. The migration runs at most once per slot
+    /// per device (the legacy reads return nil after the deletes).
+    private static func migrateLegacySlot(into account: String) -> Data? {
+        let (legacyHashAccount, legacySaltAccount): (String, String)
+        switch account {
+        case realSlotAccount:
+            legacyHashAccount = legacyRealHashAccount
+            legacySaltAccount = legacyRealSaltAccount
+        case duressSlotAccount:
+            legacyHashAccount = legacyDuressHashAccount
+            legacySaltAccount = legacyDuressSaltAccount
+        default:
+            return nil
+        }
+        guard let legacyHash = Keychain.read(account: legacyHashAccount),
+              let legacySalt = Keychain.read(account: legacySaltAccount),
+              legacyHash.count == hashLen,
+              legacySalt.count == saltLen else {
+            return nil
+        }
+        var blob = Data(capacity: slotLen)
+        blob.append(legacySalt)
+        blob.append(legacyHash)
+        guard Keychain.write(blob, account: account) else {
+            // Couldn't write the new slot — leave legacy rows in place
+            // so a retry later still has the material.
+            return nil
+        }
+        // Wipe legacy rows now that the atomic slot is authoritative.
+        secureDelete(account: legacyHashAccount)
+        secureDelete(account: legacySaltAccount)
+        return blob
+    }
+
+    private static func readSlotSplit(_ account: String) -> (Data, Data)? {
+        guard let data = readSlot(account) else { return nil }
+        let salt = data.prefix(saltLen)
+        let hash = data.suffix(hashLen)
+        return (Data(salt), Data(hash))
+    }
+
+    /// Returns `(salt, expectedHash, isSet)`. If the slot is unset,
+    /// returns `(dummySalt, dummyHash, false)` so the caller's
+    /// derivation still pays the Argon2id cost — preserving constant
+    /// wall-clock behavior regardless of which slots are configured.
+    private static func slotMaterial(account: String) -> (Data, Data, Bool) {
+        if let (salt, hash) = readSlotSplit(account) {
+            return (salt, hash, true)
+        }
+        return (dummySalt, dummyHash, false)
+    }
+
+    /// Constant-time byte comparison. Pulls a copy through
+    /// `withUnsafeBytes` so the loop walks raw `UInt8` pointers — no
+    /// `Data.index(_:offsetBy:)` arithmetic, no NSData bridging, no
+    /// behavior the compiler can rewrite to an early-exit `memcmp`.
+    private static func constantTimeEquals(_ a: Data, _ b: Data) -> Bool {
+        if a.count != b.count { return false }
+        return a.withUnsafeBytes { aRaw in
+            b.withUnsafeBytes { bRaw in
+                guard let aPtr = aRaw.baseAddress, let bPtr = bRaw.baseAddress else {
+                    return false
+                }
+                let aBytes = aPtr.assumingMemoryBound(to: UInt8.self)
+                let bBytes = bPtr.assumingMemoryBound(to: UInt8.self)
+                var diff: UInt8 = 0
+                for i in 0..<a.count {
+                    diff |= aBytes[i] ^ bBytes[i]
+                }
+                return diff == 0
+            }
+        }
+    }
+
+    /// Overwrite-then-delete a Keychain slot. iOS's `SecItemDelete`
+    /// unlinks the Keychain row from `keychain-2.db` but does not
+    /// promise NAND-flash wipe of the underlying ciphertext. Writing
+    /// a fresh random blob of the same size first forces the keychain
+    /// daemon to re-encrypt the row under a new IV, which on most
+    /// modern iOS releases supersedes the prior ciphertext block —
+    /// raising the bar against Cellebrite-class flash forensics.
+    /// Falls back to plain delete if the overwrite write fails.
+    static func secureDelete(account: String) {
+        // Only overwrite if a row exists; otherwise plain delete is
+        // already idempotent.
+        if Keychain.read(account: account) != nil {
+            var noise = [UInt8](repeating: 0, count: slotLen)
+            let rc = SecRandomCopyBytes(kSecRandomDefault, noise.count, &noise)
+            if rc == errSecSuccess {
+                _ = Keychain.write(Data(noise), account: account)
+            }
+        }
+        Keychain.delete(account: account)
     }
 }

@@ -51,7 +51,22 @@ struct LockOverlayView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(lockManager.authInFlight)
                 .padding(.horizontal, 32)
-                .padding(.bottom, 32)
+                // When Face ID is enabled AND a real / duress passcode
+                // is set, surface a discreet "Use passcode" button so
+                // a user whose biometric is wedged (locked out after 5
+                // failed attempts, sensor unavailable, etc.) has a
+                // visible second path. The long-press gesture below
+                // remains the undocumented entry — both reach the same
+                // sheet. Hidden when no passcode is configured.
+                if faceIDOn,
+                   AppPasscode.isPasscodeSet || AppPasscode.isDuressPasscodeSet {
+                    Button("Use passcode") {
+                        lockManager.isPasscodeSheetPresented = true
+                    }
+                    .buttonStyle(.bordered)
+                    .padding(.horizontal, 32)
+                }
+                Spacer().frame(height: 32)
             }
         }
         // Long-press anywhere on the lock screen brings up the
@@ -59,10 +74,14 @@ struct LockOverlayView: View {
         // entry point for the duress passcode AND a fallback when
         // Face ID is misbehaving. 0.8s is long enough to avoid
         // accidental triggers from a thumb-rest, short enough to
-        // feel responsive when intentional.
+        // feel responsive when intentional. Gate the gesture on
+        // `!isPasscodeSheetPresented` so a thumb-rest inside the
+        // sheet's gesture-passthrough region can't re-trigger.
         .contentShape(Rectangle())
         .onLongPressGesture(minimumDuration: 0.8) {
-            lockManager.isPasscodeSheetPresented = true
+            if !lockManager.isPasscodeSheetPresented {
+                lockManager.isPasscodeSheetPresented = true
+            }
         }
         .onAppear(perform: handleAppear)
         .sheet(isPresented: Binding(
@@ -144,6 +163,11 @@ struct LockOverlayView: View {
             // would otherwise see a flash of the real contacts
             // before they disappear — that single frame is the
             // entire feature's weak point.
+            //
+            // `beginDuressWipe` gates LockManager.submitPasscode
+            // against any racing entry (e.g. panicked second tap
+            // arriving after the first cleared the passcode slots).
+            lockManager.beginDuressWipe()
             store.duressWipe()
             lockManager.unlockAfterDuress()
         case .wrong:

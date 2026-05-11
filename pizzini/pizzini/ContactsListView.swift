@@ -144,8 +144,7 @@ struct ContactsListView: View {
                     .textFieldStyle(.plain)
                     .focused($searchFocused)
                     .submitLabel(.search)
-                    .autocorrectionDisabled(true)
-                    .textInputAutocapitalization(.never)
+                    .hardenedTextInput()
                 if !searchQuery.isEmpty {
                     Button {
                         searchQuery = ""
@@ -406,6 +405,7 @@ private struct ContactRow: View {
                         // contact name is a hierarchy cue (this row's TITLE)
                         // rather than a state cue (read / unread).
                         .font(.body.weight(.semibold))
+                    verificationBadge
                 }
                 if let last = contact.log.last {
                     Text(preview(last))
@@ -436,6 +436,34 @@ private struct ContactRow: View {
             .padding(.vertical, 3)
             .background(Capsule().fill(Color.accentColor))
             .accessibilityLabel("\(unread) unread")
+    }
+
+    /// Small in-line glyph next to the display name reflecting the
+    /// `ContactVerificationState`. Verified state gets a green check
+    /// seal that is the load-bearing reassurance for users scanning
+    /// the list. Unverified states use distinct colours and shapes so
+    /// red/green colour-blind users still see a glyph difference.
+    /// Tap target is intentionally absent — the row itself navigates
+    /// into the chat, where the banner offers the action.
+    @ViewBuilder
+    private var verificationBadge: some View {
+        switch contact.verificationState {
+        case .verified:
+            Image(systemName: "checkmark.seal.fill")
+                .font(.caption)
+                .foregroundStyle(.green)
+                .accessibilityLabel("verified")
+        case .scannedUnverified:
+            Image(systemName: "checkmark.shield")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .accessibilityLabel("scanned but not safety-number verified")
+        case .pastedUnverified:
+            Image(systemName: "exclamationmark.shield.fill")
+                .font(.caption)
+                .foregroundStyle(.red)
+                .accessibilityLabel("pasted identity, not verified — open chat to verify")
+        }
     }
 
     private func preview(_ msg: PersistedMessage) -> String {

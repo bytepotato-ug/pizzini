@@ -104,6 +104,14 @@ cat > "$PLIST_PATH" <<EOF
         <string>$APNS_KEY_ID</string>
         <key>APNS_ENDPOINT</key>
         <string>$APNS_ENDPOINT</string>
+        <!-- Dev override: the relay defaults to 127.0.0.1:7777
+             (production posture, reached only via Tor) so the
+             simulator on this Mac and any sibling simulator/device
+             on the LAN would fail to connect without this line.
+             Production deploys (Hetzner) DROP this env var so the
+             default loopback bind takes effect. -->
+        <key>PIZZINI_RELAY_BIND</key>
+        <string>0.0.0.0:7777</string>
     </dict>
 
     <key>RunAtLoad</key>

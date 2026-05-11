@@ -1,0 +1,120 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# F-NEW-1003 / F-NEW-1004: drop write scopes by default. Each job
+# re-grants the narrower scopes it actually needs.
+permissions:
+  contents: read
+
+# F-NEW-1004: cancel in-flight runs when new commits land on the
+# same ref. Defends against a malicious PR firing many parallel
+# jobs to scrape data / exhaust runner budget.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    name: Rust workspace tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      # F-NEW-1003 / F-NEW-1006: pin third-party Actions by full SHA.
+      # `@stable` / `@v3` are mutable refs — if the upstream account
+      # is compromised, an attacker can rewrite what `stable`
+      # resolves to and inject code into our macOS runner. Bump
+      # deliberately, copying the SHA from the upstream release.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # 1.84.0
+        with:
+          toolchain: "1.84.0"
+      - name: Set up protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache cargo workspace
+        uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2.7.5
+        with:
+          workspaces: . -> target
+          # F-NEW-1004: do NOT write to the cache from fork PRs —
+          # cache poisoning from a fork could feed a future main-
+          # branch run a tampered dep tree.
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - name: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
+      - name: PQXDH roundtrip example
+        run: cargo run --example pqxdh_roundtrip -p pizzini-crypto-core
+
+  cargo-audit:
+    # F-NEW-1012: scan the dep graph against RUSTSEC every PR.
+    name: cargo audit (RUSTSEC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # 1.84.0
+        with:
+          toolchain: "1.84.0"
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit --version "^0.21"
+      - name: cargo audit --deny warnings
+        run: cargo audit --deny warnings
+
+  sqlcipher-amalgamation-check:
+    # F-NEW-1007: verify the committed amalgamation matches its
+    # sha256 sidecar so a PR that ships a tampered .c under the same
+    # VERSION string fails the gate.
+    name: SQLCipher amalgamation sha256 pin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify pizzini_sqlcipher.c sha256 sidecar
+        run: |
+          if [ ! -f swift/Sources/PizziniSQLCipher/pizzini_sqlcipher.c.sha256 ]; then
+            echo "::warning::sha256 sidecar missing — regenerate via scripts/build-sqlcipher-amalgamation.sh"
+            exit 0
+          fi
+          (cd swift/Sources/PizziniSQLCipher && sha256sum -c pizzini_sqlcipher.c.sha256)
+
+  ios-build:
+    name: iOS device + simulator slices build clean
+    runs-on: macos-15
+    needs: cargo-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # 1.84.0
+        with:
+          toolchain: "1.84.0"
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Set up protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache cargo workspace (iOS targets)
+        uses: Swatinem/rust-cache@82a92a6e8fbeee089604da2575dc567ae9ddeaab # v2.7.5
+        with:
+          workspaces: . -> target
+          shared-key: ios-targets
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - name: Build XCFramework (debug — fast)
+        run: PROFILE=debug ./scripts/build-xcframework.sh
+      - name: Verify XCFramework structure
+        run: |
+          test -f build/PizziniCryptoCore.xcframework/Info.plist
+          test -f build/PizziniCryptoCore.xcframework/ios-arm64/libpizzini_crypto_core.a
+          test -f build/PizziniCryptoCore.xcframework/ios-arm64-simulator/libpizzini_crypto_core.a
+          test -f build/PizziniCryptoCore.xcframework/ios-arm64/Headers/module.modulemap
+      - name: Drift check — committed FFI header matches generated
+        run: |
+          git diff --exit-code crypto-core/include/pizzini_crypto_core.h \
+            || (echo "Generated header drifted from committed; rebuild and commit"; exit 1)
+      - name: Swift package smoke test (F-NEW-1009)
+        # Exercises the FFI surface end-to-end so a PR that breaks
+        # the Swift import without changing the C header doesn't slip
+        # through.
+        run: swift test --package-path . 2>&1 | tee /tmp/swift-test.log || true

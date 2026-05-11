@@ -1,10 +1,14 @@
 import SwiftUI
 
-/// First-launch flow. Two steps: welcome screen (threat-model TL;DR),
-/// then a Face ID opt-in. The opt-in does a real authentication
-/// round-trip *before* flipping `biometricLockEnabled` on, so we
-/// don't end up with a setting enabled when biometrics are
-/// unavailable / unenrolled / dismissed.
+/// First-launch flow. The user steps through: welcome → icon
+/// legend → notifications opt-in → **mandatory lock-posture step**.
+///
+/// The lock-posture step is the security gate that defends against
+/// "user installs Pizzini, pairs with contacts, never sets a lock,
+/// loses unlocked phone." `onComplete` is only reachable after Face
+/// ID has been enabled OR an app passcode has been set — there is no
+/// "skip" path. The user can still disable both later in Settings,
+/// but the first-launch flow forces a deliberate decision.
 ///
 /// `onComplete` is called with the chosen biometric setting; the host
 /// then writes it to AppState and dismisses the cover.
@@ -15,6 +19,7 @@ struct OnboardingView: View {
     @State private var authError: String?
     @State private var authInFlight = false
     @State private var notificationsInFlight = false
+    @State private var passcodeSheetPresented = false
 
     private enum Step { case welcome, icons, notifications, biometric }
 
@@ -176,10 +181,10 @@ struct OnboardingView: View {
             Image(systemName: "faceid")
                 .font(.system(size: 72))
                 .foregroundStyle(.tint)
-            Text("Protect Pizzini with Face ID")
+            Text("Lock Pizzini")
                 .font(.title.bold())
                 .multilineTextAlignment(.center)
-            Text("Anyone with your unlocked phone can read every message in Pizzini unless you add a second lock. Strongly recommended — Face ID (or Touch ID, or your device passcode) will be required to open the app.")
+            Text("Anyone with your unlocked phone can read every message in Pizzini unless you add a second lock. Choose Face ID (recommended — fast, biometric-gated) or set an app passcode you'll type to unlock.")
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -202,9 +207,9 @@ struct OnboardingView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(authInFlight)
                 Button {
-                    onComplete(false)
+                    passcodeSheetPresented = true
                 } label: {
-                    Text("Skip — I'll add it later")
+                    Label("Use app passcode instead", systemImage: "lock.fill")
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 8)
                 }
@@ -212,6 +217,23 @@ struct OnboardingView: View {
                 .disabled(authInFlight)
             }
             .padding(.bottom, 24)
+        }
+        .sheet(isPresented: $passcodeSheetPresented) {
+            PasscodeSetupView(
+                mode: .real,
+                onSaved: {
+                    passcodeSheetPresented = false
+                    // Passcode is set; biometric stays OFF (the user
+                    // explicitly chose passcode-only). LockManager's
+                    // `isLockGateActive` now returns true via the
+                    // `isPasscodeSet` path so the user is gated on
+                    // every cold launch.
+                    onComplete(false)
+                },
+                onCancel: {
+                    passcodeSheetPresented = false
+                },
+            )
         }
     }
 

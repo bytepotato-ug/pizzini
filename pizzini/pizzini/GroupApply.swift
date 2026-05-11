@@ -52,6 +52,19 @@ extension ChatGroup {
         /// developer logs; the host surfaces a generic "operation
         /// failed" if anything user-facing is needed.
         case rejectedMalformed(String)
+        /// USP #5. Op's `priorMemberSetRoot` does not match the
+        /// receiver's locally-computed canonical root over the
+        /// current member set. The operator either:
+        ///   - Forked the membership (silently added a ghost member
+        ///     visible only on their side), OR
+        ///   - Operated on stale state (didn't see a peer's removal
+        ///     before issuing this op).
+        /// Either way the apply is unsafe — surfaces a stronger
+        /// "group integrity warning" than the equivocation case,
+        /// because the operator's signature is valid but the state
+        /// they witnessed disagrees with ours. Carries both digests
+        /// for the diagnostic UI / dev logs.
+        case rejectedMemberSetMismatch(local: Data, claimed: Data)
     }
 
     /// Side effects accumulated during `apply(_:sideEffects:)`. The host
@@ -181,6 +194,28 @@ extension ChatGroup {
             return .rejectedAuthorization
         }
 
+        // Phase 5.5: USP #5 — verifiable group membership.
+        //
+        // The operator stamped this op with a canonical hash of the
+        // member set they believed to be current at signing time.
+        // Recompute against our local view; mismatch means our two
+        // views of "who is in this group" differ — either someone
+        // added a ghost member on one side and not the other, or an
+        // earlier op didn't propagate, or somebody is operating on
+        // stale state. None of those are safe to apply: the
+        // resulting state would diverge from every other honest
+        // member's view, and a malicious admin would be able to
+        // inject ghost members the rest of us never authorised.
+        //
+        // Two-byte equality compare via the Data == implementation,
+        // which is constant-time enough for a 32-byte BLAKE3 digest
+        // — there is no secret on either side anyway (both digests
+        // are derived from public membership state).
+        let localRoot = self.memberSetRoot
+        if op.priorMemberSetRoot != localRoot {
+            return .rejectedMemberSetMismatch(local: localRoot, claimed: op.priorMemberSetRoot)
+        }
+
         // Phase 6: domain mutation.
         switch executeMutation(op: op, sideEffects: &sx) {
         case .ok:
@@ -218,12 +253,22 @@ extension ChatGroup {
 
         // Decode + sort once so the drain is monotonic. Ops we can't
         // decode are dropped here rather than surviving the queue.
+        //
+        // F-NEW-501 retention is enforced at queue-INSERT time via
+        // `queuePending`'s per-operator cap rather than as a
+        // timestamp filter here. The audit's original suggestion
+        // ("drop ops whose claimed timestamp is > 30d old") is
+        // attractive but `timestampMillis` is operator-chosen — a
+        // malicious admin can claim any value. The per-operator cap
+        // is the architectural fix: one bad admin can occupy at
+        // most `pendingOpsPerOperatorCap` slots regardless of what
+        // they sign or when. A future-claimed timestamp doesn't
+        // change the queue-fill math.
         var decoded: [(epoch: UInt64, bytes: Data, op: GroupOp)] = []
         decoded.reserveCapacity(pendingOps.count)
         for bytes in pendingOps {
-            if let op = GroupOp.decode(bytes) {
-                decoded.append((op.epoch, bytes, op))
-            }
+            guard let op = GroupOp.decode(bytes) else { continue }
+            decoded.append((op.epoch, bytes, op))
         }
         decoded.sort { $0.epoch < $1.epoch }
 
@@ -265,9 +310,23 @@ extension ChatGroup {
 
     private mutating func queuePending(signedBytes: Data) {
         if pendingOps.count >= ChatGroup.pendingOpsCap { return }
-        if !pendingOps.contains(signedBytes) {
-            pendingOps.append(signedBytes)
+        if pendingOps.contains(signedBytes) { return }
+        // F-NEW-501 — per-operator sub-cap. Without this, one
+        // compromised admin can sign `pendingOpsCap` future-epoch ops
+        // and pin the entire queue, silently dropping every other
+        // admin's legitimate future ops. With it, the worst-case
+        // impact of a single bad admin is bounded to their own
+        // `pendingOpsPerOperatorCap` slots.
+        if let incoming = GroupOp.decode(signedBytes) {
+            let ownedByThisOperator = pendingOps.reduce(0) { acc, bytes in
+                guard let op = GroupOp.decode(bytes) else { return acc }
+                return op.operatorIdentity == incoming.operatorIdentity ? acc + 1 : acc
+            }
+            if ownedByThisOperator >= ChatGroup.pendingOpsPerOperatorCap {
+                return
+            }
         }
+        pendingOps.append(signedBytes)
     }
 
     /// Same path as `apply(_:)` but skips the queue check — invoked

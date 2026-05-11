@@ -620,6 +620,117 @@ pub unsafe extern "C" fn pizzini_blake3_hash(
     PIZZINI_OK
 }
 
+// ───── Safety number (SAS) ─────────────────────────────────────────────
+//
+// Symmetric, human-comparable code derived deterministically from two
+// IdentityKey public bytes. Both parties — regardless of which side
+// initiated pairing — see the same 60 digits when no MITM is in their
+// session. Read aloud over a voice call (or scanned hand-to-hand a
+// second time) to detect identity substitution that happened during
+// the initial QR/paste exchange.
+//
+// Why 60 digits, why decimal:
+//   * Signal ships a 60-digit safety number; the format is widely
+//     understood and easy to read on a phone call. Decimal keeps the
+//     comparison fully accessible (no hex glyphs, no wordlist), and
+//     groups of 5 digits map cleanly to short verbal chunks.
+//   * 60 decimal digits ≈ 199 bits of entropy from BLAKE3. We truncate
+//     the XOF stream to 48 bytes (12 × u32 → mod 100_000). The mod
+//     reduction bias is bounded by 2^32 / 100_000 ≈ 42_949 worst-case
+//     vs the cycle of 100_000 — i.e. ~0.0023% bias per group, far
+//     below "matters for a 60-digit human-compared SAS" thresholds.
+//
+// Domain separation:
+//   * `b"pizzini.safety-number.v1"` is included so a future format change
+//     (e.g. emoji SAS, longer digit code) gets a distinct v2 derivation
+//     and cannot be confused with a v1 SAS by either side.
+//   * Inputs are sorted byte-lexicographically before hashing so Alice
+//     and Bob feed the hasher in the same order regardless of who is
+//     the local / remote peer. The order tag follows: `b"\x21\x21"` is
+//     the two `IdentityKey` wire lengths (33 bytes each, asserted at
+//     entry) so a key-confusion attack between (peer_a || peer_b) and
+//     a hypothetical (peer_a || peer_b_truncated) cannot collide.
+
+/// Wire size of one IdentityKey public half: 1-byte DJB type prefix +
+/// 32-byte Curve25519 point. The SAS derivation rejects any input that
+/// is not exactly this many bytes, on either side.
+pub const SAFETY_NUMBER_IDENTITY_LEN: usize = 33;
+
+/// Length of the rendered safety number in ASCII digits (no spaces).
+/// Caller formats the spacing (typically `XXXXX XXXXX ... XXXXX` —
+/// twelve groups of five) at the display layer.
+pub const SAFETY_NUMBER_DIGIT_LEN: usize = 60;
+
+/// Domain-separation tag for the v1 SAS derivation. Any change to
+/// digit count, group layout, or hash input ordering MUST bump the
+/// version suffix so that a v2 client never accepts a v1 SAS as a
+/// match.
+const SAFETY_NUMBER_DOMAIN_TAG: &[u8] = b"pizzini.safety-number.v1";
+
+/// Derive the symmetric Pizzini safety number for the pair of identity
+/// keys `(peer_a, peer_b)`. Order is normalized internally — either
+/// caller order produces the same 60 digits.
+///
+/// Writes exactly `SAFETY_NUMBER_DIGIT_LEN = 60` ASCII bytes (each in
+/// `b'0'..=b'9'`) to `out_buf` on success. Returns
+/// `PIZZINI_ERR_INVALID_ARG` for null pointers, wrong-length identity
+/// inputs, or `out_buf_cap < 60`.
+///
+/// # Safety
+/// `peer_a` must point to `peer_a_len` readable bytes;
+/// `peer_b` must point to `peer_b_len` readable bytes;
+/// `out_buf` must point to `out_buf_cap` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_safety_number_derive(
+    peer_a: *const u8,
+    peer_a_len: usize,
+    peer_b: *const u8,
+    peer_b_len: usize,
+    out_buf: *mut u8,
+    out_buf_cap: usize,
+) -> i32 {
+    if peer_a.is_null() || peer_b.is_null() || out_buf.is_null() {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    if peer_a_len != SAFETY_NUMBER_IDENTITY_LEN || peer_b_len != SAFETY_NUMBER_IDENTITY_LEN {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    if out_buf_cap < SAFETY_NUMBER_DIGIT_LEN {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+
+    // SAFETY: lengths validated above; caller asserted slice validity.
+    let a = unsafe { std::slice::from_raw_parts(peer_a, peer_a_len) };
+    let b = unsafe { std::slice::from_raw_parts(peer_b, peer_b_len) };
+
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(SAFETY_NUMBER_DOMAIN_TAG);
+    // Length tags bind both inputs to their declared sizes — a defense
+    // against length-extension-style confusion if SAFETY_NUMBER_IDENTITY_LEN
+    // ever changes in a future version without a domain-tag bump.
+    hasher.update(&[SAFETY_NUMBER_IDENTITY_LEN as u8, SAFETY_NUMBER_IDENTITY_LEN as u8]);
+    hasher.update(lo);
+    hasher.update(hi);
+
+    let mut xof = [0u8; 48];
+    hasher.finalize_xof().fill(&mut xof);
+
+    // SAFETY: out_buf has at least SAFETY_NUMBER_DIGIT_LEN writable bytes.
+    let out = unsafe { std::slice::from_raw_parts_mut(out_buf, SAFETY_NUMBER_DIGIT_LEN) };
+    for i in 0..12 {
+        let word = u32::from_be_bytes(xof[i * 4..i * 4 + 4].try_into().unwrap());
+        let group = word % 100_000;
+        // 5 digits, big-endian decimal (most significant first).
+        let mut n = group;
+        for j in (0..5).rev() {
+            out[i * 5 + j] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+    }
+    PIZZINI_OK
+}
+
 /// FFI ceiling on `bits` to prevent an untrusted caller from wedging
 /// the host thread. 26 is well above the protocol's
 /// `HASHCASH_DEFAULT_BITS = 18` (which costs ~1s on a modern phone),
@@ -853,6 +964,13 @@ pub unsafe extern "C" fn pizzini_verify_identity_signature(
     signature: *const u8,
     signature_len: usize,
 ) -> i32 {
+    // F-NEW-101: keep the no-tag FFI in source but route every caller
+    // through the v2 form. Internal callers use `_v2` directly; the
+    // no-tag form here is the legacy shim and is removed from cbindgen
+    // via the #[doc(hidden)] attribute. Future call sites MUST take
+    // the v2 path — the tag-less variant is structurally vulnerable to
+    // cross-context signature reuse if a future caller passes
+    // attacker-influenced bytes without their own domain prefix.
     if identity_pub.is_null() || message.is_null() || signature.is_null() {
         return PIZZINI_ERR_INVALID_ARG;
     }
@@ -875,6 +993,60 @@ pub unsafe extern "C" fn pizzini_verify_identity_signature(
         Err(_) => return PIZZINI_ERR_INTERNAL,
     };
     if key.verify_signature(msg, sig) {
+        PIZZINI_OK
+    } else {
+        PIZZINI_ERR_BAD_SIGNATURE
+    }
+}
+
+/// F-NEW-101: domain-separated identity signature verify. The signed
+/// bytes the verifier reconstructs are
+/// `u16_be(context_tag_len) || context_tag || message`. A caller that
+/// forgets to pass the tag — or passes a different tag than the
+/// signer — gets `PIZZINI_ERR_BAD_SIGNATURE`. The tag MUST be
+/// non-empty; empty tags collapse to the unsafe legacy contract.
+///
+/// # Safety
+/// `identity_pub` (33 bytes), `context_tag` (`context_tag_len`),
+/// `message` (`message_len`), and `signature` (64 bytes) must point
+/// at readable buffers of the stated sizes.
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_verify_identity_signature_v2(
+    identity_pub: *const u8,
+    identity_pub_len: usize,
+    context_tag: *const u8,
+    context_tag_len: usize,
+    message: *const u8,
+    message_len: usize,
+    signature: *const u8,
+    signature_len: usize,
+) -> i32 {
+    if identity_pub.is_null() || context_tag.is_null() || message.is_null() || signature.is_null() {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    if identity_pub_len != 33 || signature_len != 64 {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    if context_tag_len == 0 || context_tag_len > u16::MAX as usize {
+        // Empty tag = legacy contract; refuse so an attacker-influenced
+        // caller can't downgrade to the tag-less surface.
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted slice validity above.
+    let id_bytes = unsafe { std::slice::from_raw_parts(identity_pub, identity_pub_len) };
+    let tag = unsafe { std::slice::from_raw_parts(context_tag, context_tag_len) };
+    let msg = unsafe { std::slice::from_raw_parts(message, message_len) };
+    let sig = unsafe { std::slice::from_raw_parts(signature, signature_len) };
+
+    let key = match PublicKey::deserialize(id_bytes) {
+        Ok(k) => k,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    let mut signed = Vec::with_capacity(2 + tag.len() + msg.len());
+    signed.extend_from_slice(&(tag.len() as u16).to_be_bytes());
+    signed.extend_from_slice(tag);
+    signed.extend_from_slice(msg);
+    if key.verify_signature(&signed, sig) {
         PIZZINI_OK
     } else {
         PIZZINI_ERR_BAD_SIGNATURE
@@ -905,6 +1077,9 @@ pub unsafe extern "C" fn pizzini_store_identity_sign(
     out_cap: usize,
     out_len: *mut usize,
 ) -> i32 {
+    // Legacy tag-less signing path. Kept for ABI continuity but no
+    // longer called by Swift (RelayClient.swift uses the _v2 form
+    // post-F-NEW-101). Any future caller MUST prefer the _v2 form.
     if store.is_null() || payload.is_null() || out_sig.is_null() || out_len.is_null() {
         return PIZZINI_ERR_INVALID_ARG;
     }
@@ -914,6 +1089,65 @@ pub unsafe extern "C" fn pizzini_store_identity_sign(
     let kp = s.local_identity_keypair();
     let mut rng = OsRng.unwrap_err();
     let sig = match kp.private_key().calculate_signature(payload_bytes, &mut rng) {
+        Ok(s) => s,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    let sig_bytes: &[u8] = &sig;
+    if sig_bytes.len() > out_cap {
+        unsafe { *out_len = sig_bytes.len() };
+        return PIZZINI_ERR_BUFFER_TOO_SMALL;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(sig_bytes.as_ptr(), out_sig, sig_bytes.len());
+        *out_len = sig_bytes.len();
+    }
+    PIZZINI_OK
+}
+
+/// F-NEW-101: domain-separated identity sign. Signs
+/// `u16_be(context_tag_len) || context_tag || payload`. The tag MUST
+/// be non-empty; passing an empty tag returns `PIZZINI_ERR_INVALID_ARG`
+/// to prevent a misuse path from silently producing legacy-format
+/// signatures.
+///
+/// # Safety
+/// `store` must point to a live `DeviceStore`. `context_tag`
+/// (`context_tag_len`) and `payload` (`payload_len`) must point to
+/// readable buffers. `out_sig` must be writable for `out_cap` bytes;
+/// `out_len` writable for one `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_store_identity_sign_v2(
+    store: *mut DeviceStore,
+    context_tag: *const u8,
+    context_tag_len: usize,
+    payload: *const u8,
+    payload_len: usize,
+    out_sig: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if store.is_null()
+        || context_tag.is_null()
+        || payload.is_null()
+        || out_sig.is_null()
+        || out_len.is_null()
+    {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    if context_tag_len == 0 || context_tag_len > u16::MAX as usize {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted slice + pointer validity.
+    let s = unsafe { &*store };
+    let tag = unsafe { std::slice::from_raw_parts(context_tag, context_tag_len) };
+    let payload_bytes = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+    let mut signed = Vec::with_capacity(2 + tag.len() + payload_bytes.len());
+    signed.extend_from_slice(&(tag.len() as u16).to_be_bytes());
+    signed.extend_from_slice(tag);
+    signed.extend_from_slice(payload_bytes);
+    let kp = s.local_identity_keypair();
+    let mut rng = OsRng.unwrap_err();
+    let sig = match kp.private_key().calculate_signature(&signed, &mut rng) {
         Ok(s) => s,
         Err(_) => return PIZZINI_ERR_INTERNAL,
     };
@@ -2069,5 +2303,157 @@ mod tests {
             pizzini_hashcash_compute(challenge.as_ptr(), challenge.len(), 64, &mut nonce_bad)
         };
         assert_eq!(rc_dos, PIZZINI_ERR_INVALID_ARG);
+    }
+
+    // ───── Safety number (SAS) ─────────────────────────────────────────
+
+    /// Helper: generate two distinct IdentityKey public bytes via the
+    /// FFI so tests use the same shape Swift sees on real devices.
+    fn two_identity_publics() -> (Vec<u8>, Vec<u8>) {
+        let a = unsafe { pizzini_store_new(std::ptr::null(), 0) };
+        let b = unsafe { pizzini_store_new(std::ptr::null(), 0) };
+        assert!(!a.is_null() && !b.is_null());
+        let mut a_pub = vec![0u8; 64];
+        let mut a_len = 0usize;
+        let mut b_pub = vec![0u8; 64];
+        let mut b_len = 0usize;
+        unsafe {
+            assert_eq!(
+                pizzini_store_identity_public(a, a_pub.as_mut_ptr(), a_pub.len(), &mut a_len),
+                PIZZINI_OK
+            );
+            assert_eq!(
+                pizzini_store_identity_public(b, b_pub.as_mut_ptr(), b_pub.len(), &mut b_len),
+                PIZZINI_OK
+            );
+            pizzini_store_free(a);
+            pizzini_store_free(b);
+        }
+        a_pub.truncate(a_len);
+        b_pub.truncate(b_len);
+        assert_eq!(a_pub.len(), SAFETY_NUMBER_IDENTITY_LEN);
+        assert_eq!(b_pub.len(), SAFETY_NUMBER_IDENTITY_LEN);
+        (a_pub, b_pub)
+    }
+
+    #[test]
+    fn safety_number_is_60_ascii_digits() {
+        let (a, b) = two_identity_publics();
+        let mut out = [0u8; SAFETY_NUMBER_DIGIT_LEN];
+        let rc = unsafe {
+            pizzini_safety_number_derive(
+                a.as_ptr(),
+                a.len(),
+                b.as_ptr(),
+                b.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(rc, PIZZINI_OK);
+        assert!(out.iter().all(|c| (b'0'..=b'9').contains(c)));
+    }
+
+    #[test]
+    fn safety_number_is_order_independent() {
+        let (a, b) = two_identity_publics();
+        let mut fwd = [0u8; SAFETY_NUMBER_DIGIT_LEN];
+        let mut rev = [0u8; SAFETY_NUMBER_DIGIT_LEN];
+        unsafe {
+            pizzini_safety_number_derive(
+                a.as_ptr(),
+                a.len(),
+                b.as_ptr(),
+                b.len(),
+                fwd.as_mut_ptr(),
+                fwd.len(),
+            );
+            pizzini_safety_number_derive(
+                b.as_ptr(),
+                b.len(),
+                a.as_ptr(),
+                a.len(),
+                rev.as_mut_ptr(),
+                rev.len(),
+            );
+        }
+        assert_eq!(
+            fwd, rev,
+            "Alice's and Bob's SAS must match regardless of caller order"
+        );
+    }
+
+    #[test]
+    fn safety_number_differs_per_pair() {
+        let (a, b) = two_identity_publics();
+        let (_a2, c) = two_identity_publics();
+        let mut ab = [0u8; SAFETY_NUMBER_DIGIT_LEN];
+        let mut ac = [0u8; SAFETY_NUMBER_DIGIT_LEN];
+        unsafe {
+            pizzini_safety_number_derive(
+                a.as_ptr(), a.len(), b.as_ptr(), b.len(),
+                ab.as_mut_ptr(), ab.len(),
+            );
+            pizzini_safety_number_derive(
+                a.as_ptr(), a.len(), c.as_ptr(), c.len(),
+                ac.as_mut_ptr(), ac.len(),
+            );
+        }
+        assert_ne!(
+            ab, ac,
+            "Substituting one identity must change the SAS (the whole point)"
+        );
+    }
+
+    #[test]
+    fn safety_number_rejects_wrong_identity_length() {
+        let (a, _b) = two_identity_publics();
+        let short = vec![0u8; 32]; // missing the 1-byte DJB prefix
+        let mut out = [0u8; SAFETY_NUMBER_DIGIT_LEN];
+        let rc = unsafe {
+            pizzini_safety_number_derive(
+                a.as_ptr(),
+                a.len(),
+                short.as_ptr(),
+                short.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(rc, PIZZINI_ERR_INVALID_ARG);
+    }
+
+    #[test]
+    fn safety_number_rejects_small_output_buffer() {
+        let (a, b) = two_identity_publics();
+        let mut out = [0u8; SAFETY_NUMBER_DIGIT_LEN - 1];
+        let rc = unsafe {
+            pizzini_safety_number_derive(
+                a.as_ptr(),
+                a.len(),
+                b.as_ptr(),
+                b.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(rc, PIZZINI_ERR_INVALID_ARG);
+    }
+
+    #[test]
+    fn safety_number_rejects_null_pointers() {
+        let (a, _b) = two_identity_publics();
+        let mut out = [0u8; SAFETY_NUMBER_DIGIT_LEN];
+        let rc = unsafe {
+            pizzini_safety_number_derive(
+                a.as_ptr(),
+                a.len(),
+                std::ptr::null(),
+                SAFETY_NUMBER_IDENTITY_LEN,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(rc, PIZZINI_ERR_INVALID_ARG);
     }
 }

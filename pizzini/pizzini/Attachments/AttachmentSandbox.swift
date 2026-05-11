@@ -36,8 +36,11 @@ enum AttachmentSandbox {
 
     /// Root `attachments/` directory. Created on first call; idempotent.
     /// Excluded from iCloud backup so a journalist's iCloud-backed
-    /// account can't leak attachment bytes off the device. Confirmed by
-    /// `URLResourceKey.isExcludedFromBackupKey` on the directory.
+    /// account can't leak attachment bytes off the device. Both the
+    /// protection class and the backup-exclusion flag are RE-ASSERTED
+    /// on every call — a refactor that ever creates the directory
+    /// out-of-band can't silently re-enable backup or downgrade the
+    /// protection class.
     static func root() throws -> URL {
         let fm = FileManager.default
         guard let appSupport = fm.urls(
@@ -60,15 +63,21 @@ enum AttachmentSandbox {
                     .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication,
                 ],
             )
-            // Mark the whole tree non-iCloud-backed in one shot. The
-            // resource key flag inherits to children, so per-attachment
-            // directories don't each need to opt out.
-            var v = URLResourceValues()
-            v.isExcludedFromBackup = true
-            var mutable = dir
-            try mutable.setResourceValues(v)
         }
+        try assertSandboxAttributes(dir)
         return dir
+    }
+
+    /// Re-assert the protection class + iCloud backup exclusion on a
+    /// sandbox-managed directory. Setting the same value is a no-op,
+    /// so this is safe on every call. Belt-and-suspenders against
+    /// future code paths that might create a sibling directory without
+    /// the attributes.
+    private static func assertSandboxAttributes(_ url: URL) throws {
+        var v = URLResourceValues()
+        v.isExcludedFromBackup = true
+        var mutable = url
+        try mutable.setResourceValues(v)
     }
 
     /// Per-attachment inbound directory. Caller passes the 16-byte
@@ -96,6 +105,11 @@ enum AttachmentSandbox {
     ) throws -> URL {
         let dir = try inboundDirectory(forAttachmentId: attachmentId)
         let url = dir.appending(path: sanitizedFilename, directoryHint: .notDirectory)
+        // Defense in depth on top of FilenameSanitizer: if the URL
+        // resolves outside the per-attachment directory (which would
+        // require a `..` or absolute-path component that survived
+        // sanitization), refuse the write.
+        try assertContained(url: url, in: dir)
         do {
             try contents.write(
                 to: url,
@@ -111,6 +125,40 @@ enum AttachmentSandbox {
             throw SandboxError.writeFailed("\(error)")
         }
         return url
+    }
+
+    /// Assert that `url` is contained inside `dir` after URL
+    /// standardization. Throws `writeFailed` if the resolved path
+    /// would escape — the only place a `..`-bearing filename can
+    /// reach is here, and we close it at the sandbox layer.
+    static func assertContained(url: URL, in dir: URL) throws {
+        let resolved = url.standardized.path
+        let parent = dir.standardized.path
+        let parentPrefix = parent.hasSuffix("/") ? parent : parent + "/"
+        if !resolved.hasPrefix(parentPrefix) {
+            throw SandboxError.writeFailed("path escapes sandbox dir")
+        }
+    }
+
+    /// Wipe the entire `attachments/` tree — every inbound directory,
+    /// every outbound staging directory, every assembled file. Called
+    /// by `Storage.eraseAndReinitialize` as part of the duress flow so
+    /// the post-wipe filesystem contains no plaintext attachment bytes
+    /// at all. The SQLCipher DB rows that reference these files are
+    /// wiped in the same call (different code path), so cross-table
+    /// consistency is preserved.
+    ///
+    /// Idempotent: returns silently if the root directory does not
+    /// exist (first-launch pre-attachment state).
+    static func eraseEverything() {
+        let fm = FileManager.default
+        guard let appSupport = fm.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else { return }
+        let dir = appSupport.appending(path: rootName, directoryHint: .isDirectory)
+        guard fm.fileExists(atPath: dir.path) else { return }
+        try? fm.removeItem(at: dir)
     }
 
     /// Delete every per-attachment directory whose mtime is older than
@@ -149,10 +197,13 @@ enum AttachmentSandbox {
     /// a runtime safety check (we control the producer); a regression
     /// guard.
     static func isInPhotoLibraryOrICloudDocs(_ url: URL) -> Bool {
-        let path = url.path
-        return path.contains("/PhotoData/")
-            || path.contains("/Photos/")
-            || path.contains("/Documents/")
+        // Component-exact match. Substring containment would
+        // false-positive on any path that happens to contain
+        // `/Documents/` as a substring (e.g. `Mobile Documents`).
+        let parts = Set(url.standardized.pathComponents)
+        return parts.contains("PhotoData")
+            || parts.contains("Photos")
+            || parts.contains("Documents")
     }
 
     private static func perAttachmentDirectory(parent: String, id: Data) throws -> URL {
@@ -161,6 +212,16 @@ enum AttachmentSandbox {
         let hex = id.map { String(format: "%02x", $0) }.joined()
         let dir = parentURL.appending(path: hex, directoryHint: .isDirectory)
         let fm = FileManager.default
+        if !fm.fileExists(atPath: parentURL.path) {
+            try fm.createDirectory(
+                at: parentURL,
+                withIntermediateDirectories: true,
+                attributes: [
+                    .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication,
+                ],
+            )
+            try assertSandboxAttributes(parentURL)
+        }
         if !fm.fileExists(atPath: dir.path) {
             try fm.createDirectory(
                 at: dir,
@@ -170,6 +231,7 @@ enum AttachmentSandbox {
                 ],
             )
         }
+        try assertSandboxAttributes(dir)
         return dir
     }
 }

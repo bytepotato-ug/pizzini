@@ -119,12 +119,18 @@ extension ChatStore {
             ))
         }
         let kind = GroupOpKind.create(name: trimmedName, initialMembers: members)
+        // Create op has no prior state — witness is the canonical
+        // empty-member-set root. Receivers of the Create op
+        // bootstrap directly from the op's `initialMembers`
+        // without running through `apply`, so this value is
+        // structural rather than validated against any local view.
         guard let signedOp = signOp(
             session: session,
             groupId: groupId,
             epoch: 0,
             parent: GroupOp.zeroParentDigest,
             operatorIdentity: myCard.peerId,
+            priorMemberSetRoot: ChatGroup.memberSetRoot(of: []),
             kind: kind,
         ) else { return nil }
 
@@ -225,6 +231,7 @@ extension ChatStore {
             epoch: state.groups[gIdx].currentEpoch + 1,
             parent: state.groups[gIdx].lastOpDigest,
             operatorIdentity: myCard.peerId,
+            priorMemberSetRoot: state.groups[gIdx].memberSetRoot,
             kind: kind,
         ) else { return false }
 
@@ -294,6 +301,7 @@ extension ChatStore {
             epoch: state.groups[gIdx].currentEpoch + 1,
             parent: state.groups[gIdx].lastOpDigest,
             operatorIdentity: myCard.peerId,
+            priorMemberSetRoot: state.groups[gIdx].memberSetRoot,
             kind: kind,
         ) else { return false }
 
@@ -341,6 +349,7 @@ extension ChatStore {
             epoch: state.groups[gIdx].currentEpoch + 1,
             parent: state.groups[gIdx].lastOpDigest,
             operatorIdentity: myCard.peerId,
+            priorMemberSetRoot: state.groups[gIdx].memberSetRoot,
             kind: kind,
         ) else { return false }
 
@@ -398,6 +407,7 @@ extension ChatStore {
             epoch: state.groups[gIdx].currentEpoch + 1,
             parent: state.groups[gIdx].lastOpDigest,
             operatorIdentity: myCard.peerId,
+            priorMemberSetRoot: state.groups[gIdx].memberSetRoot,
             kind: kind,
         ) else { return false }
 
@@ -1192,6 +1202,7 @@ extension ChatStore {
             epoch: state.groups[gIdx].currentEpoch + 1,
             parent: state.groups[gIdx].lastOpDigest,
             operatorIdentity: myCard.peerId,
+            priorMemberSetRoot: state.groups[gIdx].memberSetRoot,
             kind: kind,
         ) else { return }
         var sx = ChatGroup.ApplySideEffects(localIdentityPub: myCard.peerId)
@@ -1428,6 +1439,24 @@ extension ChatStore {
             NSLog("[pizzini.group] groupOp ← \(short(sender)): unauthorised operator")
         case let .rejectedMalformed(reason):
             NSLog("[pizzini.group] groupOp ← \(short(sender)): malformed — \(reason)")
+        case let .rejectedMemberSetMismatch(local, claimed):
+            // USP #5. The operator signed an op witnessing a member
+            // set that doesn't match our local view — surfaces as a
+            // stronger warning than equivocation because the
+            // signature itself verified, but the operator's reality
+            // disagreed with ours. UI string is deliberately
+            // similar to the equivocation copy so the user doesn't
+            // need to learn two new vocab words.
+            NSLog(
+                "[pizzini.group] groupOp ← \(short(sender)):"
+                    + " MEMBER SET MISMATCH at epoch \(op.epoch)"
+                    + " (local=\(short(local)), claimed=\(short(claimed)))",
+            )
+            appendGroupSystem(
+                groupAt: gIdx,
+                "Group integrity warning: a group action arrived with a member-list signature"
+                    + " that doesn't match this device's view. Op rejected.",
+            )
         }
         Storage.upsertGroup(state.groups[gIdx])
     }
@@ -1487,6 +1516,21 @@ extension ChatStore {
         }
         guard (try? bootstrap.verifySignature()) == true else {
             NSLog("[pizzini.group] bootstrap ← \(short(sender)): signature INVALID")
+            return
+        }
+        // USP #5 self-consistency: the admin's signed `members[]`
+        // must hash to the `memberSetRoot` they also signed. A
+        // mismatch means the admin shipped an internally
+        // inconsistent snapshot — refuse to bootstrap from it.
+        // The signature alone proves the bytes came from the
+        // admin's key; this check proves the admin's claim about
+        // their own state is at least self-consistent.
+        guard bootstrap.verifyMemberSetRoot() else {
+            NSLog(
+                "[pizzini.group] bootstrap ← \(short(sender)):"
+                    + " member-set root MISMATCH — refusing to bootstrap"
+                    + " (groupId=\(short(bootstrap.groupId)))",
+            )
             return
         }
         // The issuing operator must be an active admin in their own
@@ -1798,7 +1842,25 @@ extension ChatStore {
             // libsignal's store keeps our chain — no FFI to forget
             // it. Cosmetic; we won't use it again because
             // sendGroupMessage gates on activeMember-self.
-            return
+            //
+            // F-NEW-506: if a same-drain re-add brought us back as an
+            // active member (admin removed-then-added in quick
+            // succession), don't return early — fall through to the
+            // SKDM hook below, which will mint a fresh chain via
+            // `enrolMyChainOnFirstJoin`-equivalent logic when it
+            // sees `myCurrentDistributionId == nil` AND we're
+            // active again.
+            if let myCard,
+               state.groups[gIdx].activeMembers.contains(where: { $0.peerId == myCard.peerId }) {
+                // Re-mint a fresh chain id; the SKDM broadcast hook
+                // below ships it to all other active members.
+                let freshDistribution = UUID()
+                state.groups[gIdx].myCurrentDistributionId = freshDistribution
+                state.groups[gIdx].lastRotatedAt = Date()
+                // Fall through to ensureMySKDMReachesActiveMembers.
+            } else {
+                return
+            }
         }
         // Pending invitations don't enrol or broadcast anything
         // until the user taps Join — silently skip the SKDM /
@@ -1818,6 +1880,28 @@ extension ChatStore {
         }
         // Bidirectional SKDM (HIGH-2).
         ensureMySKDMReachesActiveMembers(groupAt: gIdx, session: session, relay: relay)
+        // F-NEW-502: surface a visible system row when an admin
+        // added a peer who is NOT in our 1:1 contacts. The
+        // cryptographic state of the group accepts the new member
+        // (per the group's transitive-trust design), but the user
+        // deserves an explicit "you have not personally verified
+        // this identity" signal in-chat — Group Settings hides it
+        // behind a tap. The system row dedups against our own
+        // additions and against repeats from the same op replay.
+        for peer in sx.newActiveMembers {
+            let isOneOnOneContact = state.contacts.contains { $0.identityPub == peer }
+            guard !isOneOnOneContact else { continue }
+            let name = memberDisplayName(peer, in: state.groups[gIdx])
+            let body = "\(name) was added to this group. You have not personally verified their identity yet — only the admin who added them has."
+            // Dedup: don't repaint the same warning if the previous
+            // log row is already this exact message.
+            if let last = state.groups[gIdx].log.last,
+               last.kind == .system,
+               last.text == body {
+                continue
+            }
+            appendGroupSystem(groupAt: gIdx, body)
+        }
     }
 
     /// For every active member who isn't us and isn't yet in
@@ -1861,12 +1945,22 @@ extension ChatStore {
         }
     }
 
+    /// Build + sign a new GroupOp.
+    ///
+    /// `priorMemberSetRoot` (USP #5) is the canonical hash of the
+    /// member set the operator believed to be current at signing
+    /// time. Callers in steady state pass `group.memberSetRoot`;
+    /// the Create path passes `ChatGroup.memberSetRoot(of: [])`
+    /// (no prior members existed). Receivers verify this against
+    /// their own local view in `GroupApply` — see
+    /// `rejectedMemberSetMismatch`.
     private func signOp(
         session: Session,
         groupId: Data,
         epoch: UInt64,
         parent: Data,
         operatorIdentity: Data,
+        priorMemberSetRoot: Data,
         kind: GroupOpKind,
     ) -> GroupOp? {
         let now = UInt64(Date().timeIntervalSince1970 * 1000)
@@ -1876,11 +1970,15 @@ extension ChatStore {
             parentDigest: parent,
             operatorIdentity: operatorIdentity,
             timestampMillis: now,
+            priorMemberSetRoot: priorMemberSetRoot,
             kind: kind,
             signature: Data(repeating: 0, count: GroupOp.signatureSize),
         )
         guard let header = try? unsigned.encodedHeader(),
-              let sig = try? session.identitySign(header)
+              let sig = try? session.identitySign(
+                  header,
+                  contextTag: Session.SignatureContext.groupOp,
+              )
         else { return nil }
         return GroupOp(
             groupId: unsigned.groupId,
@@ -1888,6 +1986,7 @@ extension ChatStore {
             parentDigest: unsigned.parentDigest,
             operatorIdentity: unsigned.operatorIdentity,
             timestampMillis: unsigned.timestampMillis,
+            priorMemberSetRoot: unsigned.priorMemberSetRoot,
             kind: unsigned.kind,
             signature: sig,
         )
@@ -1901,6 +2000,10 @@ extension ChatStore {
         operatorIdentity: Data,
     ) -> GroupBootstrap? {
         let now = UInt64(Date().timeIntervalSince1970 * 1000)
+        // USP #5: stamp the canonical member-set root in lockstep
+        // with the `members` array. The joiner re-derives this
+        // from the parsed members and rejects the snapshot if the
+        // two disagree — see `GroupBootstrap.verifyMemberSetRoot`.
         let unsigned = GroupBootstrap(
             groupId: group.id,
             displayName: group.displayName,
@@ -1909,10 +2012,14 @@ extension ChatStore {
             lastOpDigest: group.lastOpDigest,
             operatorIdentity: operatorIdentity,
             timestampMillis: now,
+            memberSetRoot: group.memberSetRoot,
             signature: Data(repeating: 0, count: GroupOp.signatureSize),
         )
         guard let header = try? unsigned.encodedHeader(),
-              let sig = try? session.identitySign(header)
+              let sig = try? session.identitySign(
+                  header,
+                  contextTag: Session.SignatureContext.groupBootstrap,
+              )
         else { return nil }
         return GroupBootstrap(
             groupId: unsigned.groupId,
@@ -1922,6 +2029,7 @@ extension ChatStore {
             lastOpDigest: unsigned.lastOpDigest,
             operatorIdentity: unsigned.operatorIdentity,
             timestampMillis: unsigned.timestampMillis,
+            memberSetRoot: unsigned.memberSetRoot,
             signature: sig,
         )
     }

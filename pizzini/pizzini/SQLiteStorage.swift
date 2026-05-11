@@ -41,11 +41,15 @@ final class SQLiteStorage {
         self.databasePath = path
     }
 
+#if DEBUG
     /// Test-only entry point: bypass DBKey + the Keychain-bound
     /// derivation chain. Tests pass an opened `Database` (typically
     /// pointed at `NSTemporaryDirectory()`) and a fresh raw key.
     /// The migration runner is invoked here so the schema lands
     /// before the test touches the singleton.
+    ///
+    /// Gated on `#if DEBUG` so the symbols are absent from release
+    /// builds — an in-process attacker can't pivot through them.
     @discardableResult
     static func _bootstrapForTesting(path: String, rawKey: Data) throws -> SQLiteStorage {
         let db = try Database(path: path, rawKey: rawKey)
@@ -61,16 +65,35 @@ final class SQLiteStorage {
     static func _resetForTesting() {
         shared = nil
     }
+#endif
 
     /// Open (or create) the SQLCipher database. Idempotent — calling
     /// twice in a single process is a programmer bug and trips a
     /// precondition. The expected lifecycle is one call from
     /// `pizziniApp.init`-equivalent code, before any UI surface
     /// reads from `Storage`.
+    ///
+    /// **Orphan-wipe recovery.** If a `.sqlite` file exists on disk
+    /// AND no SE-wrap row is present in Keychain, the prior duress
+    /// wipe was interrupted between "unlink DB" and "erase keys" (or
+    /// the user has a Keychain-restored backup pointing at a DB the
+    /// keys can no longer decrypt). Either way the DB file is unusable
+    /// — unlink it before deriving fresh key material so the next
+    /// open produces a clean database.
     static func bootstrap() throws {
         precondition(shared == nil, "SQLiteStorage.bootstrap called twice")
         let path = try databaseURL().path
         try ensureParentDirectory()
+
+        // Orphan check before any key derivation. If a DB file exists
+        // but the SE wrap doesn't, the file is forensically useless
+        // (no key can ever decrypt it) and would just produce a
+        // confusing open-failure if we tried. Unlink it and the
+        // next path proceeds as fresh-install.
+        let fm = FileManager.default
+        if fm.fileExists(atPath: path), !DBKey.isInitialized {
+            unlinkDatabaseFiles()
+        }
 
         // Run Argon2id with the same params the DB was originally
         // keyed under. On first launch `loadStoredParams()` returns
@@ -82,7 +105,56 @@ final class SQLiteStorage {
 
         let db = try Database(path: path, rawKey: key)
         try Migrator.run(on: db)
-        shared = SQLiteStorage(db: db, path: path)
+        let inst = SQLiteStorage(db: db, path: path)
+        shared = inst
+        // Re-assert file-protection + iCloud-backup-exclusion on the
+        // database files themselves (not just the parent directory).
+        // iOS inherits the directory's class for newly-created files,
+        // but Apple recommends setting per-file `URLResourceValues`
+        // explicitly and the cost is one no-op syscall per file.
+        try? inst.reassertDatabaseFileAttributes()
+
+        // USP #8: rotate the at-rest encryption key if it's been
+        // longer than `DBKey.rotationInterval` since the last
+        // rotation. Runs INLINE on bootstrap — Argon2id + rekey +
+        // VACUUM total ~1–5 s on a typical DB. That's a one-time
+        // cost per week (per launch frequency), paid on the first
+        // unlock the rotation window opens. A failure here is
+        // logged but non-fatal: the DB is still openable under the
+        // current key, so the user keeps working; the next launch
+        // re-evaluates `rotationDue` and tries again. Better than
+        // refusing to boot the chat over a missed rotation.
+        if DBKey.rotationDue() {
+            do {
+                _ = try DBKey.rotateKeyMaterial(liveDB: db, params: params)
+                NSLog("[pizzini.dbkey] at-rest key rotated (USP #8)")
+            } catch {
+                NSLog("[pizzini.dbkey] at-rest key rotation FAILED: \(error)")
+            }
+        }
+    }
+
+    /// Unlink the SQLCipher database file + its WAL/SHM sidecars.
+    /// Closes the open connection (drops `shared`) so the next
+    /// `bootstrap()` call re-opens fresh. Used by the duress wipe
+    /// path in `Storage.eraseAndReinitialize` and by the orphan
+    /// recovery path in `bootstrap()` itself.
+    static func unlinkDatabaseFiles() {
+        let fm = FileManager.default
+        let path: String
+        if let existing = shared {
+            path = existing.databasePath
+            shared = nil
+        } else {
+            guard let url = try? databaseURL() else { return }
+            path = url.path
+        }
+        try? fm.removeItem(atPath: path)
+        // SQLCipher writes `-wal` and `-shm` siblings for WAL
+        // journalling; both must go for the next open to produce a
+        // clean database.
+        try? fm.removeItem(atPath: path + "-wal")
+        try? fm.removeItem(atPath: path + "-shm")
     }
 
     /// Reset path used by `Storage.resetEverything`. Closes the
@@ -91,15 +163,31 @@ final class SQLiteStorage {
     /// wiped. Caller is responsible for re-persisting any preserved
     /// settings via the per-row mutators afterwards.
     static func wipeAndReopen() throws {
-        let path = shared.databasePath
-        shared = nil
-        try? FileManager.default.removeItem(atPath: path)
-        // SQLCipher writes a `-wal` and `-shm` sibling for WAL
-        // journalling; both must go for the next open to produce a
-        // clean database.
-        try? FileManager.default.removeItem(atPath: path + "-wal")
-        try? FileManager.default.removeItem(atPath: path + "-shm")
+        unlinkDatabaseFiles()
         try bootstrap()
+    }
+
+    /// Set `completeUntilFirstUserAuthentication` + excluded-from-backup
+    /// on the live database files. Per-file attributes layer on top of
+    /// the parent directory's class — the SHM/WAL sidecars are created
+    /// lazily by SQLCipher on first write, so this is called both at
+    /// bootstrap (covers the main `.sqlite`) and could be re-run after
+    /// the first transaction (covers the sidecars). Setting the same
+    /// value is a no-op.
+    private func reassertDatabaseFileAttributes() throws {
+        let paths = [databasePath, databasePath + "-wal", databasePath + "-shm"]
+        for p in paths {
+            var url = URL(fileURLWithPath: p)
+            guard FileManager.default.fileExists(atPath: p) else { continue }
+            var v = URLResourceValues()
+            v.isExcludedFromBackup = true
+            try? url.setResourceValues(v)
+            // The protection-class flag is a separate FileManager call.
+            try? FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                ofItemAtPath: p,
+            )
+        }
     }
 
     // MARK: - DB location
@@ -134,13 +222,20 @@ final class SQLiteStorage {
                     .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication,
                 ],
             )
-            // Exclude from iCloud backup — same rationale as the
-            // attachments sandbox in `AttachmentSandbox.swift`.
-            var v = URLResourceValues()
-            v.isExcludedFromBackup = true
-            var mutable = dir
-            try mutable.setResourceValues(v)
         }
+        // Re-assert the iCloud-backup-exclusion + protection class on
+        // every bootstrap, not just at creation. Setting the same value
+        // is a no-op, so this defends against (a) a future code path
+        // that creates the directory out-of-band, and (b) any iOS
+        // version that demands explicit re-assertion after restore.
+        var v = URLResourceValues()
+        v.isExcludedFromBackup = true
+        var mutable = dir
+        try? mutable.setResourceValues(v)
+        try? fm.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: dir.path,
+        )
     }
 
     // MARK: - Settings (singleton row)
@@ -235,13 +330,20 @@ final class SQLiteStorage {
             SELECT id, identity_pub, display_name, session_established,
                    last_message_at, last_seen_at, added_at,
                    last_refill_request_sent_at, last_refill_request_handled_at,
-                   ttl_seconds, read_receipts_enabled, peer_verify_key, last_bundle_served_at
+                   ttl_seconds, read_receipts_enabled, peer_verify_key, last_bundle_served_at,
+                   added_via, verified_at
             FROM contacts ORDER BY added_at ASC;
         """)
         var contacts: [Contact] = []
         while try stmt.step() {
             let idData = stmt.columnBlob(0) ?? Data()
             guard let uuid = idData.asUUID() else { continue }
+            let rawSource = stmt.columnText(13) ?? ContactSource.unknown.rawValue
+            // Schema v2 migration backfills 'qr_scan' for pre-v2 rows
+            // and the column is NOT NULL — but a future schema rewrite
+            // could in principle introduce a new variant. Fall back to
+            // `.unknown` instead of crashing the chat list.
+            let source = ContactSource(rawValue: rawSource) ?? .unknown
             var c = Contact(
                 id: uuid,
                 identityPub: stmt.columnBlob(1) ?? Data(),
@@ -258,6 +360,8 @@ final class SQLiteStorage {
                 readReceiptsEnabled: stmt.columnBool(10),
                 peerVerifyKey: stmt.columnBlob(11),
                 lastBundleServedAt: stmt.columnOptionalInt64(12).map { $0.dateFromEpochMs },
+                addedVia: source,
+                verifiedAt: stmt.columnOptionalInt64(14).map { $0.dateFromEpochMs },
             )
             c.log = try loadMessages(contactId: idData)
             c.deliveryTokensForPeer = try loadDeliveryTokens(contactId: idData)
@@ -266,14 +370,22 @@ final class SQLiteStorage {
         return contacts
     }
 
+    /// Note: `added_via` is intentionally absent from the ON CONFLICT
+    /// UPDATE list below. A contact's provenance is fixed the moment
+    /// it first enters the database. Re-scanning the same QR or
+    /// re-pasting the same URL doesn't change how it originally
+    /// arrived, and silently upgrading a `pasted_text` row to
+    /// `qr_scan` if the user later rescans would erase the warning
+    /// state that previously informed the verification UI.
     func upsertContact(_ c: Contact) throws {
         let stmt = try db.prepare("""
             INSERT INTO contacts (
                 id, identity_pub, display_name, session_established,
                 last_message_at, last_seen_at, added_at,
                 last_refill_request_sent_at, last_refill_request_handled_at,
-                ttl_seconds, read_receipts_enabled, peer_verify_key, last_bundle_served_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ttl_seconds, read_receipts_enabled, peer_verify_key, last_bundle_served_at,
+                added_via, verified_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 identity_pub = excluded.identity_pub,
                 display_name = excluded.display_name,
@@ -285,7 +397,8 @@ final class SQLiteStorage {
                 ttl_seconds = excluded.ttl_seconds,
                 read_receipts_enabled = excluded.read_receipts_enabled,
                 peer_verify_key = excluded.peer_verify_key,
-                last_bundle_served_at = excluded.last_bundle_served_at;
+                last_bundle_served_at = excluded.last_bundle_served_at,
+                verified_at = excluded.verified_at;
         """)
         try stmt
             .bind(c.id.data, at: 1)
@@ -301,6 +414,8 @@ final class SQLiteStorage {
             .bind(c.readReceiptsEnabled, at: 11)
             .bind(c.peerVerifyKey, at: 12)
             .bind(c.lastBundleServedAt, at: 13)
+            .bind(c.addedVia.rawValue, at: 14)
+            .bind(c.verifiedAt, at: 15)
             .run()
     }
 

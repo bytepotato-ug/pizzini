@@ -1,6 +1,7 @@
 import Foundation
 import PizziniCryptoCore
 import PizziniDB
+import Security
 
 /// One-shot migration from the legacy Keychain slots
 /// (`app-state` / `outbox` / `device-store` / `long-term-identity`)
@@ -29,8 +30,17 @@ enum StorageMigration {
     static let metaKey = "keychain_migration_v1_complete"
 
     static func run(storage: SQLiteStorage) throws {
-        // Already migrated? Nothing to do.
-        if try metaFlagPresent(storage: storage) { return }
+        // Already migrated? Re-probe the legacy slots anyway —
+        // a prior run could have set the marker BEFORE the delete
+        // pass completed (process kill, OOM, watchdog) and left
+        // plaintext Keychain copies behind. The delete is
+        // idempotent (returns success on errSecItemNotFound), so
+        // running it on every bootstrap is cheap and closes the
+        // post-marker-pre-delete crash window forever.
+        if try metaFlagPresent(storage: storage) {
+            deleteAllLegacySlots()
+            return
+        }
         // No legacy Keychain content? Set the marker and return —
         // fresh install needs no migration but should not re-probe
         // every launch.
@@ -47,16 +57,51 @@ enum StorageMigration {
         }
 
         // Verify readback BEFORE deleting the Keychain slots.
-        // This is the F-603-class defense from `Storage.loadOrCreateSession`:
-        // we only delete the source once the destination round-trips.
+        // Includes app-state, outbox, AND device-store round-trips
+        // so a `try?` decode failure cannot pretend to have migrated
+        // an outbox we couldn't actually parse.
         try verifyReadback(storage: storage)
-        try setMetaFlag(storage: storage)
 
-        Keychain.delete(account: legacyAppStateAccount)
-        Keychain.delete(account: legacyOutboxAccount)
-        Keychain.delete(account: legacyDeviceStoreAccount)
-        Keychain.delete(account: legacyIdentityAccount)
+        // **Delete-before-flag.** Drop the legacy slots first; only
+        // mark the migration complete once the source is gone. A
+        // process kill between the deletes and the flag means the
+        // next launch's `hasLegacyContent` check returns false (or
+        // partially false) and the migration is a no-op, leaving
+        // the marker unset — which is fine: the next launch sets
+        // it. A process kill in the prior ordering (flag set,
+        // deletes pending) left Cellebrite-extractable plaintext
+        // copies permanently behind the marker's short-circuit.
+        deleteAllLegacySlots()
+        try setMetaFlag(storage: storage)
         NSLog("[pizzini.migration] Keychain → SQLCipher migration complete")
+    }
+
+    /// Idempotent delete of every legacy Keychain slot. Each row is
+    /// overwritten with same-sized noise before delete so the on-disk
+    /// `keychain-2.db` page is re-encrypted under a fresh IV before
+    /// the row is unlinked — defense in depth against NAND-level
+    /// recovery of the pre-deletion ciphertext (F-NEW-403 mitigation
+    /// applied here too since these blobs are the same threat shape).
+    private static func deleteAllLegacySlots() {
+        for account in [
+            legacyAppStateAccount,
+            legacyOutboxAccount,
+            legacyDeviceStoreAccount,
+            legacyIdentityAccount,
+        ] {
+            secureDeleteLegacySlot(account: account)
+        }
+    }
+
+    private static func secureDeleteLegacySlot(account: String) {
+        if let existing = Keychain.read(account: account) {
+            var noise = [UInt8](repeating: 0, count: max(existing.count, 16))
+            let rc = SecRandomCopyBytes(kSecRandomDefault, noise.count, &noise)
+            if rc == errSecSuccess {
+                _ = Keychain.write(Data(noise), account: account)
+            }
+        }
+        Keychain.delete(account: account)
     }
 
     // MARK: - Legacy slot constants (frozen, never reused)
@@ -76,11 +121,21 @@ enum StorageMigration {
     }
 
     private static func migrateAppState(into storage: SQLiteStorage) throws {
-        guard
-            let data = Keychain.read(account: legacyAppStateAccount),
-            let state = try? JSONDecoder().decode(AppState.self, from: data)
-        else {
+        guard let data = Keychain.read(account: legacyAppStateAccount) else {
             return
+        }
+        // `try` (not `try?`) — a decode failure here is a hard
+        // migration error, NOT a silent drop. A `try?` would let the
+        // transaction commit with no settings row, the deletes would
+        // wipe the legacy slot, and the user's previous AppState
+        // would be permanently lost without any user-visible signal.
+        // Better to throw and let the next launch retry (the legacy
+        // row is still present because the deletes run AFTER verify).
+        let state: AppState
+        do {
+            state = try JSONDecoder().decode(AppState.self, from: data)
+        } catch {
+            throw MigrationError.appStateDecodeFailed(detail: "\(error)")
         }
         try storage.upsertSettings(state)
         for contact in state.contacts {
@@ -110,11 +165,16 @@ enum StorageMigration {
     }
 
     private static func migrateOutbox(into storage: SQLiteStorage) throws {
-        guard
-            let data = Keychain.read(account: legacyOutboxAccount),
-            let store = try? JSONDecoder().decode(OutboxStore.self, from: data)
-        else {
+        guard let data = Keychain.read(account: legacyOutboxAccount) else {
             return
+        }
+        // Same reasoning as `migrateAppState`: a decode failure must
+        // throw rather than silently drop the outbox.
+        let store: OutboxStore
+        do {
+            store = try JSONDecoder().decode(OutboxStore.self, from: data)
+        } catch {
+            throw MigrationError.outboxDecodeFailed(detail: "\(error)")
         }
         for (_, entry) in store.entries {
             try storage.upsertOutboxEntry(entry)
@@ -155,6 +215,30 @@ enum StorageMigration {
                 throw MigrationError.settingsNotReadable
             }
         }
+        // Outbox round-trip — explicitly verify that the row count
+        // in SQLCipher matches the legacy entries we tried to migrate.
+        // The migrate path uses `try` (not `try?`) on decode now, so
+        // a decode failure would have thrown earlier; this check
+        // catches any UPSERT path that silently no-ops (which would
+        // also be a bug, but is worth catching at the verify step).
+        if let data = Keychain.read(account: legacyOutboxAccount) {
+            let legacyCount: Int
+            do {
+                let store = try JSONDecoder().decode(OutboxStore.self, from: data)
+                legacyCount = store.entries.count
+            } catch {
+                // Decode failed at verify time too — let the caller
+                // throw the same shape as the migrate path would.
+                throw MigrationError.outboxDecodeFailed(detail: "\(error)")
+            }
+            let landed = try storage.loadOutbox().entries.count
+            guard landed == legacyCount else {
+                throw MigrationError.outboxRowCountMismatch(
+                    expected: legacyCount,
+                    actual: landed,
+                )
+            }
+        }
     }
 
     // MARK: - Marker
@@ -176,5 +260,8 @@ enum StorageMigration {
     enum MigrationError: Error {
         case deviceStoreNotReadable
         case settingsNotReadable
+        case appStateDecodeFailed(detail: String)
+        case outboxDecodeFailed(detail: String)
+        case outboxRowCountMismatch(expected: Int, actual: Int)
     }
 }

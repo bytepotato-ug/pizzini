@@ -25,7 +25,7 @@ struct NewGroupSheet: View {
             Form {
                 Section("Group name") {
                     TextField("e.g. field-team", text: $name)
-                        .textInputAutocapitalization(.words)
+                        .hardenedTextInput(autocap: .words)
                 }
                 Section {
                     if store.state.contacts.isEmpty {

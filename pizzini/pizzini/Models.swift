@@ -122,6 +122,50 @@ struct PersistedMessage: Codable, Identifiable, Sendable {
     }
 }
 
+/// How a contact's identity entered Pizzini. The single source of
+/// truth for "could a network attacker have substituted these bytes
+/// in transit?" The verification UI uses this to size the warning it
+/// shows before the first send.
+///
+/// `qrScan` — the camera saw the QR code in person. A MITM has to
+///            physically interpose on the visual channel between two
+///            phones held centimetres apart; assume out of scope unless
+///            the user later admits "actually I scanned it off
+///            WhatsApp."
+/// `pastedText` — the `pizzini1://…` URL came in via the system
+///                clipboard. Any channel could have produced those
+///                bytes (SMS, WhatsApp, email, AirDrop). Trust is
+///                NOT inferred from the entry mode — the safety
+///                number must be compared out of band before the
+///                contact is treated as verified.
+/// `unknown` — pre-v2 row whose provenance was never recorded. UI
+///             treats it identically to `qrScan` (because v1 only
+///             ever materialised contacts via the camera scanner) but
+///             keeps the distinction so a future audit/forensic flow
+///             can tell "we know it was scanned" from "we don't know."
+enum ContactSource: String, Codable, Sendable {
+    case qrScan = "qr_scan"
+    case pastedText = "pasted_text"
+    case unknown
+}
+
+/// Three-state UI trust ladder used by chat header, contact-list row
+/// and verification screen. Always derived from `Contact.addedVia` +
+/// `Contact.verifiedAt`; never stored on its own. Order is significant
+/// — comparison operators are used by tests to assert "did the state
+/// only improve" after a successful SAS confirmation.
+enum ContactVerificationState: String, Sendable {
+    /// Verified out of band by safety number comparison. Green badge.
+    case verified
+    /// Scanned in person (or pre-v2 unknown-provenance row) but the
+    /// user has not yet confirmed the safety number against the peer's
+    /// screen. Yellow badge.
+    case scannedUnverified
+    /// Pasted from clipboard; the channel that carried the bytes is
+    /// untrusted by definition. Red badge with a verification prompt.
+    case pastedUnverified
+}
+
 /// One row in the contacts list. `identityPub` is the trust anchor — the
 /// 33-byte serialized libsignal IdentityKey. Two `Contact` rows with the
 /// same `identityPub` should never coexist; uniqueness is enforced at
@@ -175,6 +219,14 @@ struct Contact: Codable, Identifiable, Sendable {
     /// publish per `Contact.refillCooldown`. The same gate already
     /// applies to `issueTokens` via `lastRefillRequestHandledAt`.
     var lastBundleServedAt: Date?
+    /// How this contact's identity entered the device. The verification
+    /// UI relies on this to grade the warning — see `ContactSource`.
+    let addedVia: ContactSource
+    /// When the user confirmed the symmetric safety number matched the
+    /// peer's screen, out of band. NULL means unverified — the chat
+    /// header shows the "compare safety number" call to action and the
+    /// list-row badge stays warning-coloured until set.
+    var verifiedAt: Date?
 
     init(
         id: UUID = UUID(),
@@ -191,7 +243,9 @@ struct Contact: Codable, Identifiable, Sendable {
         ttlSeconds: UInt32 = Contact.defaultTTLSeconds,
         readReceiptsEnabled: Bool = false,
         peerVerifyKey: Data? = nil,
-        lastBundleServedAt: Date? = nil
+        lastBundleServedAt: Date? = nil,
+        addedVia: ContactSource = .qrScan,
+        verifiedAt: Date? = nil
     ) {
         self.id = id
         self.identityPub = identityPub
@@ -208,6 +262,19 @@ struct Contact: Codable, Identifiable, Sendable {
         self.readReceiptsEnabled = readReceiptsEnabled
         self.peerVerifyKey = peerVerifyKey
         self.lastBundleServedAt = lastBundleServedAt
+        self.addedVia = addedVia
+        self.verifiedAt = verifiedAt
+    }
+
+    /// Three-state shorthand for verification status used by the UI.
+    /// Treat `unknown` provenance as `qrScan` (pre-v2 contact rows came
+    /// in through the camera scanner — see migration v2 in `Schema.swift`).
+    var verificationState: ContactVerificationState {
+        if verifiedAt != nil { return .verified }
+        switch addedVia {
+        case .qrScan, .unknown: return .scannedUnverified
+        case .pastedText: return .pastedUnverified
+        }
     }
 
     /// Default per-message TTL: 1 day. Picker offers 1h / 1 day / 3d / 7d.
@@ -233,6 +300,7 @@ struct Contact: Codable, Identifiable, Sendable {
         case deliveryTokensForPeer, lastRefillRequestSentAt, lastRefillRequestHandledAt
         case ttlSeconds, readReceiptsEnabled
         case peerVerifyKey, lastBundleServedAt
+        case addedVia, verifiedAt
     }
 
     init(from decoder: Decoder) throws {
@@ -252,6 +320,13 @@ struct Contact: Codable, Identifiable, Sendable {
         self.readReceiptsEnabled = try c.decodeIfPresent(Bool.self, forKey: .readReceiptsEnabled) ?? false
         self.peerVerifyKey = try c.decodeIfPresent(Data.self, forKey: .peerVerifyKey)
         self.lastBundleServedAt = try c.decodeIfPresent(Date.self, forKey: .lastBundleServedAt)
+        // Codable path is used for previews/tests/in-memory snapshots,
+        // not the on-disk schema (SQLite is the source of truth). Pre-v2
+        // payloads omit provenance → default to `.unknown` so the UI
+        // does not silently upgrade a non-verified contact to "scanned
+        // in person" trust.
+        self.addedVia = try c.decodeIfPresent(ContactSource.self, forKey: .addedVia) ?? .unknown
+        self.verifiedAt = try c.decodeIfPresent(Date.self, forKey: .verifiedAt)
     }
 
     var unreadCount: Int {

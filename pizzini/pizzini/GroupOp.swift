@@ -7,23 +7,38 @@ import PizziniCryptoCore
 /// parent so equivocation by an admin (two ops claiming the same
 /// epoch) is detectable on the receiver side.
 ///
-/// **Wire format (`op_version = 1`, big-endian):**
+/// **Wire format (`op_version = 2`, big-endian):**
 ///
 /// ```text
 /// header (covered by signature):
-///   u8   op_version = 1
+///   u8   op_version = 2
 ///   [16] groupId
 ///   u64  epoch
 ///   [32] parentDigest          (BLAKE3 of the previous signed op,
 ///                                all-zero for the Create op)
 ///   [33] operatorIdentityPub   (libsignal-native serialised IdentityKey)
 ///   u64  timestampMillis
+///   [32] priorMemberSetRoot    (USP #5: canonical hash of the member
+///                                set the operator believed to be
+///                                current at signing time. Receiver
+///                                recomputes against their local view
+///                                and rejects on mismatch — defeats
+///                                ghost-member / equivocation attacks.
+///                                Constant `ChatGroup.emptyMemberSetRoot`
+///                                for the Create op.)
 ///   u8   opKind
 ///   u32  payloadLen + payload bytes
 /// trailer:
 ///   [64] signature             (XEd25519 by operator's identity-key
 ///                                private half over the header bytes)
 /// ```
+///
+/// **v1 → v2 break.** The wire format gained the 32-byte
+/// `priorMemberSetRoot` field. The opVersion was bumped, and the
+/// signing-context tag bumped in lockstep
+/// (`pizzini.group.op.v1` → `.v2`) so a v1 op produced before the
+/// upgrade simply fails signature verification under v2 — no risk
+/// of a downgrade attack treating new bytes as old ones.
 ///
 /// **Op kinds and payloads:**
 ///
@@ -72,15 +87,30 @@ struct GroupOp: Sendable, Equatable {
     let parentDigest: Data
     let operatorIdentity: Data
     let timestampMillis: UInt64
+    /// Canonical hash of the member set the operator believed to be
+    /// current at the moment they signed this op (USP #5). The
+    /// receiver recomputes this from their own local view and
+    /// rejects the op on mismatch — defeats the ghost-member
+    /// equivocation attack where an admin silently adds a member
+    /// only on their own device and uses the resulting "fork" to
+    /// receive group traffic.
+    ///
+    /// Set to `ChatGroup.memberSetRoot(of: [])` for the Create op
+    /// (no prior state to witness) — see `signed(...)`.
+    let priorMemberSetRoot: Data
     let kind: GroupOpKind
     let signature: Data
 
-    static let opVersion: UInt8 = 1
+    static let opVersion: UInt8 = 2
     static let parentDigestSize: Int = 32
     static let identityKeySize: Int = 33
     static let signatureSize: Int = 64
     static let distributionIdSize: Int = 16
     static let groupIdSize: Int = 16
+    /// Width of the member-set-root field. Matches BLAKE3's 32-byte
+    /// output; mirrored from `parentDigestSize` so the same constant
+    /// drives both fixed-32 fields.
+    static let memberSetRootSize: Int = 32
     /// All-zero parent digest used by the `Create` op. There is no
     /// prior signed op to chain to, so we anchor with zeros — the
     /// signed `Create` op's own digest becomes the parent for op #1.
@@ -103,6 +133,7 @@ struct GroupOp: Sendable, Equatable {
             identityPub: operatorIdentity,
             message: header,
             signature: signature,
+            contextTag: Session.SignatureContext.groupOp,
         )
     }
 
@@ -129,6 +160,9 @@ struct GroupOp: Sendable, Equatable {
         guard operatorIdentity.count == GroupOp.identityKeySize else {
             throw GroupOpError.malformed("operatorIdentity must be \(GroupOp.identityKeySize) bytes")
         }
+        guard priorMemberSetRoot.count == GroupOp.memberSetRootSize else {
+            throw GroupOpError.malformed("priorMemberSetRoot must be \(GroupOp.memberSetRootSize) bytes")
+        }
         var out = Data(capacity: 256)
         out.append(GroupOp.opVersion)
         out.append(groupId)
@@ -136,6 +170,7 @@ struct GroupOp: Sendable, Equatable {
         out.append(parentDigest)
         out.append(operatorIdentity)
         out.appendBigEndian(timestampMillis)
+        out.append(priorMemberSetRoot)
         let payload = try kind.encodedPayload()
         out.append(kind.kindByte)
         out.appendBigEndian(UInt32(payload.count))
@@ -152,6 +187,7 @@ struct GroupOp: Sendable, Equatable {
         parentDigest: Data,
         operatorIdentity: Data,
         timestampMillis: UInt64,
+        priorMemberSetRoot: Data,
         kind: GroupOpKind,
         signature: Data,
     ) -> GroupOp {
@@ -161,6 +197,7 @@ struct GroupOp: Sendable, Equatable {
             parentDigest: parentDigest,
             operatorIdentity: operatorIdentity,
             timestampMillis: timestampMillis,
+            priorMemberSetRoot: priorMemberSetRoot,
             kind: kind,
             signature: signature,
         )
@@ -178,6 +215,7 @@ struct GroupOp: Sendable, Equatable {
         guard let parentDigest = cursor.read(GroupOp.parentDigestSize) else { return nil }
         guard let operatorIdentity = cursor.read(GroupOp.identityKeySize) else { return nil }
         guard let timestampMillis: UInt64 = cursor.readBigEndian() else { return nil }
+        guard let priorMemberSetRoot = cursor.read(GroupOp.memberSetRootSize) else { return nil }
         guard let kindByte: UInt8 = cursor.read(1)?.first else { return nil }
         guard let payloadLen: UInt32 = cursor.readBigEndian() else { return nil }
         guard let payload = cursor.read(Int(payloadLen)) else { return nil }
@@ -190,6 +228,7 @@ struct GroupOp: Sendable, Equatable {
             parentDigest: parentDigest,
             operatorIdentity: operatorIdentity,
             timestampMillis: timestampMillis,
+            priorMemberSetRoot: priorMemberSetRoot,
             kind: kind,
             signature: signature,
         )
@@ -321,7 +360,12 @@ enum GroupOpError: Error, Equatable, Sendable {
 
 // ─── Wire helpers ────────────────────────────────────────────────────
 
-private extension GroupRole {
+extension GroupRole {
+    /// Canonical 1-byte encoding. Shared between the GroupOp wire
+    /// format (`AddMember`/`Create` payloads) and the membership-root
+    /// hash (`ChatGroup.memberSetRoot`). Single source of truth so a
+    /// future schema change doesn't have to ripple through two
+    /// independent encoders.
     var wireByte: UInt8 {
         switch self {
         case .member: 0x00
@@ -334,6 +378,23 @@ private extension GroupRole {
         case 0x00: self = .member
         case 0x01: self = .admin
         default: return nil
+        }
+    }
+}
+
+extension MemberStatus {
+    /// Canonical 1-byte encoding for the membership-root hash. Only
+    /// two states are *structurally* meaningful for group membership:
+    /// the member is part of the group, or they have been removed.
+    /// `pendingSKDM` is a transient local UI state (waiting for the
+    /// SKDM round-trip) that resolves to `active` without any
+    /// signed-op exchange — folding it to `active` here keeps the
+    /// membership root deterministic across two devices that happen
+    /// to be at slightly different points in the SKDM dance.
+    var canonicalRootByte: UInt8 {
+        switch self {
+        case .removed: 0x00
+        case .active, .pendingSKDM: 0x01
         }
     }
 }

@@ -94,15 +94,22 @@ final class PrivacyShieldWindow: NSObject {
         // remote keyboard window with it, eliminating the QuickType
         // leak. Apple-sanctioned approach for hiding sensitive
         // composer state from snapshots; what Signal/WhatsApp do.
-        UIApplication.shared.sendAction(
-            #selector(UIResponder.resignFirstResponder),
-            to: nil,
-            from: nil,
-            for: nil,
-        )
-        // Synchronous so the snapshot iOS is about to take sees the
-        // shield, not the sheet behind it.
-        if let scene = note.object as? UIScene {
+        //
+        // **Scope the resign to this scene's app windows**, not the
+        // global responder chain. A global resign would dismiss the
+        // first responder inside an in-flight system overlay (the
+        // photo picker's search field, the document picker's name
+        // field) — the user comes back to find their picker reset.
+        // Calling `endEditing(true)` on each app-owned UIWindow in
+        // the scene walks only OUR responder chain; system-presented
+        // remote view controllers live in another process and are
+        // unaffected.
+        if let scene = note.object as? UIWindowScene {
+            for w in scene.windows where w.windowLevel == .normal {
+                w.endEditing(true)
+            }
+            windows[ObjectIdentifier(scene)]?.isHidden = false
+        } else if let scene = note.object as? UIScene {
             windows[ObjectIdentifier(scene)]?.isHidden = false
         } else {
             // Fallback for older notifications without a scene object —

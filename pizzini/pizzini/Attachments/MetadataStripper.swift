@@ -102,6 +102,19 @@ enum MetadataStripper {
                 kCGImagePropertyGPSDictionary: kCFNull as Any,
                 kCGImagePropertyIPTCDictionary: kCFNull as Any,
                 kCGImagePropertyExifAuxDictionary: kCFNull as Any,
+                // Format-specific dictionaries. ImageIO on recent iOS
+                // *does* drop PNG `tEXt`/`iTXt`/`zTXt` chunks during a
+                // round-trip, but the behaviour is implementation
+                // detail, not contract — explicitly clearing the
+                // dict pins the strip behavior across iOS releases.
+                // PNG carries Author/Copyright/CreationTime/Software
+                // in this dictionary; HEICS / JFIF / TGA / WebP have
+                // their own dicts that can carry source-app fingerprints.
+                kCGImagePropertyPNGDictionary: kCFNull as Any,
+                kCGImagePropertyJFIFDictionary: kCFNull as Any,
+                kCGImagePropertyHEICSDictionary: kCFNull as Any,
+                kCGImagePropertyTGADictionary: kCFNull as Any,
+                kCGImagePropertyWebPDictionary: kCFNull as Any,
                 kCGImagePropertyMakerCanonDictionary: kCFNull as Any,
                 kCGImagePropertyMakerNikonDictionary: kCFNull as Any,
                 kCGImagePropertyMakerAppleDictionary: kCFNull as Any,

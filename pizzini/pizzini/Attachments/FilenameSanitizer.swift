@@ -65,6 +65,15 @@ enum FilenameSanitizer {
         }
         scrubbed = scrubbed.trimmingCharacters(in: .whitespaces)
         if scrubbed.isEmpty { return fallbackName }
+        // After all stripping, refuse the literal `.` or `..` names.
+        // The leading-dot stripper handles "starts with dot" but a
+        // name like ". ." or ".." survives because the loop terminates
+        // at the first non-dot OR at empty. The fallback closes both.
+        // (`URL.appending(path: "..")` standardization can resolve
+        //  upward on some iOS versions — defense in depth.)
+        if scrubbed == "." || scrubbed == ".." {
+            return fallbackName
+        }
 
         // Length cap. Preserve the final extension if there is one so
         // the OS still picks the right Save-to-Files default app.

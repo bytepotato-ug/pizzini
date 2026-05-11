@@ -47,8 +47,7 @@ struct PasscodeEntryView: View {
                 SecureField("Passcode", text: $entry)
                     .textContentType(.password)
                     .keyboardType(.asciiCapable)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
+                    .hardenedTextInput()
                     .padding(.horizontal, 16)
                     .frame(height: 44)
                     .background(Color(.secondarySystemBackground))
@@ -100,6 +99,13 @@ struct PasscodeEntryView: View {
     }
 
     private func submit() {
+        // Synchronously gate against re-entry BEFORE the Task spawn:
+        // setting `inFlight` inside the Task left a window where a
+        // rapid double-tap enqueued two main-actor tasks before the
+        // first set the flag. The second tap could then submit a
+        // panicked-second-try passcode against a Keychain state that
+        // the first task had already wiped (duress path), exposing
+        // the fresh-install gate-less UI.
         guard !entry.isEmpty, !inFlight else { return }
         inFlight = true
         errorMessage = nil

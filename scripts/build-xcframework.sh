@@ -43,10 +43,43 @@ rustup target add "${ALL_TARGETS[@]}" >/dev/null
 echo "==> Building crypto-core ($PROFILE) for ${#ALL_TARGETS[@]} target(s)"
 target_args=()
 for t in "${ALL_TARGETS[@]}"; do target_args+=(--target "$t"); done
-# Match the iOS app's deployment target (17.0). Cargo's aarch64-apple-ios
-# default is iOS 10, which is incompatible with blake3's NEON path
-# (links against `___chkstk_darwin`, present only since iOS 14).
-export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-17.0}"
+# Match the iOS app's deployment target. F-NEW-1008 fix: the
+# `Package.swift` SwiftPM target is `.iOS(.v18)` (bumped 2026-05-11);
+# the previous default `17.0` here would build crypto-core against
+# iOS 17 SDK while the app linked against iOS 18. Stale link
+# warnings + drift. Sync to 18.0; override per build only via the
+# env var.
+export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-18.0}"
+
+# F-NEW-1005 reproducible-build hardening. Three changes:
+#
+#   1. `SOURCE_DATE_EPOCH` from the git commit time of the working
+#      tree. Tools that honour it (lipo on recent Xcode, some
+#      strip variants, the cc crate) embed this timestamp instead
+#      of `time(2)` so two builds at different wall-clocks produce
+#      identical bytes.
+#   2. `--remap-path-prefix` so the absolute repo path
+#      (`/Users/username/Software/pizzini/`) doesn't end up in
+#      Rust debug info / panic strings. Without it, anyone signing
+#      a release can't share bit-identical binaries.
+#   3. Equivalent `-ffile-prefix-map` for the C compiler used by
+#      blake3's NEON sources. Passed through `CFLAGS` which the cc
+#      crate picks up.
+#
+# Reproducibility is still best-effort — `xcodebuild -create-xcframework`
+# stamps creation timestamps into the Info.plist, and lipo writes
+# Mach-O headers with a creation timestamp. The README's claim that
+# every release should be reproducible by a third party stands as a
+# work-item; this script gets the Cargo half right so a future
+# Apple-tool wrapper completes the picture.
+if SOURCE_DATE_EPOCH_AUTO="$(git -C "$REPO_ROOT" log -1 --format=%ct 2>/dev/null)" \
+   && [ -n "$SOURCE_DATE_EPOCH_AUTO" ]; then
+    export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$SOURCE_DATE_EPOCH_AUTO}"
+fi
+# Combine RUSTFLAGS rather than overwrite — caller may have set
+# their own (e.g. for code coverage instrumentation).
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix $REPO_ROOT=."
+export CFLAGS="${CFLAGS:-} -ffile-prefix-map=$REPO_ROOT=."
 
 # Crates with C/asm sources (notably blake3's NEON assembly) bake the
 # deployment target into the Mach-O `.o` header at build time. cargo

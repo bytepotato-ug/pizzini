@@ -29,8 +29,11 @@ import Foundation
 /// to type without worrying about accents.
 ///
 /// Pure-function — operates on `AppState` (or a `[PersistedMessage]`),
-/// has no `ChatStore` dependency, is trivially unit-testable. The
-/// `ChatStore.searchAllChats` thin wrapper just plumbs `state` in.
+/// has no `ChatStore` dependency, is trivially unit-testable. Call
+/// `ChatSearch.searchAll(in: store.state, query: ...)` from views
+/// directly; there is intentionally NO `ChatStore.searchAllChats`
+/// wrapper because that wrapper would invite a memoisation cache
+/// that could persist search terms past the conversation window.
 enum ChatSearch {
     /// Maximum total results returned by `searchAll`. The UI paginates
     /// by truncation rather than incremental fetch — at 200 matches the

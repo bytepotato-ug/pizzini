@@ -1,0 +1,16 @@
+# Pin the Rust toolchain for reproducible builds (USP #1).
+#
+# Every build environment that picks up this repo will install and
+# use this exact compiler version, so two independent builds of the
+# same git commit by two different operators on two different
+# machines produce bit-for-bit identical relay binaries — the
+# foundation of the "verifiable transparency log" USP.
+#
+# Bumping the channel is a deliberate act: every relay-binary hash
+# published in the transparency log is tied to this version, so a
+# bump invalidates every prior published hash. Coordinate with the
+# transparency-log refresh when changing.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

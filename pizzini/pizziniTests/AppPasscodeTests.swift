@@ -87,13 +87,36 @@ struct AppPasscodeTests {
         // user-facing invariant. Verify it's distinct passcodes that
         // get distinct hashes by setting a DIFFERENT duress value.
         try AppPasscode.setDuressPasscode("differentValue")
-        let realHash = Keychain.read(account: AppPasscode.realHashAccount)
-        let duressHash = Keychain.read(account: AppPasscode.duressHashAccount)
-        let realSalt = Keychain.read(account: AppPasscode.realSaltAccount)
-        let duressSalt = Keychain.read(account: AppPasscode.duressSaltAccount)
-        #expect(realHash != nil)
-        #expect(duressHash != nil)
+        // Atomic slot layout: `salt(32) || hash(32)`.
+        let realBlob = Keychain.read(account: AppPasscode.realSlotAccount)
+        let duressBlob = Keychain.read(account: AppPasscode.duressSlotAccount)
+        #expect(realBlob?.count == 64)
+        #expect(duressBlob?.count == 64)
+        let realSalt = realBlob?.prefix(32)
+        let duressSalt = duressBlob?.prefix(32)
         #expect(realSalt != duressSalt, "real and duress must use distinct salts")
+    }
+
+    @Test("legacy two-row layout is migrated to the atomic slot on first read")
+    func legacyLayoutMigrates() throws {
+        freshKeychain()
+        // Simulate a pre-upgrade install: write the legacy slot
+        // pair directly, then assert the atomic slot doesn't exist
+        // yet — the public API hasn't been touched.
+        let salt = Data(repeating: 0xAB, count: 32)
+        let hash = Data(repeating: 0xCD, count: 32)
+        _ = Keychain.write(hash, account: AppPasscode.legacyRealHashAccount)
+        _ = Keychain.write(salt, account: AppPasscode.legacyRealSaltAccount)
+        // Reading `isPasscodeSet` triggers the migration internally.
+        #expect(AppPasscode.isPasscodeSet)
+        // Atomic slot now populated; legacy slots wiped.
+        let atomic = Keychain.read(account: AppPasscode.realSlotAccount)
+        #expect(atomic?.count == 64)
+        #expect(atomic?.prefix(32) == salt)
+        #expect(atomic?.suffix(32) == hash)
+        #expect(Keychain.read(account: AppPasscode.legacyRealHashAccount) == nil)
+        #expect(Keychain.read(account: AppPasscode.legacyRealSaltAccount) == nil)
+        AppPasscode.eraseAll()
     }
 
     @Test("eraseAll wipes both slots in one call")

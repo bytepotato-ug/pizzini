@@ -39,8 +39,7 @@ struct PasscodeSetupView: View {
                     )
                     .textContentType(.newPassword)
                     .keyboardType(.asciiCapable)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
+                    .hardenedTextInput()
                     .focused($focusedField, equals: .entry)
                     .submitLabel(.next)
                     .onSubmit { focusedField = .confirm }

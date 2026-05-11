@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import PizziniCryptoCore
+import PizziniDB
 import Security
 
 /// Derives the SQLCipher database key.
@@ -56,6 +57,21 @@ enum DBKey {
     static let paramsAccount = "db-kdf-params"
     /// Application tag for the SE-resident P-256 wrapping key.
     static let enclaveTag = "app.pizzini.db-wrap-key".data(using: .utf8)!
+    /// USP #8: wall-clock (epoch seconds, big-endian u64) of the
+    /// last at-rest-key rotation. Read on launch to decide whether
+    /// `rotationDue` should fire; written by `rotateKeyMaterial`.
+    /// Missing slot is treated as "rotate immediately" — the first
+    /// post-install launch performs an initial rotation so the salt
+    /// that ships in the first DB write is independent of any
+    /// material reachable to an attacker who exfiltrated the
+    /// pre-install Keychain (e.g. a profile-installed enterprise
+    /// app sharing the access group).
+    static let lastRotationAccount = "db-key-last-rotation"
+    /// How often the at-rest key is rotated. Default 7 days
+    /// balances "wall of forgotten plaintext recovers in ~52
+    /// per-year" against the ~250 ms Argon2id + a one-time VACUUM
+    /// cost the user pays on the first launch each week.
+    static let rotationInterval: TimeInterval = 7 * 24 * 60 * 60
 
     /// Codable shape persisted under `paramsAccount`.
     struct StoredParams: Codable {
@@ -89,12 +105,42 @@ enum DBKey {
 
     /// Wipe the wrap + salt + params slots. Combined with `unlink` of
     /// the database file this is the cryptographic-erasure primitive
-    /// for the future duress-passphrase task.
+    /// for the duress-passphrase flow.
+    ///
+    /// Each Keychain row is OVERWRITTEN with random bytes of equal
+    /// length before deletion. `SecItemDelete` only unlinks the row
+    /// from `keychain-2.db`; on most modern iOS releases the underlying
+    /// ciphertext block can persist in NAND. Forcing a re-encrypt
+    /// under a new IV raises the bar against Cellebrite-class flash
+    /// forensics. The SE key itself cannot leak its private half (the
+    /// chip's attestation guarantees that), so a plain delete of its
+    /// handle is sufficient.
     static func eraseKeyMaterial() {
-        Keychain.delete(account: wrapAccount)
-        Keychain.delete(account: saltAccount)
-        Keychain.delete(account: paramsAccount)
+        secureDeleteKeychainSlot(account: wrapAccount)
+        secureDeleteKeychainSlot(account: saltAccount)
+        secureDeleteKeychainSlot(account: paramsAccount)
+        // USP #8: the rotation timestamp lives in Keychain too — if
+        // we left it around, a future reinstall would inherit a
+        // stale "last rotated" mark and the first-launch initial
+        // rotation would be skipped. Drop the slot here so reinstall
+        // = fresh rotation cycle.
+        secureDeleteKeychainSlot(account: lastRotationAccount)
         deleteEnclaveKey()
+    }
+
+    /// Overwrite a Keychain row with same-sized random bytes, then
+    /// delete it. Used by `eraseKeyMaterial` (duress flow) and by the
+    /// AppPasscode slot teardown so the on-disk Keychain page is
+    /// re-encrypted before the row entry is unlinked.
+    private static func secureDeleteKeychainSlot(account: String) {
+        if let existing = Keychain.read(account: account) {
+            var noise = [UInt8](repeating: 0, count: max(existing.count, 16))
+            let rc = SecRandomCopyBytes(kSecRandomDefault, noise.count, &noise)
+            if rc == errSecSuccess {
+                _ = Keychain.write(Data(noise), account: account)
+            }
+        }
+        Keychain.delete(account: account)
     }
 
     /// Convenience: True iff the SE-wrap exists. Used by the
@@ -270,6 +316,20 @@ enum DBKey {
     /// Restore the Argon2id parameters under which this database was
     /// last keyed. Returns the production preset if no params row
     /// exists (first install path) — that's also what got written.
+    ///
+    /// **Validation against pre-planted weak params.** A Keychain
+    /// row written before first launch by another process (a profile-
+    /// installed enterprise app sharing an access group, a Cellebrite
+    /// staging attack) could plant `M=8 KiB, T=1, P=1`-style weak
+    /// parameters. Pizzini would then mint the DB key under those
+    /// parameters and an offline Argon2id grind becomes feasible
+    /// against a captured extraction. The minimum-strength gate below
+    /// catches that: any stored params weaker than half of production
+    /// memory OR less than 2 iterations are treated as tampered and
+    /// rejected, falling back to `.production`. The legitimate use
+    /// case for non-production params is unit tests, which use
+    /// `Argon2id.Params` directly rather than going through the
+    /// Keychain round-trip.
     static func loadStoredParams() -> Argon2id.Params {
         guard
             let data = Keychain.read(account: paramsAccount),
@@ -277,10 +337,124 @@ enum DBKey {
         else {
             return .production
         }
-        return Argon2id.Params(
+        let params = Argon2id.Params(
             memoryKiB: stored.memoryKiB,
             timeIterations: stored.timeIterations,
             parallelism: stored.parallelism,
         )
+        if paramsFailMinimumStrength(params) {
+            NSLog("[pizzini.dbkey] stored Argon2id params below floor — using production")
+            return .production
+        }
+        return params
+    }
+
+    /// True if stored params look like a tamper / downgrade attempt:
+    /// memory < 32 MiB (half of production) OR iterations < 2.
+    /// Production is M=64 MiB, T=3, P=1. The floor leaves room for
+    /// future hardware-aware lowering on truly resource-constrained
+    /// devices while still refusing anything that's brute-forceable
+    /// in seconds.
+    private static func paramsFailMinimumStrength(_ p: Argon2id.Params) -> Bool {
+        if p.memoryKiB < 32 * 1024 { return true }  // < 32 MiB
+        if p.timeIterations < 2 { return true }
+        return false
+    }
+
+    // MARK: - USP #8: timed at-rest key rotation
+
+    /// True iff the at-rest key has not been rotated within
+    /// `rotationInterval`. The first post-install launch always
+    /// returns true (no slot present → treat as "due"), giving
+    /// the user a fresh salt that's not reachable to any
+    /// pre-install Keychain reader.
+    static func rotationDue(now: Date = Date()) -> Bool {
+        guard let bytes = Keychain.read(account: lastRotationAccount),
+              bytes.count == MemoryLayout<UInt64>.size
+        else {
+            return true
+        }
+        let epoch = bytes.withUnsafeBytes { raw -> UInt64 in
+            let beValue = raw.load(as: UInt64.self)
+            return UInt64(bigEndian: beValue)
+        }
+        let last = Date(timeIntervalSince1970: TimeInterval(epoch))
+        return now.timeIntervalSince(last) >= rotationInterval
+    }
+
+    /// Run a full at-rest key rotation against the already-open
+    /// `db`. The caller owns the live DB connection (so we don't
+    /// open + close + re-open here, which would require the host
+    /// to thread a fresh handle through the entire app). Steps:
+    ///
+    ///   1. Derive a fresh 32-byte key from a brand-new salt
+    ///      (existing SE-wrapped seed; existing Argon2id params).
+    ///   2. `sqlite3_rekey_v2` to re-encrypt every page under the
+    ///      new key.
+    ///   3. `VACUUM` to rewrite the entire file, purging any
+    ///      orphaned plaintext-shaped bytes the rekey alone left
+    ///      behind (SQLite doesn't reclaim freelist pages without
+    ///      vacuum; a wiped page on disk under the old key is
+    ///      still recoverable forensically until those bytes are
+    ///      overwritten).
+    ///   4. Persist the new salt (so the next launch derives the
+    ///      same key) and a fresh rotation timestamp.
+    ///   5. Return the new key so the caller can keep it in
+    ///      memory for the rest of the session.
+    ///
+    /// If any step throws, the DB is in an indeterminate state.
+    /// Callers must either (a) reopen with the old key — they
+    /// still have the old salt in Keychain until step 4 — or
+    /// (b) report the failure and force-quit. The function is
+    /// transactional only in the all-or-nothing sense of "the
+    /// Keychain salt commit at step 4 is the point of no return."
+    static func rotateKeyMaterial(
+        liveDB db: Database,
+        params: Argon2id.Params = DBKey.loadStoredParams(),
+        now: Date = Date(),
+    ) throws -> Data {
+        let seed = try unwrapOrCreateSeed()
+
+        // Step 1: fresh salt + fresh derivation.
+        var saltBytes = [UInt8](repeating: 0, count: 32)
+        let saltRC = SecRandomCopyBytes(kSecRandomDefault, saltBytes.count, &saltBytes)
+        guard saltRC == errSecSuccess else { throw DBKeyError.wrapFailed }
+        let newSalt = Data(saltBytes)
+        let newKey = try Argon2id.derive(
+            passphrase: seed,
+            salt: newSalt,
+            params: params,
+            outputLength: 32,
+        )
+
+        // Step 2: SQLCipher rekey. Throws on failure; DB stays
+        // openable under the old key in that case.
+        try db.rekey(newRawKey: newKey)
+
+        // Step 3: vacuum. Releases freelist pages back as
+        // ciphertext-under-the-new-key bytes; before this call
+        // the old plaintext-on-disk pattern can still be
+        // reconstructed by a forensic analyst with the
+        // pre-rotation key.
+        try db.execute("VACUUM;")
+
+        // Step 4: commit the new salt + rotation timestamp. The
+        // order here is load-bearing — until both lines complete,
+        // the on-disk salt still derives the OLD key, which is no
+        // longer the DB's key. A crash between rekey and salt-write
+        // is recoverable: the next launch fails the SQLCipher
+        // smoke-read, the user re-runs onboarding. A crash AFTER
+        // the salt write but before timestamp write means we'll
+        // rotate again on the next launch — wasteful but safe.
+        guard Keychain.write(newSalt, account: saltAccount) else {
+            throw DBKeyError.keychainWriteFailed
+        }
+        var epochBE = UInt64(now.timeIntervalSince1970).bigEndian
+        let stampBytes = withUnsafeBytes(of: &epochBE) { Data($0) }
+        guard Keychain.write(stampBytes, account: lastRotationAccount) else {
+            throw DBKeyError.keychainWriteFailed
+        }
+
+        return newKey
     }
 }

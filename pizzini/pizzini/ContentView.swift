@@ -57,6 +57,17 @@ struct ContentView: View {
                             if integrity.isCompromised {
                                 integrityBanner
                             }
+                            // View-level fallback for the screenshot
+                            // mask. `WindowSecureMask` silently no-ops
+                            // when `SecureScreenshotSelfTest` failed on
+                            // this iOS major — without this persistent
+                            // banner the user has no in-app signal
+                            // that screenshot protection is degraded
+                            // (only a Settings notice they may never
+                            // see). Surface it where they'll notice.
+                            if !store.shouldMaskAppContents {
+                                screenshotDegradedBanner
+                            }
                         }
                     }
                 }
@@ -134,10 +145,14 @@ struct ContentView: View {
             presenting: pendingCard
         ) { card in
             TextField("name (e.g. Alice)", text: $pendingName)
-                .textInputAutocapitalization(.words)
+                .hardenedTextInput(autocap: .words)
             Button("Cancel", role: .cancel) { resetPending() }
             Button("Add") {
-                store.addContact(card: card, displayName: pendingName)
+                // QR scanner is the only entry point today. A future
+                // paste/deep-link path would pass `.pastedText` here so
+                // the contact row starts in the red "needs SAS"
+                // verification state.
+                store.addContact(card: card, displayName: pendingName, source: .qrScan)
                 resetPending()
             }
         } message: { card in
@@ -229,6 +244,42 @@ struct ContentView: View {
             return "A debugger is attached to Pizzini"
         }
         return "Device integrity warning"
+    }
+
+    /// Persistent banner shown when the screenshot-mask self-test
+    /// failed on this iOS major version. `WindowSecureMask` silently
+    /// no-ops in that state; without this banner the user could
+    /// reasonably believe protection is in place when it isn't.
+    /// Deep-links into the `screenCapture` FAQ section.
+    private var screenshotDegradedBanner: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "camera.viewfinder")
+                .foregroundStyle(.white)
+                .imageScale(.large)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Screenshot protection degraded")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                Text("This iOS version no longer hides Pizzini's content in screenshots or mirroring. Encryption is unaffected; treat the screen itself as visible.")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.95))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            Button {
+                integrityFAQ = .screenCapture
+            } label: {
+                Image(systemName: "info.circle.fill")
+                    .foregroundStyle(.white)
+                    .imageScale(.large)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("More info on screenshot protection")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange)
     }
 
     /// F-602: persistent banner shown above the nav bar when ChatStore

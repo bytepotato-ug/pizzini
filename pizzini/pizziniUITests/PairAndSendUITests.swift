@@ -17,11 +17,15 @@ final class PairAndSendUITests: XCTestCase {
 
     @MainActor
     private func dismissOnboardingIfPresent(_ app: XCUIApplication) {
-        // Welcome → Continue, Icons → Continue, Biometric → Skip.
-        // 2s waits because the welcome screen renders within ~1s of
-        // launch on a clean install. Loop in case Continue takes a
-        // moment to enable.
-        for _ in 0..<2 {
+        // Welcome → Continue, Icons → Continue, Notifications →
+        // Skip, Biometric → "Use app passcode instead" → set passcode.
+        //
+        // F-NEW-701: onboarding no longer offers "Skip — I'll add it
+        // later" on the biometric step. The user must enable Face ID
+        // or set an app passcode before reaching the home screen.
+        // The simulator can't enrol Face ID via UI test, so we go
+        // through the passcode path.
+        for _ in 0..<3 {
             let cont = app.buttons["Continue"].firstMatch
             if cont.waitForExistence(timeout: 2) {
                 cont.tap()
@@ -29,9 +33,33 @@ final class PairAndSendUITests: XCTestCase {
                 break
             }
         }
-        let skip = app.buttons["Skip — I'll add it later"].firstMatch
-        if skip.waitForExistence(timeout: 2) {
-            skip.tap()
+        // Notifications step has a "Skip — I'll enable in Settings
+        // later" button — that one IS still present (notifications
+        // are non-essential, the lock posture is essential).
+        let skipNotif = app.buttons["Skip — I'll enable in Settings later"].firstMatch
+        if skipNotif.waitForExistence(timeout: 2) {
+            skipNotif.tap()
+        }
+        // Biometric step — fall through to "Use app passcode instead"
+        // so the simulator can complete onboarding deterministically.
+        let usePasscode = app.buttons["Use app passcode instead"].firstMatch
+        if usePasscode.waitForExistence(timeout: 2) {
+            usePasscode.tap()
+            // PasscodeSetupView sheet appears. Type a test passcode.
+            let entryField = app.secureTextFields["New passcode"].firstMatch
+            if entryField.waitForExistence(timeout: 2) {
+                entryField.tap()
+                entryField.typeText("test1234")
+            }
+            let confirmField = app.secureTextFields["Confirm"].firstMatch
+            if confirmField.waitForExistence(timeout: 2) {
+                confirmField.tap()
+                confirmField.typeText("test1234")
+            }
+            let save = app.buttons["Save"].firstMatch
+            if save.waitForExistence(timeout: 2) {
+                save.tap()
+            }
         }
     }
 
