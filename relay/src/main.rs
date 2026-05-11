@@ -110,9 +110,11 @@
 //! brings the app forward. On reconnect, the queue drains.
 
 mod apns;
+mod encrypted_file;
+mod pending_store;
 mod push_token_store;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -124,6 +126,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
 use crate::apns::{ApnsClient, ApnsConfig};
+use crate::pending_store::{PendingFrame, PendingStore};
 use crate::push_token_store::PushTokenStore;
 
 const PORT: u16 = 7777;
@@ -261,17 +264,20 @@ type Replays = Arc<Mutex<HashMap<ReplayKey, Instant>>>;
 type HelloReplayKey = (PeerId, [u8; HELLO_NONCE_LEN]);
 type HelloReplays = Arc<Mutex<HashMap<HelloReplayKey, Instant>>>;
 
-/// One queued routing frame. The body is the entire frame as it would
-/// have been forwarded — including the leading frame_type byte and the
-/// recipient header — so we can hand it verbatim to the recipient's
-/// writer task on reconnect. `expires_at` is sender-chosen TTL clamped
-/// to `MAX_PENDING_TTL`; per-frame, not global.
-struct PendingFrame {
-    bytes: Vec<u8>,
-    expires_at: Instant,
-}
-
-type Pending = Arc<Mutex<HashMap<PeerId, VecDeque<PendingFrame>>>>;
+/// Persistent offline-message queue, wrapping `pending_store::PendingStore`.
+/// Pre-this refactor the queue was an in-memory `HashMap<PeerId,
+/// VecDeque<PendingFrame>>` wiped on every restart — meaning a relay
+/// bounce silently dropped every in-flight message destined for an
+/// offline recipient. Now backed by an encrypted file under
+/// `PIZZINI_RELAY_STATE_DIR/pending.bin`, atomically rewritten on
+/// every mutation, with per-frame TTL surviving the bounce.
+///
+/// `PendingFrame` lives in `pending_store` so the on-disk format is
+/// the same type as the in-memory representation — no separate
+/// serializable shadow type. The frame's `bytes_hex` field is the
+/// entire wire frame as it would have been forwarded (frame_type byte
+/// + recipient header + payload), hex-encoded for JSON-safety.
+type Pending = Arc<Mutex<PendingStore>>;
 
 /// Per-peer activity log. F-903: gated on `debug_assertions` so a
 /// `--release` relay never prints peer_id metadata to stdout, closing
@@ -363,7 +369,27 @@ async fn main() -> std::io::Result<()> {
         store.len(),
     );
     let push_tokens: PushTokens = Arc::new(Mutex::new(store));
-    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    // Persistent offline-message queue. Same shape as the push-token
+    // store: built BEFORE the listener accept loop so a corrupt state
+    // file surfaces at startup, not silently mid-traffic. Per-peer
+    // cap is `MAX_PENDING_PER_PEER` — the single source of truth on
+    // this constant stays in main.rs so a future tune doesn't need
+    // to chase it through two files.
+    let pending_store_inst = PendingStore::load_or_create(&state_dir, MAX_PENDING_PER_PEER)
+        .map_err(|e| {
+            eprintln!(
+                "[pizzini-relay] FATAL: could not open pending-queue store at {}: {e}",
+                state_dir.display(),
+            );
+            e
+        })?;
+    println!(
+        "  pending-queue store: {} ({} frames across {} peers after TTL purge)",
+        state_dir.display(),
+        pending_store_inst.total_frames(),
+        pending_store_inst.peers_with_queues(),
+    );
+    let pending: Pending = Arc::new(Mutex::new(pending_store_inst));
     let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
     let replays: Replays = Arc::new(Mutex::new(HashMap::new()));
     let hello_replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
@@ -403,31 +429,28 @@ async fn main() -> std::io::Result<()> {
 }
 
 /// Background task that walks every per-peer queue and drops entries
-/// past their per-frame `expires_at`. With sender-chosen TTLs the queue
-/// is no longer monotone in arrival order — a 1h-TTL frame queued
-/// after a 7d-TTL frame expires first — so we can't short-circuit on
-/// the front. Walks the whole deque every cycle, which is fine: caps
-/// keep each queue ≤ 100 entries.
+/// past their per-frame `expires_at_unix`. With sender-chosen TTLs
+/// the queue is no longer monotone in arrival order — a 1h-TTL frame
+/// queued after a 7d-TTL frame expires first — so we can't
+/// short-circuit on the front. Walks the whole deque every cycle,
+/// which is fine: caps keep each queue ≤ `MAX_PENDING_PER_PEER`
+/// entries.
+///
+/// Persistence-aware: `PendingStore::gc_expired` re-serializes the
+/// queue file only if anything was actually dropped, so a steady-
+/// state relay with no expirations doesn't burn disk I/O every
+/// `PENDING_GC_INTERVAL`.
 fn spawn_pending_gc(pending: Pending) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(PENDING_GC_INTERVAL);
         loop {
             tick.tick().await;
-            let now = Instant::now();
-            let mut map = pending.lock().await;
-            map.retain(|peer_id, queue| {
-                let before = queue.len();
-                queue.retain(|f| f.expires_at > now);
-                if queue.is_empty() {
-                    dev_peer_log!(
-                        "pending: GC dropped {before} expired entries for {}",
-                        short_hex(peer_id)
-                    );
-                    false
-                } else {
-                    true
-                }
-            });
+            let mut store = pending.lock().await;
+            match store.gc_expired() {
+                Ok(0) => {}
+                Ok(n) => dev_peer_log!("pending: GC dropped {n} expired frames"),
+                Err(e) => eprintln!("[pizzini-relay] warn: pending GC persist failed: {e}"),
+            }
         }
     });
 }
@@ -746,20 +769,27 @@ async fn enqueue_pending(
     ttl_seconds: u32,
     pending: &Pending,
 ) {
-    let mut map = pending.lock().await;
-    let queue = map.entry(recipient.to_vec()).or_default();
-    // Per-peer cap is a DoS safeguard: an attacker spraying SEND at a
-    // long-offline peer should not be able to balloon our memory. Drop
-    // oldest first; the recipient will at least see the most recent
-    // messages on reconnect.
-    while queue.len() >= MAX_PENDING_PER_PEER {
-        queue.pop_front();
-    }
+    // Per-peer cap + arrival-order eviction live in `PendingStore`.
+    // `enqueue` also atomically persists the new queue state, so a
+    // relay bounce immediately after a SEND from an offline-recipient
+    // path preserves the frame for the recipient's next reconnect —
+    // exactly the failure mode that lost the "dde" message during
+    // the push-token-persistence rollout.
     let ttl = clamp_ttl(ttl_seconds);
-    queue.push_back(PendingFrame {
-        bytes: frame,
-        expires_at: Instant::now() + ttl,
-    });
+    let expires_at_unix = encrypted_file::unix_now() + ttl.as_secs();
+    let entry = PendingFrame::new(frame, expires_at_unix);
+    let mut store = pending.lock().await;
+    if let Err(e) = store.enqueue(recipient.to_vec(), entry) {
+        // Persist failure is logged but doesn't fail the connection.
+        // The in-memory copy of the queue is still valid for this
+        // process's lifetime — push delivery (already best-effort)
+        // continues to work; only the cross-restart guarantee is at
+        // risk. Better than dropping the connection over an I/O hiccup.
+        eprintln!(
+            "[pizzini-relay] warn: pending enqueue persist failed for {}: {e}",
+            short_hex(recipient),
+        );
+    }
 }
 
 /// Sender-chosen TTL clamped to `MAX_PENDING_TTL`. A zero or absurd
@@ -774,38 +804,55 @@ fn clamp_ttl(ttl_seconds: u32) -> Duration {
 /// Called right after a peer's HELLO is processed and their route is
 /// installed. Forwards every non-expired queued frame to their writer
 /// task in arrival order, then drops the (now-empty) queue entry.
+///
+/// `PendingStore::drain` removes the peer's queue from the store AND
+/// atomically persists the new (queue-removed) state before returning
+/// the live frames — so even if the writer task drops mid-loop and
+/// we discard the remaining entries, the disk reflects a "delivered"
+/// queue state. A subsequent relay restart will NOT re-deliver the
+/// same frames to the same peer.
+///
+/// Expired frames are filtered out inside `drain`; this loop only
+/// sees live entries.
 async fn drain_pending(peer_id: &[u8], pending: &Pending, routes: &Routes) {
     let queue = {
-        let mut map = pending.lock().await;
-        map.remove(peer_id)
+        let mut store = pending.lock().await;
+        match store.drain(peer_id) {
+            Ok(q) => q,
+            Err(e) => {
+                eprintln!(
+                    "[pizzini-relay] warn: pending drain persist failed for {}: {e}",
+                    short_hex(peer_id),
+                );
+                // The in-memory state may still hold the queue (drain
+                // returns Err only on the post-persist path). Return
+                // empty here rather than partially forward; the
+                // recipient will retry on their next HELLO. Cleaner
+                // than risking a half-drained state on disk.
+                return;
+            }
+        }
     };
-    let Some(queue) = queue else { return };
     if queue.is_empty() {
         return;
     }
-    let now = Instant::now();
     let routes_map = routes.lock().await;
     let Some(target) = routes_map.get(peer_id) else { return };
     let mut forwarded = 0usize;
-    let mut expired = 0usize;
     for entry in queue {
-        if entry.expires_at <= now {
-            expired += 1;
-            continue;
-        }
-        if target.send(entry.bytes).is_err() {
+        if target.send(entry.bytes()).is_err() {
             // Writer task is gone (race with disconnect). Stop draining
             // — the recipient effectively isn't connected anymore. Any
-            // remaining entries are dropped because we already removed
-            // the queue from `pending`. That's a knowing tradeoff
-            // against the alternative of partial reinsertion, which
-            // adds complexity for a rare race.
+            // remaining entries are dropped because `drain` already
+            // removed the queue from the store AND persisted. The
+            // tradeoff matches the pre-persistence behaviour: partial-
+            // reinsertion adds complexity for a rare race.
             break;
         }
         forwarded += 1;
     }
     dev_peer_log!(
-        "drained pending for {}: forwarded={forwarded} expired={expired}",
+        "drained pending for {}: forwarded={forwarded}",
         short_hex(peer_id),
     );
 }
