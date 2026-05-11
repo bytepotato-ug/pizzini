@@ -10,7 +10,7 @@ We start from Signal's protocol because it is the gold standard. We diverge wher
 
 - **No phone number.** Pairwise random IDs, no central directory. Contact via QR / invite link, out of band.
 - **Tor-only transport.** No clearnet fallback. Sealed sender + onion routing.
-- **Stateless relays in multiple jurisdictions.** No single seizable server. "Stateless" here means *no per-user accounts, no long-term server state, nothing on disk*. Ephemeral in-memory routing buffers (e.g. a TTL-bounded queue holding libsignal-encrypted ciphertexts for a few hours so an offline recipient eventually gets their message) are fine — they're transient routing state, not user data, and a process restart wipes them.
+- **Stateless relays in multiple jurisdictions.** No single seizable server. "Stateless" here means *no per-user accounts, no plaintext user data, no message bodies the relay can read*. Two routing maps persist across restarts under ChaCha20-Poly1305 with 0600 perms — the offline-message queue (libsignal-sealed ciphertexts, sender-chosen TTL up to 7d, per-peer cap) and the APNs push-token map (30-day TTL) — so a relay bounce doesn't silently drop messages or break push for paired devices. The rest of relay state (live route table, verify-key cache, hashcash + token replay sets) stays in-memory only and is wiped on restart. The encryption-at-rest is defence-in-depth against operator mistakes (a careless `cp -r`, a stray tarball), not defence against an attacker who seizes the machine — the key file lives next to the data. Message bodies are libsignal-sealed end-to-end regardless.
 - **Cryptographic erasure on duress.** Real wipe, not pretend mode.
 - **Post-quantum from day one.** PQXDH + Triple Ratchet (already in libsignal as of late 2025).
 - **Reproducible builds + multi-maintainer signing.**
@@ -118,9 +118,10 @@ will pick up the new binary on next build.
 - [x] Dev relay (LAN TCP); production Tor-onion deployment still TODO (see [`docs/relay-architecture.md`](docs/relay-architecture.md) for the agreed rollout shape)
 - [x] Contact establishment (QR + clipboard fallback)
 - [x] In-app unread indicators (per-contact badge + app-icon total)
-- [x] Push notifications (payload-opaque "New message" wake-up; APNs gated on `APNS_*` env vars)
+- [x] Push notifications (payload-opaque "New message" wake-up; APNs gated on `APNS_*` env vars; tokens persisted across relay restarts under ChaCha20-Poly1305 with 30-day TTL)
 - [x] App-icon badge increments while the app is force-quit (Notification Service Extension + App Group)
-- [x] Offline-recipient message delivery (relay holds an ephemeral in-memory queue per peer, drained on reconnect)
+- [x] Offline-recipient message delivery (relay's persistent ChaCha20-Poly1305-encrypted queue, sender-chosen TTL up to 7d, per-peer cap, drained on the recipient's reconnect)
+- [x] Relay launchd LaunchAgent installer + restart helper for unattended dev hosts
 - [x] Sealed sender (libsignal SealedSenderV1, self-issued certs)
 - [x] Sender outbox + retries
 - [x] End-to-end delivered receipts
@@ -130,11 +131,18 @@ will pick up the new binary on next build.
 - [x] First-contact hashcash PoW
 - [x] Screen-capture defences (**app-wide isSecureTextEntry wrap, unconditional, no toggle** — every screen, every sheet, every full-screen cover blanks in screenshots / screen recording / AirPlay mirroring / remote-screen-sharing; runtime self-test + automatic fallback with degraded-mode notice in Settings; live shield over chat / contacts / settings while iOS reports recording or external display; black `LaunchScreen.storyboard` and black `PrivacyShieldView` so launch + multitasking-snapshot reveal nothing either)
 - [x] Device-integrity warning layer (jailbreak indicators, debugger attach in release builds, hook-framework dylib scan via `_dyld_image_*`; surfaced as a banner + FAQ — detection-only, never refuses to run, no telemetry)
+- [x] App-level biometric lock (Face ID / passcode) + first-launch onboarding + privacy shield over the app-switcher snapshot
+- [x] Session persistence across launches (full DeviceStore — identity + prekeys + per-peer ratchet sessions — serialised to Keychain on every state change, rehydrated on launch; ratchet-rollback hardening for force-quit mid-ACK)
+- [x] Group chat (E2EE, sender-key fanout, explicit accept/decline of invitations, chunked in-band sealed attachments, per-recipient outbox with ⏳/✓/✓✓/👁/✗ status, panic-mode wipe, undecryptable-message surfacing instead of silent drop)
+- [x] In-band chunked sealed-sender attachments (metadata strip + sandbox under `Application Support/attachments/` with `FileProtectionType.completeUntilFirstUserAuthentication`, excluded from iCloud, tier-classified, opt-in QuickLook preview only)
+- [x] Global chat + message search with in-chat find-bar and deep-link to the cited row
+- [x] Panic mode — opt-in three-fast-tap wipes the active 1:1 chat or group log
+- [x] In-app FAQ + relay architecture docs at [`docs/relay-architecture.md`](docs/relay-architecture.md)
+- [x] 32-finding security-review remediation pass (Surfaces 1–10)
 - [ ] Multi-relay client fanout (deferred, post-audit) — design in [`docs/relay-architecture.md`](docs/relay-architecture.md) D3
 - [ ] Production onion allowlist + signed bundle pipeline ([`docs/relay-architecture.md`](docs/relay-architecture.md) D5)
 - [ ] Three production onions stood up (`pizzini2/3/4`, vanity-prefix via `mkp224o`) — CH/IS/PA
-- [ ] Storage layer (SQLCipher) — outbox migrates from Keychain JSON when this lands
-- [ ] Session persistence across launches (currently identity persists, ratchet state does not)
+- [ ] Storage layer (SQLCipher) — AppState + outbox migrate from Keychain JSON when this lands
 - [ ] Duress passphrase + cryptographic erasure
 - [ ] App Attest + ATS strict
 - [ ] Reproducible build script
