@@ -1416,10 +1416,23 @@ final class ChatStore: NSObject {
         Storage.upsertContact(state.contacts[idx])
     }
 
-    func setReadReceipts(_ contact: Contact, enabled: Bool) {
+    /// Set the per-chat read-receipts override. Three modes:
+    ///   - `.followDefault` — inherits `state.defaultReadReceiptsEnabled`.
+    ///   - `.alwaysOn`      — opt in for this contact regardless.
+    ///   - `.alwaysOff`     — opt out for this contact regardless.
+    func setReadReceiptsMode(_ contact: Contact, mode: ReadReceiptsMode) {
         guard let idx = contactIndex(forIdentity: contact.identityPub) else { return }
-        state.contacts[idx].readReceiptsEnabled = enabled
+        state.contacts[idx].readReceiptsMode = mode
         Storage.upsertContact(state.contacts[idx])
+    }
+
+    /// App-wide default for read receipts. Flips immediately apply to
+    /// every contact whose `readReceiptsMode == .followDefault`; the
+    /// `.alwaysOn` / `.alwaysOff` per-chat overrides are unaffected.
+    func setDefaultReadReceipts(_ enabled: Bool) {
+        guard state.defaultReadReceiptsEnabled != enabled else { return }
+        state.defaultReadReceiptsEnabled = enabled
+        Storage.upsertSettings(state)
     }
 
     @MainActor
@@ -1442,7 +1455,10 @@ final class ChatStore: NSObject {
     @MainActor
     func emitReadReceipt(forContactAt idx: Int, highestMessageId: Data) {
         let contact = state.contacts[idx]
-        guard contact.readReceiptsEnabled,
+        let effective = contact.effectiveReadReceiptsEnabled(
+            globalDefault: state.defaultReadReceiptsEnabled
+        )
+        guard effective,
               let session,
               !readyRelays.isEmpty
         else { return }
@@ -2253,12 +2269,16 @@ extension ChatStore: RelayClientDelegate {
     @MainActor
     private func handleReadReceiptPayload(_ payload: Data, contactIdx idx: Int) {
         guard payload.count == 16 else { return }
-        // F-405: honour `readReceiptsEnabled` symmetrically. If the user
-        // disabled emission of their own read receipts to this contact,
+        // F-405: honour the effective read-receipts setting symmetrically.
+        // If the user disabled emission of their own read receipts to
+        // this contact (via per-chat override OR via the global default),
         // also drop incoming claims that we read — otherwise a paired
         // peer could spoof "Read" stamps onto our own messages
         // unilaterally regardless of our setting.
-        guard state.contacts[idx].readReceiptsEnabled else {
+        let effective = state.contacts[idx].effectiveReadReceiptsEnabled(
+            globalDefault: state.defaultReadReceiptsEnabled
+        )
+        guard effective else {
             return
         }
         let highest = Data(payload)

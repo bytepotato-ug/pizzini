@@ -109,6 +109,19 @@ struct SettingsView: View {
                 Text("On: a soft haptic fires when a new message lands in a chat other than the one you're in. No banner, no sound, no preview — same posture as Signal / WhatsApp / Threema. The badge and chat list always update either way.")
             }
 
+            Section {
+                Toggle(isOn: Binding(
+                    get: { store.state.defaultReadReceiptsEnabled },
+                    set: { store.setDefaultReadReceipts($0) }
+                )) {
+                    Label("Send read receipts", systemImage: "eye")
+                }
+            } header: {
+                Text("Privacy")
+            } footer: {
+                Text("Off by default. When on, contacts you've enabled will see when you open their messages (✓✓ flips to 👁). Per-chat override in each contact's ⋯ menu lets you opt in or out for individual chats regardless of this setting.")
+            }
+
             if store.state.qrBlockEffective == false {
                 Section {
                     HStack(alignment: .top, spacing: 8) {

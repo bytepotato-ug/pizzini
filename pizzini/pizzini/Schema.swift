@@ -21,7 +21,7 @@ enum Schema {
     /// Current schema version — read by SQLiteStorage at open time
     /// to decide whether the migration runner needs to fire. Bump
     /// when adding a new migration; never decrease.
-    static let currentVersion: Int32 = 2
+    static let currentVersion: Int32 = 3
 
     /// All migrations, ordered. Index `i` is `from version i`.
     /// Migration 0 → 1 is the initial schema; subsequent entries
@@ -30,6 +30,7 @@ enum Schema {
     static let migrations: [Migration] = [
         Migration(from: 0, to: 1, sql: v1InitialSchema),
         Migration(from: 1, to: 2, sql: v2ContactProvenanceAndVerification),
+        Migration(from: 2, to: 3, sql: v3ReadReceiptsModeAndDefault),
     ]
 
     private static let v1InitialSchema = """
@@ -239,6 +240,32 @@ enum Schema {
     private static let v2ContactProvenanceAndVerification = """
     ALTER TABLE contacts ADD COLUMN added_via TEXT NOT NULL DEFAULT 'qr_scan';
     ALTER TABLE contacts ADD COLUMN verified_at INTEGER;
+    """
+
+    /// v3 — three-state per-contact read-receipts override + a global
+    /// default at the settings level.
+    ///
+    /// `read_receipts_mode` is a string enum that mirrors
+    /// `ReadReceiptsMode` in Models.swift:
+    ///   * 'follow_default' — use settings.default_read_receipts_enabled.
+    ///   * 'always_on'      — per-chat opt-in.
+    ///   * 'always_off'     — per-chat opt-out.
+    /// Default value is computed from the legacy per-contact bool:
+    /// any contact that had `read_receipts_enabled = 1` becomes
+    /// `always_on` so the user's explicit opt-in is preserved across
+    /// the migration. The previously-false rows become 'follow_default',
+    /// which combined with `default_read_receipts_enabled = 0`
+    /// (off-by-default — the privacy-first posture) yields the same
+    /// effective behavior as before.
+    ///
+    /// Legacy `read_receipts_enabled` column is left in place rather
+    /// than dropped (SQLite < 3.35 has no `DROP COLUMN`; running on
+    /// SQLCipher we vendor the older version conservatively). New
+    /// code never reads it.
+    private static let v3ReadReceiptsModeAndDefault = """
+    ALTER TABLE contacts  ADD COLUMN read_receipts_mode TEXT NOT NULL DEFAULT 'follow_default';
+    UPDATE contacts SET read_receipts_mode = 'always_on' WHERE read_receipts_enabled = 1;
+    ALTER TABLE settings  ADD COLUMN default_read_receipts_enabled INTEGER NOT NULL DEFAULT 0;
     """
 }
 

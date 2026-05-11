@@ -166,6 +166,22 @@ enum ContactVerificationState: String, Sendable {
     case pastedUnverified
 }
 
+/// Three-state per-contact override for the global "send read
+/// receipts" preference. Raw string for stable Codable + SQLite
+/// serialization — a future addition (e.g. `.confirmEachMessage`)
+/// appends a new case without re-numbering anything.
+enum ReadReceiptsMode: String, Codable, Sendable {
+    /// Use `AppState.defaultReadReceiptsEnabled`. Initial state for
+    /// every fresh contact.
+    case followDefault = "follow_default"
+    /// Per-chat override: always emit a read receipt to this contact
+    /// regardless of the global default.
+    case alwaysOn      = "always_on"
+    /// Per-chat override: never emit a read receipt to this contact
+    /// regardless of the global default.
+    case alwaysOff     = "always_off"
+}
+
 /// One row in the contacts list. `identityPub` is the trust anchor — the
 /// 33-byte serialized libsignal IdentityKey. Two `Contact` rows with the
 /// same `identityPub` should never coexist; uniqueness is enforced at
@@ -200,11 +216,33 @@ struct Contact: Codable, Identifiable, Sendable {
     /// chat ⋯ menu. A reduction here doesn't shrink in-flight messages
     /// — only future SENDs pick up the new value.
     var ttlSeconds: UInt32
-    /// Per-contact read-receipts toggle. Default OFF — most journalists
-    /// keep this off, and we won't surprise them by leaking when they
-    /// open a message just because they happened to enable it once at
-    /// onboarding. ✓✓ (delivered) is independent and always emitted.
-    var readReceiptsEnabled: Bool
+    /// Per-contact read-receipts mode. Three states:
+    ///   - `.followDefault`: use `AppState.defaultReadReceiptsEnabled`.
+    ///     Toggling the global setting in Settings → Privacy affects
+    ///     this contact immediately.
+    ///   - `.alwaysOn`: emit read receipts to THIS contact regardless
+    ///     of the global default. Per-chat override.
+    ///   - `.alwaysOff`: never emit to THIS contact regardless of the
+    ///     global default. Per-chat opt-out.
+    ///
+    /// Default is `.followDefault` so a single global toggle in
+    /// Settings is the lowest-friction control; users only reach for
+    /// the per-chat override when one specific conversation needs
+    /// different treatment from the rest of their contacts.
+    ///
+    /// ✓✓ (delivered) is independent and always emitted.
+    var readReceiptsMode: ReadReceiptsMode
+
+    /// Resolve the effective per-contact setting given the global
+    /// default. Cleaner at every read site than re-implementing the
+    /// `.followDefault` lookup.
+    func effectiveReadReceiptsEnabled(globalDefault: Bool) -> Bool {
+        switch readReceiptsMode {
+        case .followDefault: return globalDefault
+        case .alwaysOn:      return true
+        case .alwaysOff:     return false
+        }
+    }
     /// Peer's published `delivery_token_verify_key` (33 bytes) extracted
     /// from their BUNDLE_RESPONSE. F-202/F-401: every TOKEN_ISSUE batch
     /// from this peer is verified against this key before any token is
@@ -241,7 +279,7 @@ struct Contact: Codable, Identifiable, Sendable {
         lastRefillRequestSentAt: Date? = nil,
         lastRefillRequestHandledAt: Date? = nil,
         ttlSeconds: UInt32 = Contact.defaultTTLSeconds,
-        readReceiptsEnabled: Bool = false,
+        readReceiptsMode: ReadReceiptsMode = .followDefault,
         peerVerifyKey: Data? = nil,
         lastBundleServedAt: Date? = nil,
         addedVia: ContactSource = .qrScan,
@@ -259,7 +297,7 @@ struct Contact: Codable, Identifiable, Sendable {
         self.lastRefillRequestSentAt = lastRefillRequestSentAt
         self.lastRefillRequestHandledAt = lastRefillRequestHandledAt
         self.ttlSeconds = ttlSeconds
-        self.readReceiptsEnabled = readReceiptsEnabled
+        self.readReceiptsMode = readReceiptsMode
         self.peerVerifyKey = peerVerifyKey
         self.lastBundleServedAt = lastBundleServedAt
         self.addedVia = addedVia
@@ -298,7 +336,11 @@ struct Contact: Codable, Identifiable, Sendable {
         case id, identityPub, displayName, sessionEstablished, log, lastMessageAt
         case lastSeenAt, addedAt
         case deliveryTokensForPeer, lastRefillRequestSentAt, lastRefillRequestHandledAt
-        case ttlSeconds, readReceiptsEnabled
+        case ttlSeconds
+        // Legacy bool (decode-only for migration); current field is
+        // `readReceiptsMode`.
+        case readReceiptsEnabled
+        case readReceiptsMode
         case peerVerifyKey, lastBundleServedAt
         case addedVia, verifiedAt
     }
@@ -317,7 +359,17 @@ struct Contact: Codable, Identifiable, Sendable {
         self.lastRefillRequestSentAt = try c.decodeIfPresent(Date.self, forKey: .lastRefillRequestSentAt)
         self.lastRefillRequestHandledAt = try c.decodeIfPresent(Date.self, forKey: .lastRefillRequestHandledAt)
         self.ttlSeconds = try c.decodeIfPresent(UInt32.self, forKey: .ttlSeconds) ?? Contact.defaultTTLSeconds
-        self.readReceiptsEnabled = try c.decodeIfPresent(Bool.self, forKey: .readReceiptsEnabled) ?? false
+        // Backward-compat: new field takes precedence; if absent, fall
+        // back to the legacy Bool (true → .alwaysOn so the user keeps
+        // their explicit opt-in; false → .followDefault so they
+        // immediately track whatever the global default is).
+        if let mode = try c.decodeIfPresent(ReadReceiptsMode.self, forKey: .readReceiptsMode) {
+            self.readReceiptsMode = mode
+        } else if let legacy = try c.decodeIfPresent(Bool.self, forKey: .readReceiptsEnabled) {
+            self.readReceiptsMode = legacy ? .alwaysOn : .followDefault
+        } else {
+            self.readReceiptsMode = .followDefault
+        }
         self.peerVerifyKey = try c.decodeIfPresent(Data.self, forKey: .peerVerifyKey)
         self.lastBundleServedAt = try c.decodeIfPresent(Date.self, forKey: .lastBundleServedAt)
         // Codable path is used for previews/tests/in-memory snapshots,
@@ -327,6 +379,32 @@ struct Contact: Codable, Identifiable, Sendable {
         // in person" trust.
         self.addedVia = try c.decodeIfPresent(ContactSource.self, forKey: .addedVia) ?? .unknown
         self.verifiedAt = try c.decodeIfPresent(Date.self, forKey: .verifiedAt)
+    }
+
+    /// Explicit encode because the legacy `readReceiptsEnabled`
+    /// CodingKey above is decode-only (we read it as fallback for
+    /// pre-3-state payloads). Synthesised encode would try to emit a
+    /// matching property that no longer exists. Everything else is
+    /// the standard one-key-per-property pass.
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(identityPub, forKey: .identityPub)
+        try c.encode(displayName, forKey: .displayName)
+        try c.encode(sessionEstablished, forKey: .sessionEstablished)
+        try c.encode(log, forKey: .log)
+        try c.encodeIfPresent(lastMessageAt, forKey: .lastMessageAt)
+        try c.encodeIfPresent(lastSeenAt, forKey: .lastSeenAt)
+        try c.encode(addedAt, forKey: .addedAt)
+        try c.encode(deliveryTokensForPeer, forKey: .deliveryTokensForPeer)
+        try c.encodeIfPresent(lastRefillRequestSentAt, forKey: .lastRefillRequestSentAt)
+        try c.encodeIfPresent(lastRefillRequestHandledAt, forKey: .lastRefillRequestHandledAt)
+        try c.encode(ttlSeconds, forKey: .ttlSeconds)
+        try c.encode(readReceiptsMode, forKey: .readReceiptsMode)
+        try c.encodeIfPresent(peerVerifyKey, forKey: .peerVerifyKey)
+        try c.encodeIfPresent(lastBundleServedAt, forKey: .lastBundleServedAt)
+        try c.encode(addedVia, forKey: .addedVia)
+        try c.encodeIfPresent(verifiedAt, forKey: .verifiedAt)
     }
 
     var unreadCount: Int {
@@ -451,6 +529,14 @@ struct AppState: Codable, Sendable {
     /// list updates is the safe default; the haptic is opt-in.
     var inAppHapticsEnabled: Bool
 
+    /// App-wide default for "Tell {contact} when I read their messages".
+    /// Per-contact `Contact.readReceiptsMode` overrides this per chat.
+    /// Default OFF — privacy-first posture; surfaces in Settings →
+    /// Privacy as a single switch the user can flip once instead of
+    /// touching every chat. Toggling this here immediately affects
+    /// every contact whose `readReceiptsMode == .followDefault`.
+    var defaultReadReceiptsEnabled: Bool
+
     static let currentVersion = 1
     // Empty = use the bundled trusted-onion fleet from
     // `RelayRegistry.trusted` (D5 default). A non-empty value is a
@@ -473,7 +559,8 @@ struct AppState: Codable, Sendable {
         qrBlockTestedOSVersion: String? = nil,
         groups: [ChatGroup] = [],
         contactsBeforeGroups: Bool = true,
-        inAppHapticsEnabled: Bool = false
+        inAppHapticsEnabled: Bool = false,
+        defaultReadReceiptsEnabled: Bool = false
     ) {
         self.version = version
         self.relayHost = relayHost
@@ -488,6 +575,7 @@ struct AppState: Codable, Sendable {
         self.groups = groups
         self.contactsBeforeGroups = contactsBeforeGroups
         self.inAppHapticsEnabled = inAppHapticsEnabled
+        self.defaultReadReceiptsEnabled = defaultReadReceiptsEnabled
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -504,6 +592,7 @@ struct AppState: Codable, Sendable {
         case groups
         case contactsBeforeGroups
         case inAppHapticsEnabled
+        case defaultReadReceiptsEnabled
     }
 
     init(from decoder: Decoder) throws {
@@ -521,6 +610,7 @@ struct AppState: Codable, Sendable {
         groups = try c.decodeIfPresent([ChatGroup].self, forKey: .groups) ?? []
         contactsBeforeGroups = try c.decodeIfPresent(Bool.self, forKey: .contactsBeforeGroups) ?? true
         inAppHapticsEnabled = try c.decodeIfPresent(Bool.self, forKey: .inAppHapticsEnabled) ?? false
+        defaultReadReceiptsEnabled = try c.decodeIfPresent(Bool.self, forKey: .defaultReadReceiptsEnabled) ?? false
         // Pre-existing JSON blobs from earlier builds may carry the
         // `notifyPeerOnScreenshot`, `blockQRScreenshots`,
         // `blockChatScreenshots`, and `blockAppScreenshots` keys.

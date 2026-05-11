@@ -276,16 +276,45 @@ struct ChatView: View {
                         } label: {
                             Label("Expires after — \(currentTTLLabel(contact.ttlSeconds))", systemImage: "hourglass")
                         }
-                        // Read-receipts toggle. The full rationale lives
-                        // in the FAQ; the menu row is just a clean
-                        // labeled toggle with the eye SF Symbol so the
-                        // icon matches the ✓✓ → 👁 status glyph the
-                        // toggle controls.
-                        Toggle(isOn: Binding(
-                            get: { contact.readReceiptsEnabled },
-                            set: { store.setReadReceipts(contact, enabled: $0) }
-                        )) {
-                            Label("Read receipts", systemImage: "eye")
+                        // Read-receipts: three-state per-chat override.
+                        // The submenu mirrors Apple's standard "On /
+                        // Off / Default" pattern (Mail's notification
+                        // settings use the same shape). The submenu's
+                        // own label inlines the resolved current state
+                        // so the user doesn't have to expand to see
+                        // what it's set to.
+                        Menu {
+                            Button {
+                                store.setReadReceiptsMode(contact, mode: .followDefault)
+                            } label: {
+                                if contact.readReceiptsMode == .followDefault {
+                                    Label("Default — \(store.state.defaultReadReceiptsEnabled ? "On" : "Off")",
+                                          systemImage: "checkmark")
+                                } else {
+                                    Text("Default — \(store.state.defaultReadReceiptsEnabled ? "On" : "Off")")
+                                }
+                            }
+                            Button {
+                                store.setReadReceiptsMode(contact, mode: .alwaysOn)
+                            } label: {
+                                if contact.readReceiptsMode == .alwaysOn {
+                                    Label("Always on for this chat", systemImage: "checkmark")
+                                } else {
+                                    Text("Always on for this chat")
+                                }
+                            }
+                            Button {
+                                store.setReadReceiptsMode(contact, mode: .alwaysOff)
+                            } label: {
+                                if contact.readReceiptsMode == .alwaysOff {
+                                    Label("Always off for this chat", systemImage: "checkmark")
+                                } else {
+                                    Text("Always off for this chat")
+                                }
+                            }
+                        } label: {
+                            Label(readReceiptsMenuLabel(contact: contact),
+                                  systemImage: "eye")
                         }
                         Button(role: .destructive) {
                             confirmDeleteChat = true
@@ -381,6 +410,23 @@ struct ChatView: View {
         searchQuery = ""
         currentMatchID = nil
         searchFocused = false
+    }
+
+    /// Inline current state for the parent "Read receipts" menu row,
+    /// e.g. `Read receipts — Default (On)` or `Read receipts — On
+    /// for this chat`. Surfaces the resolved value next to the
+    /// title so the user knows the current setting without
+    /// expanding the submenu.
+    private func readReceiptsMenuLabel(contact: Contact) -> String {
+        switch contact.readReceiptsMode {
+        case .followDefault:
+            let on = store.state.defaultReadReceiptsEnabled
+            return "Read receipts — Default (\(on ? "On" : "Off"))"
+        case .alwaysOn:
+            return "Read receipts — On for this chat"
+        case .alwaysOff:
+            return "Read receipts — Off for this chat"
+        }
     }
 
     /// Map a TTL in seconds to its short user-facing label by looking

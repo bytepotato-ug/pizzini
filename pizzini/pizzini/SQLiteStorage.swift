@@ -248,7 +248,8 @@ final class SQLiteStorage {
             SELECT relay_host, onboarding_completed, biometric_lock_enabled,
                    auto_lock_timeout, quicklook_preview_enabled, panic_mode_enabled,
                    qr_block_effective, qr_block_tested_os_version,
-                   contacts_before_groups, in_app_haptics_enabled
+                   contacts_before_groups, in_app_haptics_enabled,
+                   default_read_receipts_enabled
             FROM settings WHERE id = 1;
         """)
         guard try stmt.step() else { return nil }
@@ -267,6 +268,7 @@ final class SQLiteStorage {
             groups: [],
             contactsBeforeGroups: stmt.columnBool(8),
             inAppHapticsEnabled: stmt.columnBool(9),
+            defaultReadReceiptsEnabled: stmt.columnBool(10),
         )
     }
 
@@ -279,8 +281,9 @@ final class SQLiteStorage {
                 id, relay_host, onboarding_completed, biometric_lock_enabled,
                 auto_lock_timeout, quicklook_preview_enabled, panic_mode_enabled,
                 qr_block_effective, qr_block_tested_os_version,
-                contacts_before_groups, in_app_haptics_enabled
-            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                contacts_before_groups, in_app_haptics_enabled,
+                default_read_receipts_enabled
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 relay_host = excluded.relay_host,
                 onboarding_completed = excluded.onboarding_completed,
@@ -291,7 +294,8 @@ final class SQLiteStorage {
                 qr_block_effective = excluded.qr_block_effective,
                 qr_block_tested_os_version = excluded.qr_block_tested_os_version,
                 contacts_before_groups = excluded.contacts_before_groups,
-                in_app_haptics_enabled = excluded.in_app_haptics_enabled;
+                in_app_haptics_enabled = excluded.in_app_haptics_enabled,
+                default_read_receipts_enabled = excluded.default_read_receipts_enabled;
         """)
         try stmt
             .bind(s.relayHost, at: 1)
@@ -304,6 +308,7 @@ final class SQLiteStorage {
             .bind(s.qrBlockTestedOSVersion, at: 8)
             .bind(s.contactsBeforeGroups, at: 9)
             .bind(s.inAppHapticsEnabled, at: 10)
+            .bind(s.defaultReadReceiptsEnabled, at: 11)
             .run()
     }
 
@@ -330,7 +335,7 @@ final class SQLiteStorage {
             SELECT id, identity_pub, display_name, session_established,
                    last_message_at, last_seen_at, added_at,
                    last_refill_request_sent_at, last_refill_request_handled_at,
-                   ttl_seconds, read_receipts_enabled, peer_verify_key, last_bundle_served_at,
+                   ttl_seconds, read_receipts_mode, peer_verify_key, last_bundle_served_at,
                    added_via, verified_at
             FROM contacts ORDER BY added_at ASC;
         """)
@@ -344,6 +349,13 @@ final class SQLiteStorage {
             // could in principle introduce a new variant. Fall back to
             // `.unknown` instead of crashing the chat list.
             let source = ContactSource(rawValue: rawSource) ?? .unknown
+            let rawMode = stmt.columnText(10) ?? ReadReceiptsMode.followDefault.rawValue
+            // Schema v3 backfills 'always_on' for legacy enabled=1
+            // rows and 'follow_default' for everything else.
+            // Defence-in-depth: an unknown variant from a future
+            // downgrade falls back to `.followDefault` so the
+            // chat list still renders.
+            let receiptsMode = ReadReceiptsMode(rawValue: rawMode) ?? .followDefault
             var c = Contact(
                 id: uuid,
                 identityPub: stmt.columnBlob(1) ?? Data(),
@@ -357,7 +369,7 @@ final class SQLiteStorage {
                 lastRefillRequestSentAt: stmt.columnOptionalInt64(7).map { $0.dateFromEpochMs },
                 lastRefillRequestHandledAt: stmt.columnOptionalInt64(8).map { $0.dateFromEpochMs },
                 ttlSeconds: UInt32(stmt.columnInt64(9)),
-                readReceiptsEnabled: stmt.columnBool(10),
+                readReceiptsMode: receiptsMode,
                 peerVerifyKey: stmt.columnBlob(11),
                 lastBundleServedAt: stmt.columnOptionalInt64(12).map { $0.dateFromEpochMs },
                 addedVia: source,
@@ -383,7 +395,7 @@ final class SQLiteStorage {
                 id, identity_pub, display_name, session_established,
                 last_message_at, last_seen_at, added_at,
                 last_refill_request_sent_at, last_refill_request_handled_at,
-                ttl_seconds, read_receipts_enabled, peer_verify_key, last_bundle_served_at,
+                ttl_seconds, read_receipts_mode, peer_verify_key, last_bundle_served_at,
                 added_via, verified_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
@@ -395,7 +407,7 @@ final class SQLiteStorage {
                 last_refill_request_sent_at = excluded.last_refill_request_sent_at,
                 last_refill_request_handled_at = excluded.last_refill_request_handled_at,
                 ttl_seconds = excluded.ttl_seconds,
-                read_receipts_enabled = excluded.read_receipts_enabled,
+                read_receipts_mode = excluded.read_receipts_mode,
                 peer_verify_key = excluded.peer_verify_key,
                 last_bundle_served_at = excluded.last_bundle_served_at,
                 verified_at = excluded.verified_at;
@@ -411,7 +423,7 @@ final class SQLiteStorage {
             .bind(c.lastRefillRequestSentAt, at: 8)
             .bind(c.lastRefillRequestHandledAt, at: 9)
             .bind(Int(c.ttlSeconds), at: 10)
-            .bind(c.readReceiptsEnabled, at: 11)
+            .bind(c.readReceiptsMode.rawValue, at: 11)
             .bind(c.peerVerifyKey, at: 12)
             .bind(c.lastBundleServedAt, at: 13)
             .bind(c.addedVia.rawValue, at: 14)
