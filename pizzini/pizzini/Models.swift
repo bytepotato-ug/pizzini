@@ -452,7 +452,13 @@ struct AppState: Codable, Sendable {
     var inAppHapticsEnabled: Bool
 
     static let currentVersion = 1
-    static let defaultRelayHost = "127.0.0.1"
+    // Empty = use the bundled trusted-onion fleet from
+    // `RelayRegistry.trusted` (D5 default). A non-empty value is a
+    // BYO override: the user typed an address into Settings →
+    // Custom relay, and we treat it verbatim as a single-relay
+    // target (dev `127.0.0.1`, community-run onions, etc.). See
+    // `docs/relay-architecture.md` D5 for the override contract.
+    static let defaultRelayHost = ""
 
     init(
         version: Int = currentVersion,

@@ -114,6 +114,7 @@ struct DiagnosticsView: View {
     private var connectionLabel: String {
         switch store.relayState {
         case .idle: return "idle"
+        case let .connectingToTor(progress): return "connecting to Tor… \(progress)%"
         case .connecting: return "connecting…"
         case .connected: return "connected"
         case let .failed(msg): return "failed: \(msg)"

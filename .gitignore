@@ -27,6 +27,12 @@ target/
 # on each build. CI should fail if the working tree differs after `cargo build`.
 *.xcframework/
 
+# Staged tor C headers — populated by `scripts/build-tor-xcframework.sh`.
+# Kept out of the repo because (a) it's ~3 MB of vendored upstream
+# headers and (b) the headers must stay in lockstep with the pinned
+# Tor.xcframework artifact, which the build script enforces.
+swift/Sources/PizziniTorObjC/torheaders/
+
 # Editors
 .idea/
 .vscode/

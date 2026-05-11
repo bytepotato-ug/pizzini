@@ -46,6 +46,11 @@ struct RelayAttestationView: View {
                         Text("The relay hasn't responded to our STATUS_REQUEST yet. This usually resolves within a few seconds of connecting.")
                     }
                 }
+            case let .connectingToTor(progress):
+                Section {
+                    Label("Connecting to Tor… \(progress)%", systemImage: "hourglass")
+                        .foregroundStyle(.secondary)
+                }
             case .connecting:
                 Section {
                     Label("Connecting to relay…", systemImage: "hourglass")

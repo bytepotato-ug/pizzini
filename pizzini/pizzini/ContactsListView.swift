@@ -349,6 +349,14 @@ struct ContactsListView: View {
         switch store.relayState {
         case .connected:
             EmptyView()
+        case let .connectingToTor(progress):
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("connecting to Tor… \(progress)%")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityLabel("Connecting to Tor, \(progress) percent")
         case .idle, .connecting:
             HStack(spacing: 6) {
                 ProgressView().controlSize(.mini)

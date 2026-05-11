@@ -75,7 +75,7 @@ extension ChatStore {
     /// `ChatGroup.maxMembers`).
     @discardableResult
     func createGroup(name: String, initialContacts: [Contact]) -> Data? {
-        guard let session, let myCard, let relay else { return nil }
+        guard let session, let myCard, !readyRelays.isEmpty else { return nil }
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return nil }
         // Cap is N = local + invitees.
@@ -182,13 +182,12 @@ extension ChatStore {
         // size N" by burst timing. Tor's circuit-isolation defaults
         // and per-recipient delivery jitter are the v2 mitigation.
         for c in initialContacts {
-            broadcastGroupOp(signedBytes, toPeer: c.identityPub, session: session, relay: relay)
+            broadcastGroupOp(signedBytes, toPeer: c.identityPub, session: session)
             broadcastSenderKeyDistribution(
                 groupId: groupId,
                 skdm: mySKDM,
                 toPeer: c.identityPub,
                 session: session,
-                relay: relay,
                 groupAt: gIdx,
             )
         }
@@ -205,7 +204,7 @@ extension ChatStore {
     /// ships our current SKDM to the newcomer.
     @discardableResult
     func inviteToGroup(groupId: Data, contact: Contact) -> Bool {
-        guard let session, let myCard, let relay,
+        guard let session, let myCard,
               let gIdx = groupIndex(forId: groupId)
         else { return false }
         guard state.groups[gIdx].role(of: myCard.peerId) == .admin else { return false }
@@ -255,7 +254,6 @@ extension ChatStore {
                 bootstrap: bootstrap,
                 toPeer: contact.identityPub,
                 session: session,
-                relay: relay,
             )
         }
 
@@ -265,7 +263,7 @@ extension ChatStore {
             .map(\.peerId)
             .filter { $0 != myCard.peerId }
         for peer in recipients {
-            broadcastGroupOp(signedBytes, toPeer: peer, session: session, relay: relay)
+            broadcastGroupOp(signedBytes, toPeer: peer, session: session)
         }
 
         // Reciprocal SKDM exchange (HIGH-2): ship our current SKDM to
@@ -273,7 +271,7 @@ extension ChatStore {
         // received it). The hook also covers the case where the
         // newcomer is reached via a state mutation we didn't
         // initiate.
-        applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session, relay: relay)
+        applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session)
         Storage.upsertGroup(state.groups[gIdx])
         return true
     }
@@ -286,7 +284,7 @@ extension ChatStore {
     /// when they apply the same op (audit fix HIGH-1).
     @discardableResult
     func removeFromGroup(groupId: Data, peerIdentity: Data) -> Bool {
-        guard let session, let myCard, let relay,
+        guard let session, let myCard,
               let gIdx = groupIndex(forId: groupId)
         else { return false }
         guard state.groups[gIdx].role(of: myCard.peerId) == .admin else { return false }
@@ -318,14 +316,14 @@ extension ChatStore {
         guard let signedBytes = try? signedOp.encoded() else { return false }
         for member in state.groups[gIdx].activeMembers
             where member.peerId != myCard.peerId {
-            broadcastGroupOp(signedBytes, toPeer: member.peerId, session: session, relay: relay)
+            broadcastGroupOp(signedBytes, toPeer: member.peerId, session: session)
         }
         // Mandatory rotation post-remove (slice 4d / audit HIGH-1).
         // The state machine flagged `requestSelfRotation` if we are
         // still active; the post-mutation hook fires a single
         // rotation regardless of how many remove ops applied in this
         // call.
-        applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session, relay: relay)
+        applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session)
         Storage.upsertGroup(state.groups[gIdx])
         return true
     }
@@ -334,7 +332,7 @@ extension ChatStore {
     /// system row when the apply rejects (e.g. authorization).
     @discardableResult
     func renameGroup(groupId: Data, newName: String) -> Bool {
-        guard let session, let myCard, let relay,
+        guard let session, let myCard,
               let gIdx = groupIndex(forId: groupId)
         else { return false }
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -360,9 +358,9 @@ extension ChatStore {
         guard let signedBytes = try? signedOp.encoded() else { return false }
         for member in state.groups[gIdx].activeMembers
             where member.peerId != myCard.peerId {
-            broadcastGroupOp(signedBytes, toPeer: member.peerId, session: session, relay: relay)
+            broadcastGroupOp(signedBytes, toPeer: member.peerId, session: session)
         }
-        applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session, relay: relay)
+        applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session)
         Storage.upsertGroup(state.groups[gIdx])
         return true
     }
@@ -393,7 +391,7 @@ extension ChatStore {
         peerIdentity: Data,
         kind: GroupOpKind,
     ) -> Bool {
-        guard let session, let myCard, let relay,
+        guard let session, let myCard,
               let gIdx = groupIndex(forId: groupId)
         else { return false }
         guard state.groups[gIdx].role(of: myCard.peerId) == .admin else { return false }
@@ -428,9 +426,9 @@ extension ChatStore {
         guard let signedBytes = try? signedOp.encoded() else { return false }
         for member in state.groups[gIdx].activeMembers
             where member.peerId != myCard.peerId {
-            broadcastGroupOp(signedBytes, toPeer: member.peerId, session: session, relay: relay)
+            broadcastGroupOp(signedBytes, toPeer: member.peerId, session: session)
         }
-        applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session, relay: relay)
+        applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session)
         Storage.upsertGroup(state.groups[gIdx])
         return true
     }
@@ -444,7 +442,7 @@ extension ChatStore {
     /// is unlocked. No-op if the group isn't pending.
     @discardableResult
     func acceptGroupInvitation(groupId: Data) -> Bool {
-        guard let session, let myCard, let relay,
+        guard let session, let myCard,
               let gIdx = groupIndex(forId: groupId)
         else { return false }
         guard state.groups[gIdx].pendingInvitation else { return false }
@@ -458,7 +456,7 @@ extension ChatStore {
             "[pizzini.group] accept \(short(groupId)):"
                 + " enrolling local chain and broadcasting SKDM",
         )
-        enrolMyChainOnFirstJoin(groupAt: gIdx, session: session, relay: relay)
+        enrolMyChainOnFirstJoin(groupAt: gIdx, session: session)
         Storage.upsertGroup(state.groups[gIdx])
         return true
     }
@@ -581,7 +579,7 @@ extension ChatStore {
     func sendGroupMessage(groupId: Data, text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
-        guard let session, let myCard, let relay,
+        guard let session, let myCard,
               let gIdx = groupIndex(forId: groupId)
         else { return false }
 
@@ -672,12 +670,7 @@ extension ChatStore {
                 )
                 outbox.entries[messageId] = entry
                 Storage.upsertOutboxEntry(entry)
-                relay.sendSealed(
-                    toPeer: recipient,
-                    sealedCiphertext: sealed,
-                    ttlSeconds: ttl,
-                    token: token,
-                )
+                broadcastToRelays { $0.sendSealed(toPeer: recipient, sealedCiphertext: sealed, ttlSeconds: ttl, token: token) }
                 entry.relayedAt = now
                 entry.token = Data() // F-505: scrub once relayed
                 outbox.entries[messageId] = entry
@@ -741,7 +734,7 @@ extension ChatStore {
         // strip pass isn't wasted; we re-resolve both inside
         // `shipPreparedGroupAttachment` after the hop because those
         // properties are mutable across foreground re-arms.
-        guard session != nil, let myCard, relay != nil,
+        guard session != nil, let myCard, !relays.isEmpty,
               let gIdx = groupIndex(forId: groupId)
         else { return }
         // HIGH-3: refuse if we're no longer an active member.
@@ -883,7 +876,7 @@ extension ChatStore {
         captionText: String,
         sandboxRelPath: String?,
     ) {
-        guard let session, let myCard, let relay,
+        guard let session, let myCard,
               let gIdx = groupIndex(forId: groupId)
         else { return }
         // Re-check gates after the off-main hop: state may have
@@ -986,12 +979,7 @@ extension ChatStore {
                     )
                     outbox.entries[messageId] = entry
                     Storage.upsertOutboxEntry(entry)
-                    relay.sendSealed(
-                        toPeer: recipient,
-                        sealedCiphertext: sealed,
-                        ttlSeconds: ttl,
-                        token: token,
-                    )
+                    broadcastToRelays { $0.sendSealed(toPeer: recipient, sealedCiphertext: sealed, ttlSeconds: ttl, token: token) }
                     entry.relayedAt = now
                     entry.token = Data() // F-505 scrub-on-relay
                     outbox.entries[messageId] = entry
@@ -1185,7 +1173,7 @@ extension ChatStore {
     /// `mySkdmRecipients` so the bidirectional-SKDM hook re-ships to
     /// everyone.
     func rotateMyGroupChain(groupId: Data) {
-        guard let session, let myCard, let relay,
+        guard let session, let myCard,
               let gIdx = groupIndex(forId: groupId)
         else { return }
         guard state.groups[gIdx].activeMembers.contains(where: { $0.peerId == myCard.peerId }) else {
@@ -1226,13 +1214,12 @@ extension ChatStore {
         }
         for member in state.groups[gIdx].activeMembers
             where member.peerId != myCard.peerId {
-            broadcastGroupOp(signedBytes, toPeer: member.peerId, session: session, relay: relay)
+            broadcastGroupOp(signedBytes, toPeer: member.peerId, session: session)
             broadcastSenderKeyDistribution(
                 groupId: groupId,
                 skdm: newSKDM,
                 toPeer: member.peerId,
                 session: session,
-                relay: relay,
                 groupAt: gIdx,
             )
         }
@@ -1251,7 +1238,7 @@ extension ChatStore {
     /// state. Idempotent and safe to call repeatedly.
     @discardableResult
     func resendMyKeys(groupId: Data) -> Bool {
-        guard let session, let myCard, let relay,
+        guard let session, let myCard,
               let gIdx = groupIndex(forId: groupId)
         else { return false }
         guard let myDist = state.groups[gIdx].myCurrentDistributionId else {
@@ -1284,7 +1271,6 @@ extension ChatStore {
                 skdm: skdm,
                 toPeer: recipient,
                 session: session,
-                relay: relay,
                 groupAt: gIdx,
             )
         }
@@ -1309,7 +1295,7 @@ extension ChatStore {
     /// fires the bidirectional-SKDM / mandatory-rotation post-apply
     /// hooks.
     func handleGroupOp(payload: Data, fromPeer sender: Data) {
-        guard let session, let myCard, let relay else { return }
+        guard let session, let myCard, !readyRelays.isEmpty else { return }
         guard let op = GroupOp.decode(payload) else {
             diagLog("group", "groupOp ← \(short(sender)): malformed signed bytes")
             return
@@ -1413,7 +1399,7 @@ extension ChatStore {
                     + " APPLIED \(opKindLabel(op.kind)) at epoch \(epoch),"
                     + " group now has \(state.groups[gIdx].activeMembers.count) active member(s)",
             )
-            applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session, relay: relay)
+            applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session)
         case let .queued(epoch):
             NSLog(
                 "[pizzini.group] groupOp ← \(short(sender)):"
@@ -1587,7 +1573,7 @@ extension ChatStore {
     /// the libsignal store and lets non-members pre-position chains
     /// for the message-injection attack documented in CRITICAL-2.
     func handleGroupKeyDistribution(payload: Data, fromPeer sender: Data) {
-        guard let session, let relay else { return }
+        guard let session, !readyRelays.isEmpty else { return }
         guard let parsed = GroupEnvelope.decodeKeyDistribution(payload) else {
             NSLog("[pizzini.group] SKDM ← \(short(sender)): malformed body")
             return
@@ -1644,7 +1630,7 @@ extension ChatStore {
         // active member of this group, ensure the sender has our
         // current SKDM so they can decrypt our messages too.
         let mySxStub = ChatGroup.ApplySideEffects(localIdentityPub: myCard?.peerId)
-        applyPostMutationSideEffects(groupAt: gIdx, sideEffects: mySxStub, session: session, relay: relay)
+        applyPostMutationSideEffects(groupAt: gIdx, sideEffects: mySxStub, session: session)
         Storage.upsertGroup(state.groups[gIdx])
     }
 
@@ -1780,7 +1766,6 @@ extension ChatStore {
     private func enrolMyChainOnFirstJoin(
         groupAt gIdx: Int,
         session: Session,
-        relay: RelayClient,
     ) {
         guard let myCard else { return }
         // Idempotent — only enrol if we haven't already.
@@ -1818,7 +1803,6 @@ extension ChatStore {
                 skdm: skdm,
                 toPeer: member.peerId,
                 session: session,
-                relay: relay,
                 groupAt: gIdx,
             )
         }
@@ -1832,7 +1816,6 @@ extension ChatStore {
         groupAt gIdx: Int,
         sideEffects sx: ChatGroup.ApplySideEffects,
         session: Session,
-        relay: RelayClient,
     ) {
         // Self-chain clear (we got removed).
         if sx.requestSelfChainClear {
@@ -1879,7 +1862,7 @@ extension ChatStore {
             return
         }
         // Bidirectional SKDM (HIGH-2).
-        ensureMySKDMReachesActiveMembers(groupAt: gIdx, session: session, relay: relay)
+        ensureMySKDMReachesActiveMembers(groupAt: gIdx, session: session)
         // F-NEW-502: surface a visible system row when an admin
         // added a peer who is NOT in our 1:1 contacts. The
         // cryptographic state of the group accepts the new member
@@ -1912,7 +1895,6 @@ extension ChatStore {
     private func ensureMySKDMReachesActiveMembers(
         groupAt gIdx: Int,
         session: Session,
-        relay: RelayClient,
     ) {
         guard let myCard else { return }
         guard let myDist = state.groups[gIdx].myCurrentDistributionId else { return }
@@ -1939,7 +1921,6 @@ extension ChatStore {
                 skdm: skdm,
                 toPeer: peer,
                 session: session,
-                relay: relay,
                 groupAt: gIdx,
             )
         }
@@ -2038,7 +2019,6 @@ extension ChatStore {
         _ signedBytes: Data,
         toPeer recipient: Data,
         session: Session,
-        relay: RelayClient,
     ) {
         guard let cIdx = state.contacts.firstIndex(where: { $0.identityPub == recipient }) else {
             diagLog("group", "groupOp → \(short(recipient)): NO CONTACT (1:1 unpaired)")
@@ -2058,12 +2038,7 @@ extension ChatStore {
                 messageId: messageId,
                 plaintext: inner,
             )
-            relay.sendSealed(
-                toPeer: recipient,
-                sealedCiphertext: sealed,
-                ttlSeconds: state.contacts[cIdx].ttlSeconds,
-                token: token,
-            )
+            broadcastToRelays { $0.sendSealed(toPeer: recipient, sealedCiphertext: sealed, ttlSeconds: state.contacts[cIdx].ttlSeconds, token: token) }
             diagLog("group", "groupOp → \(short(recipient)): sealed=\(sealed.count) B, sent")
         } catch {
             diagLog("group", "groupOp → \(short(recipient)): seal failed — \(error)")
@@ -2079,7 +2054,6 @@ extension ChatStore {
         skdm: Data,
         toPeer recipient: Data,
         session: Session,
-        relay: RelayClient,
         groupAt gIdx: Int,
     ) {
         guard let cIdx = state.contacts.firstIndex(where: { $0.identityPub == recipient }) else {
@@ -2102,12 +2076,7 @@ extension ChatStore {
                 messageId: messageId,
                 plaintext: inner,
             )
-            relay.sendSealed(
-                toPeer: recipient,
-                sealedCiphertext: sealed,
-                ttlSeconds: state.contacts[cIdx].ttlSeconds,
-                token: token,
-            )
+            broadcastToRelays { $0.sendSealed(toPeer: recipient, sealedCiphertext: sealed, ttlSeconds: state.contacts[cIdx].ttlSeconds, token: token) }
             // Successful seal → record so the bidirectional hook
             // doesn't re-fire for this peer until next rotation.
             state.groups[gIdx].mySkdmRecipients.insert(recipient)
@@ -2123,7 +2092,6 @@ extension ChatStore {
         bootstrap: GroupBootstrap,
         toPeer recipient: Data,
         session: Session,
-        relay: RelayClient,
     ) {
         guard let bytes = try? bootstrap.encoded() else {
             NSLog("[pizzini.group] bootstrap → \(short(recipient)): encode failed")
@@ -2146,12 +2114,7 @@ extension ChatStore {
                 messageId: messageId,
                 plaintext: inner,
             )
-            relay.sendSealed(
-                toPeer: recipient,
-                sealedCiphertext: sealed,
-                ttlSeconds: state.contacts[cIdx].ttlSeconds,
-                token: token,
-            )
+            broadcastToRelays { $0.sendSealed(toPeer: recipient, sealedCiphertext: sealed, ttlSeconds: state.contacts[cIdx].ttlSeconds, token: token) }
             NSLog("[pizzini.group] bootstrap → \(short(recipient)): sealed=\(sealed.count) B, sent")
         } catch {
             NSLog("[pizzini.group] bootstrap → \(short(recipient)): seal failed — \(error)")

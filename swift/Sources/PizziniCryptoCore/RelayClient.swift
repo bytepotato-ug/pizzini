@@ -8,6 +8,7 @@
 
 import Foundation
 import Network
+import PizziniTor
 
 /// USP #1: snapshot of the running relay binary's identity.
 /// Returned by `RelayClient.requestStatus()` and delivered to the
@@ -78,6 +79,13 @@ public extension RelayClientDelegate {
 public final class RelayClient: @unchecked Sendable {
     public enum State: Sendable, Equatable {
         case idle
+        /// Connecting to a .onion target — Tor bootstrap is in flight.
+        /// `progress` is the latest `BOOTSTRAP PROGRESS=N` value the
+        /// embedded daemon emitted (0–100). The UI surfaces this as
+        /// "Connecting to Tor… N%". Transitions to `.connecting` once
+        /// the SOCKS5 handshake begins and to `.connected` once the
+        /// relay HELLO completes.
+        case connectingToTor(progress: Int)
         case connecting
         case connected
         case failed(String)
@@ -272,13 +280,28 @@ public final class RelayClient: @unchecked Sendable {
     public func connect(to host: String, port: UInt16) {
         disconnect()
         state = .connecting
-        let endpoint = NWEndpoint.Host(host)
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             state = .failed("invalid port \(port)")
             return
         }
-        let params = NWParameters.tcp
-        let conn = NWConnection(host: endpoint, port: nwPort, using: params)
+        if host.hasSuffix(".onion") {
+            // Onion target: bootstrap Tor (if needed), dial the local
+            // SOCKS5 port, hand-roll the SOCKS5 handshake, then drop
+            // into the normal relay HELLO. NWParameters.proxyConfiguration
+            // is unreliable for SOCKS5 + .onion on iOS 18 (it tries to
+            // DNS-resolve the hostname first), so we speak the protocol
+            // by hand instead.
+            startTorConnection(host: host, port: nwPort)
+        } else {
+            // LAN / loopback / dev path. Existing direct-TCP flow,
+            // unchanged.
+            startDirectConnection(host: host, port: nwPort)
+        }
+    }
+
+    private func startDirectConnection(host: String, port: NWEndpoint.Port) {
+        let endpoint = NWEndpoint.Host(host)
+        let conn = NWConnection(host: endpoint, port: port, using: .tcp)
         self.connection = conn
 
         conn.stateUpdateHandler = { [weak self] s in
@@ -308,6 +331,215 @@ public final class RelayClient: @unchecked Sendable {
             }
         }
         conn.start(queue: queue)
+    }
+
+    /// .onion target. Multi-step setup:
+    ///   1. Ensure embedded Tor is bootstrapped → get SOCKS port
+    ///   2. Open NWConnection to 127.0.0.1:<socksPort>
+    ///   3. SOCKS5 greeting + CONNECT to <host>:<port>
+    ///   4. Drop into the relay HELLO + scheduleRead
+    /// Any failure on the way maps to `state = .failed(...)` and the
+    /// host's retry timer picks it up on the next tick.
+    private func startTorConnection(host: String, port: NWEndpoint.Port) {
+        let target = host
+        let targetPort = port.rawValue
+        // Seed UI with the "Connecting to Tor… 0%" frame before the
+        // first progress event lands.
+        state = .connectingToTor(progress: 0)
+        // Capture the queue + self via a weak ref for the async work.
+        // The Task escapes the synchronous `connect()` call, but every
+        // subsequent operation hops back onto `queue` before touching
+        // any instance state — same threading invariant the existing
+        // direct path enforces via NWConnection's stateUpdateHandler.
+        Task { [weak self] in
+            guard let self else { return }
+
+            // Sibling task: poll TorController.bootstrapProgress and
+            // republish it via our `state`. Cheap (50ms hop to
+            // MainActor + an int read every 200ms). Cancelled below
+            // once bootstrap() returns. Without this, the UI would
+            // sit at "Connecting to Tor… 0%" for the entire
+            // bootstrap because we'd never observe the intermediate
+            // PROGRESS=N events.
+            let progressTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    let pct = await TorController.shared.bootstrapProgress
+                    self?.queue.async {
+                        guard let self else { return }
+                        if case .connectingToTor = self.state {
+                            // Setting the same percent is a no-op
+                            // through the `didSet` guard, so 0→0
+                            // ticks don't spam the delegate.
+                            self.state = .connectingToTor(progress: pct)
+                        }
+                    }
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                }
+            }
+
+            let socksPort: UInt16
+            do {
+                socksPort = try await TorController.shared.bootstrap()
+            } catch {
+                progressTask.cancel()
+                self.queue.async {
+                    self.state = .failed("tor bootstrap failed: \(error)")
+                }
+                return
+            }
+            progressTask.cancel()
+
+            // After the await, hop back onto our serial queue before
+            // mutating any state.
+            self.queue.async {
+                // Transition into the SOCKS5 handshake phase. The UI
+                // collapses this to a plain "connecting" indicator
+                // — Tor is bootstrapped, the remaining work is
+                // sub-second on healthy circuits.
+                self.state = .connecting
+                self.openSocksConnection(
+                    socksPort: socksPort,
+                    targetHost: target,
+                    targetPort: targetPort
+                )
+            }
+        }
+    }
+
+    private func openSocksConnection(
+        socksPort: UInt16,
+        targetHost: String,
+        targetPort: UInt16
+    ) {
+        guard let nwSocksPort = NWEndpoint.Port(rawValue: socksPort) else {
+            state = .failed("invalid SOCKS port \(socksPort)")
+            return
+        }
+        // Loopback IPv4 — tor's SocksPort binds 127.0.0.1 explicitly.
+        let conn = NWConnection(
+            host: .ipv4(.loopback),
+            port: nwSocksPort,
+            using: .tcp
+        )
+        self.connection = conn
+
+        conn.stateUpdateHandler = { [weak self] s in
+            guard let self else { return }
+            switch s {
+            case .ready:
+                self.beginSocksHandshake(on: conn, targetHost: targetHost, targetPort: targetPort)
+            case .waiting:
+                self.state = .connecting
+            case .failed(let err):
+                self.state = .failed("socks tcp: \(err)")
+            case .cancelled:
+                self.state = .idle
+            default:
+                break
+            }
+        }
+        conn.start(queue: queue)
+    }
+
+    private func beginSocksHandshake(
+        on conn: NWConnection,
+        targetHost: String,
+        targetPort: UInt16
+    ) {
+        // Stage 1: send the NO_AUTH greeting.
+        conn.send(content: Socks5.clientGreeting, completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            if let error {
+                self.state = .failed("socks greeting send: \(error)")
+                return
+            }
+            self.readSocksGreetingReply(on: conn, targetHost: targetHost, targetPort: targetPort)
+        })
+    }
+
+    private func readSocksGreetingReply(
+        on conn: NWConnection,
+        targetHost: String,
+        targetPort: UInt16
+    ) {
+        // Greeting reply is exactly 2 bytes. Use minimum=maximum=2 so
+        // NWConnection delivers in one chunk.
+        conn.receive(minimumIncompleteLength: 2, maximumLength: 2) { [weak self] data, _, _, error in
+            guard let self else { return }
+            if let error {
+                self.state = .failed("socks greeting reply: \(error)")
+                return
+            }
+            guard let data else {
+                self.state = .failed("socks greeting reply: empty")
+                return
+            }
+            do {
+                _ = try Socks5.parseGreetingReply(data)
+            } catch {
+                self.state = .failed("socks greeting reply: \(error)")
+                return
+            }
+            self.sendSocksConnect(on: conn, targetHost: targetHost, targetPort: targetPort)
+        }
+    }
+
+    private func sendSocksConnect(
+        on conn: NWConnection,
+        targetHost: String,
+        targetPort: UInt16
+    ) {
+        let req = Socks5.connectRequest(host: targetHost, port: targetPort)
+        conn.send(content: req, completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            if let error {
+                self.state = .failed("socks connect send: \(error)")
+                return
+            }
+            self.readSocksConnectReply(on: conn, buffer: Data())
+        })
+    }
+
+    private func readSocksConnectReply(on conn: NWConnection, buffer: Data) {
+        // CONNECT reply is variable length (10-262 bytes). We can't
+        // ask NWConnection for "exactly enough" because we don't know
+        // the length until we've parsed past the ATYP byte. Read up to
+        // 262 bytes (the absolute maximum) and let the parser tell us
+        // when it has a complete frame.
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 262) { [weak self] data, _, _, error in
+            guard let self else { return }
+            if let error {
+                self.state = .failed("socks connect reply: \(error)")
+                return
+            }
+            var buf = buffer
+            if let data, !data.isEmpty {
+                buf.append(data)
+            }
+            do {
+                switch try Socks5.tryParseConnectReply(buf) {
+                case .complete(let consumed):
+                    // Anything past `consumed` belongs to the relay
+                    // stream (the relay's HELLO is client-initiated,
+                    // so the proxy shouldn't have any post-reply bytes
+                    // yet — but seed the relay buffer defensively).
+                    let trailing = buf.dropFirst(consumed)
+                    if !trailing.isEmpty {
+                        self.readBuffer.append(trailing)
+                    }
+                    self.sendHello()
+                    if let token = self.pushToken {
+                        self.sendRegisterPush(token: token)
+                    }
+                    self.state = .connected
+                    self.scheduleRead()
+                case .incomplete:
+                    self.readSocksConnectReply(on: conn, buffer: buf)
+                }
+            } catch {
+                self.state = .failed("socks connect reply: \(error)")
+            }
+        }
     }
 
     public func disconnect() {

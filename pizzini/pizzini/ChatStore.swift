@@ -1,5 +1,6 @@
 import Foundation
 import PizziniCryptoCore
+import PizziniTor
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -122,7 +123,32 @@ final class ChatStore: NSObject {
     // proliferation of public methods. Still hidden from any
     // out-of-module consumer.
     var session: Session?
-    var relay: RelayClient?
+    /// **D3 (app-side fanout).** One `RelayClient` per trusted onion
+    /// in the bundled fleet (`RelayRegistry.trusted`), connected in
+    /// parallel. Outbound SENDs / ACKs / BUNDLEs fan out across every
+    /// element in `readyRelays`. Inbound dedup is handled at the
+    /// libsignal layer via `SealedSenderResult.isDuplicate`, so the
+    /// receiver naturally drops the copy-of-N copies that arrive on
+    /// the alternate routes.
+    ///
+    /// When `state.relayHost` is a non-empty BYO override (D5
+    /// fallback), this array holds exactly one client pointing at the
+    /// override host. When empty, it holds one client per bundled
+    /// descriptor.
+    var relays: [RelayClient] = []
+    /// Subset of `relays` currently in `.connected`. Send-fanout
+    /// targets this set; if it's empty the call is a no-op (the
+    /// outbox retry walk picks it back up once a relay reconnects).
+    var readyRelays: [RelayClient] {
+        relays.filter { $0.state == .connected }
+    }
+    /// Primary push-token holder. APNs registrations target ONE relay
+    /// at a time — registering on N relays would mean N "New message"
+    /// pushes per send while the recipient is offline (each relay
+    /// independently fires the wake-up). Re-armed in
+    /// `electPushPrimary` whenever the current primary drops below
+    /// `.connected`.
+    private weak var pushPrimary: RelayClient?
     private var myIdentityPublicCached: Data?
     /// Latest APNs token. Stashed so a relay-host change (which builds
     /// a fresh `RelayClient`) re-publishes the token automatically.
@@ -180,6 +206,24 @@ final class ChatStore: NSObject {
         // first reconnect to repopulate.
         self.transparencyLog = TransparencyLog.loadCachedLog()
         super.init()
+        // Migration: pre-fleet installs persisted dev hosts like
+        // `127.0.0.1`. Per `docs/relay-architecture.md` D1 every
+        // production relay is Tor-only, so a legitimate BYO value
+        // ends in `.onion`. Anything else (LAN IPs, hostnames,
+        // localhost, …) is a stale dev value that we silently
+        // migrate to the fleet — without this every existing
+        // install lands in single-relay-to-{stale-IP} mode and
+        // Settings → Relays shows the bundled Germany row as
+        // "offline" because the fleet isn't connected.
+        //
+        // Must run AFTER super.init() — `self.state =` on an
+        // NSObject subclass is illegal until then.
+        let trimmed = self.state.relayHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, !trimmed.hasSuffix(".onion") {
+            NSLog("[pizzini] migrating legacy relayHost '\(self.state.relayHost)' → fleet mode")
+            self.state.relayHost = ""
+            Storage.upsertSettings(self.state)
+        }
         do {
             let s = try Storage.loadOrCreateSession()
             self.session = s
@@ -235,59 +279,153 @@ final class ChatStore: NSObject {
 
     /// Forwards the APNs device token to the relay so it can wake us
     /// when a SEND lands while we're disconnected. Called by
-    /// `AppDelegate` once iOS has issued a token.
+    /// `AppDelegate` once iOS has issued a token. With multi-relay
+    /// fanout (D3), the token registers on exactly ONE relay — see
+    /// `pushPrimary` for the elect / re-elect rules.
     func publishPushToken(_ token: Data) {
         pushTokenCached = token
-        relay?.registerPush(token: token)
+        pushPrimary?.registerPush(token: token)
     }
 
     // MARK: - Relay
 
+    /// Build a target list for the current connect cycle.
+    ///
+    /// **Fleet mode (D5 default):** when `state.relayHost` is empty,
+    /// connect to every entry in `RelayRegistry.trusted`.
+    /// **BYO mode (D5 fallback):** when `state.relayHost` is set,
+    /// connect to just that one host. Used by dev/test (127.0.0.1)
+    /// and by communities running their own relay. BYO disables the
+    /// fleet — D3 fanout only spans the bundled list, not the
+    /// user-typed override.
+    private func relayTargets() -> [RelayDescriptor] {
+        let trimmed = state.relayHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return RelayRegistry.trusted
+        }
+        return [RelayDescriptor(label: "Custom relay", host: trimmed, port: Self.relayPort)]
+    }
+
     private func connectRelay() {
         guard let session else { return }
-        // Clear the OLD client's delegate before disconnecting — its
-        // NWConnection cancellation fires asynchronously, and we don't
-        // want its dying `.idle` callback to clobber our relayState
-        // after the new client is already connected.
-        if let oldRelay = relay {
-            oldRelay.delegate = nil
-            oldRelay.disconnect()
-        }
+        // Wipe the previous fleet completely before standing up new
+        // clients. The clear-delegate-before-disconnect dance from
+        // the single-relay era is preserved (see comment in
+        // `teardownRelay`); without it, a dying client's `.idle`
+        // callback can clobber the fresh fleet's aggregated state
+        // moments after we've replaced it.
+        teardownRelay(keepRetryTimer: true)
         guard
             let myId = myIdentityPublicCached ?? (try? session.identityPublic()),
             let verifyKey = try? session.deliveryTokenVerifyKey()
         else {
             return
         }
-        // F-203: capture the session for HELLO signing. Using a strong
-        // capture here is fine because RelayClient lifetime is bounded
-        // by ChatStore (we own it as `self.relay`). If the user resets
-        // identity, `teardownRelay` nils self.relay, and the closure's
-        // captured session is harmless.
+        let targets = relayTargets()
+        // Strong capture for HELLO signing — RelayClient lifetime is
+        // bounded by the fleet we're building; `teardownRelay` clears
+        // the array on identity reset, and the captured closure is
+        // then harmless.
         let signingSession = session
-        let client = RelayClient(
-            myIdentity: myId,
-            myDeliveryTokenVerifyKey: verifyKey,
-            signer: { payload in
-                // F-NEW-101: HELLO signatures are domain-separated
-                // by the `hello` context tag. RelayClient passes the
-                // payload (peer_id || verify_key || ts || nonce);
-                // the FFI internally prepends `u16(tag_len) || tag`
-                // and signs that.
-                try? signingSession.identitySign(
-                    payload,
-                    contextTag: Session.SignatureContext.hello,
-                )
-            },
-        )
-        client.delegate = self
-        if let token = pushTokenCached {
-            client.registerPush(token: token)
+        for descriptor in targets {
+            let client = RelayClient(
+                myIdentity: myId,
+                myDeliveryTokenVerifyKey: verifyKey,
+                signer: { payload in
+                    // F-NEW-101: HELLO signatures are domain-separated
+                    // by the `hello` context tag. The FFI prepends
+                    // `u16(tag_len) || tag` before signing.
+                    try? signingSession.identitySign(
+                        payload,
+                        contextTag: Session.SignatureContext.hello,
+                    )
+                },
+            )
+            client.delegate = self
+            relays.append(client)
+            NSLog("[pizzini] connecting to \(descriptor.label) @ \(descriptor.host):\(descriptor.port)")
+            client.connect(to: descriptor.host, port: descriptor.port)
         }
-        self.relay = client
-        NSLog("[pizzini] connecting to \(state.relayHost):\(Self.relayPort)")
-        client.connect(to: state.relayHost, port: Self.relayPort)
+        // Push primary is re-elected lazily as relays cross into
+        // `.connected`; the first one to land wins. See
+        // `electPushPrimary` / the `didChange` delegate path.
+        pushPrimary = nil
         scheduleRetryTimer()
+    }
+
+    /// Elect the push-token primary. Called whenever a relay
+    /// transitions in or out of `.connected`. Picks the first ready
+    /// relay (deterministic per session, since `relays` retains the
+    /// `relayTargets()` order) and registers our cached APNs token
+    /// against it. Idempotent — re-electing the same primary is a
+    /// no-op.
+    private func electPushPrimary() {
+        let firstReady = readyRelays.first
+        guard firstReady !== pushPrimary else { return }
+        pushPrimary = firstReady
+        if let token = pushTokenCached, let primary = firstReady {
+            primary.registerPush(token: token)
+        }
+    }
+
+    /// Aggregate the per-relay states into the single value the UI
+    /// reads via `relayState`. Rules, in priority order:
+    ///   1. **Any** ready → `.connected`.
+    ///   2. **Any** in `.connectingToTor` → take the max progress
+    ///      across the fleet. (In practice every client shares the
+    ///      same `TorController` singleton, so progress is uniform;
+    ///      `max` is the safe choice if that ever changes.)
+    ///   3. **Any** `.connecting` → `.connecting`.
+    ///   4. **All** failed → `.failed(merged-message)`.
+    ///   5. Otherwise → `.idle`.
+    ///
+    /// "Any ready wins" is the contract D3 hangs on — the user only
+    /// cares that we can send + receive, not how many redundant routes
+    /// are alive.
+    private func aggregateRelayState() -> RelayClient.State {
+        guard !relays.isEmpty else { return .idle }
+        if relays.contains(where: { $0.state == .connected }) {
+            return .connected
+        }
+        let torProgresses: [Int] = relays.compactMap { client in
+            if case let .connectingToTor(p) = client.state { return p }
+            return nil
+        }
+        if let p = torProgresses.max() {
+            return .connectingToTor(progress: p)
+        }
+        if relays.contains(where: { $0.state == .connecting }) {
+            return .connecting
+        }
+        let failures: [String] = relays.compactMap { client in
+            if case let .failed(msg) = client.state { return msg }
+            return nil
+        }
+        if failures.count == relays.count, let first = failures.first {
+            // De-dup identical messages (e.g. "Tor bootstrap failed:
+            // …" reported by N clients sharing one TorController).
+            let unique = Array(Set(failures))
+            return .failed(unique.count == 1 ? first : unique.joined(separator: " / "))
+        }
+        return .idle
+    }
+
+    /// **D3 broadcaster.** Invoke `body` on every currently-ready
+    /// relay. Returns the count for callers that want to know whether
+    /// at least one delivery path succeeded.
+    ///
+    /// The "currently-ready" set is sampled once and held for the
+    /// duration of the call — a relay that drops mid-loop is treated
+    /// as still-ready (NWConnection's send completion will surface
+    /// the error and the retry walk picks it up later); a relay that
+    /// arrives mid-loop misses this round (it'll catch the next
+    /// outbox tick). Both behaviours match the single-relay semantics
+    /// the call-sites were originally written against.
+    @discardableResult
+    func broadcastToRelays(_ body: (RelayClient) -> Void) -> Int {
+        let ready = readyRelays
+        for r in ready { body(r) }
+        return ready.count
     }
 
     private func scheduleRetryTimer() {
@@ -305,9 +443,24 @@ final class ChatStore: NSObject {
         retryTimer = timer
     }
 
+    /// Force-rebuild every RelayClient. Bound to the Settings →
+    /// Relays → "Reconnect now" button. Useful when a Tor circuit
+    /// gets stuck on a slow guard and the user wants to retry
+    /// without re-launching. Tor itself stays bootstrapped if it
+    /// was already (the second `connect()` reuses the cached SOCKS
+    /// port), so the second cycle is sub-5 s on healthy networks.
+    func forceReconnectRelays() {
+        NSLog("[pizzini] manual reconnect requested")
+        connectRelay()
+    }
+
+    /// Apply a BYO relay-host override (D5 fallback). Pass an empty
+    /// string to clear the override and fall back to the bundled
+    /// fleet. Non-empty values are trusted verbatim — the user typed
+    /// it, the user owns the consequences.
     func setRelayHost(_ host: String) {
         let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed != state.relayHost else { return }
+        guard trimmed != state.relayHost else { return }
         state.relayHost = trimmed
         Storage.upsertSettings(state)
         connectRelay()
@@ -319,10 +472,46 @@ final class ChatStore: NSObject {
     /// stale `.failed` callbacks that surface only on the *next*
     /// foreground (red → green → red flapping). Closing here avoids
     /// the race entirely.
+    ///
+    /// Tor is held open for `torBackgroundGrace` seconds after the
+    /// relay socket closes. That window covers the existing
+    /// `retryTimer` outbox-drain ticks that may want to reopen the
+    /// relay one last time before iOS suspends us. If iOS suspends
+    /// us before the grace expires, the scheduled stop never fires
+    /// — that's fine, the singleton's pendingBootstrap is cleared
+    /// on the next foreground bootstrap() call.
     func disconnectForBackground() {
-        guard relay != nil else { return }
-        NSLog("[pizzini] relay disconnect for background")
+        guard !relays.isEmpty else { return }
+        NSLog("[pizzini] relay disconnect for background (\(relays.count) clients)")
         teardownRelay()
+        scheduleTorBackgroundStop()
+    }
+
+    /// Background grace before Tor itself is stopped. 30 s lines up
+    /// with iOS's standard "soft background" allowance and the
+    /// 30-second retry-walk cadence in `scheduleRetryTimer`.
+    private static let torBackgroundGrace: TimeInterval = 30
+
+    /// Pending background-stop. Re-entering foreground cancels it so
+    /// we don't tear down Tor right after the user comes back. The
+    /// concrete value is a `DispatchWorkItem` we can cancel by
+    /// reference — `asyncAfter` alone has no cancellation handle.
+    private var torStopWorkItem: DispatchWorkItem?
+
+    private func scheduleTorBackgroundStop() {
+        torStopWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard self != nil else { return }
+            NSLog("[pizzini] tor stop (background grace expired)")
+            TorController.shared.stop()
+        }
+        torStopWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.torBackgroundGrace, execute: work)
+    }
+
+    private func cancelTorBackgroundStop() {
+        torStopWorkItem?.cancel()
+        torStopWorkItem = nil
     }
 
     /// F-704: shared disconnect path used by `disconnectForBackground`
@@ -333,15 +522,18 @@ final class ChatStore: NSObject {
     /// inserted between disconnect and reconnect could let a queued
     /// retry tick fire on the OLD client with the new outbox state. Make
     /// the cleanup symmetric and explicit.
-    private func teardownRelay() {
-        if let relay {
-            relay.delegate = nil
-            relay.disconnect()
+    private func teardownRelay(keepRetryTimer: Bool = false) {
+        for r in relays {
+            r.delegate = nil
+            r.disconnect()
         }
-        self.relay = nil
+        relays.removeAll()
+        pushPrimary = nil
         relayState = .idle
-        retryTimer?.invalidate()
-        retryTimer = nil
+        if !keepRetryTimer {
+            retryTimer?.invalidate()
+            retryTimer = nil
+        }
     }
 
     /// Build a fresh relay connection on every foreground entry. We
@@ -350,6 +542,14 @@ final class ChatStore: NSObject {
     /// bug.
     func reconnectAfterBackground() {
         NSLog("[pizzini] relay reconnect on foreground")
+        // Cancel any pending background tor-stop from the previous
+        // suspend. If Tor is still running, `connectRelay()` →
+        // `RelayClient.connect()` → `TorController.shared.bootstrap()`
+        // returns the cached SOCKS port immediately (no fresh
+        // bootstrap). If the grace window already fired and Tor is
+        // gone, bootstrap() starts cleanly from cache — typically
+        // sub-5s.
+        cancelTorBackgroundStop()
         connectRelay()
     }
 
@@ -448,7 +648,7 @@ final class ChatStore: NSObject {
     /// weakly via `self.relay` so an instance swap (relay-host change /
     /// reconnect) doesn't ship the proof to a torn-down client.
     private func requestBundleWithHashcash(fromPeer peer: Data) {
-        guard relay != nil else { return }
+        guard !relays.isEmpty else { return }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             // Re-derive hour bucket here. If suspended for ≥1h between
             // request scheduling and PoW completion, the bucket would
@@ -459,12 +659,16 @@ final class ChatStore: NSObject {
             )
             let nonce = Hashcash.compute(challenge: challenge)
             DispatchQueue.main.async {
-                // Look up the CURRENT relay instance via self — capturing
-                // the local `relay` strongly would target the pre-swap
-                // client. Drop on the floor if the chat-store or relay
-                // are gone (e.g. identity reset mid-PoW).
-                guard let liveRelay = self?.relay else { return }
-                liveRelay.requestBundle(fromPeer: peer, hashcashNonce: nonce)
+                // D3 fanout: dispatch the BUNDLE_REQUEST to every
+                // currently-ready relay. The peer-owner is connected
+                // to some subset of the fleet; broadcasting maximises
+                // the chance one of them carries the request through.
+                // The peer's response is idempotent — if multiple
+                // relays forward the request, the peer's
+                // `lastBundleServedAt` cooldown collapses the
+                // responses to one.
+                guard let self else { return }
+                self.broadcastToRelays { $0.requestBundle(fromPeer: peer, hashcashNonce: nonce) }
             }
         }
     }
@@ -634,7 +838,7 @@ final class ChatStore: NSObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               let session,
-              let relay,
+              !readyRelays.isEmpty,
               let idx = contactIndex(forIdentity: contact.identityPub)
         else { return }
         guard contact.sessionEstablished else {
@@ -643,7 +847,7 @@ final class ChatStore: NSObject {
         }
         guard let token = popDeliveryToken(forContactAt: idx) else {
             appendSystem("Out of delivery tokens — asking your peer for more.", to: idx)
-            requestTokenRefill(from: state.contacts[idx], via: relay, session: session)
+            requestTokenRefillBroadcast(from: state.contacts[idx], session: session)
             return
         }
         do {
@@ -689,12 +893,19 @@ final class ChatStore: NSObject {
             // synchronous return + state==.connected as the "✓ relayed"
             // tier — see `markRelayed` for the explicit completion
             // hook in the new RelayClient.send completion.
-            relay.sendSealed(
-                toPeer: contact.identityPub,
-                sealedCiphertext: sealed,
-                ttlSeconds: ttl,
-                token: token,
-            )
+            // D3 fanout: write the same sealed envelope to every
+            // ready relay. The first one to land at the recipient
+            // wins; libsignal `SealedSenderResult.isDuplicate` drops
+            // the copy-of-N copies that arrive via the alternate
+            // relays.
+            broadcastToRelays {
+                $0.sendSealed(
+                    toPeer: contact.identityPub,
+                    sealedCiphertext: sealed,
+                    ttlSeconds: ttl,
+                    token: token,
+                )
+            }
             entry.relayedAt = now
             // F-505: scrub the token field once the relay accepts the
             // bytes. The signed token is no longer needed (further
@@ -720,7 +931,7 @@ final class ChatStore: NSObject {
             state.contacts[idx].log.append(logEntry)
             state.contacts[idx].lastMessageAt = logEntry.timestamp
             persistContactSliceAndAppended(logEntry, at: idx)
-            maybeRequestRefill(forContactAt: idx, via: relay, session: session)
+            maybeRequestRefill(forContactAt: idx, session: session)
         } catch {
             appendSystem("Encrypt failed: \(error)", to: idx)
         }
@@ -747,7 +958,7 @@ final class ChatStore: NSObject {
         // so we only need to know they exist before kicking off the
         // off-main read + strip pass.
         guard session != nil,
-              relay != nil,
+              !relays.isEmpty,
               let idx = contactIndex(forIdentity: contact.identityPub)
         else { return }
         guard contact.sessionEstablished else {
@@ -896,7 +1107,7 @@ final class ChatStore: NSObject {
         sandboxRelPath: String?,
     ) {
         guard let session,
-              let relay,
+              !readyRelays.isEmpty,
               let idx = contactIndex(forIdentity: contactId)
         else { return }
         // Token availability check — refuse the whole attachment up
@@ -909,7 +1120,7 @@ final class ChatStore: NSObject {
                 "Need \(chunks.count) tokens to send this file; only \(state.contacts[idx].deliveryTokensForPeer.count) on hand. Asking your peer for more.",
                 to: idx,
             )
-            requestTokenRefill(from: state.contacts[idx], via: relay, session: session)
+            requestTokenRefillBroadcast(from: state.contacts[idx], session: session)
             return
         }
 
@@ -966,12 +1177,14 @@ final class ChatStore: NSObject {
                 outbox.entries[messageId] = entry
                 Storage.upsertOutboxEntry(entry)
                 persistSession()
-                relay.sendSealed(
-                    toPeer: contactId,
-                    sealedCiphertext: sealed,
-                    ttlSeconds: ttl,
-                    token: token,
-                )
+                broadcastToRelays {
+                    $0.sendSealed(
+                        toPeer: contactId,
+                        sealedCiphertext: sealed,
+                        ttlSeconds: ttl,
+                        token: token,
+                    )
+                }
                 entry.relayedAt = now
                 entry.token = Data() // F-505: scrub once relayed
                 outbox.entries[messageId] = entry
@@ -1002,7 +1215,7 @@ final class ChatStore: NSObject {
         state.contacts[idx].log.append(row)
         state.contacts[idx].lastMessageAt = row.timestamp
         persistContactSliceAndAppended(row, at: idx)
-        maybeRequestRefill(forContactAt: idx, via: relay, session: session)
+        maybeRequestRefill(forContactAt: idx, session: session)
     }
 
     /// Map a sanitized filename to the best-guess MIME / UTI string.
@@ -1045,16 +1258,16 @@ final class ChatStore: NSObject {
 
     /// If the stash dropped below `Contact.refillThreshold` and the
     /// 6h cooldown has elapsed, send a sealed refill-request.
-    private func maybeRequestRefill(forContactAt idx: Int, via relay: RelayClient, session: Session) {
+    private func maybeRequestRefill(forContactAt idx: Int, session: Session) {
         let c = state.contacts[idx]
         guard c.deliveryTokensForPeer.count < Contact.refillThreshold else { return }
         if let last = c.lastRefillRequestSentAt, Date().timeIntervalSince(last) < Contact.refillCooldown {
             return
         }
-        requestTokenRefill(from: c, via: relay, session: session)
+        requestTokenRefillBroadcast(from: c, session: session)
     }
 
-    private func requestTokenRefill(from contact: Contact, via relay: RelayClient, session: Session) {
+    private func requestTokenRefillBroadcast(from contact: Contact, session: Session) {
         guard let idx = contactIndex(forIdentity: contact.identityPub) else { return }
         // Refill requests bypass the token rate-limit (the relay accepts
         // a SEND with a 0-length token field iff the recipient has not
@@ -1083,12 +1296,14 @@ final class ChatStore: NSObject {
             // emitAck and emitReadReceiptIfEnabled).
             state.contacts[idx].lastRefillRequestSentAt = Date()
             persistContactSlice(at: idx)
-            relay.sendSealed(
-                toPeer: contact.identityPub,
-                sealedCiphertext: sealed,
-                ttlSeconds: Self.defaultTTLSeconds,
-                token: token,
-            )
+            broadcastToRelays {
+                $0.sendSealed(
+                    toPeer: contact.identityPub,
+                    sealedCiphertext: sealed,
+                    ttlSeconds: Self.defaultTTLSeconds,
+                    token: token,
+                )
+            }
         } catch {
             appendSystem("Refill request failed: \(error)", to: idx)
         }
@@ -1115,7 +1330,7 @@ final class ChatStore: NSObject {
                 return
             }
         }
-        relay.sendTokenIssue(toPeer: peer, tokens: tokens)
+        broadcastToRelays { $0.sendTokenIssue(toPeer: peer, tokens: tokens) }
         state.contacts[idx].lastRefillRequestHandledAt = Date()
         Storage.upsertContact(state.contacts[idx])
     }
@@ -1209,7 +1424,8 @@ final class ChatStore: NSObject {
     func emitReadReceipt(forContactAt idx: Int, highestMessageId: Data) {
         let contact = state.contacts[idx]
         guard contact.readReceiptsEnabled,
-              let session, let relay
+              let session,
+              !readyRelays.isEmpty
         else { return }
         // Read receipts are NOT in the outbox retry walk — if we
         // pop a token + encrypt + hand to a disconnected
@@ -1238,12 +1454,14 @@ final class ChatStore: NSObject {
             // socket write so a force-quit between encrypt and the
             // next chat send can't roll the ratchet back.
             persistSession()
-            relay.sendSealed(
-                toPeer: contact.identityPub,
-                sealedCiphertext: sealed,
-                ttlSeconds: contact.ttlSeconds,
-                token: token,
-            )
+            broadcastToRelays {
+                $0.sendSealed(
+                    toPeer: contact.identityPub,
+                    sealedCiphertext: sealed,
+                    ttlSeconds: contact.ttlSeconds,
+                    token: token,
+                )
+            }
         } catch {
             NSLog("[pizzini] read-receipt encrypt failed: \(error)")
         }
@@ -1580,60 +1798,78 @@ final class ChatStore: NSObject {
 extension ChatStore: RelayClientDelegate {
     nonisolated func relayClient(_ client: RelayClient, didChange state: RelayClient.State) {
         Task { @MainActor in
-            self.relayState = state
+            let prevAggregate = self.relayState
+            self.relayState = self.aggregateRelayState()
+            self.electPushPrimary()
+            // STATUS_REQUEST is per-relay — each one attests
+            // separately. The cached `relayStatus` will be
+            // overwritten by whichever response arrives last, but
+            // since every relay should run the same audited binary
+            // the value converges. A future UI surface that lists
+            // per-relay attestation can use the per-client identity.
+            // STATUS_REQUEST per relay — each one attests separately.
+            // The response lands at `didReceiveStatus` and overwrites
+            // the cached `relayStatus`. With a homogeneous fleet
+            // (every relay runs the audited binary) the value
+            // converges; a future UI surface can key per-relay
+            // identity to show divergence.
             if state == .connected {
-                // Retry bundle requests for any contact that hasn't yet
-                // completed the handshake — the typical reason is "the
-                // other side hadn't scanned us when we last asked".
-                //
-                // Also re-request for paired contacts whose `peerVerifyKey`
-                // is nil. This catches the F-202 upgrade-path strand: a
-                // user upgrading from pre-Phase-3 has every Contact row
-                // with `peerVerifyKey == nil` (the field didn't exist on
-                // disk). Without this, every TOKEN_ISSUE batch from those
-                // peers gets dropped at didReceiveTokenIssueFrom and the
-                // user silently drains their stash. The next BUNDLE_RESPONSE
-                // re-populates the key via Session.extractBundleVerifyKey.
-                // F-404's lastBundleServedAt cooldown (peer-side) keeps
-                // this from amplifying into a flood.
-                for c in self.state.contacts
-                    where !c.sessionEstablished || c.peerVerifyKey == nil
-                {
-                    self.requestBundleWithHashcash(fromPeer: c.identityPub)
-                }
-                // F-502: also kick the outbox retry walk immediately on
-                // reconnect rather than waiting up to 30s for the next
-                // timer tick. `runRetryWalk` is idempotent — if no
-                // entries are due, it's a no-op.
-                self.runRetryWalk()
-                // USP #1: ask the relay which build it's running.
-                // The response lands at `didReceiveStatus` and gets
-                // cached on `self.relayStatus` for the Settings panel.
-                // Re-issuing on every reconnect catches operator
-                // redeploys without a client restart.
                 client.requestStatus()
-                // USP #1 second half: refresh the transparency log
-                // from the operator's pinned URL alongside the
-                // relay-attestation refresh. The UI's match badge
-                // depends on both — pulling them together keeps
-                // the rendered state internally consistent.
-                self.refreshTransparencyLog()
-                // Drain any read receipts deferred while the relay
-                // was offline. `emitReadReceipt` skips when
-                // `relayState != .connected` so a missed receive
-                // from a flapping socket doesn't burn a token into
-                // a dead channel; re-firing mark-read here ships a
-                // fresh receipt covering the current latest.
-                switch self.activeSurface {
-                case .oneOnOne(let peerIdentity):
-                    if let cIdx = self.contactIndex(forIdentity: peerIdentity) {
-                        self.emitReadReceiptIfEnabled(forContactAt: cIdx)
-                    }
-                case .group(let groupId):
-                    self.markGroupRead(groupID: groupId)
-                case .none:
-                    break
+            }
+            // Fleet-level one-shots: bundle requests, the retry
+            // walk, transparency-log refresh, deferred read
+            // receipts. We only fire these on the transition from
+            // "no relays ready" to "at least one ready" — each
+            // additional relay joining after that shouldn't
+            // re-trigger them (would re-walk the outbox N times,
+            // re-fetch the transparency log over HTTPS N times).
+            let isNewlyReady = (self.relayState == .connected && prevAggregate != .connected)
+            guard isNewlyReady else { return }
+            // Retry bundle requests for any contact that hasn't yet
+            // completed the handshake — the typical reason is "the
+            // other side hadn't scanned us when we last asked".
+            //
+            // Also re-request for paired contacts whose `peerVerifyKey`
+            // is nil. This catches the F-202 upgrade-path strand: a
+            // user upgrading from pre-Phase-3 has every Contact row
+            // with `peerVerifyKey == nil` (the field didn't exist on
+            // disk). Without this, every TOKEN_ISSUE batch from those
+            // peers gets dropped at didReceiveTokenIssueFrom and the
+            // user silently drains their stash. The next BUNDLE_RESPONSE
+            // re-populates the key via Session.extractBundleVerifyKey.
+            // F-404's lastBundleServedAt cooldown (peer-side) keeps
+            // this from amplifying into a flood.
+            for c in self.state.contacts
+                where !c.sessionEstablished || c.peerVerifyKey == nil
+            {
+                self.requestBundleWithHashcash(fromPeer: c.identityPub)
+            }
+            // F-502: also kick the outbox retry walk immediately on
+            // reconnect rather than waiting up to 30s for the next
+            // timer tick. `runRetryWalk` is idempotent — if no
+            // entries are due, it's a no-op.
+            self.runRetryWalk()
+            // USP #1 second half: refresh the transparency log
+            // from the operator's pinned URL alongside the
+            // relay-attestation refresh. The UI's match badge
+            // depends on both — pulling them together keeps
+            // the rendered state internally consistent.
+            self.refreshTransparencyLog()
+            // Drain any read receipts deferred while the relay
+            // was offline. `emitReadReceipt` skips when
+            // `relayState != .connected` so a missed receive
+            // from a flapping socket doesn't burn a token into
+            // a dead channel; re-firing mark-read here ships a
+            // fresh receipt covering the current latest.
+            switch self.activeSurface {
+            case .oneOnOne(let peerIdentity):
+                if let cIdx = self.contactIndex(forIdentity: peerIdentity) {
+                    self.emitReadReceiptIfEnabled(forContactAt: cIdx)
                 }
+            case .group(let groupId):
+                self.markGroupRead(groupID: groupId)
+            case .none:
+                break
             }
         }
     }
@@ -2061,7 +2297,7 @@ extension ChatStore: RelayClientDelegate {
     /// Every mutation persists per-row to SQLCipher.
     @MainActor
     private func runRetryWalk() {
-        guard let session, let relay else { return }
+        guard let session, !relays.isEmpty else { return }
         let now = Date()
 
         // 1. TTL expiry → mark failed.
@@ -2083,12 +2319,14 @@ extension ChatStore: RelayClientDelegate {
                     NSLog("[pizzini] cannot retry \(short(entry.recipientPeerId)): out of tokens")
                     continue
                 }
-                relay.sendSealed(
-                    toPeer: entry.recipientPeerId,
-                    sealedCiphertext: entry.sealedCiphertext,
-                    ttlSeconds: UInt32(entry.ttl),
-                    token: token,
-                )
+                broadcastToRelays {
+                    $0.sendSealed(
+                        toPeer: entry.recipientPeerId,
+                        sealedCiphertext: entry.sealedCiphertext,
+                        ttlSeconds: UInt32(entry.ttl),
+                        token: token,
+                    )
+                }
                 var e = entry
                 e.retries += 1
                 // `relayedAt` records the FIRST time bytes left our
@@ -2174,12 +2412,18 @@ extension ChatStore: RelayClientDelegate {
             // outbound encrypt reuses an already-consumed counter that
             // the peer will reject as DuplicatedMessage.
             persistSession()
-            client.sendAck(
-                toPeer: toPeer,
-                sealedCiphertext: sealed,
-                ttlSeconds: Self.defaultTTLSeconds,
-                token: token,
-            )
+            // D3 fanout: the sender of the SEND we're acking may be
+            // connected to any subset of the fleet. Fan the ACK out
+            // so they get ✓✓ via whichever relay's queue holds their
+            // session.
+            broadcastToRelays {
+                $0.sendAck(
+                    toPeer: toPeer,
+                    sealedCiphertext: sealed,
+                    ttlSeconds: Self.defaultTTLSeconds,
+                    token: token,
+                )
+            }
         } catch {
             NSLog("[pizzini] failed to emit ACK to \(self.short(toPeer)): \(error)")
         }
@@ -2218,7 +2462,11 @@ extension ChatStore: RelayClientDelegate {
             }
             do {
                 let bundle = try session.publishBundle()
-                client.sendBundle(toPeer: fromPeer, bundle: bundle)
+                // D3 fanout: requester may be connected to a different
+                // subset of the fleet than we are. Fan the response
+                // out so the bundle reaches them via at least one
+                // shared relay.
+                self.broadcastToRelays { $0.sendBundle(toPeer: fromPeer, bundle: bundle) }
                 self.state.contacts[idx].lastBundleServedAt = Date()
                 // Right after the bundle, mint and ship a fresh stash
                 // of delivery tokens for the requester. They'll need

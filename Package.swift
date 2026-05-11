@@ -4,8 +4,9 @@
 // and the vendored SQLCipher amalgamation.
 //
 // Before opening the iOS app in Xcode, run `scripts/build-xcframework.sh`
-// to produce build/PizziniCryptoCore.xcframework. The Xcode project then
-// adds this package as a local dependency:
+// AND `scripts/build-tor-xcframework.sh` to produce both XCFrameworks
+// under build/. The Xcode project then adds this package as a local
+// dependency:
 //   File → Add Package Dependencies → Add Local… → select the workspace root.
 //
 // Products:
@@ -17,6 +18,17 @@
 //   PizziniDB               — thin typed wrapper around SQLCipher (connection /
 //                             statement / transaction lifecycle). The app
 //                             target imports this to talk to the encrypted db.
+//   PizziniTor              — Swift wrapper around an embedded C-tor daemon.
+//                             The app target imports this to bootstrap Tor
+//                             on launch and obtain a local SOCKS5 port that
+//                             RelayClient dials through when reaching a
+//                             .onion relay. Sits on top of two private
+//                             targets: a `.binaryTarget` for the C-tor
+//                             static library (Tor.xcframework, produced by
+//                             scripts/build-tor-xcframework.sh) and the
+//                             ObjC wrappers (TORThread / TORController /
+//                             TORConfiguration) vendored under
+//                             swift/Sources/PizziniTorObjC.
 
 import PackageDescription
 
@@ -26,15 +38,23 @@ let package = Package(
     products: [
         .library(name: "PizziniCryptoCore", targets: ["PizziniCryptoCore"]),
         .library(name: "PizziniDB", targets: ["PizziniDB"]),
+        .library(name: "PizziniTor", targets: ["PizziniTor"]),
     ],
     targets: [
         .binaryTarget(
             name: "PizziniCryptoCoreFFI",
             path: "build/PizziniCryptoCore.xcframework"
         ),
+        // PizziniTor sits below PizziniCryptoCore in the dependency
+        // graph: RelayClient routes connections to .onion addresses
+        // through the embedded Tor daemon's local SOCKS5 port. The
+        // direct dep keeps the .onion-vs-direct decision colocated
+        // with the rest of the relay framing code; alternatives that
+        // injected the SOCKS port through a closure would have spread
+        // the contract across the call site.
         .target(
             name: "PizziniCryptoCore",
-            dependencies: ["PizziniCryptoCoreFFI"],
+            dependencies: ["PizziniCryptoCoreFFI", "PizziniTor"],
             path: "swift/Sources/PizziniCryptoCore"
         ),
         // SQLCipher amalgamation, vendored under
@@ -80,6 +100,70 @@ let package = Package(
             name: "PizziniDB",
             dependencies: ["PizziniSQLCipher"],
             path: "swift/Sources/PizziniDB"
+        ),
+        // Embedded Tor: prebuilt static library (C-tor + libevent + OpenSSL
+        // + lzma) repackaged into a static-library xcframework by
+        // `scripts/build-tor-xcframework.sh`. The artifact is pinned by
+        // SHA-256 against an iCepa Tor.framework release tag — see that
+        // script for the bump procedure.
+        //
+        // The xcframework is intentionally a STATIC-LIB-ONLY shape
+        // (`libtor.a` per slice, no Headers/, no module map). Shipping
+        // headers inside the xcframework would put a `module.modulemap`
+        // at the same `<DerivedData>/Build/Products/.../include/`
+        // output path as PizziniCryptoCore.xcframework, and Xcode would
+        // bail with "Multiple commands produce module.modulemap". The
+        // tor C headers live under `swift/Sources/PizziniTorObjC/torheaders/`
+        // (gitignored, populated by the same build script) and are
+        // exposed via `headerSearchPath` below.
+        .binaryTarget(
+            name: "TorCore",
+            path: "build/Tor.xcframework"
+        ),
+        // ObjC wrappers around tor_api (TORThread / TORController /
+        // TORConfiguration), vendored verbatim from iCepa Tor.framework's
+        // Tor/Classes/{Core,CTor}/ at the same release tag the static
+        // library was built from. Refresh both together when bumping the
+        // pinned version in `scripts/build-tor-xcframework.sh`.
+        //
+        // `publicHeadersPath: "include"` makes the Foundation-facing
+        // headers visible to Swift via the auto-generated umbrella
+        // module map. linkerSettings link zlib because tor's lzma /
+        // compression code calls into libz.
+        .target(
+            name: "PizziniTorObjC",
+            dependencies: ["TorCore"],
+            path: "swift/Sources/PizziniTorObjC",
+            // `torheaders` is the build-time-staged tree of C-tor
+            // headers; nothing else in there should be compiled.
+            exclude: ["torheaders"],
+            publicHeadersPath: "include",
+            cSettings: [
+                // Surfaces the staged C-tor headers (see binaryTarget
+                // comment above for why they don't live in the
+                // xcframework). Bracket includes like
+                // `<feature/api/tor_api.h>` resolve here.
+                .headerSearchPath("torheaders"),
+                // Quiet the Tor C codebase's expected warnings — the
+                // upstream sources are deliberately not warning-free
+                // and we don't want to vendor a -Werror landmine.
+                .unsafeFlags([
+                    "-Wno-deprecated-declarations",
+                    "-Wno-shorten-64-to-32",
+                ]),
+            ],
+            linkerSettings: [
+                .linkedLibrary("z"),
+            ]
+        ),
+        // Swift API consumers actually call. Wraps TORThread /
+        // TORController callbacks into Swift concurrency, exposes a
+        // singleton `TorController.shared` with `bootstrap()`,
+        // `bootstrapProgress`, `isReady`, `stop()`.
+        .target(
+            name: "PizziniTor",
+            dependencies: ["PizziniTorObjC"],
+            path: "swift/Sources/PizziniTor"
         ),
         .testTarget(
             name: "PizziniCryptoCoreTests",

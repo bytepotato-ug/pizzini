@@ -203,8 +203,30 @@ public final class Database {
     /// for the writer fail-fast at `BEGIN` time rather than at
     /// the first write — matters for the migration path where we
     /// want a hard guarantee that nothing else is writing.
+    ///
+    /// **Reentrant.** If a transaction is already active on this
+    /// connection (`sqlite3_get_autocommit` returns 0), `body` is
+    /// run inline against the existing one — no nested `BEGIN`
+    /// (SQLite would error: "cannot start a transaction within a
+    /// transaction"), no nested commit. The outer transaction's
+    /// COMMIT / ROLLBACK still atomically covers every nested
+    /// caller. A throw from a nested body propagates and the
+    /// outer transaction will roll back. The migration path leans
+    /// on this — `StorageMigration.run` wraps the whole replay in
+    /// one transaction, and the per-row helpers it calls
+    /// (`upsertGroup`, `replaceDeliveryTokens`, …) each open their
+    /// own transaction in non-migration contexts.
     @discardableResult
     public func transaction<T>(_ body: (Database) throws -> T) throws -> T {
+        // sqlite3_get_autocommit returns NONZERO when autocommit is
+        // on (i.e. no transaction is active), and 0 when a
+        // transaction is active. We invert into "inTransaction".
+        let inTransaction = sqlite3_get_autocommit(handle) == 0
+        if inTransaction {
+            // A throw still propagates — the outer-most caller
+            // sees it and triggers its ROLLBACK.
+            return try body(self)
+        }
         try execute("BEGIN IMMEDIATE;")
         do {
             let result = try body(self)
