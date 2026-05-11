@@ -28,6 +28,15 @@ final class ChatStore: NSObject {
 
     // Public, observable.
     var relayState: RelayClient.State = .idle
+    /// Per-relay connection state, keyed by `RelayDescriptor.host`.
+    /// `RelayClient` itself is a plain final class (it lives in
+    /// PizziniCryptoCore which doesn't depend on SwiftUI/Observation),
+    /// so its `state` var doesn't trigger SwiftUI redraws. This dict
+    /// IS observed (member of @Observable ChatStore), so Settings →
+    /// Relays gets the per-row colored badge to update live as each
+    /// client crosses through `.connectingToTor → .connecting →
+    /// .connected`. Mirrored from the delegate's `didChange`.
+    var perRelayState: [String: RelayClient.State] = [:]
     /// USP #1: most-recent self-attestation snapshot from the relay
     /// (binary SHA-256, git commit, dirty bit, crate version).
     /// Refreshed on every successful (re)connect; rendered in
@@ -136,6 +145,12 @@ final class ChatStore: NSObject {
     /// override host. When empty, it holds one client per bundled
     /// descriptor.
     var relays: [RelayClient] = []
+    /// Parallel array — `relayDescriptors[i]` is the descriptor that
+    /// `relays[i]` was built from. Lets the `didChange` delegate
+    /// look up which descriptor a client belongs to without storing
+    /// the descriptor on the RelayClient itself (which lives in a
+    /// SwiftUI-free crypto-core module).
+    private var relayDescriptors: [RelayDescriptor] = []
     /// Subset of `relays` currently in `.connected`. Send-fanout
     /// targets this set; if it's empty the call is a no-op (the
     /// outbox retry walk picks it back up once a relay reconnects).
@@ -343,6 +358,8 @@ final class ChatStore: NSObject {
             )
             client.delegate = self
             relays.append(client)
+            relayDescriptors.append(descriptor)
+            perRelayState[descriptor.host] = .idle
             NSLog("[pizzini] connecting to \(descriptor.label) @ \(descriptor.host):\(descriptor.port)")
             client.connect(to: descriptor.host, port: descriptor.port)
         }
@@ -528,6 +545,8 @@ final class ChatStore: NSObject {
             r.disconnect()
         }
         relays.removeAll()
+        relayDescriptors.removeAll()
+        perRelayState.removeAll()
         pushPrimary = nil
         relayState = .idle
         if !keepRetryTimer {
@@ -1798,6 +1817,16 @@ final class ChatStore: NSObject {
 extension ChatStore: RelayClientDelegate {
     nonisolated func relayClient(_ client: RelayClient, didChange state: RelayClient.State) {
         Task { @MainActor in
+            // Mirror the per-client state into the observable
+            // `perRelayState` dict so Settings → Relays gets a live
+            // redraw without the user having to expand/collapse the
+            // row. `relays` and `relayDescriptors` are kept in
+            // lockstep by `connectRelay` / `teardownRelay`, so
+            // position-by-index lookup is sound.
+            if let idx = self.relays.firstIndex(where: { $0 === client }),
+               idx < self.relayDescriptors.count {
+                self.perRelayState[self.relayDescriptors[idx].host] = state
+            }
             let prevAggregate = self.relayState
             self.relayState = self.aggregateRelayState()
             self.electPushPrimary()

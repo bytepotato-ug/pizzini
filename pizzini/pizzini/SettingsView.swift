@@ -303,7 +303,12 @@ private struct RelayHostScreen: View {
                         .font(.caption2.monospaced())
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
-                    Text("Port \(descriptor.port)")
+                    // `Text("Port \(port)")` would let SwiftUI apply
+                    // locale-specific grouping to the integer (e.g.
+                    // de_DE renders 7777 as "7.777"). `verbatim`
+                    // forces literal string interpolation, no
+                    // localization.
+                    Text(verbatim: "Port \(descriptor.port)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                     Text(stateDetail(state))
@@ -375,19 +380,16 @@ private struct RelayHostScreen: View {
         return .secondary
     }
 
-    /// Look up the per-client state for this descriptor.
-    /// Returns `nil` when the descriptor isn't currently mounted
-    /// (e.g. the user is in BYO mode — the fleet isn't connected).
+    /// Look up the per-client state for this descriptor. Reads the
+    /// observable `ChatStore.perRelayState` dict so SwiftUI redraws
+    /// the row badge live as the client crosses through
+    /// `.connectingToTor → .connecting → .connected`. Returns `nil`
+    /// when the user is in BYO mode (the bundled fleet isn't being
+    /// dialled at all) or the descriptor isn't mounted yet.
     private func clientState(for descriptor: RelayDescriptor) -> RelayClient.State? {
-        // The store doesn't expose a descriptor→client map; in fleet
-        // mode the clients are created in `RelayRegistry.trusted`
-        // order, so position-by-index is sufficient.
         let isFleetMode = store.state.relayHost.isEmpty
-        guard isFleetMode,
-              let idx = RelayRegistry.trusted.firstIndex(where: { $0.host == descriptor.host }),
-              idx < store.relays.count
-        else { return nil }
-        return store.relays[idx].state
+        guard isFleetMode else { return nil }
+        return store.perRelayState[descriptor.host]
     }
 }
 

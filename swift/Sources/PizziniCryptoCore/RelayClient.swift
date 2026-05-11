@@ -343,65 +343,86 @@ public final class RelayClient: @unchecked Sendable {
     private func startTorConnection(host: String, port: NWEndpoint.Port) {
         let target = host
         let targetPort = port.rawValue
-        // Seed UI with the "Connecting to Tor… 0%" frame before the
-        // first progress event lands.
-        state = .connectingToTor(progress: 0)
-        // Capture the queue + self via a weak ref for the async work.
-        // The Task escapes the synchronous `connect()` call, but every
-        // subsequent operation hops back onto `queue` before touching
-        // any instance state — same threading invariant the existing
-        // direct path enforces via NWConnection's stateUpdateHandler.
+        // Hold off on emitting `.connectingToTor(progress: 0)` until
+        // we've checked whether Tor is already bootstrapped. The
+        // common case after the first launch is "Tor is up", and
+        // flashing 0% on every Reconnect tap is misleading. We make
+        // the async hop on the Task below — `state` stays as
+        // `.connecting` (set in the caller before this function
+        // returned) in the meantime.
         Task { [weak self] in
             guard let self else { return }
 
-            // Sibling task: poll TorController.bootstrapProgress and
-            // republish it via our `state`. Cheap (50ms hop to
-            // MainActor + an int read every 200ms). Cancelled below
-            // once bootstrap() returns. Without this, the UI would
-            // sit at "Connecting to Tor… 0%" for the entire
-            // bootstrap because we'd never observe the intermediate
-            // PROGRESS=N events.
-            let progressTask = Task { [weak self] in
-                while !Task.isCancelled {
-                    let pct = await TorController.shared.bootstrapProgress
-                    self?.queue.async {
-                        guard let self else { return }
-                        if case .connectingToTor = self.state {
-                            // Setting the same percent is a no-op
-                            // through the `didSet` guard, so 0→0
-                            // ticks don't spam the delegate.
-                            self.state = .connectingToTor(progress: pct)
+            // Already bootstrapped? Skip the Tor UI phase entirely.
+            // RelayClient's caller already moved state to .connecting;
+            // we leave it there.
+            let alreadyReady = await TorController.shared.isReady
+            if !alreadyReady {
+                self.queue.async { [weak self] in
+                    guard let self else { return }
+                    // Seed the UI with the CURRENT bootstrap progress
+                    // (which the poll task below will refresh every
+                    // 200ms). On a cold launch this is 0; on a warm
+                    // restart from cache it's typically already at
+                    // 100 by the time we get here.
+                    self.state = .connectingToTor(progress: 0)
+                }
+                // Sibling task: poll TorController.bootstrapProgress
+                // and republish via `state`. Cheap (a MainActor hop
+                // + int read every 200ms). Cancelled below once
+                // bootstrap() returns.
+                let progressTask = Task { [weak self] in
+                    while !Task.isCancelled {
+                        let pct = await TorController.shared.bootstrapProgress
+                        self?.queue.async {
+                            guard let self else { return }
+                            if case .connectingToTor = self.state {
+                                self.state = .connectingToTor(progress: pct)
+                            }
                         }
+                        try? await Task.sleep(nanoseconds: 200_000_000)
                     }
-                    try? await Task.sleep(nanoseconds: 200_000_000)
                 }
-            }
 
-            let socksPort: UInt16
-            do {
-                socksPort = try await TorController.shared.bootstrap()
-            } catch {
+                let socksPort: UInt16
+                do {
+                    socksPort = try await TorController.shared.bootstrap()
+                } catch {
+                    progressTask.cancel()
+                    self.queue.async {
+                        self.state = .failed("tor bootstrap failed: \(error)")
+                    }
+                    return
+                }
                 progressTask.cancel()
-                self.queue.async {
-                    self.state = .failed("tor bootstrap failed: \(error)")
-                }
-                return
-            }
-            progressTask.cancel()
 
-            // After the await, hop back onto our serial queue before
-            // mutating any state.
-            self.queue.async {
-                // Transition into the SOCKS5 handshake phase. The UI
-                // collapses this to a plain "connecting" indicator
-                // — Tor is bootstrapped, the remaining work is
-                // sub-second on healthy circuits.
-                self.state = .connecting
-                self.openSocksConnection(
-                    socksPort: socksPort,
-                    targetHost: target,
-                    targetPort: targetPort
-                )
+                self.queue.async {
+                    self.state = .connecting
+                    self.openSocksConnection(
+                        socksPort: socksPort,
+                        targetHost: target,
+                        targetPort: targetPort
+                    )
+                }
+            } else {
+                // Tor is already up. `bootstrap()` returns the cached
+                // SOCKS port immediately; no progress emission needed.
+                let socksPort: UInt16
+                do {
+                    socksPort = try await TorController.shared.bootstrap()
+                } catch {
+                    self.queue.async {
+                        self.state = .failed("tor bootstrap failed: \(error)")
+                    }
+                    return
+                }
+                self.queue.async {
+                    self.openSocksConnection(
+                        socksPort: socksPort,
+                        targetHost: target,
+                        targetPort: targetPort
+                    )
+                }
             }
         }
     }
