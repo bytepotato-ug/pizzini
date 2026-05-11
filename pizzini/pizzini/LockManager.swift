@@ -60,17 +60,39 @@ final class LockManager {
     /// user knows whether to retry, use the passcode, or check Settings.
     private(set) var lastError: String?
 
+    /// True when the user has summoned the passcode entry sheet from
+    /// the lock overlay (via long-press, or directly when Face ID is
+    /// disabled). Drives the LockOverlayView's `.sheet` presentation
+    /// of `PasscodeEntryView`. Cleared when the sheet is dismissed
+    /// or when a passcode entry succeeds.
+    var isPasscodeSheetPresented: Bool = false
+
     private var backgroundedAt: Date?
 
     private init() {
-        // Cold launch: if biometric lock is enabled per persisted state,
-        // start locked. We read AppState through ChatStore.shared, which
-        // is already initialised by the time SwiftUI builds the view
-        // tree (its @State initialiser runs before our singleton is
-        // first accessed).
-        if ChatStore.shared.state.biometricLockEnabled {
+        // Cold launch: lock if EITHER Face ID is enabled OR an app
+        // passcode has been set. Face ID's role is unchanged from
+        // the pre-duress design — `biometricLockEnabled` drives the
+        // existing Face ID prompt. The passcode path is independent:
+        // even with Face ID off, setting a passcode (real or duress)
+        // gates the app behind the passcode entry sheet on cold
+        // launch.
+        if ChatStore.shared.state.biometricLockEnabled
+            || AppPasscode.isPasscodeSet
+            || AppPasscode.isDuressPasscodeSet
+        {
             isLocked = true
         }
+    }
+
+    /// True iff the lock UI should require ANY form of unlock — i.e.
+    /// Face ID is on, OR the user has set an app passcode (real or
+    /// duress). Used by ContentView + SecuritySettingsView so the
+    /// lock-related UI mirrors the same gate `isLocked` reacts to.
+    var isLockGateActive: Bool {
+        ChatStore.shared.state.biometricLockEnabled
+            || AppPasscode.isPasscodeSet
+            || AppPasscode.isDuressPasscodeSet
     }
 
     // MARK: - Scene lifecycle hooks
@@ -104,7 +126,7 @@ final class LockManager {
         // Decide the lock state before the scene becomes active. The
         // shield stays up until handleDidActivate clears it, so any
         // re-render in this window is still safe.
-        guard ChatStore.shared.state.biometricLockEnabled else {
+        guard isLockGateActive else {
             backgroundedAt = nil
             return
         }
@@ -186,15 +208,67 @@ final class LockManager {
     /// Explicit lock (called when user toggles biometric lock on, or
     /// could be wired to a future "Lock now" button).
     func lockNow() {
-        guard ChatStore.shared.state.biometricLockEnabled else { return }
+        guard isLockGateActive else { return }
         isLocked = true
     }
 
     /// Called by ChatStore when the user disables biometric lock — drop
     /// any active gate so they aren't stranded on an overlay they can
-    /// no longer authenticate against.
+    /// no longer authenticate against. Also applies when the user
+    /// removes their passcode and has no other gate left.
     func unlockBecauseDisabled() {
         isLocked = false
         lastError = nil
+    }
+
+    /// Drop the lock after a duress wipe. The caller (the lock
+    /// overlay's duress handler) MUST have already invoked
+    /// `ChatStore.shared.duressWipe()` so the UI underneath
+    /// observes the post-wipe state on the next frame.
+    func unlockAfterDuress() {
+        isLocked = false
+        isPasscodeSheetPresented = false
+        lastError = nil
+    }
+
+    // MARK: - Passcode entry
+
+    /// Result of submitting a passcode at the lock overlay.
+    enum PasscodeOutcome: Sendable, Equatable {
+        /// The real unlock passcode — drop the lock and continue.
+        case unlocked
+        /// The duress passcode — caller MUST trigger the wipe
+        /// (`ChatStore.shared.duressWipe()`) BEFORE dropping the
+        /// lock so the UI underneath observes the wiped state.
+        case duress
+        /// Neither matched — UI shows "Incorrect passcode" and the
+        /// user can retry.
+        case wrong
+    }
+
+    /// Submit a passcode string. Returns synchronously — Argon2id
+    /// verification is ~250 ms on iPhone 12, well under the user's
+    /// perceptible-latency budget for a one-time entry.
+    ///
+    /// On `.unlocked`, this method drops the lock + clears the
+    /// sheet flag. On `.duress`, the caller is responsible for
+    /// invoking `ChatStore.shared.duressWipe()` and only then
+    /// clearing the lock — the order matters because the lock
+    /// drop reveals whatever UI is mounted underneath, and we
+    /// want that UI to render against the post-wipe state. On
+    /// `.wrong`, the lock stays up; the caller surfaces an error
+    /// to the user.
+    func submitPasscode(_ entry: String) -> PasscodeOutcome {
+        switch AppPasscode.check(entry) {
+        case .real:
+            isLocked = false
+            isPasscodeSheetPresented = false
+            lastError = nil
+            return .unlocked
+        case .duress:
+            return .duress
+        case .neither:
+            return .wrong
+        }
     }
 }

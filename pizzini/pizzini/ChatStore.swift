@@ -1230,6 +1230,53 @@ final class ChatStore: NSObject {
         refreshAppBadge()
     }
 
+    // MARK: - Duress wipe
+
+    /// Trigger the cryptographic-erasure path. Called when the user
+    /// enters the duress passcode at the lock screen.
+    ///
+    /// Steps, in order:
+    ///   1. Snapshot the UX settings (relay host, Face ID, panic
+    ///      mode, etc.) so the post-wipe app looks lived-in rather
+    ///      than freshly installed (design Q2 → option b).
+    ///   2. Tear down the relay socket + retry timer so no in-
+    ///      flight encrypt can reach the network with the soon-to-
+    ///      be-orphaned session.
+    ///   3. `Storage.eraseAndReinitialize` — deletes the SQLCipher
+    ///      file, the Secure-Enclave key, the Argon2id salt + params
+    ///      + wrapped seed, and the AppPasscode slots; re-opens a
+    ///      fresh empty DB.
+    ///   4. Reset every in-memory ChatStore field to its cold-launch
+    ///      defaults: load AppState + outbox from the fresh DB, mint
+    ///      a brand-new libsignal identity, reconnect the relay
+    ///      under the new identity.
+    ///
+    /// Returns synchronously — the caller (LockManager) drops the
+    /// lock + the UI shows the now-empty chat list. From a
+    /// coercer's perspective the timing is indistinguishable from a
+    /// real unlock (Argon2id verify dominates wall-clock either way).
+    func duressWipe() {
+        let snapshot = state
+        teardownRelay()
+        session = nil
+        myIdentityPublicCached = nil
+        Storage.eraseAndReinitialize(preserving: snapshot, clearPasscodes: true)
+        state = Storage.loadAppState()
+        outbox = Storage.loadOutbox()
+        diagEvents.removeAll()
+        keychainWriteFailing = false
+        initError = nil
+        do {
+            let s = try Storage.loadOrCreateSession()
+            session = s
+            myIdentityPublicCached = try s.identityPublic()
+            connectRelay()
+        } catch {
+            initError = String(describing: error)
+        }
+        refreshAppBadge()
+    }
+
     // MARK: - Helpers
 
     /// **Wholesale fallback** used by paths that mutate multiple

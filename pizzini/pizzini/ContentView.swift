@@ -67,7 +67,7 @@ struct ContentView: View {
             // `isShielded` is also still true (cleared only after this),
             // so any frame in between renders the shield, not the chat.
             if lockManager.isLocked {
-                LockOverlayView(lockManager: lockManager)
+                LockOverlayView(lockManager: lockManager, store: store)
             }
 
             // Privacy shield. Set on `willDeactivate` so it's already in

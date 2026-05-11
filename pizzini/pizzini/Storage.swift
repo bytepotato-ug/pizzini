@@ -285,6 +285,61 @@ enum Storage {
 
     // MARK: - Reset
 
+    /// **Cryptographic erasure** — the primitive behind the duress
+    /// passphrase flow. Wipes the SQLCipher database file AND the key
+    /// material that decrypts it, in this order:
+    ///
+    ///   1. Close the open `Database` and delete the `.sqlite` + WAL
+    ///      sidecars from Application Support.
+    ///   2. Delete the Secure-Enclave private key (so the wrapped
+    ///      seed in Keychain becomes ECIES-undecryptable).
+    ///   3. Delete the Argon2id salt + params + wrapped seed slots
+    ///      from Keychain.
+    ///   4. Re-bootstrap a fresh, empty SQLCipher store with new
+    ///      key material.
+    ///
+    /// Optionally preserves the caller-supplied `AppState` settings
+    /// (relay host, lock posture, UX prefs) in the post-wipe state.
+    /// The duress flow uses this so the post-wipe app looks lived-in
+    /// rather than freshly installed (design Q2 → option b).
+    ///
+    /// `clearPasscodes: true` (the duress path) also wipes the
+    /// `AppPasscode` slots so the next launch has no real/duress
+    /// passcode set at all — matches a "fresh install" presentation
+    /// to a coercer. The `false` default leaves them in place for
+    /// the existing `resetEverything` callers.
+    static func eraseAndReinitialize(
+        preserving snapshot: AppState? = nil,
+        clearPasscodes: Bool = false,
+    ) {
+        if clearPasscodes {
+            AppPasscode.eraseAll()
+        }
+        DBKey.eraseKeyMaterial()
+        do {
+            try SQLiteStorage.wipeAndReopen()
+            try StorageMigration.run(storage: SQLiteStorage.shared)
+            if let snapshot {
+                _ = persist(appState: AppState(
+                    relayHost: snapshot.relayHost,
+                    contacts: [],
+                    onboardingCompleted: snapshot.onboardingCompleted,
+                    biometricLockEnabled: snapshot.biometricLockEnabled,
+                    autoLockTimeout: snapshot.autoLockTimeout,
+                    quickLookPreviewEnabled: snapshot.quickLookPreviewEnabled,
+                    panicModeEnabled: snapshot.panicModeEnabled,
+                    qrBlockEffective: snapshot.qrBlockEffective,
+                    qrBlockTestedOSVersion: snapshot.qrBlockTestedOSVersion,
+                    groups: [],
+                    contactsBeforeGroups: snapshot.contactsBeforeGroups,
+                    inAppHapticsEnabled: snapshot.inAppHapticsEnabled,
+                ))
+            }
+        } catch {
+            NSLog("[pizzini.storage] eraseAndReinitialize failed: \(error)")
+        }
+    }
+
     /// Wipe the database. Called by "Reset identity" and "Reset
     /// everything" UI surfaces. `preserveAppState` mirrors the
     /// Keychain-era behaviour: when `true`, the post-wipe path
