@@ -127,6 +127,22 @@ if ! grep -qE '^[[:space:]]*%include[[:space:]]+/etc/tor/torrc\.d/pizzini\.conf'
         >> /etc/tor/torrc
 fi
 
+# Ubuntu's `system_tor` AppArmor profile only whitelists
+# `/etc/tor/torrc`. Reading our `/etc/tor/torrc.d/pizzini.conf`
+# from the include directive above gets DENIED at kernel level by
+# AppArmor even though file perms are 0644 — tor fails to start
+# with "Could not open ... Permission denied" and the `[err]
+# Reading config failed`. The fix is a one-line local override
+# (the upstream profile includes `local/system_tor` for exactly
+# this purpose). Idempotent: rewrites the same content if it
+# already exists.
+install -d -m 0755 -o root -g root /etc/apparmor.d/local
+echo '/etc/tor/torrc.d/*.conf r,' > /etc/apparmor.d/local/system_tor
+chmod 0644 /etc/apparmor.d/local/system_tor
+if command -v apparmor_parser >/dev/null 2>&1 && [[ -f /etc/apparmor.d/system_tor ]]; then
+    apparmor_parser -r /etc/apparmor.d/system_tor 2>/dev/null || true
+fi
+
 # ---- 10. onion key material ----
 # debian-tor is the user Ubuntu's tor package runs as. /var/lib/tor
 # already exists (created by the tor postinst) so just nest pizzini/
@@ -148,7 +164,52 @@ fi
 systemctl enable nftables >/dev/null 2>&1
 systemctl restart nftables
 
-# ---- 12. sshd hardening ----
+# ---- 12a. self-lock guard: ensure a non-root sudo user exists ----
+# `PermitRootLogin no` below would lock the operator out of a fresh
+# Hetzner-style image where root is the only login user. Mirror
+# root's authorized_keys into a `pizzini-admin` account with NOPASSWD
+# sudo before disabling root, so there is always a way back in.
+#
+# Idempotent: if the user already exists (e.g. operator already
+# created their own `monitor` / `deploy` user and ran the script as
+# them), we still ensure `pizzini-admin` exists as a guaranteed
+# fallback. We don't enable it as the *primary* shell account — it's
+# strictly a break-glass.
+if ! getent passwd pizzini-admin >/dev/null; then
+    useradd --create-home --shell /bin/bash --user-group pizzini-admin
+    echo "[bootstrap] created user pizzini-admin"
+fi
+install -d -m 0700 -o pizzini-admin -g pizzini-admin /home/pizzini-admin/.ssh
+# Seed authorized_keys from whichever account is running this script
+# AND from root's existing authorized_keys, deduped. If the operator
+# ran the script as a non-root sudo'er, $SUDO_USER's keys also get
+# included so they retain access via pizzini-admin.
+{
+    [[ -r /root/.ssh/authorized_keys ]] && cat /root/.ssh/authorized_keys
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        sudo_user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+        [[ -r "$sudo_user_home/.ssh/authorized_keys" ]] && cat "$sudo_user_home/.ssh/authorized_keys"
+    fi
+} | awk 'NF && !seen[$0]++' > /home/pizzini-admin/.ssh/authorized_keys
+chown pizzini-admin:pizzini-admin /home/pizzini-admin/.ssh/authorized_keys
+chmod 0600 /home/pizzini-admin/.ssh/authorized_keys
+# Passwordless sudo so the operator can recover if they get locked
+# out of the primary account. Drop a single-line drop-in (NOT the
+# whole sudoers file) so we don't accidentally clobber distro
+# defaults.
+install -d -m 0750 -o root -g root /etc/sudoers.d
+cat > /etc/sudoers.d/90-pizzini-admin <<'SUDOEOF'
+pizzini-admin ALL=(ALL) NOPASSWD: ALL
+SUDOEOF
+chmod 0440 /etc/sudoers.d/90-pizzini-admin
+# Final guard: only proceed if pizzini-admin actually has at least
+# one key. Otherwise disabling root login *would* lock the box.
+if [[ ! -s /home/pizzini-admin/.ssh/authorized_keys ]]; then
+    echo "[bootstrap] refusing to harden sshd: pizzini-admin has no SSH keys (would lock you out)" >&2
+    exit 1
+fi
+
+# ---- 12b. sshd hardening ----
 install -d -m 0755 -o root -g root /etc/ssh/sshd_config.d
 cat > /etc/ssh/sshd_config.d/90-pizzini-hardening.conf <<'SSHEOF'
 # Pizzini relay sshd hardening — installed by scripts/deploy/bootstrap.sh.
@@ -204,6 +265,22 @@ systemctl restart unattended-upgrades
 # ---- 15. enable + start services ----
 systemctl daemon-reload
 systemctl enable tor.service pizzini-relay.service >/dev/null 2>&1
+# Wipe any cached tor state from a previous (failed or partial) run.
+# Tor caches the last HS-descriptor upload timestamp in
+# /var/lib/tor/state — if a prior run uploaded then we restart for
+# whatever reason (config change, AppArmor reload, …), tor will
+# read the cached "last uploaded at T" and reschedule the next
+# upload for T + random(60-120min), so the freshly-started instance
+# refuses to publish for over an hour. On a clean bootstrap there's
+# nothing valuable in the state file (no introduction-point pinning
+# for v3, no PoW state we care about) so prune it unconditionally.
+systemctl stop tor.service tor@default.service 2>/dev/null || true
+rm -f /var/lib/tor/state \
+      /var/lib/tor/cached-descriptors{,.new} \
+      /var/lib/tor/cached-microdescs{,.new} \
+      /var/lib/tor/cached-extrainfo{,.new} \
+      /var/lib/tor/cached-rend
+systemctl reset-failed tor.service tor@default.service 2>/dev/null || true
 systemctl restart tor.service
 
 # Tor reads HiddenServiceDir on start; we pre-populated the key
@@ -226,6 +303,12 @@ systemctl restart pizzini-relay.service
 echo
 echo "================================================================"
 echo "Bootstrap complete."
+echo
+echo "SSH access:"
+echo "  ssh pizzini-admin@$(hostname --ip-address 2>/dev/null | awk '{print $1}')"
+echo "  (root login disabled by the sshd hardening; pizzini-admin"
+echo "   has NOPASSWD sudo and the same authorized_keys you used"
+echo "   to run this bootstrap.)"
 echo
 echo ".onion address:"
 echo "  $(cat /var/lib/tor/pizzini/hostname)"
