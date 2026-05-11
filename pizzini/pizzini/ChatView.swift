@@ -256,7 +256,12 @@ struct ChatView: View {
                             renameDraft = contact.displayName
                             renaming = true
                         } label: { Label("Rename", systemImage: "pencil") }
-                        Menu("Expires after") {
+                        // Submenu label embeds the current selection
+                        // ("Expires after — 1 day") so the menu surfaces
+                        // state at a glance. SwiftUI's `Menu(_:)` with a
+                        // plain String renders the label verbatim,
+                        // including the dash + current value.
+                        Menu {
                             ForEach(Contact.ttlOptions, id: \.seconds) { opt in
                                 Button {
                                     store.setContactTTL(contact, seconds: opt.seconds)
@@ -268,17 +273,19 @@ struct ChatView: View {
                                     }
                                 }
                             }
+                        } label: {
+                            Label("Expires after — \(currentTTLLabel(contact.ttlSeconds))", systemImage: "hourglass")
                         }
+                        // Read-receipts toggle. The full rationale lives
+                        // in the FAQ; the menu row is just a clean
+                        // labeled toggle with the eye SF Symbol so the
+                        // icon matches the ✓✓ → 👁 status glyph the
+                        // toggle controls.
                         Toggle(isOn: Binding(
                             get: { contact.readReceiptsEnabled },
                             set: { store.setReadReceipts(contact, enabled: $0) }
                         )) {
-                            VStack(alignment: .leading) {
-                                Text("Tell \(contact.displayName) when I read their messages")
-                                Text("Off by default. Most journalists keep this off. \(contact.displayName) will see ✓✓ when their messages arrive on your phone either way.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
+                            Label("Read receipts", systemImage: "eye")
                         }
                         Button(role: .destructive) {
                             confirmDeleteChat = true
@@ -374,6 +381,22 @@ struct ChatView: View {
         searchQuery = ""
         currentMatchID = nil
         searchFocused = false
+    }
+
+    /// Map a TTL in seconds to its short user-facing label by looking
+    /// it up in `Contact.ttlOptions`. Falls back to a compact h/d
+    /// formatting for any value outside the menu's preset list (so a
+    /// future expansion of the picker doesn't surface an empty
+    /// trailing label).
+    private func currentTTLLabel(_ seconds: UInt32) -> String {
+        if let match = Contact.ttlOptions.first(where: { $0.seconds == seconds }) {
+            // Strip the "(recommended)" annotation when it's stitched
+            // into the parent menu label — the menu row only has
+            // room for the bare value.
+            return match.label.replacingOccurrences(of: " (recommended)", with: "")
+        }
+        let hours = Int(seconds) / 3600
+        return hours >= 24 ? "\(hours / 24)d" : "\(hours)h"
     }
 
     private var pairingBanner: some View {
