@@ -916,8 +916,14 @@ struct ChatStatusGlyph: View {
     var body: some View {
         switch kind {
         case .pending:
+            // Orange to match the other "waiting" hourglass surfaces
+            // in the app — the per-contact "waiting for handshake"
+            // row badge and the pairing banner above the chat composer
+            // both render `hourglass` in orange. Keeping this colour
+            // consistent means the user learns one visual association
+            // for "waiting" instead of two.
             Image(systemName: "hourglass")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.orange)
                 .help("Queued — waiting for the connection")
         case .sent:
             Image(systemName: "checkmark")
