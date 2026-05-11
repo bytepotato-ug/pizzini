@@ -1,0 +1,244 @@
+import Foundation
+import PizziniCryptoCore
+import PizziniDB
+import Testing
+@testable import pizzini
+
+/// Per-row round-trip tests for `SQLiteStorage`. Confirms each
+/// table writes + reads back losslessly, and that the legacy
+/// Keychain → SQLCipher migration path lands data in the right
+/// shape.
+@MainActor
+@Suite("SQLiteStorage + migration round-trips")
+struct SQLiteStorageTests {
+    private func freshStore() throws -> SQLiteStorage {
+        let path = NSTemporaryDirectory() + "pizzini-test-\(UUID()).sqlite"
+        let key = Data(repeating: 0xAA, count: 32)
+        return try SQLiteStorage._bootstrapForTesting(path: path, rawKey: key)
+    }
+
+    // MARK: - Settings
+
+    @Test("settings row round-trips every field")
+    func settingsRoundTrip() throws {
+        let store = try freshStore()
+        let s = AppState(
+            relayHost: "example.local",
+            contacts: [],
+            onboardingCompleted: true,
+            biometricLockEnabled: true,
+            autoLockTimeout: .fiveMinutes,
+            quickLookPreviewEnabled: true,
+            panicModeEnabled: true,
+            qrBlockEffective: false,
+            qrBlockTestedOSVersion: "26.0.1",
+            groups: [],
+            contactsBeforeGroups: false,
+            inAppHapticsEnabled: true,
+        )
+        try store.upsertSettings(s)
+        let loaded = try store.loadSettings()
+        #expect(loaded?.relayHost == s.relayHost)
+        #expect(loaded?.onboardingCompleted == true)
+        #expect(loaded?.biometricLockEnabled == true)
+        #expect(loaded?.autoLockTimeout == .fiveMinutes)
+        #expect(loaded?.quickLookPreviewEnabled == true)
+        #expect(loaded?.panicModeEnabled == true)
+        #expect(loaded?.qrBlockEffective == false)
+        #expect(loaded?.qrBlockTestedOSVersion == "26.0.1")
+        #expect(loaded?.contactsBeforeGroups == false)
+        #expect(loaded?.inAppHapticsEnabled == true)
+    }
+
+    // MARK: - Contacts + messages + tokens
+
+    @Test("contact + log + tokens round-trip")
+    func contactGraphRoundTrip() throws {
+        let store = try freshStore()
+        let identityPub = Data(repeating: 0x07, count: 33)
+        var c = Contact(
+            identityPub: identityPub,
+            displayName: "Alice",
+            sessionEstablished: true,
+            log: [],
+            lastMessageAt: Date(),
+            addedAt: Date(),
+            deliveryTokensForPeer: [],
+            ttlSeconds: 3600,
+            readReceiptsEnabled: true,
+            peerVerifyKey: Data(repeating: 0x05, count: 33),
+        )
+        let msg = PersistedMessage(
+            side: .me,
+            text: "hello",
+            kind: .whisper,
+            bytes: 5,
+            timestamp: Date(),
+            messageId: Data(repeating: 0xCC, count: 16),
+        )
+        c.log = [msg]
+        try store.upsertContact(c)
+        try store.appendContactMessage(contactId: c.id, msg)
+        try store.replaceDeliveryTokens(
+            contactId: c.id,
+            tokens: [Data(repeating: 0x01, count: 84), Data(repeating: 0x02, count: 84)],
+        )
+        let loaded = try store.loadContacts()
+        #expect(loaded.count == 1)
+        let lc = try #require(loaded.first)
+        #expect(lc.id == c.id)
+        #expect(lc.identityPub == identityPub)
+        #expect(lc.displayName == "Alice")
+        #expect(lc.sessionEstablished == true)
+        #expect(lc.readReceiptsEnabled == true)
+        #expect(lc.ttlSeconds == 3600)
+        #expect(lc.peerVerifyKey == c.peerVerifyKey)
+        #expect(lc.log.count == 1)
+        #expect(lc.log.first?.text == "hello")
+        #expect(lc.log.first?.kind == .whisper)
+        #expect(lc.log.first?.messageId == msg.messageId)
+        #expect(lc.deliveryTokensForPeer.count == 2)
+    }
+
+    @Test("popDeliveryToken returns FIFO")
+    func tokenFIFO() throws {
+        let store = try freshStore()
+        let c = Contact(
+            identityPub: Data(repeating: 0x08, count: 33),
+            displayName: "Bob",
+            addedAt: Date(),
+            ttlSeconds: 3600,
+        )
+        try store.upsertContact(c)
+        try store.replaceDeliveryTokens(contactId: c.id, tokens: [
+            Data(repeating: 0xA1, count: 84),
+            Data(repeating: 0xA2, count: 84),
+            Data(repeating: 0xA3, count: 84),
+        ])
+        #expect(try store.popDeliveryToken(contactId: c.id)?.first == 0xA1)
+        #expect(try store.popDeliveryToken(contactId: c.id)?.first == 0xA2)
+        try store.appendDeliveryTokens(contactId: c.id, tokens: [Data(repeating: 0xA4, count: 84)])
+        #expect(try store.popDeliveryToken(contactId: c.id)?.first == 0xA3)
+        #expect(try store.popDeliveryToken(contactId: c.id)?.first == 0xA4)
+        #expect(try store.popDeliveryToken(contactId: c.id) == nil)
+    }
+
+    // MARK: - Outbox
+
+    @Test("outbox entry round-trips")
+    func outboxRoundTrip() throws {
+        let store = try freshStore()
+        let entry = OutboxEntry(
+            messageId: Data(repeating: 0xBB, count: 16),
+            recipientPeerId: Data(repeating: 0x09, count: 33),
+            sealedCiphertext: Data(repeating: 0xCD, count: 200),
+            token: Data(repeating: 0x55, count: 84),
+            ttl: 86400,
+            sentAt: Date(timeIntervalSinceReferenceDate: 0),
+            retries: 2,
+            deliveredAt: nil,
+            failedAt: nil,
+            relayedAt: Date(timeIntervalSinceReferenceDate: 5),
+        )
+        try store.upsertOutboxEntry(entry)
+        let loaded = try store.loadOutbox()
+        let got = try #require(loaded.entries[entry.messageId])
+        #expect(got.messageId == entry.messageId)
+        #expect(got.recipientPeerId == entry.recipientPeerId)
+        #expect(got.sealedCiphertext == entry.sealedCiphertext)
+        #expect(got.token == entry.token)
+        #expect(got.retries == 2)
+        #expect(got.deliveredAt == nil)
+        #expect(got.relayedAt != nil)
+    }
+
+    // MARK: - Device store (libsignal blob)
+
+    @Test("device store round-trips the libsignal blob")
+    func deviceStoreRoundTrip() throws {
+        let store = try freshStore()
+        let session = try Session()
+        let original = try session.serialize()
+        try store.saveDeviceStore(original)
+        let restored = try #require(try store.loadDeviceStore())
+        #expect(restored == original)
+        // And the loaded blob must rehydrate into a working Session
+        // — ratchet continuity is the load-bearing invariant for
+        // anything stored here.
+        let rebuilt = try Session(serialized: restored)
+        let rebuiltId = try rebuilt.identityPublic()
+        let origId = try session.identityPublic()
+        #expect(rebuiltId == origId)
+    }
+
+    // MARK: - Migration
+
+    @Test("migration marker prevents re-running on a fresh-content database")
+    func migrationMarker() throws {
+        // Keychain is shared between the app and the test runner.
+        // Whatever the iOS app left in `app-state` / `outbox` /
+        // `device-store` would otherwise feed into the migration
+        // path and make this test non-deterministic. Clear all four
+        // legacy slots up front so the migration sees "fresh
+        // install" content.
+        Keychain.delete(account: "app-state")
+        Keychain.delete(account: "outbox")
+        Keychain.delete(account: "device-store")
+        Keychain.delete(account: "long-term-identity")
+
+        let store = try freshStore()
+        try StorageMigration.run(storage: store)
+        let stmt = try store.db.prepare("SELECT count(*) FROM meta WHERE key = ?;")
+        try stmt.bindAll(StorageMigration.metaKey)
+        #expect(try stmt.step())
+        #expect(stmt.columnInt64(0) == 1, "marker row should exist after first run on fresh-content DB")
+    }
+
+    @Test("migration copies a Keychain AppState blob into SQLCipher and wipes the slot")
+    func migrationCopiesLegacyAppState() throws {
+        // Plant a synthetic legacy blob, run the migration, verify
+        // SQLCipher has the data + Keychain has been wiped. Same
+        // verify-before-delete defense as the production path.
+        Keychain.delete(account: "app-state")
+        Keychain.delete(account: "outbox")
+        Keychain.delete(account: "device-store")
+        Keychain.delete(account: "long-term-identity")
+
+        let store = try freshStore()
+        // Reset the migration marker so the run actually executes
+        // its body — `freshStore` doesn't set it but the migration
+        // bails early if it's present from a prior test run on the
+        // same SQLCipher file (which can't happen here because the
+        // path is per-test, but the assertion is cheap).
+        try store.db.prepare("DELETE FROM meta WHERE key = ?;")
+            .bindAll(StorageMigration.metaKey).run()
+
+        let contact = Contact(
+            identityPub: Data(repeating: 0x11, count: 33),
+            displayName: "Migration Test",
+            addedAt: Date(timeIntervalSinceReferenceDate: 100),
+            ttlSeconds: 86400,
+        )
+        let legacy = AppState(
+            relayHost: "192.168.1.42",
+            contacts: [contact],
+            onboardingCompleted: true,
+        )
+        let blob = try JSONEncoder().encode(legacy)
+        _ = Keychain.write(blob, account: "app-state")
+
+        try StorageMigration.run(storage: store)
+
+        // Keychain slot should be empty.
+        #expect(Keychain.read(account: "app-state") == nil, "legacy slot should be deleted post-migration")
+
+        // SQLCipher should have the contact + settings.
+        let settings = try store.loadSettings()
+        #expect(settings?.relayHost == "192.168.1.42")
+        #expect(settings?.onboardingCompleted == true)
+        let contacts = try store.loadContacts()
+        #expect(contacts.count == 1)
+        #expect(contacts.first?.displayName == "Migration Test")
+        #expect(contacts.first?.identityPub == contact.identityPub)
+    }
+}

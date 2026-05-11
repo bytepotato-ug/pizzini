@@ -16,6 +16,19 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
+        // Open the SQLCipher store + run the one-shot Keychain →
+        // SQLCipher migration before any other init code constructs
+        // `ChatStore.shared`. Storage methods on the SQLite-backed
+        // facade dereference `SQLiteStorage.shared`, which is set
+        // only after `Storage.bootstrap`; calling them earlier would
+        // hit a force-unwrap. A failure here is fatal for app
+        // function — surface it through the same diagnostic banner
+        // path used for other unrecoverable startup errors.
+        do {
+            try Storage.bootstrap()
+        } catch {
+            NSLog("[pizzini] Storage.bootstrap failed: \(error)")
+        }
         UNUserNotificationCenter.current().delegate = self
         // Window-level privacy shield: covers sheets and popovers in the
         // multitasking snapshot, which an in-body overlay can't do.

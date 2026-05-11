@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		3DD827FC2FAE791900977B79 /* PizziniCryptoCore in Frameworks */ = {isa = PBXBuildFile; productRef = 3DD827FB2FAE791900977B79 /* PizziniCryptoCore */; };
+		3DDB0001000000000000DB01 /* PizziniDB in Frameworks */ = {isa = PBXBuildFile; productRef = 3DDB0001000000000000DB02 /* PizziniDB */; };
 		7E5E000000000002C0000001 /* pizziniNotificationService.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 7E5E000000000001D0000001 /* pizziniNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
@@ -98,6 +99,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				3DD827FC2FAE791900977B79 /* PizziniCryptoCore in Frameworks */,
+				3DDB0001000000000000DB01 /* PizziniDB in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -178,6 +180,7 @@
 			name = pizzini;
 			packageProductDependencies = (
 				3DD827FB2FAE791900977B79 /* PizziniCryptoCore */,
+				3DDB0001000000000000DB02 /* PizziniDB */,
 			);
 			productName = pizzini;
 			productReference = 3DA1C5E22FAE69AA00B75E2A /* pizzini.app */;
@@ -776,6 +779,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 3DD827F92FAE780C00977B79 /* XCLocalSwiftPackageReference ".." */;
 			productName = PizziniCryptoCore;
+		};
+		3DDB0001000000000000DB02 /* PizziniDB */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 3DD827F92FAE780C00977B79 /* XCLocalSwiftPackageReference ".." */;
+			productName = PizziniDB;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

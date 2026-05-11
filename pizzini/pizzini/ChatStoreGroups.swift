@@ -660,7 +660,7 @@ extension ChatStore {
                     groupMessageId: groupMessageId,
                 )
                 outbox.entries[messageId] = entry
-                Storage.persist(outbox: outbox)
+                Storage.upsertOutboxEntry(entry)
                 relay.sendSealed(
                     toPeer: recipient,
                     sealedCiphertext: sealed,
@@ -670,7 +670,7 @@ extension ChatStore {
                 entry.relayedAt = now
                 entry.token = Data() // F-505: scrub once relayed
                 outbox.entries[messageId] = entry
-                Storage.persist(outbox: outbox)
+                Storage.upsertOutboxEntry(entry)
             } catch {
                 NSLog("[pizzini] group fan-out failed for \(short(recipient)): \(error)")
             }
@@ -972,7 +972,7 @@ extension ChatStore {
                         groupMessageId: groupMessageId,
                     )
                     outbox.entries[messageId] = entry
-                    Storage.persist(outbox: outbox)
+                    Storage.upsertOutboxEntry(entry)
                     relay.sendSealed(
                         toPeer: recipient,
                         sealedCiphertext: sealed,
@@ -982,7 +982,7 @@ extension ChatStore {
                     entry.relayedAt = now
                     entry.token = Data() // F-505 scrub-on-relay
                     outbox.entries[messageId] = entry
-                    Storage.persist(outbox: outbox)
+                    Storage.upsertOutboxEntry(entry)
                 } catch {
                     NSLog(
                         "[pizzini] group attachment fan-out failed for \(short(recipient))"

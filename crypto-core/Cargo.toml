@@ -35,6 +35,13 @@ blake3 = { version = "1", default-features = false }
 # DeviceStore boundary to convert our raw 16-byte FFI argument into
 # libsignal's `Uuid`.
 uuid = { version = "1", default-features = false }
+# Argon2id (RustCrypto, MIT/Apache-2.0, audited). The only KDF on
+# Pizzini's allowed-primitives list besides HKDF. Exposed across the
+# FFI as `pizzini_argon2id_derive` so the iOS SQLCipher layer can
+# stretch a Secure-Enclave-unwrapped 32-byte seed into the database
+# key — CryptoKit doesn't ship Argon2 and we don't want a parallel
+# Swift implementation drifting from the Rust one.
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 
 [build-dependencies]
 cbindgen = "0.29"

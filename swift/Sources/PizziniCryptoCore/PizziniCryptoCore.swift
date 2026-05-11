@@ -753,6 +753,84 @@ public enum Hashcash {
     }
 }
 
+/// Argon2id KDF — used by the SQLCipher storage layer to stretch a
+/// Secure-Enclave-unwrapped seed into the database key. Implemented
+/// in `crypto-core/src/lib.rs` (Rust, RustCrypto's `argon2` crate)
+/// and exposed across the FFI rather than re-implemented Swift-side:
+/// CryptoKit doesn't ship Argon2 and the only pure-Swift options
+/// (CryptoSwift) are an order of magnitude slower than RustCrypto.
+public enum Argon2id {
+    /// Parameter set passed to Argon2id. Stored alongside the database
+    /// so we can bump the cost on newer hardware without breaking
+    /// existing installs (the meta row persists what the current
+    /// database was keyed with; a future migration can re-derive
+    /// under stronger params and re-key with `PRAGMA rekey`).
+    public struct Params: Sendable, Equatable {
+        /// Memory cost in KiB.
+        public let memoryKiB: UInt32
+        /// Time / iteration cost.
+        public let timeIterations: UInt32
+        /// Degree of parallelism.
+        public let parallelism: UInt32
+
+        public init(memoryKiB: UInt32, timeIterations: UInt32, parallelism: UInt32) {
+            self.memoryKiB = memoryKiB
+            self.timeIterations = timeIterations
+            self.parallelism = parallelism
+        }
+
+        /// Production parameters — OWASP 2025 mobile-app
+        /// recommendation. ~250 ms on iPhone 12 / ~80 ms on iPhone
+        /// 15 Pro. Paid once per cold launch when the database
+        /// opens.
+        public static let production = Params(
+            memoryKiB: 64 * 1024,
+            timeIterations: 3,
+            parallelism: 1,
+        )
+    }
+
+    /// Derive `outputLength` bytes from `passphrase` + `salt` under
+    /// `params`. Throws on FFI errors (bad parameters, salt too short,
+    /// etc). The successful path is the common case and writes a
+    /// fresh deterministic key.
+    public static func derive(
+        passphrase: Data,
+        salt: Data,
+        params: Params,
+        outputLength: Int = 32,
+    ) throws -> Data {
+        var out = [UInt8](repeating: 0, count: outputLength)
+        let rc: Int32 = salt.withUnsafeBytes { saltPtr in
+            passphrase.withUnsafeBytes { passPtr in
+                out.withUnsafeMutableBufferPointer { outBuf in
+                    pizzini_argon2id_derive(
+                        saltPtr.bindMemory(to: UInt8.self).baseAddress,
+                        UInt(salt.count),
+                        passPtr.bindMemory(to: UInt8.self).baseAddress,
+                        UInt(passphrase.count),
+                        params.memoryKiB,
+                        params.timeIterations,
+                        params.parallelism,
+                        outBuf.baseAddress,
+                        UInt(outputLength),
+                    )
+                }
+            }
+        }
+        switch rc {
+        case PIZZINI_OK:
+            return Data(out)
+        case PIZZINI_ERR_INVALID_ARG:
+            throw CryptoCoreError.invalidArgument
+        case PIZZINI_ERR_INTERNAL:
+            throw CryptoCoreError.internalError
+        default:
+            throw CryptoCoreError.unknown(code: rc)
+        }
+    }
+}
+
 public enum CryptoCoreError: Error, Sendable {
     case invalidArgument
     case bufferTooSmall(required: Int)

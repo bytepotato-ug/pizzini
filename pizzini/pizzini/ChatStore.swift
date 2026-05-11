@@ -504,7 +504,7 @@ final class ChatStore: NSObject {
                 relayedAt: nil,
             )
             outbox.entries[messageId] = entry
-            Storage.persist(outbox: outbox)
+            Storage.upsertOutboxEntry(entry)
             // CRITICAL: encryptSealed advanced the ratchet; flush that
             // state to Keychain BEFORE the socket write. The
             // outbox-then-session-then-send order means a force-quit
@@ -532,7 +532,7 @@ final class ChatStore: NSObject {
             // for the token's 30-day TTL.
             entry.token = Data()
             outbox.entries[messageId] = entry
-            Storage.persist(outbox: outbox)
+            Storage.upsertOutboxEntry(entry)
 
             let logEntry = PersistedMessage(
                 side: .me,
@@ -792,7 +792,7 @@ final class ChatStore: NSObject {
                     chunkCount: chunkCountU32,
                 )
                 outbox.entries[messageId] = entry
-                Storage.persist(outbox: outbox)
+                Storage.upsertOutboxEntry(entry)
                 persistSession()
                 relay.sendSealed(
                     toPeer: contactId,
@@ -803,7 +803,7 @@ final class ChatStore: NSObject {
                 entry.relayedAt = now
                 entry.token = Data() // F-505: scrub once relayed
                 outbox.entries[messageId] = entry
-                Storage.persist(outbox: outbox)
+                Storage.upsertOutboxEntry(entry)
             } catch {
                 appendSystem("Encrypt failed at chunk \(i)/\(chunks.count): \(error)", to: idx)
                 return
@@ -1702,7 +1702,6 @@ extension ChatStore: RelayClientDelegate {
         // same `readReceiptsEnabled`-off symmetric drop as the 1:1
         // path above (the early-return already guarded it).
         let peerId = state.contacts[idx].identityPub
-        var outboxChanged = false
         for (id, entry) in outbox.entries
             where entry.recipientPeerId == peerId
                 && entry.groupMessageId != nil
@@ -1711,9 +1710,8 @@ extension ChatStore: RelayClientDelegate {
             var updated = entry
             updated.readAt = now
             outbox.entries[id] = updated
-            outboxChanged = true
+            Storage.upsertOutboxEntry(updated)
         }
-        if outboxChanged { Storage.persist(outbox: outbox) }
     }
 
     @MainActor
@@ -1729,24 +1727,24 @@ extension ChatStore: RelayClientDelegate {
         }
         entry.deliveredAt = Date()
         outbox.entries[messageId] = entry
-        Storage.persist(outbox: outbox)
+        Storage.upsertOutboxEntry(entry)
     }
 
     /// Periodic walk: re-send unacked entries that satisfy
     /// `OutboxEntry.shouldRetry`, mark expired entries failed, drop
-    /// terminal entries older than 24h to keep the JSON blob bounded.
+    /// terminal entries older than 24h to keep the outbox bounded.
+    /// Every mutation persists per-row to SQLCipher.
     @MainActor
     private func runRetryWalk() {
         guard let session, let relay else { return }
         let now = Date()
-        var changed = false
 
         // 1. TTL expiry → mark failed.
         for (id, entry) in outbox.entries where entry.hasExpired(now: now) {
             var e = entry
             e.failedAt = now
             outbox.entries[id] = e
-            changed = true
+            Storage.upsertOutboxEntry(e)
         }
 
         // 2. Retry walk — only if connected. NWConnection.send while
@@ -1774,7 +1772,7 @@ extension ChatStore: RelayClientDelegate {
                 // status icon reads from `relayedAt`/`deliveredAt`/
                 // `failedAt`; only the new retry count is interesting.
                 outbox.entries[entry.messageId] = e
-                changed = true
+                Storage.upsertOutboxEntry(e)
                 _ = session  // silence unused-let in current scope
             }
         }
@@ -1788,11 +1786,9 @@ extension ChatStore: RelayClientDelegate {
             if let t = entry.deliveredAt ?? entry.failedAt,
                now.timeIntervalSince(t) > postMortem {
                 outbox.entries.removeValue(forKey: id)
-                changed = true
+                Storage.deleteOutboxEntry(messageId: id)
             }
         }
-
-        if changed { Storage.persist(outbox: outbox) }
 
         // 4. Reassembler stale cleanup. A malicious sender shipping
         // chunk_count=1024 then 1 chunk would otherwise pin a partial

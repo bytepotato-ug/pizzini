@@ -164,4 +164,50 @@ struct PizziniCryptoCoreTests {
         #expect(try s2.deliveryTokenVerifyKey() == key1)
         #expect(key1.count == 33)
     }
+
+    // MARK: - Argon2id KDF (SQLCipher key derivation)
+
+    @Test("Argon2id derive is deterministic for fixed inputs")
+    func argon2idDeterministic() throws {
+        let salt = Data(repeating: 0x42, count: 16)
+        let pass = Data("correct-horse-battery-staple".utf8)
+        // Test-fixture params (tiny) — the production params would
+        // take ~250 ms and pad the test suite for no benefit. The
+        // Rust-side test pins the upstream-crate output for the
+        // production-shape inputs; this test pins the Swift bridge.
+        let params = Argon2id.Params(memoryKiB: 64, timeIterations: 2, parallelism: 1)
+        let a = try Argon2id.derive(passphrase: pass, salt: salt, params: params, outputLength: 32)
+        let b = try Argon2id.derive(passphrase: pass, salt: salt, params: params, outputLength: 32)
+        #expect(a == b)
+        #expect(a.count == 32)
+        #expect(a != Data(repeating: 0, count: 32))
+    }
+
+    @Test("Argon2id derive distinguishes salts")
+    func argon2idSaltSensitive() throws {
+        let pass = Data("shared".utf8)
+        let params = Argon2id.Params(memoryKiB: 64, timeIterations: 2, parallelism: 1)
+        let a = try Argon2id.derive(
+            passphrase: pass, salt: Data(repeating: 0x01, count: 16),
+            params: params, outputLength: 32,
+        )
+        let b = try Argon2id.derive(
+            passphrase: pass, salt: Data(repeating: 0x02, count: 16),
+            params: params, outputLength: 32,
+        )
+        #expect(a != b)
+    }
+
+    @Test("Argon2id derive throws on too-short salt")
+    func argon2idGuardSalt() {
+        let params = Argon2id.Params(memoryKiB: 64, timeIterations: 2, parallelism: 1)
+        #expect(throws: CryptoCoreError.self) {
+            try Argon2id.derive(
+                passphrase: Data("x".utf8),
+                salt: Data(repeating: 0, count: 8),  // < 16 byte floor
+                params: params,
+                outputLength: 32,
+            )
+        }
+    }
 }

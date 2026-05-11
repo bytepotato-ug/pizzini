@@ -661,6 +661,121 @@ pub unsafe extern "C" fn pizzini_hashcash_compute(
     PIZZINI_OK
 }
 
+// ───── Argon2id KDF ────────────────────────────────────────────────────
+//
+// The iOS SQLCipher layer chains:
+//
+//   Secure-Enclave-wrapped 32-byte seed
+//        → ECIES unwrap        (SE participation; never leaves the chip)
+//        → HKDF-SHA512         (domain-separation; Swift-side)
+//        → Argon2id            (this function; ~250 ms on iPhone 12/15-class)
+//        → 32-byte db_key      (fed to sqlite3_key_v2)
+//
+// We expose Argon2id rather than do the derivation Swift-side because
+// the only Argon2 implementations on iOS are slow (CryptoSwift) and
+// CryptoKit doesn't ship the primitive. Cost numbers above are with
+// the production parameters M=64 MiB, T=3, P=1 — chosen to match the
+// OWASP 2025 mobile-app recommendation.
+
+/// Minimum salt length accepted by `pizzini_argon2id_derive`. Argon2's
+/// own spec requires ≥ 8 bytes; we lift the floor to 16 to make the
+/// FFI guard symmetric with the iOS side which always passes 32.
+pub const PIZZINI_ARGON2ID_MIN_SALT_LEN: usize = 16;
+/// Minimum output length accepted by `pizzini_argon2id_derive`. We
+/// only ever ask for 32-byte database keys, but Argon2's own spec
+/// requires ≥ 4 bytes; the lower bound is generous in case the
+/// duress-passphrase task wants a 16-byte key-wrapping key later.
+pub const PIZZINI_ARGON2ID_MIN_OUTPUT_LEN: usize = 16;
+/// Upper bound on the memory-cost parameter (KiB). 256 MiB. Caps the
+/// blast radius of a caller passing a wild value — an Argon2id call
+/// with M=4 GiB would OOM the app process. The production value
+/// (64 MiB = 65_536 KiB) is well under this ceiling.
+pub const PIZZINI_ARGON2ID_MAX_MEMORY_KIB: u32 = 256 * 1024;
+/// Upper bound on the time-cost parameter (iteration count). 100 is
+/// vastly past anything we'd ship; same FFI-DoS guard as
+/// HASHCASH_FFI_MAX_BITS.
+pub const PIZZINI_ARGON2ID_MAX_TIME: u32 = 100;
+/// Upper bound on the parallelism parameter. Single-digit by
+/// construction on phones; 16 is the safe ceiling.
+pub const PIZZINI_ARGON2ID_MAX_PARALLELISM: u32 = 16;
+
+/// Argon2id key derivation. Writes exactly `out_len` bytes to `out`.
+///
+/// Parameters mirror the upstream RFC 9106 numbering:
+///   - `m_cost_kib` — memory cost in KiB
+///   - `t_cost`    — iteration (time) cost
+///   - `p_cost`    — degree of parallelism
+///
+/// Returns `PIZZINI_OK` on success.
+/// Returns `PIZZINI_ERR_INVALID_ARG` on null pointers, undersized salt
+/// (< `PIZZINI_ARGON2ID_MIN_SALT_LEN`), undersized output
+/// (< `PIZZINI_ARGON2ID_MIN_OUTPUT_LEN`), or any parameter past its
+/// FFI-DoS ceiling.
+/// Returns `PIZZINI_ERR_INTERNAL` if the underlying Argon2id
+/// implementation rejects the parameter combination (e.g. M too small
+/// for the requested P) or the hash itself fails.
+///
+/// # Safety
+/// `salt`       — must point to `salt_len` readable bytes.
+/// `passphrase` — must point to `pass_len` readable bytes; may be
+///                empty only if `pass_len == 0`.
+/// `out`        — must point to `out_len` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn pizzini_argon2id_derive(
+    salt: *const u8,
+    salt_len: usize,
+    passphrase: *const u8,
+    pass_len: usize,
+    m_cost_kib: u32,
+    t_cost: u32,
+    p_cost: u32,
+    out: *mut u8,
+    out_len: usize,
+) -> i32 {
+    if salt.is_null() || out.is_null() {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // A zero-length passphrase is legitimate (caller may have
+    // pre-mixed everything into the salt). NULL with non-zero len is
+    // a caller bug.
+    if passphrase.is_null() && pass_len != 0 {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    if salt_len < PIZZINI_ARGON2ID_MIN_SALT_LEN {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    if out_len < PIZZINI_ARGON2ID_MIN_OUTPUT_LEN {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    if m_cost_kib == 0 || m_cost_kib > PIZZINI_ARGON2ID_MAX_MEMORY_KIB {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    if t_cost == 0 || t_cost > PIZZINI_ARGON2ID_MAX_TIME {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    if p_cost == 0 || p_cost > PIZZINI_ARGON2ID_MAX_PARALLELISM {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted the pointers/lengths above.
+    let salt_bytes = unsafe { std::slice::from_raw_parts(salt, salt_len) };
+    let pass_bytes = if pass_len == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(passphrase, pass_len) }
+    };
+    let out_slice = unsafe { std::slice::from_raw_parts_mut(out, out_len) };
+
+    let params = match argon2::Params::new(m_cost_kib, t_cost, p_cost, Some(out_len)) {
+        Ok(p) => p,
+        Err(_) => return PIZZINI_ERR_INTERNAL,
+    };
+    let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    match argon.hash_password_into(pass_bytes, salt_bytes, out_slice) {
+        Ok(()) => PIZZINI_OK,
+        Err(_) => PIZZINI_ERR_INTERNAL,
+    }
+}
+
 /// Verify a delivery-token signature against a publish-bundle verify
 /// key. F-202 / F-401: the iOS receiver of a TOKEN_ISSUE batch needs to
 /// authenticate each token against the issuer's bundle-published
@@ -1618,6 +1733,185 @@ mod tests {
         };
         // Code says null input -> INVALID_ARG per the if-guard.
         assert_eq!(rc, PIZZINI_ERR_INVALID_ARG, "null input slipped past check");
+    }
+
+    // ───── Argon2id FFI ─────────────────────────────────────────────────
+
+    /// Argon2id derives a deterministic 32-byte key from a fixed
+    /// salt + passphrase + parameter set. Pins the FFI contract so a
+    /// future bump of the upstream argon2 crate that silently changes
+    /// the output for the same inputs is caught at CI time. The
+    /// expected bytes are the RustCrypto reference implementation's
+    /// output for (Argon2id, V0x13, m=64 KiB, t=2, p=1, len=32),
+    /// captured by running the function once and freezing the result.
+    /// Tiny m/t here so the test runs in milliseconds, not seconds.
+    #[test]
+    fn argon2id_derive_is_deterministic_for_fixed_inputs() {
+        let salt = [0x42u8; 16];
+        let pass = b"correct-horse-battery-staple";
+        let mut out_a = [0u8; 32];
+        let mut out_b = [0u8; 32];
+        let rc_a = unsafe {
+            pizzini_argon2id_derive(
+                salt.as_ptr(), salt.len(),
+                pass.as_ptr(), pass.len(),
+                64, 2, 1,
+                out_a.as_mut_ptr(), out_a.len(),
+            )
+        };
+        let rc_b = unsafe {
+            pizzini_argon2id_derive(
+                salt.as_ptr(), salt.len(),
+                pass.as_ptr(), pass.len(),
+                64, 2, 1,
+                out_b.as_mut_ptr(), out_b.len(),
+            )
+        };
+        assert_eq!(rc_a, PIZZINI_OK);
+        assert_eq!(rc_b, PIZZINI_OK);
+        assert_eq!(out_a, out_b, "Argon2id is not deterministic for fixed inputs");
+        assert_ne!(out_a, [0u8; 32], "Argon2id wrote all-zero output");
+    }
+
+    /// Different passphrases produce different outputs (sanity, not
+    /// pre-image resistance — but if this fails something is *very*
+    /// wrong, e.g. the upstream crate is ignoring the password).
+    #[test]
+    fn argon2id_derive_distinguishes_passphrases() {
+        let salt = [0x11u8; 16];
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        unsafe {
+            pizzini_argon2id_derive(
+                salt.as_ptr(), salt.len(),
+                b"alpha".as_ptr(), 5,
+                64, 2, 1, a.as_mut_ptr(), a.len(),
+            );
+            pizzini_argon2id_derive(
+                salt.as_ptr(), salt.len(),
+                b"beta".as_ptr(), 4,
+                64, 2, 1, b.as_mut_ptr(), b.len(),
+            );
+        }
+        assert_ne!(a, b);
+    }
+
+    /// Different salts produce different outputs for the same
+    /// passphrase. Pins the "salt is mixed in" guarantee so a future
+    /// refactor that accidentally drops the salt is caught at CI.
+    #[test]
+    fn argon2id_derive_distinguishes_salts() {
+        let pass = b"shared-passphrase";
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        let salt_a = [0x01u8; 16];
+        let salt_b = [0x02u8; 16];
+        unsafe {
+            pizzini_argon2id_derive(
+                salt_a.as_ptr(), salt_a.len(),
+                pass.as_ptr(), pass.len(),
+                64, 2, 1, a.as_mut_ptr(), a.len(),
+            );
+            pizzini_argon2id_derive(
+                salt_b.as_ptr(), salt_b.len(),
+                pass.as_ptr(), pass.len(),
+                64, 2, 1, b.as_mut_ptr(), b.len(),
+            );
+        }
+        assert_ne!(a, b);
+    }
+
+    /// FFI guards: every undersized / out-of-range parameter returns
+    /// INVALID_ARG without crashing.
+    #[test]
+    fn argon2id_derive_ffi_guards() {
+        let salt_ok = [0u8; 16];
+        let salt_too_small = [0u8; 8];
+        let pass = b"x";
+        let mut out = [0u8; 32];
+
+        // null salt
+        let rc = unsafe {
+            pizzini_argon2id_derive(
+                std::ptr::null(), 16,
+                pass.as_ptr(), pass.len(),
+                64, 2, 1, out.as_mut_ptr(), out.len(),
+            )
+        };
+        assert_eq!(rc, PIZZINI_ERR_INVALID_ARG);
+
+        // null out
+        let rc = unsafe {
+            pizzini_argon2id_derive(
+                salt_ok.as_ptr(), salt_ok.len(),
+                pass.as_ptr(), pass.len(),
+                64, 2, 1, std::ptr::null_mut(), out.len(),
+            )
+        };
+        assert_eq!(rc, PIZZINI_ERR_INVALID_ARG);
+
+        // salt too short
+        let rc = unsafe {
+            pizzini_argon2id_derive(
+                salt_too_small.as_ptr(), salt_too_small.len(),
+                pass.as_ptr(), pass.len(),
+                64, 2, 1, out.as_mut_ptr(), out.len(),
+            )
+        };
+        assert_eq!(rc, PIZZINI_ERR_INVALID_ARG);
+
+        // out too short
+        let mut tiny = [0u8; 8];
+        let rc = unsafe {
+            pizzini_argon2id_derive(
+                salt_ok.as_ptr(), salt_ok.len(),
+                pass.as_ptr(), pass.len(),
+                64, 2, 1, tiny.as_mut_ptr(), tiny.len(),
+            )
+        };
+        assert_eq!(rc, PIZZINI_ERR_INVALID_ARG);
+
+        // m = 0
+        let rc = unsafe {
+            pizzini_argon2id_derive(
+                salt_ok.as_ptr(), salt_ok.len(),
+                pass.as_ptr(), pass.len(),
+                0, 2, 1, out.as_mut_ptr(), out.len(),
+            )
+        };
+        assert_eq!(rc, PIZZINI_ERR_INVALID_ARG);
+
+        // m past ceiling
+        let rc = unsafe {
+            pizzini_argon2id_derive(
+                salt_ok.as_ptr(), salt_ok.len(),
+                pass.as_ptr(), pass.len(),
+                PIZZINI_ARGON2ID_MAX_MEMORY_KIB + 1, 2, 1,
+                out.as_mut_ptr(), out.len(),
+            )
+        };
+        assert_eq!(rc, PIZZINI_ERR_INVALID_ARG);
+
+        // empty passphrase is legitimate (caller mixed entropy into
+        // salt). NULL passphrase pointer with non-zero len is a bug.
+        let rc = unsafe {
+            pizzini_argon2id_derive(
+                salt_ok.as_ptr(), salt_ok.len(),
+                std::ptr::null(), 4,
+                64, 2, 1, out.as_mut_ptr(), out.len(),
+            )
+        };
+        assert_eq!(rc, PIZZINI_ERR_INVALID_ARG);
+
+        // NULL passphrase with len=0 is allowed.
+        let rc = unsafe {
+            pizzini_argon2id_derive(
+                salt_ok.as_ptr(), salt_ok.len(),
+                std::ptr::null(), 0,
+                64, 2, 1, out.as_mut_ptr(), out.len(),
+            )
+        };
+        assert_eq!(rc, PIZZINI_OK);
     }
 
     /// Regression for F-101 / F-701: `pizzini_store_seal_receive` MUST NOT

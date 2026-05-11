@@ -1,0 +1,5 @@
+module PizziniSQLCipher [system] {
+    umbrella header "PizziniSQLCipher.h"
+    link "z"
+    export *
+}

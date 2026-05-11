@@ -39,6 +39,42 @@
 #define HASHCASH_FFI_MAX_BITS 26
 
 /**
+ * Minimum salt length accepted by `pizzini_argon2id_derive`. Argon2's
+ * own spec requires ≥ 8 bytes; we lift the floor to 16 to make the
+ * FFI guard symmetric with the iOS side which always passes 32.
+ */
+#define PIZZINI_ARGON2ID_MIN_SALT_LEN 16
+
+/**
+ * Minimum output length accepted by `pizzini_argon2id_derive`. We
+ * only ever ask for 32-byte database keys, but Argon2's own spec
+ * requires ≥ 4 bytes; the lower bound is generous in case the
+ * duress-passphrase task wants a 16-byte key-wrapping key later.
+ */
+#define PIZZINI_ARGON2ID_MIN_OUTPUT_LEN 16
+
+/**
+ * Upper bound on the memory-cost parameter (KiB). 256 MiB. Caps the
+ * blast radius of a caller passing a wild value — an Argon2id call
+ * with M=4 GiB would OOM the app process. The production value
+ * (64 MiB = 65_536 KiB) is well under this ceiling.
+ */
+#define PIZZINI_ARGON2ID_MAX_MEMORY_KIB (256 * 1024)
+
+/**
+ * Upper bound on the time-cost parameter (iteration count). 100 is
+ * vastly past anything we'd ship; same FFI-DoS guard as
+ * HASHCASH_FFI_MAX_BITS.
+ */
+#define PIZZINI_ARGON2ID_MAX_TIME 100
+
+/**
+ * Upper bound on the parallelism parameter. Single-digit by
+ * construction on phones; 16 is the safe ceiling.
+ */
+#define PIZZINI_ARGON2ID_MAX_PARALLELISM 16
+
+/**
  * Wire size of a `distribution_id`: a 16-byte raw UUID. The Swift
  * caller derives this per-chain (e.g. from a random-UUID generator)
  * and persists the mapping `(group_id, member_peer_id) → distribution_id`
@@ -370,6 +406,39 @@ int32_t pizzini_hashcash_compute(const uint8_t *challenge,
                                  uintptr_t challenge_len,
                                  uint32_t bits,
                                  uint64_t *out_nonce);
+
+/**
+ * Argon2id key derivation. Writes exactly `out_len` bytes to `out`.
+ *
+ * Parameters mirror the upstream RFC 9106 numbering:
+ *   - `m_cost_kib` — memory cost in KiB
+ *   - `t_cost`    — iteration (time) cost
+ *   - `p_cost`    — degree of parallelism
+ *
+ * Returns `PIZZINI_OK` on success.
+ * Returns `PIZZINI_ERR_INVALID_ARG` on null pointers, undersized salt
+ * (< `PIZZINI_ARGON2ID_MIN_SALT_LEN`), undersized output
+ * (< `PIZZINI_ARGON2ID_MIN_OUTPUT_LEN`), or any parameter past its
+ * FFI-DoS ceiling.
+ * Returns `PIZZINI_ERR_INTERNAL` if the underlying Argon2id
+ * implementation rejects the parameter combination (e.g. M too small
+ * for the requested P) or the hash itself fails.
+ *
+ * # Safety
+ * `salt`       — must point to `salt_len` readable bytes.
+ * `passphrase` — must point to `pass_len` readable bytes; may be
+ *                empty only if `pass_len == 0`.
+ * `out`        — must point to `out_len` writable bytes.
+ */
+int32_t pizzini_argon2id_derive(const uint8_t *salt,
+                                uintptr_t salt_len,
+                                const uint8_t *passphrase,
+                                uintptr_t pass_len,
+                                uint32_t m_cost_kib,
+                                uint32_t t_cost,
+                                uint32_t p_cost,
+                                uint8_t *out,
+                                uintptr_t out_len);
 
 /**
  * Verify a delivery-token signature against a publish-bundle verify
