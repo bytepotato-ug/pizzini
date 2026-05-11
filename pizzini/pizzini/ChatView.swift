@@ -874,36 +874,82 @@ struct ChatRow: View {
     }
 }
 
-/// Status indicator glyph for an outbound row. Lifted from `ChatRow`
-/// so the group chat bubble can render the same scale without
-/// duplicating the switch arm — the only place the legend lives now is
-/// `OnboardingView.iconsStep`. Pure rendering, no state.
+/// Status indicator glyph for an outbound row. Used by `ChatRow`,
+/// `GroupChatBubble`, and `OnboardingView.iconsStep` (the legend
+/// that teaches the user what each glyph means). All three render
+/// from the SAME `ChatStatusGlyph` view so the legend matches what
+/// the user later sees in a real chat row pixel-for-pixel.
 ///
-/// Progression: ⏳ pending → ✓ sent → ✓✓ delivered → 👁 read. The
-/// eye REPLACES the ✓✓ rather than appending — one glyph scale, no
+/// Progression: hourglass → ✓ → ✓✓ → 👁 → ✗. The eye REPLACES the
+/// double-check rather than appending — one glyph scale, no
 /// redundant "Read" text. Honours `Contact.readReceiptsEnabled`-off
-/// by default: with no incoming readAt timestamp the eye never shows,
-/// the row stays at ✓✓ delivered.
+/// by default: with no incoming readAt timestamp the eye never
+/// shows, the row stays at the blue double-check.
 struct ChatStatusIcon: View {
     let status: OutboxEntry.Status
     let read: Bool
 
     var body: some View {
         switch status {
-        case .pending:
-            Text("⏳").help("Queued — waiting for the connection")
-        case .relayed:
-            Text("✓").foregroundStyle(.secondary).help("Sent")
+        case .pending:   ChatStatusGlyph(kind: .pending)
+        case .relayed:   ChatStatusGlyph(kind: .sent)
         case .delivered:
-            if read {
-                Image(systemName: "eye.fill")
-                    .foregroundStyle(.blue)
-                    .help("They read it")
-            } else {
-                Text("✓✓").foregroundStyle(.blue).help("Delivered to their phone")
-            }
+            if read { ChatStatusGlyph(kind: .read) }
+            else    { ChatStatusGlyph(kind: .delivered) }
+        case .failed:    ChatStatusGlyph(kind: .failed)
+        }
+    }
+}
+
+/// Single source of truth for the five status glyphs. All five
+/// render as SF Symbols at the same nominal size so column
+/// alignment is consistent without manual baseline tweaks. The
+/// double-check (delivered, not yet read) uses two overlapping
+/// `checkmark` symbols rather than a Unicode `✓✓` so it stays in
+/// the same rendering pipeline as the rest.
+struct ChatStatusGlyph: View {
+    enum Kind: Sendable, Equatable {
+        case pending, sent, delivered, read, failed
+    }
+    let kind: Kind
+
+    var body: some View {
+        switch kind {
+        case .pending:
+            Image(systemName: "hourglass")
+                .foregroundStyle(.secondary)
+                .help("Queued — waiting for the connection")
+        case .sent:
+            Image(systemName: "checkmark")
+                .foregroundStyle(.secondary)
+                .help("Sent")
+        case .delivered:
+            DoubleCheckmark()
+                .foregroundStyle(.blue)
+                .help("Delivered to their phone")
+        case .read:
+            Image(systemName: "eye.fill")
+                .foregroundStyle(.blue)
+                .help("They read it")
         case .failed:
-            Text("✗").foregroundStyle(.red).help("Expired before reaching them")
+            Image(systemName: "xmark")
+                .foregroundStyle(.red)
+                .help("Expired before reaching them")
+        }
+    }
+}
+
+/// Two `checkmark` SF Symbols overlapped to read as a tidy
+/// double-tick. The negative `spacing` brings the second check
+/// into the first's tail, mimicking the iMessage / WhatsApp
+/// rendering without falling back to a Unicode `✓✓` (which
+/// renders inconsistently across iOS versions and Dynamic Type
+/// sizes). Color is set by the parent via `.foregroundStyle`.
+private struct DoubleCheckmark: View {
+    var body: some View {
+        HStack(spacing: -3) {
+            Image(systemName: "checkmark")
+            Image(systemName: "checkmark")
         }
     }
 }
