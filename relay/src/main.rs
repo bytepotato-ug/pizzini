@@ -320,7 +320,7 @@ async fn main() -> std::io::Result<()> {
         }
     }
     println!(
-        "  DEV BUILD — clearnet, no auth, ephemeral in-memory queue (cap={MAX_PENDING_PER_PEER}/peer, max ttl={}h, sender-chosen per frame). Tor-only in prod.",
+        "  DEV BUILD — clearnet, no auth, persistent offline queue (cap={MAX_PENDING_PER_PEER}/peer, max ttl={}h, sender-chosen per frame). Tor-only in prod.",
         MAX_PENDING_TTL.as_secs() / 3600,
     );
     println!("  protocol v{PROTOCOL_VERSION} — sealed-sender SEND/ACK, drop on TTL");
