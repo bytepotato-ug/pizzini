@@ -267,6 +267,21 @@ public final class RelayClient: @unchecked Sendable {
     /// relay restart wipes it).
     private var pushToken: Data?
 
+    /// SOCKS5 retry counter for the .onion path. The first SOCKS5
+    /// CONNECT after a fresh install / fresh Tor bootstrap can fail
+    /// because tor hasn't fetched the onion's introduction-point
+    /// descriptor yet — HSDir lookup + rendezvous setup adds
+    /// 10-30 s to the first dial against a new onion, often
+    /// longer than the SOCKS reply tor returns when its first
+    /// internal attempt times out. Subsequent attempts hit tor's
+    /// descriptor cache and succeed in <1 s. Auto-retry up to
+    /// `maxSocksRetries` times with `socksRetryDelay` backoff so
+    /// the user doesn't see a spurious "Connection refused" on
+    /// first launch. Reset to 0 on every new `connect()` call.
+    private var socksRetries: Int = 0
+    private static let maxSocksRetries: Int = 4
+    private static let socksRetryDelay: TimeInterval = 5
+
     public init(
         myIdentity: Data,
         myDeliveryTokenVerifyKey: Data,
@@ -280,6 +295,7 @@ public final class RelayClient: @unchecked Sendable {
     public func connect(to host: String, port: UInt16) {
         disconnect()
         state = .connecting
+        socksRetries = 0
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
             state = .failed("invalid port \(port)")
             return
@@ -448,11 +464,16 @@ public final class RelayClient: @unchecked Sendable {
             guard let self else { return }
             switch s {
             case .ready:
-                self.beginSocksHandshake(on: conn, targetHost: targetHost, targetPort: targetPort)
+                self.beginSocksHandshake(on: conn, socksPort: socksPort, targetHost: targetHost, targetPort: targetPort)
             case .waiting:
                 self.state = .connecting
             case .failed(let err):
-                self.state = .failed("socks tcp: \(err)")
+                self.handleSocksFailure(
+                    reason: "socks tcp: \(err)",
+                    socksPort: socksPort,
+                    targetHost: targetHost,
+                    targetPort: targetPort
+                )
             case .cancelled:
                 self.state = .idle
             default:
@@ -464,6 +485,7 @@ public final class RelayClient: @unchecked Sendable {
 
     private func beginSocksHandshake(
         on conn: NWConnection,
+        socksPort: UInt16,
         targetHost: String,
         targetPort: UInt16
     ) {
@@ -471,15 +493,21 @@ public final class RelayClient: @unchecked Sendable {
         conn.send(content: Socks5.clientGreeting, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
             if let error {
-                self.state = .failed("socks greeting send: \(error)")
+                self.handleSocksFailure(
+                    reason: "socks greeting send: \(error)",
+                    socksPort: socksPort,
+                    targetHost: targetHost,
+                    targetPort: targetPort
+                )
                 return
             }
-            self.readSocksGreetingReply(on: conn, targetHost: targetHost, targetPort: targetPort)
+            self.readSocksGreetingReply(on: conn, socksPort: socksPort, targetHost: targetHost, targetPort: targetPort)
         })
     }
 
     private func readSocksGreetingReply(
         on conn: NWConnection,
+        socksPort: UInt16,
         targetHost: String,
         targetPort: UInt16
     ) {
@@ -488,25 +516,41 @@ public final class RelayClient: @unchecked Sendable {
         conn.receive(minimumIncompleteLength: 2, maximumLength: 2) { [weak self] data, _, _, error in
             guard let self else { return }
             if let error {
-                self.state = .failed("socks greeting reply: \(error)")
+                self.handleSocksFailure(
+                    reason: "socks greeting reply: \(error)",
+                    socksPort: socksPort,
+                    targetHost: targetHost,
+                    targetPort: targetPort
+                )
                 return
             }
             guard let data else {
-                self.state = .failed("socks greeting reply: empty")
+                self.handleSocksFailure(
+                    reason: "socks greeting reply: empty",
+                    socksPort: socksPort,
+                    targetHost: targetHost,
+                    targetPort: targetPort
+                )
                 return
             }
             do {
                 _ = try Socks5.parseGreetingReply(data)
             } catch {
-                self.state = .failed("socks greeting reply: \(error)")
+                self.handleSocksFailure(
+                    reason: "socks greeting reply: \(error)",
+                    socksPort: socksPort,
+                    targetHost: targetHost,
+                    targetPort: targetPort
+                )
                 return
             }
-            self.sendSocksConnect(on: conn, targetHost: targetHost, targetPort: targetPort)
+            self.sendSocksConnect(on: conn, socksPort: socksPort, targetHost: targetHost, targetPort: targetPort)
         }
     }
 
     private func sendSocksConnect(
         on conn: NWConnection,
+        socksPort: UInt16,
         targetHost: String,
         targetPort: UInt16
     ) {
@@ -514,14 +558,25 @@ public final class RelayClient: @unchecked Sendable {
         conn.send(content: req, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
             if let error {
-                self.state = .failed("socks connect send: \(error)")
+                self.handleSocksFailure(
+                    reason: "socks connect send: \(error)",
+                    socksPort: socksPort,
+                    targetHost: targetHost,
+                    targetPort: targetPort
+                )
                 return
             }
-            self.readSocksConnectReply(on: conn, buffer: Data())
+            self.readSocksConnectReply(on: conn, socksPort: socksPort, targetHost: targetHost, targetPort: targetPort, buffer: Data())
         })
     }
 
-    private func readSocksConnectReply(on conn: NWConnection, buffer: Data) {
+    private func readSocksConnectReply(
+        on conn: NWConnection,
+        socksPort: UInt16,
+        targetHost: String,
+        targetPort: UInt16,
+        buffer: Data
+    ) {
         // CONNECT reply is variable length (10-262 bytes). We can't
         // ask NWConnection for "exactly enough" because we don't know
         // the length until we've parsed past the ATYP byte. Read up to
@@ -530,7 +585,12 @@ public final class RelayClient: @unchecked Sendable {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 262) { [weak self] data, _, _, error in
             guard let self else { return }
             if let error {
-                self.state = .failed("socks connect reply: \(error)")
+                self.handleSocksFailure(
+                    reason: "socks connect reply: \(error)",
+                    socksPort: socksPort,
+                    targetHost: targetHost,
+                    targetPort: targetPort
+                )
                 return
             }
             var buf = buffer
@@ -555,12 +615,64 @@ public final class RelayClient: @unchecked Sendable {
                     self.state = .connected
                     self.scheduleRead()
                 case .incomplete:
-                    self.readSocksConnectReply(on: conn, buffer: buf)
+                    self.readSocksConnectReply(on: conn, socksPort: socksPort, targetHost: targetHost, targetPort: targetPort, buffer: buf)
                 }
             } catch {
-                self.state = .failed("socks connect reply: \(error)")
+                self.handleSocksFailure(
+                    reason: "socks connect reply: \(error)",
+                    socksPort: socksPort,
+                    targetHost: targetHost,
+                    targetPort: targetPort
+                )
             }
         }
+    }
+
+    /// Centralised failure-handling for the .onion SOCKS5 path.
+    /// First-time dials against a brand-new onion routinely fail
+    /// because tor hasn't yet fetched the hidden-service descriptor
+    /// — HSDir lookup + rendezvous setup is 10-30 s on the cold path
+    /// while tor's internal timeout for the SOCKS5 request is much
+    /// shorter, so tor returns a non-zero REP byte (or the kernel
+    /// returns ECONNREFUSED if the SOCKS connection gets torn down)
+    /// before the descriptor cache is warm. Auto-retry with a fixed
+    /// 5 s back-off up to `maxSocksRetries` times — by then tor has
+    /// the descriptor cached and the subsequent SOCKS5 dial
+    /// succeeds in well under a second.
+    ///
+    /// Must run on `queue` (every call-site already does).
+    private func handleSocksFailure(
+        reason: String,
+        socksPort: UInt16,
+        targetHost: String,
+        targetPort: UInt16
+    ) {
+        // Cancel the dead SOCKS connection so its stateUpdateHandler
+        // doesn't fire `.failed` again from inside a retry attempt.
+        connection?.cancel()
+        connection = nil
+
+        if socksRetries < Self.maxSocksRetries {
+            socksRetries += 1
+            // Stay in `.connecting` rather than flapping to `.failed`
+            // and back — the UI shouldn't show an error during what
+            // is effectively a single ongoing connection attempt.
+            state = .connecting
+            let attempt = socksRetries
+            queue.asyncAfter(deadline: .now() + Self.socksRetryDelay) { [weak self] in
+                guard let self else { return }
+                NSLog("[pizzini] socks5 retry \(attempt)/\(Self.maxSocksRetries) (\(reason))")
+                self.openSocksConnection(
+                    socksPort: socksPort,
+                    targetHost: targetHost,
+                    targetPort: targetPort
+                )
+            }
+            return
+        }
+        // Out of retries — surface the last failure to the host so the
+        // user-facing retry timer / Reconnect button can pick it up.
+        state = .failed(reason)
     }
 
     public func disconnect() {
