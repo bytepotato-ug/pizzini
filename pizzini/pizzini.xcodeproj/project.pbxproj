@@ -518,6 +518,7 @@
 				DEVELOPMENT_TEAM = N3WYDR67GB;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Pizzini;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Scan a contact's QR code";
 				INFOPLIST_KEY_NSFaceIDUsageDescription = "Pizzini uses Face ID to keep your messages private. You can change this in Security settings.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -553,6 +554,7 @@
 				DEVELOPMENT_TEAM = N3WYDR67GB;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Pizzini;
 				INFOPLIST_KEY_NSCameraUsageDescription = "Scan a contact's QR code";
 				INFOPLIST_KEY_NSFaceIDUsageDescription = "Pizzini uses Face ID to keep your messages private. You can change this in Security settings.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
