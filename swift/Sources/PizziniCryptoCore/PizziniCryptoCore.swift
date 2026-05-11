@@ -851,9 +851,18 @@ public enum SafetyNumber {
 /// The relay's challenge layout is
 /// `BLAKE3(recipient_peer_id || floor(unix_time / 3600))`. Caller derives
 /// that, hands it to `compute`, gets a u64 nonce that satisfies the
-/// 18-bit difficulty target. Cost ~1s on a modern phone.
+/// `defaultBits` difficulty target. Cost ~16s on a modern phone at 22
+/// bits.
+///
+/// **MUST stay in sync with the relay's `HASHCASH_BITS` constant in
+/// `relay/src/main.rs` and the Rust crate's `HASHCASH_DEFAULT_BITS` in
+/// `crypto-core/src/hashcash.rs`.** A drift here (e.g. iOS at 18 while
+/// the relay enforces 22, the F-NEW-209 bump) causes every iOS
+/// BUNDLE_REQUEST to be rejected by the relay with `invalid hashcash`
+/// and no peer can ever complete the PreKey handshake. The pairing UI
+/// stalls indefinitely on "Waiting for handshake".
 public enum Hashcash {
-    public static let defaultBits: UInt32 = 18
+    public static let defaultBits: UInt32 = 22
 
     public static func compute(challenge: Data, bits: UInt32 = defaultBits) -> UInt64 {
         var nonce: UInt64 = 0
