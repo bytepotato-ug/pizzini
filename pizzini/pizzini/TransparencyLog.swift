@@ -201,7 +201,7 @@ enum TransparencyLogConfig {
     /// `scripts/generate-operator-key.sh` prints under "Raw
     /// Ed25519 public key (base64)"). Empty default = no log
     /// verification (UI renders "not configured").
-    static let operatorVerifyKeyBase64: String = ""
+    static let operatorVerifyKeyBase64: String = "QlHwZ2S6RoU2B4J7ucPYAZueCIbiJaFZsyVawnhylpg="
 
     /// Public URL of the operator's NDJSON transparency log file.
     /// MUST be hosted on infrastructure **independent of the
@@ -212,7 +212,7 @@ enum TransparencyLogConfig {
     /// E2E signature provides cryptographic integrity.
     /// Empty default = no automatic fetch (UI renders
     /// "log URL not configured").
-    static let logURLString: String = ""
+    static let logURLString: String = "https://raw.githubusercontent.com/bytepotato-ug/pizzini/main/transparency-log.ndjson"
 
     /// Decoded form. Returns nil for unset / malformed keys —
     /// the verifier propagates this to
