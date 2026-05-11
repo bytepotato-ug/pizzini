@@ -23,13 +23,19 @@ struct ContactsListView: View {
     /// dismissal flow; we just react to the value it produces.
     @State private var searchQuery = ""
 
-    /// Drives the `.searchable(isPresented:)` binding so the global
-    /// search field is HIDDEN by default and only slides in when the
-    /// user taps the magnifying-glass toolbar button. The previous
-    /// always-on placement pinned a search bar under every nav-bar
-    /// view, taking real estate from the chat list. Tapping Cancel
-    /// on the search bar (system-rendered) sets this back to false.
+    /// True when the user has tapped the magnifying-glass toolbar
+    /// button. Drives a CUSTOM inline search bar that the body
+    /// renders above the contacts list — we don't use SwiftUI's
+    /// `.searchable` because its `isPresented` binding controls
+    /// FOCUS, not visibility (the nav-bar-drawer search field stays
+    /// mounted regardless). Cancel button on the custom bar flips
+    /// this back to false and clears the query.
     @State private var searchActive = false
+    /// Drives the focus on the inline TextField so the keyboard
+    /// raises the instant the user taps the magnifying-glass icon,
+    /// without needing a separate `.onAppear { searchFocused = true }`
+    /// runloop hop.
+    @FocusState private var searchFocused: Bool
 
     /// True when the user typed something searchable (non-blank).
     /// Computed rather than stored so a programmatic mutation to
@@ -40,21 +46,18 @@ struct ContactsListView: View {
     }
 
     var body: some View {
-        ZStack {
-            if isSearching {
-                // Global search swap: replace the normal list with
-                // the search-results surface. SwiftUI's `.searchable`
-                // (applied below) renders the search bar in the nav
-                // bar drawer above this view — the user types there,
-                // we re-render here. Keeps the search keyboard / cancel
-                // button / focus-state owned by SwiftUI's nav-bar
-                // search machinery rather than something we own
-                // manually.
-                SearchResultsView(store: store, query: searchQuery)
-            } else if store.state.contacts.isEmpty, store.state.groups.isEmpty {
-                emptyState
-            } else {
-                list
+        VStack(spacing: 0) {
+            if searchActive {
+                customSearchBar
+            }
+            ZStack {
+                if isSearching {
+                    SearchResultsView(store: store, query: searchQuery)
+                } else if store.state.contacts.isEmpty, store.state.groups.isEmpty {
+                    emptyState
+                } else {
+                    list
+                }
             }
         }
         // Hide the contacts list when iOS reports a screen recording
@@ -62,26 +65,6 @@ struct ContactsListView: View {
         // a user who triggered Control-Centre Record by mistake can
         // still navigate out / open Settings to disable recording.
         .screenCaptureShielded()
-        // Global search across every chat log + chat name. Lives on
-        // the root contacts list so it's reachable from anywhere via
-        // the nav-stack drag-down gesture. The placement explicitly
-        // hoists it INTO the nav bar drawer (default on iOS) so the
-        // search field reads as part of the list's nav chrome rather
-        // than a body element.
-        .searchable(
-            text: $searchQuery,
-            isPresented: $searchActive,
-            placement: .navigationBarDrawer(displayMode: .automatic),
-            prompt: Text("Search chats and messages"),
-        )
-        // Default-disable autocorrect on the search field. A user
-        // searching "alice" doesn't want iOS to helpfully replace it
-        // with "slice" — and an activist searching for a sensitive
-        // keyword doesn't want it landing in the system's keyboard-
-        // learning cache where another app or a forensic extract
-        // would find it. Same posture as the chat composer.
-        .autocorrectionDisabled(true)
-        .textInputAutocapitalization(.never)
         .navigationTitle("Pizzini")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -128,11 +111,8 @@ struct ContactsListView: View {
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
-                    // Open the global search drawer. SwiftUI focuses
-                    // the field, raises the keyboard, and renders the
-                    // Cancel button — we just flip the binding. Same
-                    // pattern as ChatView's find-in-chat icon.
                     searchActive = true
+                    searchFocused = true
                 } label: {
                     Image(systemName: "magnifyingglass")
                 }
@@ -147,6 +127,48 @@ struct ContactsListView: View {
                 .accessibilityLabel("Settings")
             }
         }
+    }
+
+    // ─── Custom search bar ─────────────────────────────────────────────
+    // Rolled our own rather than `.searchable` because that modifier's
+    // `isPresented` binding controls focus, NOT visibility — its nav-
+    // bar drawer field stays mounted regardless. This bar only exists
+    // in the view tree when `searchActive` is true, so on first
+    // launch the chat list opens to a clean top edge.
+    private var customSearchBar: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search chats and messages", text: $searchQuery)
+                    .textFieldStyle(.plain)
+                    .focused($searchFocused)
+                    .submitLabel(.search)
+                    .autocorrectionDisabled(true)
+                    .textInputAutocapitalization(.never)
+                if !searchQuery.isEmpty {
+                    Button {
+                        searchQuery = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityLabel("Clear search")
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color(.secondarySystemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            Button("Cancel") {
+                searchActive = false
+                searchQuery = ""
+                searchFocused = false
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color(.systemBackground))
     }
 
     // ─── Empty state ───────────────────────────────────────────────────

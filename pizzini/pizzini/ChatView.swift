@@ -37,17 +37,21 @@ struct ChatView: View {
     /// this to deep-link into FAQView at the right anchor.
     @State private var faqAnchor: FAQSection?
     @FocusState private var composerFocused: Bool
-    /// In-chat find-bar state. `searchQuery` is bound to a
-    /// `.searchable(text:isPresented:)` modifier; `searchActive` is
-    /// bound to the same modifier's isPresented argument so the
-    /// toolbar magnifying-glass button can toggle the search bar
-    /// programmatically. `currentMatchID` tracks which hit the user
-    /// has cycled to — index-by-UUID rather than by integer offset so
-    /// a row arriving / TTL-expiring under the user's feet doesn't
-    /// shift the highlighted "current match" to the wrong bubble.
+    /// In-chat find-bar state. Drives a CUSTOM inline search bar
+    /// that the body renders at the top of the chat ONLY when
+    /// `searchActive` is true. We don't use SwiftUI's `.searchable`
+    /// because its `isPresented` binding controls focus, not
+    /// visibility — the bar stays mounted under the nav bar
+    /// regardless. `currentMatchID` tracks which hit the user has
+    /// cycled to (index-by-UUID rather than by integer offset so a
+    /// row arriving / TTL-expiring under the user's feet doesn't
+    /// shift the highlighted "current match" to the wrong bubble).
     @State private var searchQuery = ""
     @State private var searchActive = false
     @State private var currentMatchID: UUID?
+    /// Focuses the inline find-bar TextField the instant the user
+    /// taps the toolbar magnifying-glass.
+    @FocusState private var searchFocused: Bool
     // iOS 18 ScrollPosition binding for the message list. Two roles:
     //   1. Initial position is `.bottom`, so opening the chat lands
     //      on the latest message without any imperative `scrollTo`.
@@ -69,6 +73,9 @@ struct ChatView: View {
     var body: some View {
         if let contact {
             VStack(spacing: 0) {
+                if searchActive {
+                    customSearchBar
+                }
                 if !contact.sessionEstablished {
                     pairingBanner
                     Divider()
@@ -149,27 +156,6 @@ struct ChatView: View {
             // the user can pop back out without seeing what they were
             // reading mirror to a TV.
             .screenCaptureShielded()
-            // In-chat find. `isPresented` is wired through so the
-            // toolbar magnifying-glass button can programmatically
-            // open the search bar, and so a global-search-result
-            // deep-link arriving via `initialFocus` can pre-activate
-            // it. Cancel on the bar binds back to false; our
-            // `.onChange(of: searchActive)` below clears the query +
-            // current-match-id when that happens so the next
-            // re-activation starts fresh.
-            .searchable(
-                text: $searchQuery,
-                isPresented: $searchActive,
-                placement: .navigationBarDrawer(displayMode: .automatic),
-                prompt: Text("Find in this chat"),
-            )
-            // Same posture as the global search field on
-            // `ContactsListView`: don't let iOS autocorrect a user
-            // searching for a sensitive keyword into something else,
-            // and don't leak the typed-but-not-sent terms into the
-            // device's keyboard-learning store.
-            .autocorrectionDisabled(true)
-            .textInputAutocapitalization(.never)
             .navigationTitle(contact.displayName)
             .navigationBarTitleDisplayMode(.inline)
             .onAppear {
@@ -230,11 +216,13 @@ struct ChatView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        // Toggle the find-bar. `.searchable(isPresented:)`
-                        // takes care of focusing the TextField, raising
-                        // the keyboard, and rendering the Cancel button;
-                        // we just flip the binding.
-                        searchActive.toggle()
+                        if searchActive {
+                            // Already open — second tap dismisses.
+                            cancelInlineSearch()
+                        } else {
+                            searchActive = true
+                            searchFocused = true
+                        }
                     } label: {
                         Image(systemName: "magnifyingglass")
                     }
@@ -315,6 +303,53 @@ struct ChatView: View {
             // Contact deleted from another path — bounce out.
             Color.clear.onAppear { dismiss() }
         }
+    }
+
+    /// Custom inline find-bar. Rolled our own because SwiftUI's
+    /// `.searchable` doesn't actually hide its drawer field when
+    /// `isPresented` is false — it just unfocuses. Only mounts in
+    /// the view tree when `searchActive == true`, so the chat opens
+    /// to a clean top edge.
+    private var customSearchBar: some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Find in this chat", text: $searchQuery)
+                    .textFieldStyle(.plain)
+                    .focused($searchFocused)
+                    .submitLabel(.search)
+                    .autocorrectionDisabled(true)
+                    .textInputAutocapitalization(.never)
+                if !searchQuery.isEmpty {
+                    Button {
+                        searchQuery = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityLabel("Clear search")
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color(.secondarySystemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            Button("Cancel") {
+                cancelInlineSearch()
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color(.systemBackground))
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
+    private func cancelInlineSearch() {
+        searchActive = false
+        searchQuery = ""
+        currentMatchID = nil
+        searchFocused = false
     }
 
     private var pairingBanner: some View {
