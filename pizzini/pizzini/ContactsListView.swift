@@ -23,6 +23,14 @@ struct ContactsListView: View {
     /// dismissal flow; we just react to the value it produces.
     @State private var searchQuery = ""
 
+    /// Drives the `.searchable(isPresented:)` binding so the global
+    /// search field is HIDDEN by default and only slides in when the
+    /// user taps the magnifying-glass toolbar button. The previous
+    /// always-on placement pinned a search bar under every nav-bar
+    /// view, taking real estate from the chat list. Tapping Cancel
+    /// on the search bar (system-rendered) sets this back to false.
+    @State private var searchActive = false
+
     /// True when the user typed something searchable (non-blank).
     /// Computed rather than stored so a programmatic mutation to
     /// `searchQuery` flips this through `body` without a second
@@ -62,6 +70,7 @@ struct ContactsListView: View {
         // than a body element.
         .searchable(
             text: $searchQuery,
+            isPresented: $searchActive,
             placement: .navigationBarDrawer(displayMode: .automatic),
             prompt: Text("Search chats and messages"),
         )
@@ -116,6 +125,18 @@ struct ContactsListView: View {
             }
             ToolbarItem(placement: .principal) {
                 relayBadge
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    // Open the global search drawer. SwiftUI focuses
+                    // the field, raises the keyboard, and renders the
+                    // Cancel button — we just flip the binding. Same
+                    // pattern as ChatView's find-in-chat icon.
+                    searchActive = true
+                } label: {
+                    Image(systemName: "magnifyingglass")
+                }
+                .accessibilityLabel("Search chats and messages")
             }
             ToolbarItem(placement: .topBarTrailing) {
                 NavigationLink {

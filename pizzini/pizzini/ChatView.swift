@@ -160,7 +160,7 @@ struct ChatView: View {
             .searchable(
                 text: $searchQuery,
                 isPresented: $searchActive,
-                placement: .navigationBarDrawer(displayMode: .always),
+                placement: .navigationBarDrawer(displayMode: .automatic),
                 prompt: Text("Find in this chat"),
             )
             // Same posture as the global search field on
