@@ -344,6 +344,11 @@ struct ContactsListView: View {
     /// industry pattern (Signal, WhatsApp, iMessage) is to stay silent
     /// on the happy path and only banner when reconnecting / offline.
     /// "relay" is also wire-speak; users see "connection" instead.
+    ///
+    /// The `.failed` badge is tappable: tap retries the connection.
+    /// Disabled while a reconnect is already in flight (any non-
+    /// `.failed`, non-`.connected` state) so a frustrated tap-spam
+    /// can't pile up duplicate connect calls.
     @ViewBuilder
     private var relayBadge: some View {
         switch store.relayState {
@@ -366,15 +371,31 @@ struct ContactsListView: View {
             }
             .accessibilityLabel("Connecting")
         case .failed:
-            HStack(spacing: 6) {
-                Image(systemName: "wifi.slash")
-                    .font(.caption2)
-                    .foregroundStyle(.red)
-                Text("no connection")
-                    .font(.caption2)
-                    .foregroundStyle(.red)
+            Button {
+                store.forceReconnectRelays()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                    Text("tap to reconnect")
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    Capsule()
+                        .fill(Color.red.opacity(0.10))
+                )
+                .overlay(
+                    Capsule()
+                        .stroke(Color.red.opacity(0.25), lineWidth: 0.5)
+                )
             }
-            .accessibilityLabel("No connection — your messages will not send")
+            .buttonStyle(.plain)
+            .accessibilityLabel("No connection. Tap to reconnect.")
+            .accessibilityHint("Retries the relay connection.")
         }
     }
 }
