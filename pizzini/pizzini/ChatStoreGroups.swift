@@ -159,7 +159,7 @@ extension ChatStore {
 
         state.groups.append(group)
         let gIdx = state.groups.count - 1
-        Storage.persist(appState: state)
+        Storage.upsertGroup(state.groups[gIdx])
 
         diagLog("group", "createGroup \(short(groupId)) name=\"\(trimmedName)\""
             + " admin=\(short(myCard.peerId)) inviting \(initialContacts.count) member(s):"
@@ -186,7 +186,7 @@ extension ChatStore {
                 groupAt: gIdx,
             )
         }
-        Storage.persist(appState: state)
+        Storage.upsertGroup(state.groups[gIdx])
         return groupId
     }
 
@@ -267,7 +267,7 @@ extension ChatStore {
         // newcomer is reached via a state mutation we didn't
         // initiate.
         applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session, relay: relay)
-        Storage.persist(appState: state)
+        Storage.upsertGroup(state.groups[gIdx])
         return true
     }
 
@@ -303,7 +303,7 @@ extension ChatStore {
             // here; tell the user instead of silently failing
             // (audit MEDIUM-4).
             appendGroupSystem(groupAt: gIdx, "Could not remove member: \(reason).")
-            Storage.persist(appState: state)
+            Storage.upsertGroup(state.groups[gIdx])
             return false
         }
 
@@ -318,7 +318,7 @@ extension ChatStore {
         // rotation regardless of how many remove ops applied in this
         // call.
         applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session, relay: relay)
-        Storage.persist(appState: state)
+        Storage.upsertGroup(state.groups[gIdx])
         return true
     }
 
@@ -354,7 +354,7 @@ extension ChatStore {
             broadcastGroupOp(signedBytes, toPeer: member.peerId, session: session, relay: relay)
         }
         applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session, relay: relay)
-        Storage.persist(appState: state)
+        Storage.upsertGroup(state.groups[gIdx])
         return true
     }
 
@@ -407,7 +407,7 @@ extension ChatStore {
             break
         case let .rejectedMalformed(reason):
             appendGroupSystem(groupAt: gIdx, "Role change failed: \(reason).")
-            Storage.persist(appState: state)
+            Storage.upsertGroup(state.groups[gIdx])
             return false
         default:
             // Auth/duplicate/equiv/sig: silent — these mean our own
@@ -421,7 +421,7 @@ extension ChatStore {
             broadcastGroupOp(signedBytes, toPeer: member.peerId, session: session, relay: relay)
         }
         applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session, relay: relay)
-        Storage.persist(appState: state)
+        Storage.upsertGroup(state.groups[gIdx])
         return true
     }
 
@@ -449,7 +449,7 @@ extension ChatStore {
                 + " enrolling local chain and broadcasting SKDM",
         )
         enrolMyChainOnFirstJoin(groupAt: gIdx, session: session, relay: relay)
-        Storage.persist(appState: state)
+        Storage.upsertGroup(state.groups[gIdx])
         return true
     }
 
@@ -465,7 +465,7 @@ extension ChatStore {
         guard state.groups[gIdx].pendingInvitation else { return false }
         NSLog("[pizzini.group] decline \(short(groupId)): removing local group state")
         state.groups.remove(at: gIdx)
-        Storage.persist(appState: state)
+        Storage.deleteGroup(id: groupId)
         return true
     }
 
@@ -486,7 +486,7 @@ extension ChatStore {
     func markGroupRead(groupID: Data) {
         guard let gIdx = groupIndex(forId: groupID) else { return }
         state.groups[gIdx].lastSeenAt = Date()
-        Storage.persist(appState: state)
+        Storage.upsertGroup(state.groups[gIdx])
         refreshAppBadge()
         // Per-sender highest-messageId scan over the group log.
         var highestPerSender: [Data: (messageId: Data, timestamp: Date)] = [:]
@@ -528,7 +528,8 @@ extension ChatStore {
         state.groups[gIdx].log.removeAll()
         state.groups[gIdx].lastMessageAt = nil
         state.groups[gIdx].lastSeenAt = Date()
-        Storage.persist(appState: state)
+        Storage.deleteAllGroupMessages(groupId: groupId)
+        Storage.upsertGroup(state.groups[gIdx])
     }
 
     /// Local-only leave: drop the group from this device. We rotate
@@ -554,7 +555,7 @@ extension ChatStore {
         // Re-lookup; rotateMyGroupChain may have mutated the array.
         guard let gIdx2 = groupIndex(forId: groupId) else { return true }
         state.groups.remove(at: gIdx2)
-        Storage.persist(appState: state)
+        Storage.deleteGroup(id: groupId)
         return true
     }
 
@@ -579,7 +580,7 @@ extension ChatStore {
         // removed member must not be able to keep posting.
         guard state.groups[gIdx].activeMembers.contains(where: { $0.peerId == myCard.peerId }) else {
             appendGroupSystem(groupAt: gIdx, "You are no longer a member of this group.")
-            Storage.persist(appState: state)
+            Storage.upsertGroup(state.groups[gIdx])
             return false
         }
         // Refuse while the invitation is pending — the user hasn't
@@ -597,13 +598,13 @@ extension ChatStore {
         }
         guard let myDist = state.groups[gIdx].myCurrentDistributionId else {
             appendGroupSystem(groupAt: gIdx, "Group encryption not yet ready — waiting for SKDM exchange.")
-            Storage.persist(appState: state)
+            Storage.upsertGroup(state.groups[gIdx])
             return false
         }
         let plaintext = Data(trimmed.utf8)
         guard let ciphertext = try? session.groupEncrypt(distributionId: myDist, plaintext: plaintext) else {
             appendGroupSystem(groupAt: gIdx, "Encrypt failed.")
-            Storage.persist(appState: state)
+            Storage.upsertGroup(state.groups[gIdx])
             return false
         }
         persistSession()
@@ -679,15 +680,17 @@ extension ChatStore {
         // without the "Name: " prefix in the chat view. The
         // `groupMessageId` stamp lets the bubble render-time lookup
         // fan in the per-recipient outbox status to a single icon.
-        state.groups[gIdx].log.append(PersistedMessage(
+        let myRow = PersistedMessage(
             side: .me,
             text: trimmed,
             kind: .whisper,
             bytes: ciphertext.count,
             groupMessageId: groupMessageId,
-        ))
+        )
+        state.groups[gIdx].log.append(myRow)
         state.groups[gIdx].lastMessageAt = Date()
         state.groups[gIdx].sentSinceRotation &+= 1
+        Storage.appendGroupMessage(groupId: state.groups[gIdx].id, myRow)
         if !skipped.isEmpty {
             appendGroupSystem(
                 groupAt: gIdx,
@@ -695,7 +698,7 @@ extension ChatStore {
                     + "No delivery tokens for: \(skipped.joined(separator: ", ")).",
             )
         }
-        Storage.persist(appState: state)
+        Storage.upsertGroup(state.groups[gIdx])
         return true
     }
 
@@ -734,7 +737,7 @@ extension ChatStore {
         // HIGH-3: refuse if we're no longer an active member.
         guard state.groups[gIdx].activeMembers.contains(where: { $0.peerId == myCard.peerId }) else {
             appendGroupSystem(groupAt: gIdx, "You are no longer a member of this group.")
-            Storage.persist(appState: state)
+            Storage.upsertGroup(state.groups[gIdx])
             return
         }
         // Refuse while pending — composer is also disabled in this
@@ -752,7 +755,7 @@ extension ChatStore {
                 groupAt: gIdx,
                 "Can't send \(safeName): files of this type can run when tapped on iOS. Pizzini blocks them at send.",
             )
-            Storage.persist(appState: state)
+            Storage.upsertGroup(state.groups[gIdx])
             return
         }
         let mime = mimeTypeForFilename(safeName)
@@ -878,13 +881,13 @@ extension ChatStore {
         // stripping). HIGH-3 still applies.
         guard state.groups[gIdx].activeMembers.contains(where: { $0.peerId == myCard.peerId }) else {
             appendGroupSystem(groupAt: gIdx, "You are no longer a member of this group.")
-            Storage.persist(appState: state)
+            Storage.upsertGroup(state.groups[gIdx])
             return
         }
         guard !state.groups[gIdx].pendingInvitation else { return }
         guard let myDist = state.groups[gIdx].myCurrentDistributionId else {
             appendGroupSystem(groupAt: gIdx, "Group encryption not yet ready — waiting for SKDM exchange.")
-            Storage.persist(appState: state)
+            Storage.upsertGroup(state.groups[gIdx])
             return
         }
 
@@ -920,7 +923,7 @@ extension ChatStore {
                 ciphertext = try session.groupEncrypt(distributionId: myDist, plaintext: plaintext)
             } catch {
                 appendGroupSystem(groupAt: gIdx, "Encrypt failed at chunk \(i)/\(chunks.count): \(error)")
-                Storage.persist(appState: state)
+                Storage.upsertGroup(state.groups[gIdx])
                 return
             }
             // Persist the chain advance immediately. A force-quit
@@ -1036,7 +1039,8 @@ extension ChatStore {
         // (`ChatGroup.rotationMessageThreshold`) is reached at the
         // intuitive cadence regardless of attachment vs text mix.
         state.groups[gIdx].sentSinceRotation &+= chunkCountU32
-        Storage.persist(appState: state)
+        Storage.appendGroupMessage(groupId: state.groups[gIdx].id, row)
+        Storage.upsertGroup(state.groups[gIdx])
     }
 
     /// Process an inbound `groupFileChunk = 0x0A` envelope. Same
@@ -1153,7 +1157,7 @@ extension ChatStore {
                 sandboxRelativePath: relPath,
                 senderPeerId: sender,
             )
-            Storage.persist(appState: state)
+            Storage.upsertGroup(state.groups[gIdx])
             maybeFireBackgroundHaptic(forIncoming: .group(groupId: groupId))
             NSLog(
                 "[pizzini.group] received attachment \(safeName) (\(completion.totalSize) bytes,"
@@ -1206,7 +1210,7 @@ extension ChatStore {
 
         // Broadcast the op + the SKDM to every remaining member.
         guard let signedBytes = try? signedOp.encoded() else {
-            Storage.persist(appState: state)
+            Storage.upsertGroup(state.groups[gIdx])
             return
         }
         for member in state.groups[gIdx].activeMembers
@@ -1221,7 +1225,7 @@ extension ChatStore {
                 groupAt: gIdx,
             )
         }
-        Storage.persist(appState: state)
+        Storage.upsertGroup(state.groups[gIdx])
     }
 
     /// Re-broadcast our CURRENT sender-key chain to every active
@@ -1273,7 +1277,7 @@ extension ChatStore {
                 groupAt: gIdx,
             )
         }
-        Storage.persist(appState: state)
+        Storage.upsertGroup(state.groups[gIdx])
         return true
     }
 
@@ -1361,7 +1365,7 @@ extension ChatStore {
             // so subsequent op/SKDM frames from the admin can apply
             // and install chains — accepting later then plugs into a
             // already-up-to-date snapshot.
-            Storage.persist(appState: state)
+            Storage.upsertGroup(group)
             return
         }
 
@@ -1425,7 +1429,7 @@ extension ChatStore {
         case let .rejectedMalformed(reason):
             NSLog("[pizzini.group] groupOp ← \(short(sender)): malformed — \(reason)")
         }
-        Storage.persist(appState: state)
+        Storage.upsertGroup(state.groups[gIdx])
     }
 
     private func opKindLabel(_ kind: GroupOpKind) -> String {
@@ -1528,7 +1532,7 @@ extension ChatStore {
         // or broadcast SKDMs until the user taps Join. Subsequent
         // op/SKDM frames apply against the pending group; on
         // acceptance the host calls `enrolMyChainOnFirstJoin`.
-        Storage.persist(appState: state)
+        Storage.upsertGroup(group)
     }
 
     /// Process a peer's incoming `groupKeyDistribution` (0x07) inner
@@ -1597,7 +1601,7 @@ extension ChatStore {
         // current SKDM so they can decrypt our messages too.
         let mySxStub = ChatGroup.ApplySideEffects(localIdentityPub: myCard?.peerId)
         applyPostMutationSideEffects(groupAt: gIdx, sideEffects: mySxStub, session: session, relay: relay)
-        Storage.persist(appState: state)
+        Storage.upsertGroup(state.groups[gIdx])
     }
 
     /// Decrypt a `groupChat` (0x06) inner envelope and append to the
@@ -1682,7 +1686,8 @@ extension ChatStore {
         )
         state.groups[gIdx].log.append(row)
         state.groups[gIdx].lastMessageAt = Date()
-        Storage.persist(appState: state)
+        Storage.appendGroupMessage(groupId: state.groups[gIdx].id, row)
+        Storage.upsertGroup(state.groups[gIdx])
         // Same deterministic mark-read shortcut as 1:1: if the user
         // is provably in this group, fire `markGroupRead`
         // synchronously instead of relying on SwiftUI's
@@ -2046,9 +2051,14 @@ extension ChatStore {
     }
 
     private func appendGroupSystem(groupAt gIdx: Int, _ text: String) {
-        state.groups[gIdx].log.append(
-            PersistedMessage(side: .me, text: text, kind: .system, bytes: 0),
-        )
+        let row = PersistedMessage(side: .me, text: text, kind: .system, bytes: 0)
+        state.groups[gIdx].log.append(row)
+        // Persist the new system row directly to SQLCipher. Callers
+        // are still expected to call `Storage.upsertGroup` (typically
+        // via `persistGroupSlice`) afterwards to flush any group-row
+        // field changes (lastMessageAt, etc.) that accompany the
+        // system row.
+        Storage.appendGroupMessage(groupId: state.groups[gIdx].id, row)
     }
 
     /// `groupId`-keyed variant for call sites that hop back from a
@@ -2058,7 +2068,7 @@ extension ChatStore {
     fileprivate func appendGroupSystem(groupId: Data, text: String) {
         guard let gIdx = groupIndex(forId: groupId) else { return }
         appendGroupSystem(groupAt: gIdx, text)
-        Storage.persist(appState: state)
+        Storage.upsertGroup(state.groups[gIdx])
     }
 
     /// Surface an in-chat system row when `groupDecrypt` fails so the
@@ -2087,7 +2097,7 @@ extension ChatStore {
             return
         }
         appendGroupSystem(groupAt: gIdx, body)
-        Storage.persist(appState: state)
+        Storage.upsertGroup(state.groups[gIdx])
     }
 
     private static func makeGroupMessageId() -> Data {

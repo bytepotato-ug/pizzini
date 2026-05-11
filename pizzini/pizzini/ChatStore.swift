@@ -236,7 +236,7 @@ final class ChatStore: NSObject {
         let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != state.relayHost else { return }
         state.relayHost = trimmed
-        Storage.persist(appState: state)
+        Storage.upsertSettings(state)
         connectRelay()
     }
 
@@ -313,7 +313,9 @@ final class ChatStore: NSObject {
         let contact = Contact(identityPub: card.peerId, displayName: name)
         state.contacts.append(contact)
         try? session.registerPeer(peerIdentity: card.peerId)
-        persistAll()
+        Storage.upsertContact(contact)
+        persistSession()
+        refreshAppBadge()
         if relayState == .connected {
             requestBundleWithHashcash(fromPeer: card.peerId)
         }
@@ -547,7 +549,7 @@ final class ChatStore: NSObject {
             )
             state.contacts[idx].log.append(logEntry)
             state.contacts[idx].lastMessageAt = logEntry.timestamp
-            persistAll()
+            persistContactSliceAndAppended(logEntry, at: idx)
             maybeRequestRefill(forContactAt: idx, via: relay, session: session)
         } catch {
             appendSystem("Encrypt failed: \(error)", to: idx)
@@ -829,7 +831,7 @@ final class ChatStore: NSObject {
         )
         state.contacts[idx].log.append(row)
         state.contacts[idx].lastMessageAt = row.timestamp
-        persistAll()
+        persistContactSliceAndAppended(row, at: idx)
         maybeRequestRefill(forContactAt: idx, via: relay, session: session)
     }
 
@@ -863,7 +865,11 @@ final class ChatStore: NSObject {
     private func popDeliveryToken(forContactAt idx: Int) -> Data? {
         guard !state.contacts[idx].deliveryTokensForPeer.isEmpty else { return nil }
         let token = state.contacts[idx].deliveryTokensForPeer.removeFirst()
-        Storage.persist(appState: state)
+        // Mirror the in-memory pop into the DB so a cold launch can't
+        // re-issue an already-consumed token. Both pops are FIFO; the
+        // DB row deleted is the one corresponding to MIN(position) —
+        // the head of the queue — same as the in-memory `removeFirst`.
+        _ = Storage.popDeliveryToken(contactId: state.contacts[idx].id)
         return token
     }
 
@@ -906,7 +912,7 @@ final class ChatStore: NSObject {
             // Mirrors the invariant the other encrypt sites uphold (see
             // emitAck and emitReadReceiptIfEnabled).
             state.contacts[idx].lastRefillRequestSentAt = Date()
-            persistAll()
+            persistContactSlice(at: idx)
             relay.sendSealed(
                 toPeer: contact.identityPub,
                 sealedCiphertext: sealed,
@@ -941,7 +947,7 @@ final class ChatStore: NSObject {
         }
         relay.sendTokenIssue(toPeer: peer, tokens: tokens)
         state.contacts[idx].lastRefillRequestHandledAt = Date()
-        Storage.persist(appState: state)
+        Storage.upsertContact(state.contacts[idx])
     }
 
     /// Default per-message TTL until Phase 4's per-message picker lands.
@@ -962,7 +968,8 @@ final class ChatStore: NSObject {
         state.contacts[idx].log.removeAll()
         state.contacts[idx].lastMessageAt = nil
         state.contacts[idx].lastSeenAt = Date()
-        Storage.persist(appState: state)
+        Storage.deleteAllContactMessages(contactId: state.contacts[idx].id)
+        Storage.upsertContact(state.contacts[idx])
         refreshAppBadge()
     }
 
@@ -970,7 +977,9 @@ final class ChatStore: NSObject {
         guard let idx = contactIndex(forIdentity: contact.identityPub) else { return }
         state.contacts.remove(at: idx)
         try? session?.forgetPeer(peerIdentity: contact.identityPub)
-        persistAll()
+        Storage.deleteContact(id: contact.id)
+        persistSession()
+        refreshAppBadge()
     }
 
     func deleteAllChats() {
@@ -979,8 +988,9 @@ final class ChatStore: NSObject {
             state.contacts[i].log.removeAll()
             state.contacts[i].lastMessageAt = nil
             state.contacts[i].lastSeenAt = now
+            Storage.deleteAllContactMessages(contactId: state.contacts[i].id)
+            Storage.upsertContact(state.contacts[i])
         }
-        Storage.persist(appState: state)
         refreshAppBadge()
     }
 
@@ -991,7 +1001,7 @@ final class ChatStore: NSObject {
     func markRead(contactID: UUID) {
         guard let idx = state.contacts.firstIndex(where: { $0.id == contactID }) else { return }
         state.contacts[idx].lastSeenAt = Date()
-        Storage.persist(appState: state)
+        Storage.upsertContact(state.contacts[idx])
         refreshAppBadge()
         emitReadReceiptIfEnabled(forContactAt: idx)
     }
@@ -999,13 +1009,13 @@ final class ChatStore: NSObject {
     func setContactTTL(_ contact: Contact, seconds: UInt32) {
         guard let idx = contactIndex(forIdentity: contact.identityPub) else { return }
         state.contacts[idx].ttlSeconds = seconds
-        Storage.persist(appState: state)
+        Storage.upsertContact(state.contacts[idx])
     }
 
     func setReadReceipts(_ contact: Contact, enabled: Bool) {
         guard let idx = contactIndex(forIdentity: contact.identityPub) else { return }
         state.contacts[idx].readReceiptsEnabled = enabled
-        Storage.persist(appState: state)
+        Storage.upsertContact(state.contacts[idx])
     }
 
     @MainActor
@@ -1075,7 +1085,7 @@ final class ChatStore: NSObject {
               let idx = contactIndex(forIdentity: contact.identityPub)
         else { return }
         state.contacts[idx].displayName = trimmed
-        Storage.persist(appState: state)
+        Storage.upsertContact(state.contacts[idx])
     }
 
     // MARK: - Onboarding + security settings
@@ -1083,13 +1093,13 @@ final class ChatStore: NSObject {
     func completeOnboarding(enableBiometric: Bool) {
         state.onboardingCompleted = true
         state.biometricLockEnabled = enableBiometric
-        Storage.persist(appState: state)
+        Storage.upsertSettings(state)
     }
 
     func setBiometricLockEnabled(_ enabled: Bool) {
         guard state.biometricLockEnabled != enabled else { return }
         state.biometricLockEnabled = enabled
-        Storage.persist(appState: state)
+        Storage.upsertSettings(state)
         // If the user just disabled the lock, lift any active gate so
         // we don't strand them on an overlay they can no longer dismiss.
         if !enabled {
@@ -1100,7 +1110,7 @@ final class ChatStore: NSObject {
     func setAutoLockTimeout(_ value: AutoLockTimeout) {
         guard state.autoLockTimeout != value else { return }
         state.autoLockTimeout = value
-        Storage.persist(appState: state)
+        Storage.upsertSettings(state)
     }
 
     /// Toggle in-app QuickLook previews for received attachments.
@@ -1111,7 +1121,7 @@ final class ChatStore: NSObject {
     func setQuickLookPreviewEnabled(_ enabled: Bool) {
         guard state.quickLookPreviewEnabled != enabled else { return }
         state.quickLookPreviewEnabled = enabled
-        Storage.persist(appState: state)
+        Storage.upsertSettings(state)
     }
 
     /// Toggle the per-chat triple-tap panic gesture. Default OFF.
@@ -1121,7 +1131,7 @@ final class ChatStore: NSObject {
     func setPanicModeEnabled(_ enabled: Bool) {
         guard state.panicModeEnabled != enabled else { return }
         state.panicModeEnabled = enabled
-        Storage.persist(appState: state)
+        Storage.upsertSettings(state)
     }
 
     /// Toggle the contacts-list ordering: contacts above groups vs.
@@ -1132,7 +1142,7 @@ final class ChatStore: NSObject {
     func setContactsBeforeGroups(_ enabled: Bool) {
         guard state.contactsBeforeGroups != enabled else { return }
         state.contactsBeforeGroups = enabled
-        Storage.persist(appState: state)
+        Storage.upsertSettings(state)
     }
 
     /// Toggle the in-app haptic for messages landing in a chat OTHER
@@ -1143,7 +1153,7 @@ final class ChatStore: NSObject {
     func setInAppHapticsEnabled(_ enabled: Bool) {
         guard state.inAppHapticsEnabled != enabled else { return }
         state.inAppHapticsEnabled = enabled
-        Storage.persist(appState: state)
+        Storage.upsertSettings(state)
     }
 
     /// True when the app-wide screenshot mask should be applied — i.e.
@@ -1167,7 +1177,7 @@ final class ChatStore: NSObject {
     func setQRBlockEffective(_ effective: Bool, osVersion: String) {
         state.qrBlockEffective = effective
         state.qrBlockTestedOSVersion = osVersion
-        Storage.persist(appState: state)
+        Storage.upsertSettings(state)
     }
 
     func resetIdentity() {
@@ -1204,7 +1214,7 @@ final class ChatStore: NSObject {
         // `AppState()` defaults — silently dropping the user's biometric
         // lock posture among the preserved fields. Now the new value is
         // durable across the wipe call's sequence of Keychain ops.
-        Storage.persist(appState: resetState)
+        Storage.upsertSettings(resetState)
         Storage.resetEverything(preserveAppState: true)
         state = resetState
         outbox = .empty
@@ -1222,8 +1232,36 @@ final class ChatStore: NSObject {
 
     // MARK: - Helpers
 
+    /// **Wholesale fallback** used by paths that mutate multiple
+    /// contacts / groups in one pass. The schema is normalised so
+    /// this is still correct on-disk — just bigger than the
+    /// per-row mutators below. Prefer `persistContactSlice` /
+    /// `persistContactSliceAndAppended` at any site that only
+    /// touched one contact + the libsignal session.
     private func persistAll() {
         Storage.persist(appState: state)
+        persistSession()
+        refreshAppBadge()
+    }
+
+    /// Per-row counterpart to `persistAll()` when the caller mutated
+    /// exactly one contact's row. Writes that row + the libsignal
+    /// session blob (any send/receive advanced the ratchet) + the
+    /// app-icon badge. Avoids the O(contact-count × message-count)
+    /// sweep that `persistAll` does.
+    private func persistContactSlice(at idx: Int) {
+        Storage.upsertContact(state.contacts[idx])
+        persistSession()
+        refreshAppBadge()
+    }
+
+    /// Per-row counterpart to `persistAll()` for the message-append
+    /// hot path. Writes the new message row, the contact row (which
+    /// the caller typically bumped — lastMessageAt, sessionEstablished,
+    /// etc.), the libsignal blob, and the badge.
+    private func persistContactSliceAndAppended(_ msg: PersistedMessage, at idx: Int) {
+        Storage.appendContactMessage(contactId: state.contacts[idx].id, msg)
+        Storage.upsertContact(state.contacts[idx])
         persistSession()
         refreshAppBadge()
     }
@@ -1301,10 +1339,9 @@ final class ChatStore: NSObject {
     }
 
     private func appendSystem(_ text: String, to idx: Int) {
-        state.contacts[idx].log.append(
-            PersistedMessage(side: .me, text: text, kind: .system, bytes: 0)
-        )
-        Storage.persist(appState: state)
+        let row = PersistedMessage(side: .me, text: text, kind: .system, bytes: 0)
+        state.contacts[idx].log.append(row)
+        Storage.appendContactMessage(contactId: state.contacts[idx].id, row)
     }
 }
 
@@ -1423,7 +1460,11 @@ extension ChatStore: RelayClientDelegate {
                 stash.removeLast(stash.count - cap)
             }
             self.state.contacts[idx].deliveryTokensForPeer = stash
-            self.persistAll()
+            Storage.replaceDeliveryTokens(
+                contactId: self.state.contacts[idx].id,
+                tokens: stash,
+            )
+            self.persistContactSlice(at: idx)
             NSLog(
                 "[pizzini] received \(verified.count) verified tokens from \(self.short(fromPeer)); stash now \(stash.count)"
             )
@@ -1556,7 +1597,7 @@ extension ChatStore: RelayClientDelegate {
         maybeFireBackgroundHaptic(
             forIncoming: .oneOnOne(peerIdentity: state.contacts[idx].identityPub),
         )
-        self.persistAll()
+        self.persistContactSliceAndAppended(entry, at: idx)
         // Emit an ACK so the sender's outbox (Phase 4) can flip ✓→✓✓.
         self.emitAck(for: ackId, toPeer: state.contacts[idx].identityPub, via: client)
     }
@@ -1614,7 +1655,7 @@ extension ChatStore: RelayClientDelegate {
             state.contacts[idx].log.append(row)
             state.contacts[idx].lastMessageAt = row.timestamp
             state.contacts[idx].sessionEstablished = true
-            persistAll()
+            persistContactSliceAndAppended(row, at: idx)
             maybeFireBackgroundHaptic(
                 forIncoming: .oneOnOne(peerIdentity: state.contacts[idx].identityPub),
             )
@@ -1683,16 +1724,17 @@ extension ChatStore: RelayClientDelegate {
         guard let cutoff = OutboxStore.readReceiptCutoff(
             highest: highest, log: state.contacts[idx].log, outbox: outbox,
         ) else { return }
-        var changed = false
         for i in state.contacts[idx].log.indices {
             let m = state.contacts[idx].log[i]
             guard m.side == .me, m.timestamp <= cutoff else { continue }
             if state.contacts[idx].log[i].readAt == nil {
                 state.contacts[idx].log[i].readAt = now
-                changed = true
+                Storage.updateContactMessage(
+                    contactId: state.contacts[idx].id,
+                    state.contacts[idx].log[i],
+                )
             }
         }
-        if changed { Storage.persist(appState: state) }
         // Phase 7 group-read aggregation. The same incoming receipt
         // ALSO covers every group fan-out leg we shipped to this peer
         // up to the cutoff. Stamp `readAt` on those outbox entries so
@@ -1900,7 +1942,7 @@ extension ChatStore: RelayClientDelegate {
                 // these for every subsequent SEND/ACK to clear our
                 // relay-side rate-limit gate.
                 self.issueTokens(for: fromPeer, via: client, session: session)
-                self.persistAll()
+                self.persistContactSlice(at: idx)
                 // The peer just proved they have us in their contacts (we
                 // only get here if our own contact-gate let them through).
                 // If we haven't yet got a session ourselves — typical when
@@ -1938,7 +1980,7 @@ extension ChatStore: RelayClientDelegate {
                 try session.initiateSession(peerIdentity: fromPeer, bundle: bundle)
                 self.state.contacts[idx].peerVerifyKey = verifyKey
                 self.state.contacts[idx].sessionEstablished = true
-                self.persistAll()
+                self.persistContactSlice(at: idx)
             } catch {
                 NSLog("[pizzini] initiateSession failed: \(error)")
             }

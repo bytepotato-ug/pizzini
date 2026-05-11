@@ -172,6 +172,16 @@ enum Storage {
         }
     }
 
+    /// Persist the settings singleton (relay host, lock toggles,
+    /// UX prefs). Use this instead of `persist(appState:)` when only
+    /// settings-level fields changed — saves the contact + group
+    /// table sweep.
+    static func upsertSettings(_ s: AppState) {
+        guard let store = SQLiteStorage.shared else { return }
+        do { try store.upsertSettings(s) }
+        catch { NSLog("[pizzini.storage] upsertSettings failed: \(error)") }
+    }
+
     static func upsertContact(_ c: Contact) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.upsertContact(c) }
