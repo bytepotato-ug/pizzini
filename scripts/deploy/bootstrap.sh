@@ -92,7 +92,11 @@ if ! getent passwd pizzini-relay >/dev/null; then
 fi
 
 # ---- 4. config + state dirs ----
-install -d -m 0700 -o root          -g root          /etc/pizzini-relay
+# /etc/pizzini-relay is root-owned but group=pizzini-relay with 0750
+# so the service can *traverse* the dir to read the .p8 (which lives
+# inside as 0640 root:pizzini-relay). Without group-traversal here
+# the systemd sandbox can't even open() the file.
+install -d -m 0750 -o root          -g pizzini-relay /etc/pizzini-relay
 install -d -m 0700 -o pizzini-relay -g pizzini-relay /var/lib/pizzini-relay
 
 # ---- 5. binary ----
