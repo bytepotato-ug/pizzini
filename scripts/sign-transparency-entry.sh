@@ -63,7 +63,12 @@ printf '%s\n%s' "$ENTRY_CANON" "$SIGNED_AT" > "$TMP"
 
 SIG_B64="$(openssl pkeyutl -sign -inkey "$KEY_PATH" -rawin -in "$TMP" | base64 | tr -d '\n')"
 
-jq -n \
+# `-c` (compact) so each signed wrapper is exactly one line — the
+# whole point of the NDJSON shape is that an external verifier can
+# `while read -r line; do …; done < transparency-log.ndjson` and get
+# one entry per iteration. Pretty-printed output would silently
+# break that contract.
+jq -cn \
     --argjson entry "$ENTRY_CANON" \
     --arg signed_at "$SIGNED_AT" \
     --arg sig "$SIG_B64" \

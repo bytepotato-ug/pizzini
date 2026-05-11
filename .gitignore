@@ -65,12 +65,21 @@ pizzini-relay-state/
 # control entirely.
 .audit-*/
 
-# Operator transparency-log signing keys + the signed log file. The
-# signing key MUST NEVER enter the repo; the published log is hosted
-# elsewhere (GitHub Pages / IPFS / a static site), not in the source
-# tree. Leaving local-only copies excluded.
+# Operator transparency-log signing key. The signing key MUST NEVER
+# enter the repo — leaks invalidate every published attestation.
+# `transparency-log.ndjson` itself IS published in this repo (operator
+# chose repo over GitHub Pages / IPFS for hosting), so it is NOT
+# gitignored — see scripts/sign-transparency-entry.sh.
 operator-keys/
-transparency-log.ndjson
+operator-key.pem
+operator-key*.pem
+!operator-key.pub.pem
+
+# Per-deploy throwaway helper at the repo root (a copy of the
+# /tmp/sign-this-deploy.sh template with paths/SHAs filled in for
+# one specific release). Stays out of the repo because it has a
+# path to the operator's signing key baked in.
+/sign.sh
 
 # Tor v3 onion-service directories. The directory name is the .onion
 # address itself, and the directory contains `hs_ed25519_secret_key`
