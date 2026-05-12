@@ -931,14 +931,13 @@ final class ChatStore: NSObject {
         let card: ContactCard
         do {
             card = try ContactCard.validate(raw)
-        } catch let error as ContactCardDecodeError {
+        } catch {
+            // `validate` uses typed throws, so `error` is statically
+            // `ContactCardDecodeError`. A future widening of that
+            // signature would force this site to compile-fail on
+            // `error.reason`, which is the signal we want anyway.
             pzLog("[pizzini.paste] malformed: \(error.reason)")
             return .malformed(reason: error.reason)
-        } catch {
-            // ContactCardDecodeError is the only declared throw; this
-            // branch is defensive against a future typed-throws bump.
-            pzLog("[pizzini.paste] malformed: unexpected error \(error)")
-            return .malformed(reason: "The contact card couldn't be read.")
         }
         // Self-paste — the peerId matches our own identity.
         if let myId = myIdentityPublicCached, myId == card.peerId {
