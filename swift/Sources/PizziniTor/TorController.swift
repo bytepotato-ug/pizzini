@@ -1199,6 +1199,26 @@ public final class TorController: ObservableObject {
                 data: nil,
             ) { @Sendable codes, lines, stop in
                 guard let firstCode = codes.first?.intValue else { return false }
+                // iCepa's `sendCommand:` registers a single observer in
+                // the same `_blocks` array that dispatches ALL incoming
+                // control-port frames — sync replies (2xx/5xx) AND
+                // async event frames (6xx). The first frame to arrive
+                // after we register can therefore be an unrelated 650
+                // HS_DESC event for ANOTHER concurrent HSFETCH (or for
+                // our own, mid-flight). Treat 6xx as "not our reply,
+                // keep waiting" and let the dedicated HS_DESC observer
+                // above handle the actual descriptor signal. Without
+                // this skip, the very first HSFETCH dispatched after a
+                // cold tor start gets falsely resolved as "HSFETCH
+                // rejected — HS_DESC REQUESTED …" — the event body
+                // gets mis-read as a sync error reason and the in-
+                // flight task tears down before the real HS_DESC
+                // RECEIVED arrives. Symptom: with a 3-relay fleet, the
+                // first onion to be HSFETCH'd never resolves, only the
+                // 2nd + 3rd connect.
+                if (600...699).contains(firstCode) {
+                    return false
+                }
                 if firstCode == 250 {
                     // Fetch initiated. The async HS_DESC event
                     // will resolve via the observer above.
@@ -1206,7 +1226,7 @@ public final class TorController: ObservableObject {
                     stop.pointee = true
                     return true
                 }
-                if firstCode >= 400 {
+                if (400...599).contains(firstCode) {
                     // tor rejected the command (unknown HS, malformed
                     // address, control port misconfigured, …). Surface
                     // as a failure so the caller doesn't sit on the
