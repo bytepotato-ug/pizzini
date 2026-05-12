@@ -157,9 +157,27 @@ public enum RelayRegistry {
             host: "pizzini2rblrswjmq7axintrq55lhnqwudf7vawckrt3toqps26vxxyd.onion",
             port: 7777
         ),
+        // pizzini-relay-no01 — Hetzner-hosted, operator: bytepotato-ceo.
+        // Onion key fingerprinted in the transparency log; binary
+        // SHA-256 matches the DE relay byte-for-byte (deployed from
+        // a mirrored copy of /usr/local/bin/pizzini-relay rather than
+        // a fresh build, so the same transparency-log entry vouches
+        // for both).
+        RelayDescriptor(
+            label: "Relay Norway",
+            host: "pizzini3gqotemflwi3i5sq73bqntk4thllpmfu6fmnbezlprsy5wmid.onion",
+            port: 7777
+        ),
+        // pizzini-relay-us01 — Hetzner-hosted, operator: bytepotato-ceo.
+        // Same binary SHA-256 as DE + NO (mirror-deployed; one
+        // transparency-log entry covers all three).
+        RelayDescriptor(
+            label: "Relay USA",
+            host: "pizzini4cape4upnom4xbaugbyewdlcey5wnczcnxwuwibd3butsuyad.onion",
+            port: 7777
+        ),
         // Future:
-        // RelayDescriptor(label: "Relay Switzerland", host: "pizzini3…onion", port: 7777),
-        // RelayDescriptor(label: "Relay Iceland",     host: "pizzini4…onion", port: 7777),
-        // RelayDescriptor(label: "Relay Panama",      host: "pizzini5…onion", port: 7777),
+        // RelayDescriptor(label: "Relay Iceland", host: "pizzini5…onion", port: 7777),
+        // RelayDescriptor(label: "Relay Panama",  host: "pizzini6…onion", port: 7777),
     ]
 }
