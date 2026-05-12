@@ -1263,8 +1263,11 @@ final class ChatStore: NSObject {
         // the two writes can never burn a token without a
         // corresponding outbox record.
         guard !state.contacts[idx].deliveryTokensForPeer.isEmpty else {
-            appendSystem("Out of delivery tokens — asking your peer for more.", to: idx)
-            requestTokenRefillBroadcast(from: state.contacts[idx], session: session)
+            // The stash is empty, so a refill broadcast can't even pay
+            // its own postage. The only honest action is to re-pair —
+            // emit one row that says so, don't follow up with a "asking
+            // for more" row that we know would fail.
+            appendSystem("Out of delivery tokens — re-pair this contact to refresh.", to: idx)
             return
         }
         do {
@@ -1305,8 +1308,10 @@ final class ChatStore: NSObject {
                     )
                 }
             ) else {
-                appendSystem("Out of delivery tokens — asking your peer for more.", to: idx)
-                requestTokenRefillBroadcast(from: state.contacts[idx], session: session)
+                // Atomic-spend failed because the SQLite delivery-tokens
+                // queue is empty. Same shape as the pre-check above:
+                // emit one chat row, skip the doomed refill broadcast.
+                appendSystem("Out of delivery tokens — re-pair this contact to refresh.", to: idx)
                 return
             }
             // Mirror the DB pop into the in-memory stash. The
@@ -1555,12 +1560,22 @@ final class ChatStore: NSObject {
         // file = ~160 chunks; if the stash has 50 we should request a
         // refill and abort, not trickle 50 partial chunks the receiver
         // can't reassemble.
-        if state.contacts[idx].deliveryTokensForPeer.count < chunks.count {
-            appendSystem(
-                "Need \(chunks.count) tokens to send this file; only \(state.contacts[idx].deliveryTokensForPeer.count) on hand. Asking your peer for more.",
-                to: idx,
-            )
-            requestTokenRefillBroadcast(from: state.contacts[idx], session: session)
+        let stash = state.contacts[idx].deliveryTokensForPeer.count
+        if stash < chunks.count {
+            // Exactly one chat row per failed attempt. When the stash is
+            // empty there's no point trying a refill broadcast (it
+            // itself needs a token), so the only honest message is
+            // "re-pair". When the stash has *some* tokens we can ask
+            // for more, and the row says so.
+            if stash == 0 {
+                appendSystem("Can't send this file — out of delivery tokens. Re-pair this contact to refresh.", to: idx)
+            } else {
+                appendSystem(
+                    "Not enough delivery tokens for this file (need \(chunks.count), have \(stash)). Asking your peer for more — try again shortly.",
+                    to: idx,
+                )
+                requestTokenRefillBroadcast(from: state.contacts[idx], session: session)
+            }
             return
         }
 
@@ -1714,9 +1729,11 @@ final class ChatStore: NSObject {
         // yet registered a verify key for this connection — but in
         // steady state that doesn't apply). The clean answer: spend a
         // token to ask for tokens. If we're at zero, we can't refill —
-        // user must re-pair. This is the documented failure mode.
+        // user must re-pair. Callers are expected to gate on stash
+        // emptiness BEFORE invoking us so they can surface the right
+        // message; we no longer emit our own chat row.
         guard let token = popDeliveryToken(forContactAt: idx) else {
-            appendSystem("Token stash exhausted — re-pair this contact.", to: idx)
+            pzLog("[pizzini] refill broadcast skipped: token stash empty")
             return
         }
         do {
