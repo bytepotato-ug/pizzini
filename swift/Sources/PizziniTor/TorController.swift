@@ -107,8 +107,9 @@ public final class TorController: ObservableObject {
     nonisolated private static let bootstrapDeadline: TimeInterval = 90
 
     /// Tor's C runtime (`tor_run_main`) can only be invoked once per
-    /// process — TORThread upstream enforces this via an NSAssert on
-    /// a static `_thread` ivar. We mirror the lifecycle in Swift:
+    /// process — TORThread enforces this via an `abort()` in its
+    /// initialiser (release-safe; the upstream NSAssert is compiled
+    /// out in App Store builds). We mirror the lifecycle in Swift:
     /// the first successful `bootstrap()` creates the thread and we
     /// keep it for the duration of the process. Subsequent
     /// `stop()` / re-`bootstrap()` cycles only re-create the
@@ -116,7 +117,23 @@ public final class TorController: ObservableObject {
     /// itself stays running. The cost is ~25 MB resident and a
     /// background CPU hum while idle; the alternative is a hard
     /// crash on every reconnect.
-    private var torThread: TORThread?
+    ///
+    /// Stored in a STATIC slot rather than an instance ivar so a
+    /// hypothetical future `TorController` re-instantiation (or a
+    /// regression that resets `shared`) cannot lose the reference
+    /// and let ARC deallocate the daemon. `tor_run_main` is a
+    /// process-global resource — its owner has to outlive every
+    /// stop / reconnect cycle, not the controller object that
+    /// happened to spawn it.
+    nonisolated(unsafe) private static var processSingletonThread: TORThread?
+
+    /// Mirror of `processSingletonThread` for the MainActor-isolated
+    /// read paths in `runBootstrap()`. Reads/writes go through the
+    /// static singleton so MainActor isolation is sufficient.
+    private var torThread: TORThread? {
+        get { Self.processSingletonThread }
+        set { Self.processSingletonThread = newValue }
+    }
     private var torController: TORController?
     /// Cached data directory for the bootstrapped tor. Used to
     /// re-read the cookie on a reconnect without re-running the
@@ -209,6 +226,19 @@ public final class TorController: ObservableObject {
                 dataDir = try resolveDataDirectory()
             }
         } else {
+            // Double-check that no TORThread is alive in the process
+            // before we ask C-tor to allocate a fresh one. The
+            // composite `torThread ?? TORThread.active` test above
+            // covers the happy path; this guard is belt-and-braces
+            // against a future refactor that splits the check from
+            // the construction. `precondition` (NOT `assert`) so the
+            // guard survives -O builds — the only safe action if
+            // both checks somehow disagreed is to refuse the second
+            // tor; everything else is undefined behaviour.
+            precondition(
+                TORThread.active == nil,
+                "TORThread.active != nil but torThread is nil — TORThread retain dropped while tor is still running. tor_run_main() is single-shot per process."
+            )
             dataDir = try resolveDataDirectory()
             let config = makeConfiguration(dataDir: dataDir)
             let thread = TORThread(configuration: config)
@@ -323,15 +353,16 @@ public final class TorController: ObservableObject {
     }
 
     private func awaitCircuitEstablished(on controller: TORController) async throws {
-        // The continuation has two competing resume paths:
-        //   1. The TORController observer fires with `established=true`.
-        //   2. The deadline timer expires.
-        // Whichever runs first wins. `BootstrapResumer` serialises
-        // both paths behind an unfair lock so the underlying
-        // CheckedContinuation is resumed exactly once. It also owns
-        // the observer token + TORController reference so neither has
-        // to leak across the @Sendable closure boundary in this
-        // function.
+        // The continuation has three competing resume paths:
+        //   1. The TORController observer fires asynchronously.
+        //   2. The TORController observer fires SYNCHRONOUSLY from
+        //      inside `addObserver(...)` (warm-cache reconnect: tor
+        //      already has an established circuit when we subscribe).
+        //   3. The deadline timer expires.
+        // Whichever resolves first wins; `BootstrapResumer` keeps
+        // both `done` and `observerToken` under a single unfair lock
+        // so a synchronous observer callback fired before `bind`
+        // recorded the token cannot leak the observer.
         let deadline = Self.bootstrapDeadline
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let resumer = BootstrapResumer(controller: controller, continuation: cont)
@@ -339,6 +370,11 @@ public final class TorController: ObservableObject {
                 guard established else { return }
                 resumer.resolveSuccess()
             })
+            // The observer above may have already fired and
+            // resumed the continuation (warm cache); `bind` then
+            // detects `done == true` and removes the token
+            // inline to prevent the observer leaking on
+            // TORController.
             resumer.bind(observerToken: token)
 
             Task.detached { [resumer] in
@@ -354,50 +390,126 @@ public final class TorController: ObservableObject {
     /// mark the whole thing `@unchecked Sendable` and keeps the
     /// non-Sendable TORController + observer-token references out of
     /// the surrounding @Sendable closures.
-    private final class BootstrapResumer: @unchecked Sendable {
+    final class BootstrapResumer: @unchecked Sendable {
         private let controller: TORController
         private let continuation: CheckedContinuation<Void, Error>
-        private let lock = OSAllocatedUnfairLock<Bool>(initialState: false)
-        private var observerToken: Any?
+        // Combined state under one lock: `done` (single-fire guard)
+        // and `observerToken` (set during bind, read during detach).
+        // Single-lock ordering closes the warm-cache race where a
+        // synchronous observer callback fires from inside
+        // `addObserver` before bind has recorded the token —
+        // resolveSuccess sees `observerToken == nil`, sets `done`,
+        // then bind() runs, sees `done == true`, and removes the
+        // token inline.
+        // `Any?` is not Sendable; OSAllocatedUnfairLock<State> requires
+        // State: Sendable. The observer token TORController hands back
+        // is opaque (an NSArray-of-blocks index in iCepa's API) and
+        // safe to pass across threads, but the type system can't
+        // verify that. Wrap it in `@unchecked Sendable` to assert the
+        // claim and keep the lock generic-bound on a Sendable type.
+        private struct State: @unchecked Sendable {
+            var done: Bool = false
+            var observerToken: Any? = nil
+        }
+        private let lock = OSAllocatedUnfairLock<State>(initialState: State())
 
         init(controller: TORController, continuation: CheckedContinuation<Void, Error>) {
             self.controller = controller
             self.continuation = continuation
         }
 
-        func bind(observerToken: Any) {
-            // Stored without locking — `bind` is called synchronously
-            // from `withCheckedThrowingContinuation`'s body, before
-            // any observer callback can fire and before the deadline
-            // timer has had a chance to wake.
-            self.observerToken = observerToken
+        /// Record the observer token. If `resolveSuccess` or
+        /// `resolveTimeout` already won (warm-cache: the
+        /// circuit-established observer fired synchronously inside
+        /// `addObserver` before this function was reached), detach
+        /// the token immediately so it doesn't leak on
+        /// TORController's internal observer array.
+        func bind(observerToken token: Any) {
+            // The observer token TORController hands us is opaque
+            // `Any`; iCepa's API doesn't expose a richer type. It's
+            // safe to move across threads because TORController
+            // owns its own serialisation, but Swift 6 doesn't
+            // know that. Box the token through a struct that
+            // explicitly opts into `@unchecked Sendable` so we can
+            // both store it inside the lock-guarded State and pass
+            // it back to `removeObserver` on the cleanup path.
+            let boxed = TokenBox(token)
+            let alreadyResolved: Bool = lock.withLock { state in
+                if state.done {
+                    return true
+                }
+                state.observerToken = boxed.unwrap()
+                return false
+            }
+            if alreadyResolved {
+                Self.removeObserverUnsafe(controller, boxed.unwrap())
+            }
+        }
+
+        /// `@unchecked Sendable` box over the opaque observer token.
+        /// The token is internally an NSArray index TORController
+        /// owns; passing it across threads is safe in practice.
+        private struct TokenBox: @unchecked Sendable {
+            private let value: Any
+            init(_ value: Any) { self.value = value }
+            func unwrap() -> Any { value }
         }
 
         func resolveSuccess() {
-            guard claim() else { return }
-            detachObserver()
+            let outcome = claim()
+            guard outcome.winner else { return }
+            if let t = outcome.token {
+                Self.removeObserverUnsafe(controller, t)
+            }
             continuation.resume()
         }
 
         func resolveTimeout(after seconds: TimeInterval) {
-            guard claim() else { return }
-            detachObserver()
+            let outcome = claim()
+            guard outcome.winner else { return }
+            if let t = outcome.token {
+                Self.removeObserverUnsafe(controller, t)
+            }
             continuation.resume(throwing: TorControllerError.bootstrapTimedOut(after: seconds))
         }
 
-        private func claim() -> Bool {
-            lock.withLock { done in
-                if done { return false }
-                done = true
-                return true
+        /// Atomically flip `done` to true and extract whatever
+        /// `observerToken` was recorded so far. `winner == false`
+        /// means another caller already claimed (loser path);
+        /// `winner == true` with `token == nil` means we won but
+        /// bind() hasn't run yet (subscribe still in flight — bind
+        /// will see `done == true` and clean up itself).
+        private struct ClaimOutcome: @unchecked Sendable {
+            let winner: Bool
+            let token: Any?
+        }
+        private func claim() -> ClaimOutcome {
+            lock.withLock { state in
+                if state.done {
+                    return ClaimOutcome(winner: false, token: nil)
+                }
+                state.done = true
+                let t = state.observerToken
+                state.observerToken = nil
+                return ClaimOutcome(winner: true, token: t)
             }
         }
 
-        private func detachObserver() {
-            if let token = observerToken {
-                controller.removeObserver(token)
-                observerToken = nil
-            }
+        /// Static-dispatch wrapper so we can call `removeObserver`
+        /// from a `@Sendable` context without Swift complaining
+        /// that `Any` isn't Sendable. The observer-token shape is
+        /// genuinely thread-safe (TORController serialises its
+        /// observer-array writes), so the unchecked move is sound.
+        nonisolated(unsafe) private static func removeObserverUnsafe(_ c: TORController, _ token: Any) {
+            c.removeObserver(token)
+        }
+
+        /// Wrapper that lets `claim()` distinguish "already
+        /// claimed" (nil ClaimedToken) from "claimed but no token
+        /// recorded yet" (ClaimedToken with nil token).
+        private struct ClaimedToken: @unchecked Sendable {
+            let token: Any?
+            func unwrap() -> Any? { token }
         }
     }
 

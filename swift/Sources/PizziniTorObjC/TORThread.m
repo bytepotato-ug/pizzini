@@ -13,7 +13,28 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-static __weak TORThread *_thread = nil;
+// Pizzini change: hold the per-process singleton STRONGLY rather than
+// weakly. The upstream iCepa code uses a `__weak` pointer plus an
+// NSAssert in the initialiser, both of which are problematic in
+// production:
+//
+//   * NSAssert is compiled out under NS_BLOCK_ASSERTIONS=1 (the App
+//     Store release default), so a second `[TORThread initWith…]`
+//     call in a release build would silently allocate and start a
+//     second tor instance, invoking `tor_run_main()` twice in the
+//     same process — undefined behaviour in C-tor.
+//
+//   * `__weak` lets ARC reset `_thread` to nil if every strong
+//     reference is dropped (a future refactor in TorController, a
+//     stopInternal() that forgets the comment, etc.), at which
+//     point the guard above is vacuously satisfied and a second
+//     TORThread can be created — same crash, same UB.
+//
+// Strong ownership pins the singleton for the process lifetime
+// (matching what `tor_run_main` already assumes about the daemon
+// it runs), and the replacement guard below uses `if + abort()` so
+// the protection survives Release builds.
+static TORThread *_thread = nil;
 
 @interface TORThread ()
 
@@ -36,16 +57,26 @@ static __weak TORThread *_thread = nil;
 }
 
 - (instancetype)initWithArguments:(nullable NSArray<NSString *> *)arguments {
-    NSAssert(_thread == nil, @"There can only be one TORThread per process");
+    if (_thread != nil) {
+        // Hard fail in BOTH debug and release. `tor_run_main` is
+        // single-shot per process; reaching this point indicates a
+        // logic bug in the caller (TorController.runBootstrap is
+        // expected to short-circuit on `[TORThread activeThread]`
+        // before constructing a second instance). Crash loudly so
+        // we don't silently produce two tor processes inside one
+        // app.
+        NSLog(@"[pizzini-tor] FATAL: TORThread initialised twice in one process; aborting");
+        abort();
+    }
     self = [super init];
     if (!self)
         return nil;
-    
+
     _thread = self;
     _arguments = [arguments copy];
-    
+
     self.name = @"Tor";
-    
+
     return self;
 }
 

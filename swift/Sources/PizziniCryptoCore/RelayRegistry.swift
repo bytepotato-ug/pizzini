@@ -59,6 +59,84 @@ public struct RelayDescriptor: Sendable, Equatable, Hashable, Codable {
     }
 }
 
+/// Strict validator + canonicaliser for Tor v3 onion addresses.
+///
+/// The single chokepoint for the D1 "Tor-only" posture. Any host the
+/// app is about to dial — bundled fleet entry, BYO override pasted by
+/// the user, or value migrated off the legacy `relay_host` setting —
+/// must pass this check before reaching `RelayClient.connect`. A
+/// failure here means the address is rejected and the app falls back
+/// to the bundled fleet rather than transparently downgrading to a
+/// clear-text TCP dial.
+///
+/// Rules (all must hold; rejection on any miss):
+///
+///   1. ASCII-only. NFKC-normalise then verify every codepoint is a
+///      printable ASCII byte (`0x21..=0x7E`). Defeats Unicode look-alike
+///      / homograph attacks where a glyph that *renders* as the dot
+///      between the v3 label and `onion` is in fact a different
+///      codepoint (U+3002, U+FF0E, U+FE52, U+2024, etc.) that would
+///      sail through a naive `.hasSuffix(".onion")` check yet resolve
+///      as a public DNS name once handed to NWConnection.
+///
+///   2. Single label, single dot. Exactly `<56-char base32>.onion` with
+///      one literal `.`. No subdomains (`x.foo.onion` is rejected — the
+///      relay is reached by its v3 service id, period); no
+///      `evil.com.onion` style trailing-suffix poisoning.
+///
+///   3. v3 only. The label is exactly 56 lowercase base32 characters
+///      (`[a-z2-7]{56}`). Legacy v2 (16 chars) is rejected outright —
+///      v2 hidden services are deprecated and unreachable on a modern
+///      tor.
+///
+///   4. Case-insensitive on input; the canonical form returned is
+///      always lowercase. RFC 3986 lets the host component be
+///      case-insensitive but tor's introspection paths and our own
+///      per-host UI key off the literal string, so we settle the
+///      ambiguity at the door.
+///
+/// The function returns `nil` for any invalid input. Callers must
+/// treat `nil` as "not safe to dial directly — use fleet".
+public enum OnionHost {
+    /// Validate + canonicalise. Returns the lowercase ASCII form on
+    /// success or `nil` if the input fails any of the rules above.
+    /// Whitespace must already have been trimmed by the caller; this
+    /// function does not trim (callers usually want to know if a
+    /// stray space was the only delta, e.g. for "did you mean…" UI).
+    public static func canonical(_ raw: String) -> String? {
+        // NFKC normalisation collapses look-alike forms (full-width
+        // ASCII, ligatures, ideographic stops, etc.) into their
+        // closest plain-ASCII representation before we run the
+        // ASCII check. An input that NFKC-folds to a valid onion
+        // is still suspicious — we therefore additionally require
+        // that the ORIGINAL bytes were already ASCII; otherwise
+        // an attacker could submit a glyph that renders as a v3
+        // onion but normalises only after this guard.
+        let nfkc = raw.precomposedStringWithCompatibilityMapping
+        guard nfkc == raw else { return nil }
+        let lowered = raw.lowercased()
+        // ASCII printable range only. Bytes outside `0x21..=0x7E`
+        // (controls, space, high-bit) are unconditionally invalid.
+        for scalar in lowered.unicodeScalars {
+            let v = scalar.value
+            if v < 0x21 || v > 0x7E { return nil }
+        }
+        // Exactly one '.', and it sits between the v3 label and "onion".
+        let parts = lowered.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 2, parts[1] == "onion" else { return nil }
+        let label = parts[0]
+        guard label.count == 56 else { return nil }
+        let alphabet: Set<Character> = Set("abcdefghijklmnopqrstuvwxyz234567")
+        for ch in label where !alphabet.contains(ch) { return nil }
+        return lowered
+    }
+
+    /// Convenience: does `raw` describe a valid v3 onion?
+    public static func isValid(_ raw: String) -> Bool {
+        canonical(raw) != nil
+    }
+}
+
 /// Compile-time fleet of trusted relays. Each iOS build ships with
 /// this exact set baked in; the build's code-signature transitively
 /// signs the list.

@@ -199,6 +199,12 @@ public final class RelayClient: @unchecked Sendable {
     /// `coverPayloadLen` random bytes. The relay receives + drops.
     /// Match `FRAME_TYPE_COVER` in `relay/src/main.rs`.
     private static let frameTypeCover: UInt8 = 10
+    /// Client → relay request to drop our APNs device token from the
+    /// relay's persistent push-token store. Empty body. Sent by the
+    /// host when a different relay is elected push-primary so the
+    /// previous primary stops emitting duplicate APNs wake-ups.
+    /// Match `FRAME_TYPE_DEREGISTER_PUSH` in `relay/src/main.rs`.
+    private static let frameTypeDeregisterPush: UInt8 = 11
     /// Body length of a COVER frame. Sized to roughly match the
     /// smallest padded sealed_ciphertext bucket so a passive
     /// observer can't trivially distinguish covers from short
@@ -300,19 +306,27 @@ public final class RelayClient: @unchecked Sendable {
             state = .failed("invalid port \(port)")
             return
         }
-        if host.hasSuffix(".onion") {
-            // Onion target: bootstrap Tor (if needed), dial the local
-            // SOCKS5 port, hand-roll the SOCKS5 handshake, then drop
-            // into the normal relay HELLO. NWParameters.proxyConfiguration
-            // is unreliable for SOCKS5 + .onion on iOS 18 (it tries to
-            // DNS-resolve the hostname first), so we speak the protocol
-            // by hand instead.
-            startTorConnection(host: host, port: nwPort)
-        } else {
-            // LAN / loopback / dev path. Existing direct-TCP flow,
-            // unchanged.
-            startDirectConnection(host: host, port: nwPort)
+        // **D1 Tor-only enforcement.** The single chokepoint for the
+        // production posture: any host that isn't a strictly-validated
+        // v3 onion routes through `startTorConnection` below; everything
+        // else takes the direct path. A naive `.hasSuffix(".onion")`
+        // gate is bypassable (Unicode look-alikes, trailing whitespace,
+        // mixed case, `evil.com.onion`), so we use the OnionHost
+        // canonicaliser instead. The direct path is gated behind a
+        // compile-time `RELAY_ALLOW_DIRECT_TCP` flag so production
+        // builds physically cannot reach `startDirectConnection`. Dev
+        // builds (Xcode "Debug" config or `swift test`) flip the flag
+        // on for the LAN-loopback test harness in
+        // `RelayClientLanTests`.
+        if let canonical = OnionHost.canonical(host) {
+            startTorConnection(host: canonical, port: nwPort)
+            return
         }
+        #if RELAY_ALLOW_DIRECT_TCP
+        startDirectConnection(host: host, port: nwPort)
+        #else
+        state = .failed("refusing non-onion relay host: \(host)")
+        #endif
     }
 
     private func startDirectConnection(host: String, port: NWEndpoint.Port) {
@@ -648,8 +662,18 @@ public final class RelayClient: @unchecked Sendable {
         targetPort: UInt16
     ) {
         // Cancel the dead SOCKS connection so its stateUpdateHandler
-        // doesn't fire `.failed` again from inside a retry attempt.
-        connection?.cancel()
+        // doesn't fire `.failed` AGAIN from inside a retry attempt,
+        // AND clear the handler first so the in-flight `.cancelled`
+        // callback that NWConnection.cancel() will deliver cannot
+        // stamp `state = .idle` over the `.connecting` we set below.
+        // NWConnection retains the handler closure; nilling it
+        // detaches the callback path before we trigger the
+        // cancellation that would otherwise enqueue a final
+        // `.cancelled` event on `queue`.
+        if let conn = connection {
+            conn.stateUpdateHandler = nil
+            conn.cancel()
+        }
         connection = nil
 
         if socksRetries < Self.maxSocksRetries {
@@ -676,7 +700,18 @@ public final class RelayClient: @unchecked Sendable {
     }
 
     public func disconnect() {
-        connection?.cancel()
+        // Detach the stateUpdateHandler before cancellation. Without
+        // this, NWConnection.cancel() enqueues a `.cancelled` state
+        // update on `queue`; that callback would run AFTER a
+        // subsequent `connect()` set `state = .connecting`, and the
+        // handler's `case .cancelled: state = .idle` line would
+        // stamp `.idle` over the freshly-started connection's
+        // `.connecting`. Clearing the handler first severs the
+        // notification path so we don't mutate stale state.
+        if let conn = connection {
+            conn.stateUpdateHandler = nil
+            conn.cancel()
+        }
         connection = nil
         readBuffer.removeAll()
     }
@@ -795,6 +830,23 @@ public final class RelayClient: @unchecked Sendable {
         if state == .connected {
             sendRegisterPush(token: token)
         }
+    }
+
+    /// Release this relay's claim on our APNs token. Sent by the
+    /// host when a different relay is elected push-primary so the
+    /// previous primary's persistent push-token store drops the
+    /// entry. Without DEREGISTER, after every reshuffle every
+    /// historical primary keeps emitting duplicate APNs wake-ups
+    /// for every inbound SEND until the relay-side TTL purge
+    /// (30 days). Idempotent both client- and server-side; safe
+    /// to send even if we never registered. No-op if not connected
+    /// — the relay has no record either way once the socket dropped.
+    public func deregisterPush() {
+        pushToken = nil
+        guard state == .connected, let connection else { return }
+        var payload = Data()
+        payload.append(Self.frameTypeDeregisterPush)
+        writeFrame(payload, on: connection)
     }
 
     private func sendRegisterPush(token: Data) {

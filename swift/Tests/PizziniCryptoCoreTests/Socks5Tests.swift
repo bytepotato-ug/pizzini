@@ -142,14 +142,13 @@ struct Socks5Tests {
         }
     }
 
-    @Test("Decision: only .onion suffix triggers SOCKS5 routing")
+    @Test("Decision: only a strict v3 onion routes through SOCKS5")
     func onionRoutingDecision() {
-        // The routing decision lives in RelayClient.connect itself.
-        // We mirror it here purely as a guard against an accidental
-        // typo / different suffix slipping into the production string
-        // check.
+        // The routing decision lives in RelayClient.connect itself,
+        // gated on `OnionHost.canonical`. Mirror the same validator
+        // here so a regression in either side (the validator OR the
+        // routing call-site) is caught by this assertion.
         let onionHosts = [
-            "abc.onion",
             "pizzini2rblrswjmq7axintrq55lhnqwudf7vawckrt3toqps26vxxyd.onion",
         ]
         let directHosts = [
@@ -158,12 +157,14 @@ struct Socks5Tests {
             "relay.example.com",
             "abc.oniondomain.com", // suffix is "domain.com", not ".onion"
             "onion",               // bare token, no leading dot
+            "abc.onion",           // too short to be a v3 (16 vs 56)
+            "evil.com.onion",      // trailing-suffix poisoning
         ]
         for h in onionHosts {
-            #expect(h.hasSuffix(".onion"))
+            #expect(OnionHost.isValid(h))
         }
         for h in directHosts {
-            #expect(!h.hasSuffix(".onion"))
+            #expect(!OnionHost.isValid(h))
         }
     }
 }

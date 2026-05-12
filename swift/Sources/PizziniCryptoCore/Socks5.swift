@@ -50,7 +50,7 @@ enum Socks5 {
 
     /// Errors surfaced from the parsers. Mapped to RelayClient.State
     /// failures by the caller.
-    enum FrameError: Error, Equatable, Sendable {
+    enum FrameError: Error, Equatable, Sendable, CustomStringConvertible {
         case shortRead
         case badVersion(UInt8)
         case noAcceptableMethods
@@ -66,6 +66,48 @@ enum Socks5 {
         /// supported types (IPv4 / IPv6 / DOMAINNAME). Either a
         /// non-SOCKS proxy got in our way or the response is corrupt.
         case unsupportedReplyAddressType(UInt8)
+
+        /// Human-readable description used by `RelayClient` when it
+        /// strings-formats the error into the user-visible
+        /// `.failed(reason)` state. The default Swift `\(error)`
+        /// for an associated-value enum is `rejected(5)` — which
+        /// surfaces verbatim in the Settings → Relays diagnostic
+        /// row. Decode REP codes into the names that match RFC 1928
+        /// §6 so the user (and the support inbox) can tell apart
+        /// "host unreachable" from "TTL expired" without a hex
+        /// table.
+        var description: String {
+            switch self {
+            case .shortRead:
+                return "incomplete SOCKS5 reply (short read)"
+            case .badVersion(let v):
+                return String(format: "SOCKS5 version mismatch (got 0x%02x, expected 0x05)", v)
+            case .noAcceptableMethods:
+                return "SOCKS5 proxy rejected NO-AUTH method"
+            case .rejected(let code):
+                return "SOCKS5 \(Self.repName(code)) (REP=0x\(String(format: "%02x", code)))"
+            case .unsupportedReplyAddressType(let t):
+                return String(format: "SOCKS5 reply ATYP unsupported (0x%02x)", t)
+            }
+        }
+
+        /// RFC 1928 §6 REP-code names. Unknown codes are surfaced
+        /// as their hex value alone — the description above adds
+        /// the `REP=` prefix so a future tor extension code stays
+        /// recognisable.
+        private static func repName(_ code: UInt8) -> String {
+            switch code {
+            case 0x01: return "general SOCKS server failure"
+            case 0x02: return "connection not allowed by ruleset"
+            case 0x03: return "network unreachable"
+            case 0x04: return "host unreachable"
+            case 0x05: return "connection refused"
+            case 0x06: return "TTL expired"
+            case 0x07: return "command not supported"
+            case 0x08: return "address type not supported"
+            default:   return "rejected"
+            }
+        }
     }
 
     /// Parse the 2-byte greeting reply.
