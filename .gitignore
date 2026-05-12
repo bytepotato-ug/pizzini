@@ -21,6 +21,13 @@ Package.resolved
 target/
 *.rs.bk
 *.pdb
+# `cargo vendor --locked vendor > .cargo/config-vendor.toml` is run by
+# scripts/build-relay-release.sh inside a Docker-driven reproducible
+# build. The generated config file is local-only and would otherwise
+# fail the "clean tree" gate on the next build invocation.
+.cargo/config-vendor.toml
+.cargo/config.toml
+vendor/
 
 # Generated FFI artifacts.
 # crypto-core/include/pizzini_crypto_core.h is committed; cbindgen regenerates it
