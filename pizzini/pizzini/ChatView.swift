@@ -519,6 +519,16 @@ struct ChatView: View {
                         // search field isn't focused.
                         highlightQuery: searchQuery,
                         isFocusedMatch: entry.id == currentMatchID,
+                        // Render-time gate: the eye glyph only shows
+                        // when the user currently honours receipts
+                        // for THIS chat (per-chat override OR
+                        // global default). The on-disk `readAt`
+                        // is independent so toggling back on
+                        // restores the eye without reissuing
+                        // anything on the wire.
+                        showReadReceipts: contact.effectiveReadReceiptsEnabled(
+                            globalDefault: store.state.defaultReadReceiptsEnabled,
+                        ),
                     ).id(entry.id)
                 }
             }
@@ -933,6 +943,14 @@ struct ChatRow: View {
     /// chevron tap, separate from the yellow text-background that
     /// marks every match generically.
     let isFocusedMatch: Bool
+    /// Live "do I currently honour read receipts for this chat?"
+    /// flag. Used to render-gate the eye glyph: even if the outbox
+    /// row's `readAt` is stamped from an earlier window when
+    /// receipts were on, the eye disappears the moment the user
+    /// toggles receipts off (globally or per-chat). The on-disk
+    /// `readAt` is preserved so re-enabling restores the eye
+    /// without re-running the wire exchange.
+    let showReadReceipts: Bool
 
     init(
         entry: PersistedMessage,
@@ -941,7 +959,8 @@ struct ChatRow: View {
         quickLookEnabled: Bool = false,
         onInfoTap: ((FAQSection) -> Void)? = nil,
         highlightQuery: String? = nil,
-        isFocusedMatch: Bool = false
+        isFocusedMatch: Bool = false,
+        showReadReceipts: Bool = false
     ) {
         self.entry = entry
         self.status = status
@@ -950,6 +969,7 @@ struct ChatRow: View {
         self.onInfoTap = onInfoTap
         self.highlightQuery = highlightQuery
         self.isFocusedMatch = isFocusedMatch
+        self.showReadReceipts = showReadReceipts
     }
 
     var body: some View {
@@ -1037,7 +1057,18 @@ struct ChatRow: View {
                     .foregroundStyle(.secondary)
             }
             if entry.side == .me, let status, entry.kind != .system {
-                ChatStatusIcon(status: status, read: entry.readAt != nil)
+                // The eye glyph requires BOTH a stamped `readAt`
+                // AND the live "send read receipts" setting being
+                // effective for this chat. Without the live gate,
+                // a user who toggled the setting off would still
+                // see eye icons on messages whose `readAt` was
+                // stamped during an earlier window when the
+                // setting was on (or under a `.alwaysOn` per-chat
+                // override that has since been cleared).
+                ChatStatusIcon(
+                    status: status,
+                    read: showReadReceipts && entry.readAt != nil,
+                )
             }
         }
         .font(.caption2)

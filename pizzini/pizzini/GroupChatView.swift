@@ -287,6 +287,16 @@ struct GroupChatView: View {
                             // highlight matches.
                             highlightQuery: searchQuery,
                             isFocusedMatch: row.id == currentMatchID,
+                            // Render-time gate for the eye glyph
+                            // (see GroupChatBubble.showReadReceipts).
+                            // Groups inherit from the global toggle
+                            // — no per-group override exists, so a
+                            // user who flipped "Send read receipts"
+                            // off in Settings sees the eyes
+                            // disappear immediately even if
+                            // `readByAll` was true from earlier
+                            // stamps.
+                            showReadReceipts: store.state.defaultReadReceiptsEnabled,
                         )
                         .id(row.id)
                     }
@@ -795,6 +805,15 @@ private struct GroupChatBubble: View {
     /// find-bar's prev/next cycle. Adds an outer orange ring so the
     /// user can see WHERE they landed after a chevron tap.
     let isFocusedMatch: Bool
+    /// Live "do I currently honour read receipts?" flag. Groups
+    /// inherit from the global `defaultReadReceiptsEnabled` toggle
+    /// (no per-group override exists). When the user flips the
+    /// global toggle off, the eye glyph disappears immediately
+    /// even if `readByAll` is still true from earlier-stamped
+    /// `readAt`s — the on-disk receipts are preserved so
+    /// re-enabling restores the eye without reissuing on the
+    /// wire.
+    let showReadReceipts: Bool
 
     var body: some View {
         HStack(alignment: .top) {
@@ -837,7 +856,16 @@ private struct GroupChatBubble: View {
             Text(message.timestamp.formatted(date: .omitted, time: .shortened))
                 .foregroundStyle(.secondary)
             if message.side == .me, let status {
-                ChatStatusIcon(status: status, read: readByAll)
+                // Live render gate: the eye glyph only lights when
+                // the user CURRENTLY honours receipts (global
+                // toggle on) AND every leg's `readAt` is stamped.
+                // Without the live gate, toggling the global
+                // setting off would leave stale eyes on rows whose
+                // `readAt` was stamped during an earlier on-window.
+                ChatStatusIcon(
+                    status: status,
+                    read: showReadReceipts && readByAll,
+                )
             }
         }
         .font(.caption2)
