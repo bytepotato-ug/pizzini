@@ -27,8 +27,23 @@ struct ContentView: View {
     @State private var integrity = DeviceIntegrityMonitor.shared
     @State private var selectedTab: TabKind = .chats
     @State private var showScanner = false
-    @State private var pendingCard: ContactCard?
+    /// What the in-flight "Add contact" alert is keyed on: the
+    /// validated card AND the source path it arrived on (QR scan vs
+    /// clipboard paste). Source matters because `ChatStore.addContact`
+    /// records it on the contact row, and the chat surface shows a
+    /// stronger "needs SAS verification" affordance for `.pastedText`
+    /// (the user couldn't physically see the QR, so the safety-number
+    /// check is more load-bearing). Previously the source was
+    /// hardcoded to `.qrScan` regardless of how the card arrived —
+    /// a paste from a hostile clipboard would have presented as
+    /// trusted-on-first-sight. Fixed.
+    @State private var pendingCard: PendingContact?
     @State private var pendingName: String = ""
+
+    private struct PendingContact: Equatable {
+        let card: ContactCard
+        let source: ContactSource
+    }
     /// FAQ deep-link target for the integrity banner's (i) button. Nil
     /// means no sheet; setting it presents the FAQ at that section.
     @State private var integrityFAQ: FAQSection?
@@ -106,7 +121,14 @@ struct ContentView: View {
             QRScannerView(
                 onScanned: { value in
                     showScanner = false
-                    promptForName(decoding: value)
+                    // QR path: run through the same evaluator paste
+                    // uses, so self / blocked / duplicate are caught
+                    // consistently. Malformed-QR feedback isn't
+                    // surfaced here — the scanner shows its own
+                    // "couldn't read" UI before this even fires.
+                    if case .ready(let card) = store.evaluatePastedContact(value) {
+                        promptForName(card: card, source: .qrScan)
+                    }
                 },
                 onCancel: { showScanner = false }
             )
@@ -120,20 +142,37 @@ struct ContentView: View {
                 }
             ),
             presenting: pendingCard
-        ) { card in
+        ) { pending in
             TextField("name (e.g. Alice)", text: $pendingName)
                 .hardenedTextInput(autocap: .words)
             Button("Cancel", role: .cancel) { resetPending() }
             Button("Add") {
-                // QR scanner is the only entry point today. A future
-                // paste/deep-link path would pass `.pastedText` here so
-                // the contact row starts in the red "needs SAS"
-                // verification state.
-                store.addContact(card: card, displayName: pendingName, source: .qrScan)
+                store.addContact(
+                    card: pending.card,
+                    displayName: pendingName,
+                    source: pending.source,
+                )
                 resetPending()
             }
-        } message: { card in
-            Text("Fingerprint \(card.fingerprintShort)\nVerify it matches the QR you scanned in person.")
+        } message: { pending in
+            // Verification copy depends on how the card arrived:
+            //   • `.qrScan`     — the user physically saw the QR; the
+            //                     SAS check is a confirmation step.
+            //   • `.pastedText` — the user can't vouch for the
+            //                     clipboard content; the SAS check
+            //                     is load-bearing (could be a card
+            //                     from a man-in-the-middle).
+            switch pending.source {
+            case .qrScan:
+                Text("Fingerprint \(pending.card.fingerprintShort)\nVerify it matches the QR you scanned in person.")
+            case .pastedText:
+                Text("Fingerprint \(pending.card.fingerprintShort)\nPasted cards aren't physically verified — confirm this fingerprint with your contact over a trusted channel before sending anything sensitive.")
+            case .unknown:
+                // Migrated rows from earlier schemas; in practice the
+                // alert never opens for them because they're already
+                // saved contacts, but the switch must cover the case.
+                Text("Fingerprint \(pending.card.fingerprintShort)")
+            }
         }
         .sheet(item: $integrityFAQ) { anchor in
             FAQView(initialSection: anchor) { integrityFAQ = nil }
@@ -155,7 +194,9 @@ struct ContentView: View {
                     ContactsListView(
                         store: store,
                         showScanner: $showScanner,
-                        onPasteContact: promptForName(decoding:),
+                        onPasteContact: { card in
+                            promptForName(card: card, source: .pastedText)
+                        },
                         onRevealMyQR: { selectedTab = .profile }
                     )
                 }
@@ -202,10 +243,9 @@ struct ContentView: View {
         }
     }
 
-    private func promptForName(decoding raw: String) {
-        guard let card = ContactCard.decode(raw) else { return }
+    private func promptForName(card: ContactCard, source: ContactSource) {
         pendingName = ""
-        pendingCard = card
+        pendingCard = PendingContact(card: card, source: source)
     }
 
     private func resetPending() {

@@ -28,28 +28,154 @@ struct ContactCard: Equatable, Identifiable {
         return "\(head)…\(tail)"
     }
 
+    /// Best-effort parse for callers that don't care about WHY a decode
+    /// failed (legacy call sites, tests, the QR-decoder hot path).
+    /// Returns nil on any rejection. New code that has a user-visible
+    /// surface should prefer `validate(_:)` so it can show the specific
+    /// reason.
     static func decode(_ s: String) -> ContactCard? {
+        try? validate(s)
+    }
+
+    /// Strict, error-typed contact-card parser. The single source of
+    /// truth for "is this string a Pizzini contact card?" Used by both
+    /// the QR-scan and clipboard-paste paths.
+    ///
+    /// Rules, every one of which yields a distinct `reason` so the UI
+    /// can tell the user exactly what's wrong:
+    ///
+    ///   1. **Bounded input.** A card is ~80 ASCII bytes; reject any
+    ///      paste >4 KiB. Defends against a clipboard accident (a
+    ///      multi-MB blob of text) AND a deliberate DoS via paste of
+    ///      a huge synthetic string designed to slow the decode loop.
+    ///
+    ///   2. **Trim whitespace.** Tap-paste on iOS often appends a
+    ///      trailing newline; macOS handoff occasionally prepends one.
+    ///      Both are benign; strip them up front.
+    ///
+    ///   3. **NFKC + printable-ASCII.** Mirrors `OnionHost.canonical`:
+    ///      reject anything where the NFKC normalisation differs from
+    ///      the input, OR contains codepoints outside `0x20..=0x7E`.
+    ///      Defeats Unicode look-alikes where a glyph rendering as
+    ///      `pizzini1://` actually contains an ideographic stop or
+    ///      look-alike `1`.
+    ///
+    ///   4. **Scheme.** Must start with the literal ASCII prefix
+    ///      `pizzini1://`. No other schemes recognised.
+    ///
+    ///   5. **Body shape.** Exactly one `@` separator, exactly one
+    ///      trailing `:` for the port. Reject `host` that contains
+    ///      additional `@` or `:` (defends against `evil@:7777@…`
+    ///      style smuggling).
+    ///
+    ///   6. **peerId.** Exactly 66 lowercase hex characters. That's
+    ///      libsignal's `IdentityKey` wire form (1 type byte + 32
+    ///      Ed25519 point bytes). Anything else means the card was
+    ///      truncated, expanded, or for a different protocol.
+    ///
+    ///   7. **peerId entropy floor.** Reject all-zero or all-same-byte
+    ///      keys — those are placeholder/test patterns, not real
+    ///      identities, and pairing with them is always a bug.
+    ///
+    ///   8. **Port.** Must be a valid 1-65535 UInt16. Port 0 isn't a
+    ///      real listener; reject it explicitly so a malformed `:0`
+    ///      doesn't silently parse.
+    static func validate(_ raw: String) throws(ContactCardDecodeError) -> ContactCard {
+        // 1. Bounded input.
+        guard raw.utf8.count <= 4096 else {
+            throw ContactCardDecodeError(
+                reason: "The pasted text is too long for a contact card. A real card is short and starts with pizzini1://."
+            )
+        }
+        // 2. Trim.
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw ContactCardDecodeError(reason: "Your clipboard is empty.")
+        }
+        // 3. NFKC + printable-ASCII gate.
+        let nfkc = trimmed.precomposedStringWithCompatibilityMapping
+        guard nfkc == trimmed else {
+            throw ContactCardDecodeError(
+                reason: "The pasted text contains non-standard characters (possibly a look-alike). It is not a Pizzini contact card."
+            )
+        }
+        for scalar in trimmed.unicodeScalars {
+            let v = scalar.value
+            if v < 0x20 || v > 0x7E {
+                throw ContactCardDecodeError(
+                    reason: "The pasted text contains characters that don't belong in a contact card."
+                )
+            }
+        }
+        // 4. Scheme.
         let prefix = "pizzini1://"
-        guard s.hasPrefix(prefix) else { return nil }
-        let body = s.dropFirst(prefix.count)
-        guard let at = body.firstIndex(of: "@") else { return nil }
+        guard trimmed.hasPrefix(prefix) else {
+            throw ContactCardDecodeError(
+                reason: "This is not a Pizzini contact card. Cards start with pizzini1://."
+            )
+        }
+        let body = trimmed.dropFirst(prefix.count)
+        // 5. Body shape: exactly one `@`, exactly one `:` in host:port.
+        guard let at = body.firstIndex(of: "@") else {
+            throw ContactCardDecodeError(reason: "The contact card is malformed (missing @ separator).")
+        }
+        guard body[body.index(after: at)...].firstIndex(of: "@") == nil else {
+            throw ContactCardDecodeError(reason: "The contact card has too many @ separators.")
+        }
         let hex = String(body[body.startIndex..<at])
-        let hostPort = String(body[body.index(after: at)...])
-        guard hex.count.isMultiple(of: 2) else { return nil }
-        var bytes = Data(capacity: hex.count / 2)
-        var idx = hex.startIndex
-        while idx < hex.endIndex {
-            let next = hex.index(idx, offsetBy: 2)
-            guard let byte = UInt8(hex[idx..<next], radix: 16) else { return nil }
+        let hostPort = body[body.index(after: at)...]
+        guard let colon = hostPort.lastIndex(of: ":") else {
+            throw ContactCardDecodeError(reason: "The contact card is missing the :port suffix.")
+        }
+        let host = String(hostPort[hostPort.startIndex..<colon])
+        let portStr = String(hostPort[hostPort.index(after: colon)...])
+        guard !host.contains(":") else {
+            throw ContactCardDecodeError(reason: "The contact card has too many : separators.")
+        }
+        // 6. peerId: exactly 66 lowercase hex chars.
+        let hexLower = hex.lowercased()
+        guard hexLower.count == 66 else {
+            throw ContactCardDecodeError(
+                reason: "The contact card's identity is the wrong length (expected 66 hex characters, got \(hex.count))."
+            )
+        }
+        guard hexLower == hex || hex.allSatisfy({ "0123456789abcdefABCDEF".contains($0) }) else {
+            throw ContactCardDecodeError(reason: "The contact card's identity contains non-hex characters.")
+        }
+        var bytes = Data(capacity: 33)
+        var idx = hexLower.startIndex
+        while idx < hexLower.endIndex {
+            let next = hexLower.index(idx, offsetBy: 2)
+            guard let byte = UInt8(hexLower[idx..<next], radix: 16) else {
+                throw ContactCardDecodeError(reason: "The contact card's identity contains non-hex characters.")
+            }
             bytes.append(byte)
             idx = next
         }
-        guard let colon = hostPort.lastIndex(of: ":") else { return nil }
-        let host = String(hostPort[hostPort.startIndex..<colon])
-        let portStr = String(hostPort[hostPort.index(after: colon)...])
-        guard let port = UInt16(portStr) else { return nil }
+        // 7. peerId entropy floor.
+        if bytes.allSatisfy({ $0 == 0 }) {
+            throw ContactCardDecodeError(reason: "The contact card's identity is all zeros — not a real identity.")
+        }
+        if let first = bytes.first, bytes.allSatisfy({ $0 == first }) {
+            throw ContactCardDecodeError(reason: "The contact card's identity has no entropy — likely a test or corrupted card.")
+        }
+        // 8. Port.
+        guard let port = UInt16(portStr), port > 0 else {
+            throw ContactCardDecodeError(
+                reason: "The contact card has an invalid port (\(portStr.isEmpty ? "missing" : portStr))."
+            )
+        }
         return ContactCard(peerId: bytes, host: host, port: port)
     }
+}
+
+/// Thrown by `ContactCard.validate(_:)`. The `reason` is a single-
+/// sentence, plain-language string suitable for an alert body — no
+/// stack traces, no internal field names. Adding a new failure mode
+/// to `validate` means adding a new reason string here (the rules are
+/// in `validate`'s doc comment for a reason: keep them grep-able).
+struct ContactCardDecodeError: Error, Equatable, Sendable {
+    let reason: String
 }
 
 /// Pure QR-image renderer. Used by `MyQRSheet`'s reveal/hide states —

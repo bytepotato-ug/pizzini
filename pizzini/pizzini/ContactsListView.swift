@@ -5,13 +5,35 @@ import UIKit
 struct ContactsListView: View {
     @Bindable var store: ChatStore
     @Binding var showScanner: Bool
-    let onPasteContact: (String) -> Void
+    /// Called with a validated `ContactCard` once paste survived the
+    /// full pipeline (syntactic + self / block / duplicate). The host
+    /// (`ContentView`) drives the name-prompt sheet and the final
+    /// `ChatStore.addContact` with `source: .pastedText`. Every non-
+    /// success path is shown inline as a `pasteAlert` instead of
+    /// reaching this callback — see `handlePasteFromClipboard()`.
+    let onPasteContact: (ContactCard) -> Void
     /// Empty-state shortcut: tell the host to switch to the Profil
     /// tab so a brand-new user can show THEIR QR to the person they
     /// want to pair with. Without it the empty-state "Show my QR"
     /// button would either disappear or open a sheet that duplicates
     /// the tab.
     let onRevealMyQR: () -> Void
+
+    /// Driver for the `.alert(item:)` that surfaces every paste
+    /// outcome that isn't `.ready`. The previous behaviour ("silently
+    /// drop on malformed input") was a UX black hole — the user
+    /// tapped Paste, nothing happened, no explanation. Each outcome
+    /// now maps to a distinct title + message:
+    ///   • .empty          — clipboard had nothing
+    ///   • .malformed      — wrong scheme / length / non-ASCII /
+    ///                       missing port / etc., with the
+    ///                       specific reason from
+    ///                       `ContactCardDecodeError`
+    ///   • .selfPaste      — they pasted their own card
+    ///   • .blocked        — the peer is in the block list
+    ///   • .alreadyPaired  — non-error "already in your contacts"
+    ///                       (we still re-queued the bundle exchange)
+    @State private var pasteAlert: PasteAlertContent?
 
     /// Confirmation-dialog state for the `+` add-contact action sheet.
     /// Local to the toolbar — no need to plumb up to ContentView.
@@ -95,9 +117,7 @@ struct ContactsListView: View {
                 ) {
                     Button { showScanner = true } label: { Text("Scan their QR") }
                     Button {
-                        if let s = UIPasteboard.general.string {
-                            onPasteContact(s)
-                        }
+                        handlePasteFromClipboard()
                     } label: { Text("Paste from clipboard") }
                     Button {
                         showNewGroupSheet = true
@@ -158,6 +178,17 @@ struct ContactsListView: View {
                 }
                 .accessibilityLabel("Search chats and messages")
             }
+        }
+        // Paste-outcome surface. `.alert(item:)` so the binding's
+        // identity drives presentation — setting `pasteAlert` from
+        // `handlePasteFromClipboard()` shows; the OK button clears
+        // it. Title + message come straight from the outcome.
+        .alert(item: $pasteAlert) { alert in
+            Alert(
+                title: Text(alert.title),
+                message: Text(alert.message),
+                dismissButton: .default(Text("OK")),
+            )
         }
     }
 
@@ -242,9 +273,7 @@ struct ContactsListView: View {
                 .controlSize(.large)
 
                 Button {
-                    if let s = UIPasteboard.general.string {
-                        onPasteContact(s)
-                    }
+                    handlePasteFromClipboard()
                 } label: {
                     Text("Paste contact from clipboard")
                         .font(.footnote)
@@ -409,6 +438,66 @@ struct ContactsListView: View {
             .accessibilityLabel("Pizzini is not connected. Tap to retry.")
         }
     }
+
+    // ─── Paste-from-clipboard entry point ─────────────────────────────
+    //
+    // Single chokepoint used by both paste call sites (the toolbar
+    // "+" confirmation dialog and the empty-state inline button).
+    // Reading `UIPasteboard.general.string` triggers iOS's paste
+    // banner; we do it exactly once per user action so the banner
+    // fires the expected number of times. The actual decision (parse
+    // / self / block / duplicate / OK) is delegated to
+    // `ChatStore.evaluatePastedContact`, which keeps the validation
+    // rules in one place. The view's only job here is to map the
+    // outcome to a user-visible alert OR to the existing name-prompt
+    // flow via `onPasteContact`.
+    //
+    // Title strings are plain language ("Nothing to paste", "Not a
+    // contact card") rather than technical ("EmptyClipboardError",
+    // "MalformedContactCardError") — the user is recovering from a
+    // mistake, not reading a stack trace.
+    private func handlePasteFromClipboard() {
+        let raw = UIPasteboard.general.string ?? ""
+        switch store.evaluatePastedContact(raw) {
+        case .ready(let card):
+            onPasteContact(card)
+        case .empty:
+            pasteAlert = PasteAlertContent(
+                title: "Nothing to paste",
+                message: "Your clipboard is empty. Copy your contact's pizzini1:// card first, then try again.",
+            )
+        case .malformed(let reason):
+            pasteAlert = PasteAlertContent(
+                title: "Not a contact card",
+                message: reason,
+            )
+        case .selfPaste:
+            pasteAlert = PasteAlertContent(
+                title: "That's your own card",
+                message: "You can't add yourself as a contact. Share your QR (Profil tab) with someone else, and have THEM scan or paste it.",
+            )
+        case .blocked:
+            pasteAlert = PasteAlertContent(
+                title: "You blocked this contact",
+                message: "Unblock them from Settings → Blocked contacts before adding them again.",
+            )
+        case .alreadyPaired(let name):
+            pasteAlert = PasteAlertContent(
+                title: "Already paired",
+                message: "You're already connected with \(name). Pizzini retried the bundle exchange in case the handshake was stuck.",
+            )
+        }
+    }
+}
+
+/// Driver for `ContactsListView`'s `.alert(item:)`. `Identifiable`
+/// + a fresh `UUID()` per instance so two failures of the same
+/// kind in a row both re-fire the alert (SwiftUI's `.alert(item:)`
+/// uses identity-equality to decide whether to re-present).
+private struct PasteAlertContent: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
 }
 
 private struct ContactRow: View {

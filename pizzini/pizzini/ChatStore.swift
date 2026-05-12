@@ -882,6 +882,90 @@ final class ChatStore: NSObject {
         state.contacts.firstIndex { $0.identityPub == peerId }
     }
 
+    /// Result of running a freshly-pasted clipboard string through
+    /// `evaluatePastedContact(_:)`. Distinct cases so the calling
+    /// view can show a precise alert for every failure path instead
+    /// of the historic silent return.
+    enum ContactCardPasteOutcome: Equatable {
+        /// Syntactically + semantically OK. Caller should drive the
+        /// name-prompt flow, then `addContact(card:displayName:source:)`.
+        case ready(ContactCard)
+        /// Clipboard was empty or whitespace-only.
+        case empty
+        /// `ContactCard.validate(_:)` threw — `reason` is the user-
+        /// facing one-line explanation.
+        case malformed(reason: String)
+        /// The peerId matches the user's own identity. Pairing with
+        /// yourself doesn't make sense; tell the user clearly.
+        case selfPaste
+        /// peerId is in the block list. UI surfaces a "unblock first"
+        /// hint instead of silently swallowing the add.
+        case blocked
+        /// peerId already exists in `state.contacts`. We don't append
+        /// a second row, but we DO retry the bundle exchange in case
+        /// the first-contact handshake stalled. `name` is the existing
+        /// row's display name so the alert can say "Already paired
+        /// with Alice."
+        case alreadyPaired(name: String)
+    }
+
+    /// Single chokepoint that converts a raw clipboard string into one
+    /// of the outcomes above. Runs `ContactCard.validate` for syntax,
+    /// then layers on the four semantic checks (self / blocked /
+    /// duplicate / OK).
+    ///
+    /// Why this lives on the store rather than on `ContactCard`:
+    /// the syntactic check is pure (no state) and stays on
+    /// `ContactCard`; the semantic checks need `state.contacts`,
+    /// `blockedIdentities`, and `myIdentityPublicCached`, all of
+    /// which are store-local. Mixing the two would force every UI
+    /// surface that wants the strict parse (tests, future tooling)
+    /// to spin up a full ChatStore.
+    func evaluatePastedContact(_ raw: String) -> ContactCardPasteOutcome {
+        // Early-exit for the common "menu hit with empty clipboard"
+        // case so we don't burn an audit-log line on it.
+        if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            pzLog("[pizzini.paste] clipboard empty")
+            return .empty
+        }
+        let card: ContactCard
+        do {
+            card = try ContactCard.validate(raw)
+        } catch let error as ContactCardDecodeError {
+            pzLog("[pizzini.paste] malformed: \(error.reason)")
+            return .malformed(reason: error.reason)
+        } catch {
+            // ContactCardDecodeError is the only declared throw; this
+            // branch is defensive against a future typed-throws bump.
+            pzLog("[pizzini.paste] malformed: unexpected error \(error)")
+            return .malformed(reason: "The contact card couldn't be read.")
+        }
+        // Self-paste — the peerId matches our own identity.
+        if let myId = myIdentityPublicCached, myId == card.peerId {
+            pzLog("[pizzini.paste] rejected: self-paste")
+            return .selfPaste
+        }
+        // Block list.
+        if isIdentityBlocked(card.peerId) {
+            pzLog("[pizzini.paste] rejected: identity is in block list")
+            return .blocked
+        }
+        // Duplicate. Mirror the QR-scan idempotency: re-request the
+        // bundle so a stalled first-contact handshake gets retried,
+        // but don't append a second row. Only fire the bundle retry
+        // when the relay fleet is currently up — otherwise it's
+        // queued silently and would just look like a no-op.
+        if let existing = state.contacts.first(where: { $0.identityPub == card.peerId }) {
+            if relayState == .connected {
+                requestBundleWithHashcash(fromPeer: card.peerId)
+            }
+            pzLog("[pizzini.paste] already paired with \(self.short(card.peerId))")
+            return .alreadyPaired(name: existing.displayName)
+        }
+        pzLog("[pizzini.paste] ready: peer=\(self.short(card.peerId))")
+        return .ready(card)
+    }
+
     /// Commit a freshly-scanned (or pasted) contact. Idempotent on
     /// `card.peerId`: re-adding the same QR is a no-op apart from a bundle
     /// retry. Eagerly requests the peer's bundle if the relay is up.
