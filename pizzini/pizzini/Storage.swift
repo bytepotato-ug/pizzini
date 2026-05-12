@@ -261,6 +261,26 @@ enum Storage {
         return (try? store.popDeliveryToken(contactId: contactId)) ?? nil
     }
 
+    /// Atomic "spend a delivery token AND record the outbox row in
+    /// the same SQLite transaction." Caller passes a builder that
+    /// receives the popped token bytes and returns the full
+    /// `OutboxEntry` to persist. Returns the assembled entry on
+    /// success, `nil` if the contact's queue was empty (the outbox
+    /// row is NOT inserted in that case). See
+    /// `SQLiteStorage.commitDeliveryTokenSpend` for the
+    /// transaction shape.
+    static func commitDeliveryTokenSpend(
+        contactId: UUID,
+        entryBuilder: (Data) -> OutboxEntry
+    ) -> OutboxEntry? {
+        guard let store = SQLiteStorage.shared else { return nil }
+        do { return try store.commitDeliveryTokenSpend(contactId: contactId, entryBuilder: entryBuilder) }
+        catch {
+            NSLog("[pizzini.storage] commitDeliveryTokenSpend failed: \(error)")
+            return nil
+        }
+    }
+
     static func appendDeliveryTokens(contactId: UUID, tokens: [Data]) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.appendDeliveryTokens(contactId: contactId, tokens: tokens) }

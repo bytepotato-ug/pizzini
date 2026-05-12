@@ -251,20 +251,24 @@ enum Schema {
     ///   * 'always_on'      — per-chat opt-in.
     ///   * 'always_off'     — per-chat opt-out.
     /// Default value is computed from the legacy per-contact bool:
-    /// any contact that had `read_receipts_enabled = 1` becomes
-    /// `always_on` so the user's explicit opt-in is preserved across
-    /// the migration. The previously-false rows become 'follow_default',
-    /// which combined with `default_read_receipts_enabled = 0`
-    /// (off-by-default — the privacy-first posture) yields the same
-    /// effective behavior as before.
+    ///   * `read_receipts_enabled = 1` → `always_on` so the user's
+    ///     explicit opt-in is preserved across the migration.
+    ///   * `read_receipts_enabled = 0` → `always_off` so a user who
+    ///     had explicitly turned receipts OFF for a chat cannot have
+    ///     them silently re-enabled the moment the new global default
+    ///     gets toggled on. `follow_default` would have been a privacy
+    ///     regression for this case.
     ///
     /// Legacy `read_receipts_enabled` column is left in place rather
     /// than dropped (SQLite < 3.35 has no `DROP COLUMN`; running on
-    /// SQLCipher we vendor the older version conservatively). New
-    /// code never reads it.
+    /// SQLCipher we vendor the older version conservatively). The
+    /// legacy column is `NOT NULL` with no default value, so
+    /// `SQLiteStorage.upsertContact` still binds it (derived from the
+    /// mode) at INSERT time; new code never reads it.
     private static let v3ReadReceiptsModeAndDefault = """
     ALTER TABLE contacts  ADD COLUMN read_receipts_mode TEXT NOT NULL DEFAULT 'follow_default';
-    UPDATE contacts SET read_receipts_mode = 'always_on' WHERE read_receipts_enabled = 1;
+    UPDATE contacts SET read_receipts_mode = 'always_on'  WHERE read_receipts_enabled = 1;
+    UPDATE contacts SET read_receipts_mode = 'always_off' WHERE read_receipts_enabled = 0;
     ALTER TABLE settings  ADD COLUMN default_read_receipts_enabled INTEGER NOT NULL DEFAULT 0;
     """
 }

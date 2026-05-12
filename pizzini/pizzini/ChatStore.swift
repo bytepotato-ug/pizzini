@@ -224,19 +224,37 @@ final class ChatStore: NSObject {
         // Migration: pre-fleet installs persisted dev hosts like
         // `127.0.0.1`. Per `docs/relay-architecture.md` D1 every
         // production relay is Tor-only, so a legitimate BYO value
-        // ends in `.onion`. Anything else (LAN IPs, hostnames,
-        // localhost, …) is a stale dev value that we silently
-        // migrate to the fleet — without this every existing
-        // install lands in single-relay-to-{stale-IP} mode and
-        // Settings → Relays shows the bundled Germany row as
-        // "offline" because the fleet isn't connected.
+        // is a strictly-validated v3 onion. Anything else (LAN IPs,
+        // hostnames, localhost, mixed-case ASCII, Unicode look-alike
+        // glyphs, `evil.com.onion`-style trailing-suffix poisoning,
+        // i2p .b32.i2p addresses, …) is migrated to fleet mode so
+        // we never silently downgrade the user to a non-Tor path.
+        //
+        // The previous suffix-only check (`.hasSuffix(".onion")`)
+        // was bypassable. We now run `OnionHost.canonical` which
+        // applies the full validator set; if the persisted value
+        // does not canonicalise to itself (or fails outright) we
+        // reset to fleet.
         //
         // Must run AFTER super.init() — `self.state =` on an
         // NSObject subclass is illegal until then.
         let trimmed = self.state.relayHost.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty, !trimmed.hasSuffix(".onion") {
-            NSLog("[pizzini] migrating legacy relayHost '\(self.state.relayHost)' → fleet mode")
+        if !trimmed.isEmpty, OnionHost.canonical(trimmed) != trimmed {
+            // Diagnostic ONLY: the rejected literal value is NOT
+            // logged. A pre-pasted LAN host could carry private
+            // identifiers (internal hostnames, user-specific paths
+            // a sysdiagnose collector would surface); the byte
+            // count is enough for "did the migration fire" without
+            // leaking the input.
+            NSLog("[pizzini] migrating legacy relayHost (len=\(trimmed.count)) → fleet mode")
             self.state.relayHost = ""
+            Storage.upsertSettings(self.state)
+        } else if !trimmed.isEmpty, trimmed != self.state.relayHost {
+            // Canonicalisation succeeded but the stored value had
+            // trailing whitespace or capitalisation; rewrite the
+            // canonical form so every later compare/key hits the
+            // same string.
+            self.state.relayHost = trimmed
             Storage.upsertSettings(self.state)
         }
         do {
@@ -318,7 +336,16 @@ final class ChatStore: NSObject {
         if trimmed.isEmpty {
             return RelayRegistry.trusted
         }
-        return [RelayDescriptor(label: "Custom relay", host: trimmed, port: Self.relayPort)]
+        // D1 Tor-only: a BYO override that doesn't canonicalise to a
+        // valid v3 onion gets rejected; the fleet stays the fallback.
+        // The init-time migration above usually wipes such a value
+        // first, but we double-guard here in case `setRelayHost` is
+        // ever bypassed (e.g. a future direct mutation of `state`).
+        guard let canonical = OnionHost.canonical(trimmed) else {
+            NSLog("[pizzini] BYO relayHost (len=\(trimmed.count)) failed onion validation; using fleet")
+            return RelayRegistry.trusted
+        }
+        return [RelayDescriptor(label: "Custom relay", host: canonical, port: Self.relayPort)]
     }
 
     private func connectRelay() {
@@ -376,10 +403,30 @@ final class ChatStore: NSObject {
     /// `relayTargets()` order) and registers our cached APNs token
     /// against it. Idempotent — re-electing the same primary is a
     /// no-op.
+    ///
+    /// On reshuffle (the previous primary dropped, a new one took
+    /// its place) the OLD primary is sent a DEREGISTER_PUSH frame
+    /// while it's still connected. Without that, the relay's
+    /// persistent push-token store on the old primary keeps our
+    /// token until the 30-day TTL purge — and since every connected
+    /// relay independently evaluates `maybe_send_push` on every
+    /// inbound SEND for us, the user would get N duplicate APNs
+    /// wake-ups per message until the TTL expired. If the old
+    /// primary is unreachable (already torn down, lost connection)
+    /// the DEREGISTER is silently skipped — that's tolerable
+    /// because the next legitimate REGISTER_PUSH to that relay
+    /// overwrites the stale token, and the relay's TTL purge
+    /// reaps anything else within 30 days.
     private func electPushPrimary() {
         let firstReady = readyRelays.first
         guard firstReady !== pushPrimary else { return }
+        let oldPrimary = pushPrimary
         pushPrimary = firstReady
+        // Best-effort DEREGISTER to the previous primary. We do it
+        // before the new register so the relay-side ordering
+        // mirrors the client-side intent: "drop the OLD, then
+        // start the NEW".
+        oldPrimary?.deregisterPush()
         if let token = pushTokenCached, let primary = firstReady {
             primary.registerPush(token: token)
         }
@@ -420,11 +467,43 @@ final class ChatStore: NSObject {
         }
         if failures.count == relays.count, let first = failures.first {
             // De-dup identical messages (e.g. "Tor bootstrap failed:
-            // …" reported by N clients sharing one TorController).
-            let unique = Array(Set(failures))
-            return .failed(unique.count == 1 ? first : unique.joined(separator: " / "))
+            // …" reported by N clients sharing one TorController),
+            // preserving the FLEET order so the rendered string is
+            // stable across re-renders. Using `Set` would shuffle
+            // the dedup output every time the view recomputed,
+            // producing visible flicker in DiagnosticsView /
+            // Settings → Relays.
+            var seen = Set<String>()
+            var unique: [String] = []
+            for msg in failures where seen.insert(msg).inserted {
+                unique.append(msg)
+            }
+            // Bound the joined string so a runaway NWError
+            // description (NWConnection occasionally yields
+            // multi-hundred-byte messages embedding onion
+            // hostnames and POSIX strerror strings) cannot
+            // unboundedly inflate the user-visible diagnostic.
+            // 240 chars is enough for two full RFC 1928 §6
+            // names plus a separator without overrunning the
+            // single-line Settings row. Anything longer is
+            // truncated with an ellipsis; the full per-relay
+            // error remains visible on each relay's expand row.
+            let joined = unique.count == 1
+                ? first
+                : unique.joined(separator: " / ")
+            let bounded = Self.boundedFailureString(joined)
+            return .failed(bounded)
         }
         return .idle
+    }
+
+    /// Hard cap on the user-visible aggregated failure string. See
+    /// `aggregateRelayState`. Public-on-the-class for tests.
+    static let maxAggregatedFailureLength: Int = 240
+    static func boundedFailureString(_ s: String) -> String {
+        if s.count <= maxAggregatedFailureLength { return s }
+        let head = s.prefix(maxAggregatedFailureLength - 1)
+        return "\(head)…"
     }
 
     /// **D3 broadcaster.** Invoke `body` on every currently-ready
@@ -461,26 +540,58 @@ final class ChatStore: NSObject {
     }
 
     /// Force-rebuild every RelayClient. Bound to the Settings →
-    /// Relays → "Reconnect now" button. Useful when a Tor circuit
-    /// gets stuck on a slow guard and the user wants to retry
-    /// without re-launching. Tor itself stays bootstrapped if it
-    /// was already (the second `connect()` reuses the cached SOCKS
+    /// Relays → "Reconnect now" button AND the contacts-toolbar
+    /// "tap to reconnect" pill. Useful when a Tor circuit gets
+    /// stuck on a slow guard and the user wants to retry without
+    /// re-launching. Tor itself stays bootstrapped if it was
+    /// already (the second `connect()` reuses the cached SOCKS
     /// port), so the second cycle is sub-5 s on healthy networks.
+    ///
+    /// Tap-spam defence: a manual reconnect is meaningful only when
+    /// the aggregate state is `.failed`. If it's `.connected`,
+    /// there's nothing to retry; if it's `.connecting` or
+    /// `.connectingToTor`, a previous reconnect (or the initial
+    /// connect) is already mid-flight and a second teardown would
+    /// drop the in-flight Tor handshake / SOCKS retry it would
+    /// otherwise complete. Either way, no-op silently. The button
+    /// is hidden by ContactsListView in those states; this is
+    /// belt-and-braces in case a future call site forgets the
+    /// guard.
     func forceReconnectRelays() {
-        NSLog("[pizzini] manual reconnect requested")
-        connectRelay()
+        switch relayState {
+        case .failed:
+            NSLog("[pizzini] manual reconnect requested")
+            connectRelay()
+        case .connected, .connecting, .connectingToTor, .idle:
+            NSLog("[pizzini] reconnect requested but state is \(relayState); ignoring")
+        }
     }
 
     /// Apply a BYO relay-host override (D5 fallback). Pass an empty
     /// string to clear the override and fall back to the bundled
-    /// fleet. Non-empty values are trusted verbatim — the user typed
-    /// it, the user owns the consequences.
-    func setRelayHost(_ host: String) {
+    /// fleet. Non-empty values must canonicalise to a valid v3
+    /// onion (`OnionHost.canonical`); anything else is rejected so
+    /// the user can never accidentally downgrade the app to a
+    /// clear-text TCP dial. Returns `true` on success, `false` on
+    /// validation failure (the existing setting is left untouched).
+    @discardableResult
+    func setRelayHost(_ host: String) -> Bool {
         let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed != state.relayHost else { return }
-        state.relayHost = trimmed
+        if trimmed.isEmpty {
+            guard !state.relayHost.isEmpty else { return true }
+            state.relayHost = ""
+            Storage.upsertSettings(state)
+            connectRelay()
+            return true
+        }
+        guard let canonical = OnionHost.canonical(trimmed) else {
+            return false
+        }
+        guard canonical != state.relayHost else { return true }
+        state.relayHost = canonical
         Storage.upsertSettings(state)
         connectRelay()
+        return true
     }
 
     /// Cleanly tear down the relay socket as the app moves to
@@ -864,7 +975,13 @@ final class ChatStore: NSObject {
             appendSystem("Session not established yet — waiting for the other side to scan you.", to: idx)
             return
         }
-        guard let token = popDeliveryToken(forContactAt: idx) else {
+        // Stash availability is checked up-front for the user-facing
+        // "out of tokens" message, but the actual pop happens
+        // ATOMICALLY with the outbox-row insert below
+        // (`Storage.commitDeliveryTokenSpend`) so a crash between
+        // the two writes can never burn a token without a
+        // corresponding outbox record.
+        guard !state.contacts[idx].deliveryTokensForPeer.isEmpty else {
             appendSystem("Out of delivery tokens — asking your peer for more.", to: idx)
             requestTokenRefillBroadcast(from: state.contacts[idx], session: session)
             return
@@ -884,22 +1001,45 @@ final class ChatStore: NSObject {
             )
             let ttl = state.contacts[idx].ttlSeconds
             let now = Date()
-            // Insert into outbox BEFORE handing off to the relay so a
-            // crash mid-send still leaves a retryable record on disk.
-            var entry = OutboxEntry(
-                messageId: messageId,
-                recipientPeerId: contact.identityPub,
-                sealedCiphertext: sealed,
-                token: token,
-                ttl: TimeInterval(ttl),
-                sentAt: now,
-                retries: 0,
-                deliveredAt: nil,
-                failedAt: nil,
-                relayedAt: nil,
-            )
-            outbox.entries[messageId] = entry
-            Storage.upsertOutboxEntry(entry)
+            // Atomic spend: in ONE SQLite transaction, pop the head
+            // of the delivery-token queue AND insert the outbox row
+            // that captures which token went where. A crash here
+            // can only leave the on-disk state with EITHER both
+            // writes applied OR neither — never the half-applied
+            // shape that would burn a token irretrievably.
+            guard let entry = Storage.commitDeliveryTokenSpend(
+                contactId: state.contacts[idx].id,
+                entryBuilder: { token in
+                    OutboxEntry(
+                        messageId: messageId,
+                        recipientPeerId: contact.identityPub,
+                        sealedCiphertext: sealed,
+                        token: token,
+                        ttl: TimeInterval(ttl),
+                        sentAt: now,
+                        retries: 0,
+                        deliveredAt: nil,
+                        failedAt: nil,
+                        relayedAt: nil,
+                    )
+                }
+            ) else {
+                appendSystem("Out of delivery tokens — asking your peer for more.", to: idx)
+                requestTokenRefillBroadcast(from: state.contacts[idx], session: session)
+                return
+            }
+            // Mirror the DB pop into the in-memory stash. The
+            // queue may be in any state (a race-window concurrent
+            // mutation is impossible — MainActor isolation
+            // serialises everything that touches it) but the DB
+            // is authoritative; pop only if non-empty so a
+            // hypothetical drift doesn't underflow.
+            if !state.contacts[idx].deliveryTokensForPeer.isEmpty {
+                state.contacts[idx].deliveryTokensForPeer.removeFirst()
+            }
+            let token = entry.token
+            var entryMut = entry
+            outbox.entries[messageId] = entryMut
             // CRITICAL: encryptSealed advanced the ratchet; flush that
             // state to Keychain BEFORE the socket write. The
             // outbox-then-session-then-send order means a force-quit
@@ -925,16 +1065,16 @@ final class ChatStore: NSObject {
                     token: token,
                 )
             }
-            entry.relayedAt = now
+            entryMut.relayedAt = now
             // F-505: scrub the token field once the relay accepts the
             // bytes. The signed token is no longer needed (further
             // retries on a relayed entry are capped by F-501 and
             // wouldn't burn a token even if they fired). Keeping it on
             // disk widens the post-Keychain-extraction replay surface
             // for the token's 30-day TTL.
-            entry.token = Data()
-            outbox.entries[messageId] = entry
-            Storage.upsertOutboxEntry(entry)
+            entryMut.token = Data()
+            outbox.entries[messageId] = entryMut
+            Storage.upsertOutboxEntry(entryMut)
 
             let logEntry = PersistedMessage(
                 side: .me,
@@ -1622,6 +1762,12 @@ final class ChatStore: NSObject {
         let preservedOnboarding = state.onboardingCompleted
         let preservedQuickLook = state.quickLookPreviewEnabled
         let preservedPanicMode = state.panicModeEnabled
+        let preservedContactsBeforeGroups = state.contactsBeforeGroups
+        let preservedInAppHaptics = state.inAppHapticsEnabled
+        // Privacy-oriented preference: surviving the identity wipe so
+        // a user who set "default read receipts off" doesn't have
+        // them silently turn back on after a duress-style reset.
+        let preservedDefaultReadReceipts = state.defaultReadReceiptsEnabled
         let resetState = AppState(
             relayHost: preservedHost,
             onboardingCompleted: preservedOnboarding,
@@ -1629,6 +1775,9 @@ final class ChatStore: NSObject {
             autoLockTimeout: preservedAutoLock,
             quickLookPreviewEnabled: preservedQuickLook,
             panicModeEnabled: preservedPanicMode,
+            contactsBeforeGroups: preservedContactsBeforeGroups,
+            inAppHapticsEnabled: preservedInAppHaptics,
+            defaultReadReceiptsEnabled: preservedDefaultReadReceipts,
         )
         // F-703: write the post-reset AppState to Keychain BEFORE wiping
         // the device-store / outbox / legacy slots. The previous order
@@ -1833,16 +1982,43 @@ final class ChatStore: NSObject {
 extension ChatStore: RelayClientDelegate {
     nonisolated func relayClient(_ client: RelayClient, didChange state: RelayClient.State) {
         Task { @MainActor in
+            // Drop callbacks from clients that are no longer in the
+            // active fleet. `teardownRelay` clears the delegate
+            // before disconnecting, but a `didChange` callback may
+            // have ALREADY been enqueued on MainActor before that
+            // delegate-nil ran; by the time the Task body executes,
+            // `self.relays` no longer contains the sender. Acting
+            // on the stale event would:
+            //   * stamp the dead host's failure into `perRelayState`
+            //     (UI flicker on the row we just rebuilt for that
+            //     host),
+            //   * recompute `aggregateRelayState` against a fleet
+            //     that includes the now-detached client (it does
+            //     not — the dead client isn't in `self.relays`
+            //     anymore, so aggregateRelayState is fine in
+            //     isolation), AND
+            //   * call `electPushPrimary`, which would set
+            //     `pushPrimary` to a freshly-built client that may
+            //     still be `.connecting` (the old `firstReady`
+            //     could now be one whose `.connected` event hadn't
+            //     fired yet — but `readyRelays.first` skips it,
+            //     so the primary candidate is consistent). The
+            //     real risk is the late event masquerading as a
+            //     real state change: `pushPrimary` could legitimately
+            //     change on every late event, burning N
+            //     `registerPush` round-trips.
             // Mirror the per-client state into the observable
             // `perRelayState` dict so Settings → Relays gets a live
             // redraw without the user having to expand/collapse the
             // row. `relays` and `relayDescriptors` are kept in
             // lockstep by `connectRelay` / `teardownRelay`, so
             // position-by-index lookup is sound.
-            if let idx = self.relays.firstIndex(where: { $0 === client }),
-               idx < self.relayDescriptors.count {
-                self.perRelayState[self.relayDescriptors[idx].host] = state
+            guard let idx = self.relays.firstIndex(where: { $0 === client }),
+                  idx < self.relayDescriptors.count
+            else {
+                return
             }
+            self.perRelayState[self.relayDescriptors[idx].host] = state
             let prevAggregate = self.relayState
             self.relayState = self.aggregateRelayState()
             self.electPushPrimary()

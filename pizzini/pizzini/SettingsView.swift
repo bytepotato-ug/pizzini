@@ -184,9 +184,22 @@ struct SettingsView: View {
         }
         let trusted = RelayRegistry.trusted
         switch trusted.count {
-        case 0:  return "No relays configured"
+        case 0:  return String(localized: "No relays configured")
         case 1:  return trusted[0].label
-        default: return "\(trusted.count) relays"
+        default:
+            // Properly pluralised + localised. The format string
+            // `%lld relay(s)` is interpreted as a stringsdict key
+            // when the bundle ships a Localizable.stringsdict
+            // entry; on a build without that dict the fallback
+            // `String.localizedStringWithFormat` still produces a
+            // locale-correct numeral (e.g. `1.000 relays` in
+            // de_DE rather than `1,000 relays`). Hand-formatting
+            // `"\(count) relays"` produced "1 relays" and skipped
+            // both pluralisation and locale digit separators.
+            return String.localizedStringWithFormat(
+                NSLocalizedString("%lld relays", comment: "Settings row trailing label: number of bundled trusted relays in fleet mode."),
+                trusted.count
+            )
         }
     }
 }
@@ -228,10 +241,25 @@ private struct RelayHostScreen: View {
     /// Which descriptor is currently expanded (showing full onion +
     /// failure detail). `nil` means all rows collapsed. Tap-toggle.
     @State private var expanded: String? = nil
+    /// Validation error surfaced when the user hits "Save" with a
+    /// non-empty draft that isn't a valid v3 onion. The alert tells
+    /// them why the value was rejected (Tor-only posture) and gives
+    /// them a single OK to dismiss; the draft remains in the field
+    /// so they can fix it instead of losing their paste.
+    @State private var saveError: String? = nil
 
     init(store: ChatStore) {
         self.store = store
         self._draft = State(initialValue: store.state.relayHost)
+    }
+
+    /// True when the draft is either empty (clear → fleet) or a
+    /// strictly-valid v3 onion. The Save button stays enabled even
+    /// for invalid drafts so the user gets the explicit error
+    /// rather than wondering why the button "doesn't work".
+    private var draftIsAcceptable: Bool {
+        let t = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty || OnionHost.isValid(t)
     }
 
     var body: some View {
@@ -271,7 +299,7 @@ private struct RelayHostScreen: View {
             } header: {
                 Text("Custom relay (advanced)")
             } footer: {
-                Text("Empty = use the trusted fleet above. Non-empty = collapse to this single host (a community onion, etc.). Port stays 7777.")
+                Text("Empty = use the trusted fleet above. Non-empty = collapse to this single host (a community v3 onion, etc.). Port stays 7777. Tor-only — clearnet hosts are refused.")
             }
         }
         .navigationTitle("Relays")
@@ -279,11 +307,22 @@ private struct RelayHostScreen: View {
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
                 Button("Save") {
-                    store.setRelayHost(draft)
-                    dismiss()
+                    if store.setRelayHost(draft) {
+                        dismiss()
+                    } else {
+                        saveError = "This isn’t a valid Tor v3 onion address. Pizzini routes all relay traffic through Tor, so the custom host must be a 56-character v3 onion ending in `.onion`. Clearnet hosts, IP addresses, and i2p addresses are rejected to keep the Tor-only posture intact."
+                    }
                 }
                 .disabled(draft == store.state.relayHost)
             }
+        }
+        .alert("Relay host rejected", isPresented: Binding(
+            get: { saveError != nil },
+            set: { if !$0 { saveError = nil } }
+        )) {
+            Button("OK", role: .cancel) { saveError = nil }
+        } message: {
+            Text(saveError ?? "")
         }
     }
 

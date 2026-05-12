@@ -48,8 +48,8 @@ struct TransparencyLogTests {
         #expect(entries[1].entry.binarySha256Hex == "b")
     }
 
-    @Test("verify returns operatorKeyMissing when no key is configured")
-    func operatorKeyMissingByDefault() {
+    @Test("verify refuses an empty / unsigned entry under the bundled operator key")
+    func verifyRefusesUnsignedEntry() {
         let dummy = TransparencyLog.SignedEntry(
             entry: TransparencyLog.Entry(
                 gitSha: "x", binarySha256Hex: "y", binarySize: 1,
@@ -58,9 +58,17 @@ struct TransparencyLogTests {
             signedAt: "t",
             signatureBase64: ""
         )
-        // Default config has an empty key; verification must
-        // refuse rather than treat anything as valid.
-        #expect(TransparencyLog.verify(dummy) == .operatorKeyMissing)
+        // The bundled build pins a real operator key
+        // (`TransparencyLogConfig.operatorVerifyKeyBase64`). An
+        // entry with no signature attached must therefore round
+        // through the bad-signature path — verification refusing
+        // is the safety property the test exists to pin. If a
+        // future build ships WITHOUT a key, the result legitimately
+        // changes to `.operatorKeyMissing`; accept either as
+        // "verification didn't accidentally approve unsigned bytes".
+        let result = TransparencyLog.verify(dummy)
+        #expect(result == .badSignature || result == .operatorKeyMissing)
+        #expect(result != .valid)
     }
 
     @Test("verify rejects a bad signature when an operator key IS available")

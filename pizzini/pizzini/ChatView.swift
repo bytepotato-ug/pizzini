@@ -267,14 +267,27 @@ struct ChatView: View {
                                     store.setContactTTL(contact, seconds: opt.seconds)
                                 } label: {
                                     if contact.ttlSeconds == opt.seconds {
-                                        Label(opt.label, systemImage: "checkmark")
+                                        Label(LocalizedStringKey(opt.label), systemImage: "checkmark")
                                     } else {
-                                        Text(opt.label)
+                                        Text(LocalizedStringKey(opt.label))
                                     }
                                 }
                             }
                         } label: {
-                            Label("Expires after — \(currentTTLLabel(contact.ttlSeconds))", systemImage: "hourglass")
+                            // Build the menu label as composed Text so
+                            // both the constant prefix and the current
+                            // TTL token route through Localizable.strings
+                            // (LocalizedStringKey, not String). The
+                            // previous Label(_:systemImage:) overload
+                            // bound to the StringProtocol-taking
+                            // initialiser when given a Swift String,
+                            // skipping the bundle lookup entirely and
+                            // leaving German users with English copy.
+                            Label {
+                                Text("Expires after — \(currentTTLText(contact.ttlSeconds))")
+                            } icon: {
+                                Image(systemName: "hourglass")
+                            }
                         }
                         // Read-receipts: three-state per-chat override.
                         // The submenu mirrors Apple's standard "On /
@@ -287,11 +300,17 @@ struct ChatView: View {
                             Button {
                                 store.setReadReceiptsMode(contact, mode: .followDefault)
                             } label: {
+                                let stateText: Text = store.state.defaultReadReceiptsEnabled
+                                    ? Text("On")
+                                    : Text("Off")
                                 if contact.readReceiptsMode == .followDefault {
-                                    Label("Default — \(store.state.defaultReadReceiptsEnabled ? "On" : "Off")",
-                                          systemImage: "checkmark")
+                                    Label {
+                                        Text("Default — \(stateText)")
+                                    } icon: {
+                                        Image(systemName: "checkmark")
+                                    }
                                 } else {
-                                    Text("Default — \(store.state.defaultReadReceiptsEnabled ? "On" : "Off")")
+                                    Text("Default — \(stateText)")
                                 }
                             }
                             Button {
@@ -313,8 +332,16 @@ struct ChatView: View {
                                 }
                             }
                         } label: {
-                            Label(readReceiptsMenuLabel(contact: contact),
-                                  systemImage: "eye")
+                            // Same Label-with-Text pattern as the TTL
+                            // row above: the embedded `Text("On")` /
+                            // `Text("Off")` are LocalizedStringKey
+                            // literals so the substitution goes
+                            // through the bundle.
+                            Label {
+                                readReceiptsMenuLabelText(contact: contact)
+                            } icon: {
+                                Image(systemName: "eye")
+                            }
                         }
                         Button(role: .destructive) {
                             confirmDeleteChat = true
@@ -414,35 +441,42 @@ struct ChatView: View {
 
     /// Inline current state for the parent "Read receipts" menu row,
     /// e.g. `Read receipts — Default (On)` or `Read receipts — On
-    /// for this chat`. Surfaces the resolved value next to the
-    /// title so the user knows the current setting without
-    /// expanding the submenu.
-    private func readReceiptsMenuLabel(contact: Contact) -> String {
+    /// for this chat`. Returns `Text` (not `String`) so every
+    /// segment goes through LocalizedStringKey lookup — the
+    /// earlier String-returning helper made the parent Label bind
+    /// to its StringProtocol overload and skip the bundle.
+    private func readReceiptsMenuLabelText(contact: Contact) -> Text {
         switch contact.readReceiptsMode {
         case .followDefault:
-            let on = store.state.defaultReadReceiptsEnabled
-            return "Read receipts — Default (\(on ? "On" : "Off"))"
+            let stateText: Text = store.state.defaultReadReceiptsEnabled
+                ? Text("On")
+                : Text("Off")
+            return Text("Read receipts — Default (\(stateText))")
         case .alwaysOn:
-            return "Read receipts — On for this chat"
+            return Text("Read receipts — On for this chat")
         case .alwaysOff:
-            return "Read receipts — Off for this chat"
+            return Text("Read receipts — Off for this chat")
         }
     }
 
-    /// Map a TTL in seconds to its short user-facing label by looking
-    /// it up in `Contact.ttlOptions`. Falls back to a compact h/d
-    /// formatting for any value outside the menu's preset list (so a
-    /// future expansion of the picker doesn't surface an empty
-    /// trailing label).
-    private func currentTTLLabel(_ seconds: UInt32) -> String {
+    /// Map a TTL in seconds to its short user-facing label as a
+    /// LocalizedStringKey-rendered `Text`. The preset rows from
+    /// `Contact.ttlOptions` are localised by their label key
+    /// (with the "(recommended)" annotation stripped); the
+    /// fallback "Nh" / "Nd" form uses the bundle for the "h" / "d"
+    /// suffix so a German build can render "12h" → "12 Std".
+    private func currentTTLText(_ seconds: UInt32) -> Text {
         if let match = Contact.ttlOptions.first(where: { $0.seconds == seconds }) {
-            // Strip the "(recommended)" annotation when it's stitched
-            // into the parent menu label — the menu row only has
-            // room for the bare value.
-            return match.label.replacingOccurrences(of: " (recommended)", with: "")
+            let stripped = match.label.replacingOccurrences(of: " (recommended)", with: "")
+            return Text(LocalizedStringKey(stripped))
         }
         let hours = Int(seconds) / 3600
-        return hours >= 24 ? "\(hours / 24)d" : "\(hours)h"
+        if hours >= 24 {
+            let days = hours / 24
+            return Text("\(days) days")
+        } else {
+            return Text("\(hours) hours")
+        }
     }
 
     private var pairingBanner: some View {

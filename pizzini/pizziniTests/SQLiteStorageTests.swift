@@ -65,7 +65,7 @@ struct SQLiteStorageTests {
             addedAt: Date(),
             deliveryTokensForPeer: [],
             ttlSeconds: 3600,
-            readReceiptsEnabled: true,
+            readReceiptsMode: .alwaysOn,
             peerVerifyKey: Data(repeating: 0x05, count: 33),
         )
         let msg = PersistedMessage(
@@ -90,7 +90,7 @@ struct SQLiteStorageTests {
         #expect(lc.identityPub == identityPub)
         #expect(lc.displayName == "Alice")
         #expect(lc.sessionEstablished == true)
-        #expect(lc.readReceiptsEnabled == true)
+        #expect(lc.readReceiptsMode == .alwaysOn)
         #expect(lc.ttlSeconds == 3600)
         #expect(lc.peerVerifyKey == c.peerVerifyKey)
         #expect(lc.log.count == 1)
@@ -157,7 +157,7 @@ struct SQLiteStorageTests {
             lastRefillRequestSentAt: p.lastRefillRequestSentAt,
             lastRefillRequestHandledAt: p.lastRefillRequestHandledAt,
             ttlSeconds: p.ttlSeconds,
-            readReceiptsEnabled: p.readReceiptsEnabled,
+            readReceiptsMode: p.readReceiptsMode,
             peerVerifyKey: p.peerVerifyKey,
             lastBundleServedAt: p.lastBundleServedAt,
             addedVia: .qrScan,

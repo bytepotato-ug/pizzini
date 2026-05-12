@@ -91,10 +91,12 @@ struct OutboxTests {
 
 @Suite("Contact read-receipt + TTL settings")
 struct ContactSettingsTests {
-    @Test("readReceiptsEnabled defaults off")
+    @Test("readReceiptsMode defaults to .followDefault (off-by-default global)")
     func readReceiptsDefault() {
         let c = Contact(identityPub: Data(repeating: 1, count: 33), displayName: "x")
-        #expect(c.readReceiptsEnabled == false)
+        #expect(c.readReceiptsMode == .followDefault)
+        // Effective value with the default global default (off).
+        #expect(c.effectiveReadReceiptsEnabled(globalDefault: false) == false)
     }
 
     @Test("ttlSeconds defaults to 1 day")
@@ -102,6 +104,78 @@ struct ContactSettingsTests {
         let c = Contact(identityPub: Data(repeating: 1, count: 33), displayName: "x")
         #expect(c.ttlSeconds == Contact.defaultTTLSeconds)
         #expect(c.ttlSeconds == 24 * 60 * 60)
+    }
+
+    @Test("effectiveReadReceiptsEnabled: alwaysOff overrides true global default")
+    func alwaysOffOverridesGlobal() {
+        var c = Contact(identityPub: Data(repeating: 1, count: 33), displayName: "x")
+        c.readReceiptsMode = .alwaysOff
+        #expect(c.effectiveReadReceiptsEnabled(globalDefault: true) == false)
+    }
+
+    @Test("effectiveReadReceiptsEnabled: alwaysOn overrides false global default")
+    func alwaysOnOverridesGlobal() {
+        var c = Contact(identityPub: Data(repeating: 1, count: 33), displayName: "x")
+        c.readReceiptsMode = .alwaysOn
+        #expect(c.effectiveReadReceiptsEnabled(globalDefault: false) == true)
+    }
+
+    @Test("effectiveReadReceiptsEnabled: followDefault inherits the global")
+    func followDefaultInheritsGlobal() {
+        var c = Contact(identityPub: Data(repeating: 1, count: 33), displayName: "x")
+        c.readReceiptsMode = .followDefault
+        #expect(c.effectiveReadReceiptsEnabled(globalDefault: true) == true)
+        #expect(c.effectiveReadReceiptsEnabled(globalDefault: false) == false)
+    }
+
+    @Test("Codable legacy `readReceiptsEnabled=false` decodes to .alwaysOff (privacy-respecting fallback)")
+    func legacyFalseDecodesToAlwaysOff() throws {
+        // Construct a JSON payload representing a pre-v3 export
+        // that only carried the legacy Bool. The decoder must
+        // preserve the user's explicit "off for this chat" intent
+        // rather than mapping false to .followDefault (which would
+        // silently re-enable receipts as soon as the user later
+        // toggled the global default on).
+        let legacyJSON: [String: Any] = [
+            "id": UUID().uuidString,
+            "identityPub": Data(repeating: 1, count: 33).base64EncodedString(),
+            "displayName": "x",
+            "sessionEstablished": false,
+            "log": [],
+            "addedAt": Date().timeIntervalSinceReferenceDate,
+            "deliveryTokensForPeer": [],
+            "ttlSeconds": 86400,
+            "readReceiptsEnabled": false,
+            "addedVia": "qr_scan",
+        ]
+        let data = try JSONSerialization.data(withJSONObject: legacyJSON)
+        let decoder = JSONDecoder()
+        decoder.dataDecodingStrategy = .base64
+        decoder.dateDecodingStrategy = .deferredToDate
+        let c = try decoder.decode(Contact.self, from: data)
+        #expect(c.readReceiptsMode == .alwaysOff)
+    }
+
+    @Test("Codable legacy `readReceiptsEnabled=true` decodes to .alwaysOn")
+    func legacyTrueDecodesToAlwaysOn() throws {
+        let legacyJSON: [String: Any] = [
+            "id": UUID().uuidString,
+            "identityPub": Data(repeating: 2, count: 33).base64EncodedString(),
+            "displayName": "y",
+            "sessionEstablished": false,
+            "log": [],
+            "addedAt": Date().timeIntervalSinceReferenceDate,
+            "deliveryTokensForPeer": [],
+            "ttlSeconds": 86400,
+            "readReceiptsEnabled": true,
+            "addedVia": "qr_scan",
+        ]
+        let data = try JSONSerialization.data(withJSONObject: legacyJSON)
+        let decoder = JSONDecoder()
+        decoder.dataDecodingStrategy = .base64
+        decoder.dateDecodingStrategy = .deferredToDate
+        let c = try decoder.decode(Contact.self, from: data)
+        #expect(c.readReceiptsMode == .alwaysOn)
     }
 }
 

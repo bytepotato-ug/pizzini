@@ -360,13 +360,16 @@ struct Contact: Codable, Identifiable, Sendable {
         self.lastRefillRequestHandledAt = try c.decodeIfPresent(Date.self, forKey: .lastRefillRequestHandledAt)
         self.ttlSeconds = try c.decodeIfPresent(UInt32.self, forKey: .ttlSeconds) ?? Contact.defaultTTLSeconds
         // Backward-compat: new field takes precedence; if absent, fall
-        // back to the legacy Bool (true → .alwaysOn so the user keeps
-        // their explicit opt-in; false → .followDefault so they
-        // immediately track whatever the global default is).
+        // back to the legacy Bool. Privacy-respecting mapping:
+        //   true  → .alwaysOn  (user had explicitly opted-in per chat)
+        //   false → .alwaysOff (user had explicitly opted-out per chat;
+        //                       mapping to .followDefault would silently
+        //                       re-enable receipts the moment the user
+        //                       later flipped the global default on).
         if let mode = try c.decodeIfPresent(ReadReceiptsMode.self, forKey: .readReceiptsMode) {
             self.readReceiptsMode = mode
         } else if let legacy = try c.decodeIfPresent(Bool.self, forKey: .readReceiptsEnabled) {
-            self.readReceiptsMode = legacy ? .alwaysOn : .followDefault
+            self.readReceiptsMode = legacy ? .alwaysOn : .alwaysOff
         } else {
             self.readReceiptsMode = .followDefault
         }
