@@ -108,7 +108,7 @@ if [[ -z "${PIZZINI_RELEASE_NO_DOCKER:-}" ]]; then
         -e HOME=/build-home \
         -v "$REPO_ROOT":/work:rw \
         -w /work \
-        rust:1.95.0-bookworm-slim \
+        rust:1.95.0-bookworm \
         bash -lc '
             set -euo pipefail
             apt-get update -qq
