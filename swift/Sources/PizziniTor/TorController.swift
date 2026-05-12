@@ -99,12 +99,24 @@ public final class TorController: ObservableObject {
     // them from the MainActor is trivially safe.
     nonisolated private static let fixedSocksPort: UInt16 = 39_150
 
-    /// Deadline for the initial bootstrap. Cold start is 5-30s on
-    /// good networks; tail can stretch to 60-90s on hostile ones
-    /// (DPI, captive portals). 90s avoids spuriously failing on a
-    /// flaky-but-recoverable network while still bounded enough
-    /// that the UI doesn't lie about progress forever.
-    nonisolated private static let bootstrapDeadline: TimeInterval = 90
+    /// Stall window — if tor's bootstrap progress hasn't advanced in
+    /// this many seconds, we conclude the network is broken and
+    /// surface the failure. A FIRST cold-launch on cellular with DPI
+    /// can take 60-120s end-to-end while still making steady
+    /// progress every few seconds; the previous hard 90s deadline
+    /// killed those bootstraps mid-flight even though tor would have
+    /// succeeded a few seconds later. Switching to a stall check
+    /// removes the spurious-failure UX (user opens app → "failed"
+    /// pill → user taps → works) without giving up the bound.
+    nonisolated private static let bootstrapStallTimeout: TimeInterval = 60
+
+    /// Hard ceiling on total bootstrap time. Even if tor is reporting
+    /// steady progress, we give up after this long — protects against
+    /// a hostile network that slow-drips progress events without ever
+    /// completing. 4 minutes is enough for a worst-case cellular cold
+    /// start with consensus fetch, well short of "user thinks the app
+    /// is broken" patience.
+    nonisolated private static let bootstrapHardDeadline: TimeInterval = 4 * 60
 
     /// Tor's C runtime (`tor_run_main`) can only be invoked once per
     /// process — TORThread enforces this via an `abort()` in its
@@ -358,12 +370,14 @@ public final class TorController: ObservableObject {
         //   2. The TORController observer fires SYNCHRONOUSLY from
         //      inside `addObserver(...)` (warm-cache reconnect: tor
         //      already has an established circuit when we subscribe).
-        //   3. The deadline timer expires.
+        //   3. The stall watchdog fires (no progress for stallTimeout
+        //      seconds, OR total elapsed past hardDeadline).
         // Whichever resolves first wins; `BootstrapResumer` keeps
         // both `done` and `observerToken` under a single unfair lock
         // so a synchronous observer callback fired before `bind`
         // recorded the token cannot leak the observer.
-        let deadline = Self.bootstrapDeadline
+        let stallTimeout = Self.bootstrapStallTimeout
+        let hardDeadline = Self.bootstrapHardDeadline
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let resumer = BootstrapResumer(controller: controller, continuation: cont)
             let token = controller.addObserver(forCircuitEstablished: { @Sendable established in
@@ -377,9 +391,55 @@ public final class TorController: ObservableObject {
             // TORController.
             resumer.bind(observerToken: token)
 
-            Task.detached { [resumer] in
-                try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))
-                resumer.resolveTimeout(after: deadline)
+            // Stall watchdog: poll bootstrapProgress every second
+            // and only declare failure if (a) progress has been
+            // unchanged for `stallTimeout` seconds OR (b) total
+            // elapsed has reached `hardDeadline`. The previous
+            // single-shot deadline killed slow-but-progressing
+            // cold-launch bootstraps the moment the clock hit 90s,
+            // even though tor would have completed in another few
+            // seconds. With the stall check, only genuinely-broken
+            // networks (no progress in a full minute) fail; the
+            // common-case cold launch on cellular completes
+            // without ever surfacing a `.failed` state.
+            Task.detached { [resumer, weak self] in
+                let start = Date()
+                // Capture the initial progress AFTER yielding the
+                // current task once — gives any pending MainActor
+                // hop from a sibling `bootstrapProgress = N` update
+                // a chance to land first.
+                var lastProgress: Int = await MainActor.run {
+                    self?.bootstrapProgress ?? 0
+                }
+                var lastChange = Date()
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 s
+                    let now = Date()
+                    let current: Int = await MainActor.run {
+                        self?.bootstrapProgress ?? 0
+                    }
+                    if current != lastProgress {
+                        lastProgress = current
+                        lastChange = now
+                    }
+                    // Hard ceiling.
+                    if now.timeIntervalSince(start) >= hardDeadline {
+                        resumer.resolveTimeout(after: hardDeadline)
+                        return
+                    }
+                    // Stall — no progress in stallTimeout. Two
+                    // sub-cases:
+                    //   • we never moved off 0 ⇒ tor never started
+                    //     making progress (network broken, or tor
+                    //     crashed). Surface failure so the host's
+                    //     auto-reconnect path retries.
+                    //   • we plateaued mid-bootstrap (e.g. 75% for
+                    //     60s). Also a network-broken signal.
+                    if now.timeIntervalSince(lastChange) >= stallTimeout {
+                        resumer.resolveTimeout(after: stallTimeout)
+                        return
+                    }
+                }
             }
         }
     }

@@ -171,6 +171,26 @@ final class ChatStore: NSObject {
     /// Periodic retry/TTL-expiry walk. Re-armed in `connectRelay` so
     /// each fresh socket gets one timer; cancelled on disconnect.
     private var retryTimer: Timer?
+    /// Auto-reconnect task scheduled when the aggregate relay state
+    /// transitions to `.failed`. Without this, a cold-launch
+    /// bootstrap failure leaves the user staring at the
+    /// "tap to reconnect" pill — which they'd then tap and the
+    /// second attempt would work, because tor's been bootstrapping
+    /// in the background the whole time. Self-healing reconnect
+    /// makes the failure-on-first-attempt invisible: the same
+    /// "wait a few seconds and try again" happens automatically.
+    /// Cancelled on teardown and on any non-failed state
+    /// transition.
+    private var autoReconnectTask: Task<Void, Never>?
+    /// Current backoff for `autoReconnectTask`. Starts at the
+    /// floor, doubles on each consecutive failure, capped at the
+    /// ceiling. Reset to the floor on `.connected`. The exponential
+    /// backoff is the contract that lets us auto-retry aggressively
+    /// without pounding the network if the user's offline for an
+    /// extended period.
+    private var autoReconnectBackoff: TimeInterval = autoReconnectBackoffFloor
+    private static let autoReconnectBackoffFloor: TimeInterval = 5
+    private static let autoReconnectBackoffCeiling: TimeInterval = 60
     /// Phase 2 attachment reassembly state. Lives in-process: a force-
     /// quit while a partial inbound is in flight loses the in-RAM
     /// indices but the per-chunk files stay on disk under
@@ -539,6 +559,67 @@ final class ChatStore: NSObject {
         retryTimer = timer
     }
 
+    /// Drive the auto-reconnect state machine from each per-relay
+    /// `.didChange` event. The contract:
+    ///
+    ///   * On the FIRST transition into `.failed` (i.e. the previous
+    ///     aggregate was not failed), arm `autoReconnectTask` with
+    ///     the current `autoReconnectBackoff`, then double the
+    ///     backoff for the next attempt (capped at the ceiling).
+    ///   * On transition into `.connected`, reset the backoff to
+    ///     the floor and cancel any pending task.
+    ///   * Other transitions are no-ops — a flap within `.connecting`
+    ///     states is normal during a Tor bootstrap and shouldn't
+    ///     accumulate backoff.
+    ///
+    /// Without this, the first cold-launch Tor bootstrap that times
+    /// out leaves the user on the "tap to reconnect" pill — a
+    /// failure path the audit flagged as ultra-bad UX. The handler
+    /// runs on MainActor (called from the `relayClient` delegate
+    /// hop), so direct property mutation is sound.
+    private func handleAggregateRelayStateTransition(
+        from prev: RelayClient.State,
+        to next: RelayClient.State,
+    ) {
+        switch next {
+        case .connected:
+            autoReconnectTask?.cancel()
+            autoReconnectTask = nil
+            autoReconnectBackoff = Self.autoReconnectBackoffFloor
+        case .failed:
+            // Already failed previously? Don't double-arm — there's
+            // already a task in flight. (The existing task will
+            // re-fire connectRelay on its own deadline.)
+            if case .failed = prev { return }
+            let delay = autoReconnectBackoff
+            NSLog("[pizzini] aggregate state .failed; auto-reconnecting in \(Int(delay)) s")
+            autoReconnectBackoff = min(
+                autoReconnectBackoff * 2,
+                Self.autoReconnectBackoffCeiling,
+            )
+            autoReconnectTask?.cancel()
+            autoReconnectTask = Task { @MainActor [weak self] in
+                let nanos = UInt64(delay * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: nanos)
+                guard let self else { return }
+                if Task.isCancelled { return }
+                // Re-check state — the user might have manually
+                // reconnected, or the prior attempt might have
+                // self-recovered between schedule and fire.
+                if case .failed = self.relayState {
+                    NSLog("[pizzini] auto-reconnect firing")
+                    self.connectRelay()
+                }
+            }
+        case .idle, .connecting, .connectingToTor:
+            // No-op. A transient drop through `.connecting` between
+            // two `.connected` states is normal during Tor circuit
+            // rebuilds; the backoff stays where it is so the NEXT
+            // genuine failure doesn't restart from 5 s.
+            break
+        }
+    }
+
     /// Force-rebuild every RelayClient. Bound to the Settings →
     /// Relays → "Reconnect now" button AND the contacts-toolbar
     /// "tap to reconnect" pill. Useful when a Tor circuit gets
@@ -561,6 +642,10 @@ final class ChatStore: NSObject {
         switch relayState {
         case .failed:
             NSLog("[pizzini] manual reconnect requested")
+            // Reset auto-reconnect backoff: the user's explicit
+            // intervention means the NEXT failure should retry
+            // quickly, not wait for the accumulated 60 s cap.
+            autoReconnectBackoff = Self.autoReconnectBackoffFloor
             connectRelay()
         case .connected, .connecting, .connectingToTor, .idle:
             NSLog("[pizzini] reconnect requested but state is \(relayState); ignoring")
@@ -664,6 +749,13 @@ final class ChatStore: NSObject {
             retryTimer?.invalidate()
             retryTimer = nil
         }
+        // Cancel any pending auto-reconnect task — `connectRelay()`
+        // (the only caller besides the cleanup paths) will fire its
+        // own fresh attempt synchronously, and on `resetIdentity`
+        // we don't want a stale auto-reconnect resurrecting the
+        // fleet after the wipe.
+        autoReconnectTask?.cancel()
+        autoReconnectTask = nil
     }
 
     /// Build a fresh relay connection on every foreground entry. We
@@ -2022,6 +2114,24 @@ extension ChatStore: RelayClientDelegate {
             let prevAggregate = self.relayState
             self.relayState = self.aggregateRelayState()
             self.electPushPrimary()
+            // Self-healing reconnect: when the aggregate state
+            // transitions to `.failed` we schedule an automatic
+            // retry with exponential backoff. Without this the user
+            // sees the "tap to reconnect" pill on EVERY cold launch
+            // where the first Tor bootstrap times out — a real
+            // problem on cellular / DPI networks where the first
+            // circuit takes 60-120s but tor keeps the daemon
+            // running in the background. The auto-retry reuses the
+            // already-bootstrapping TORThread, so by the time the
+            // backoff fires the daemon is usually ready and the
+            // user never sees a red badge.
+            //
+            // On `.connected` we reset the backoff and cancel any
+            // pending auto-reconnect.
+            self.handleAggregateRelayStateTransition(
+                from: prevAggregate,
+                to: self.relayState,
+            )
             // STATUS_REQUEST is per-relay — each one attests
             // separately. The cached `relayStatus` will be
             // overwritten by whichever response arrives last, but
