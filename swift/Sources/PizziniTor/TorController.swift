@@ -642,22 +642,38 @@ public final class TorController: ObservableObject {
             // networks (no progress in a full minute) fail; the
             // common-case cold launch on cellular completes
             // without ever surfacing a `.failed` state.
-            Task.detached { [resumer, weak self] in
+            // Bootstrap watchdog. `Task { ... }` (NOT `.detached`)
+            // because:
+            //   * The enclosing method is on `@MainActor TorController`,
+            //     so a child task inherits MainActor isolation —
+            //     `self.bootstrapProgress` reads are in-isolation, no
+            //     `MainActor.run` hop needed.
+            //   * Under Swift 6 strict concurrency, the prior shape
+            //     (`Task.detached { @MainActor [..., weak/strong self]
+            //     in ... }`) tripped a region-isolation-checker bug
+            //     ("pattern that the region-based isolation checker
+            //     does not understand how to check"). The plain
+            //     `Task` form sidesteps the bug.
+            //   * Cancellation: the watchdog's only job is to resolve
+            //     the `resumer` on stall/deadline. If the caller of
+            //     `awaitCircuitEstablished` cancels, no one is
+            //     awaiting the resumer — letting the child task
+            //     cancel too is the correct behaviour (the prior
+            //     `.detached` was over-cautious here; tor's own
+            //     bootstrap state continues regardless of whether
+            //     this Swift-side watchdog is alive).
+            //   * `self` captured strongly: TorController is a
+            //     process-wide singleton (`public static let shared`),
+            //     so there's no leak surface — the instance lives
+            //     for the app's lifetime regardless.
+            Task { [resumer, self] in
                 let start = Date()
-                // Capture the initial progress AFTER yielding the
-                // current task once — gives any pending MainActor
-                // hop from a sibling `bootstrapProgress = N` update
-                // a chance to land first.
-                var lastProgress: Int = await MainActor.run {
-                    self?.bootstrapProgress ?? 0
-                }
+                var lastProgress = self.bootstrapProgress
                 var lastChange = Date()
                 while !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 s
                     let now = Date()
-                    let current: Int = await MainActor.run {
-                        self?.bootstrapProgress ?? 0
-                    }
+                    let current = self.bootstrapProgress
                     if current != lastProgress {
                         lastProgress = current
                         lastChange = now
