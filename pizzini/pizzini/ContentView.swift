@@ -177,14 +177,16 @@ struct ContentView: View {
         // Settings or their QR wouldn't see a fresh "Storage
         // unavailable" warning.
         //
-        // The `RelayStatusBar` sits at the bottom of the inset stack
-        // (closest to the nav bar) so the relay state is the live
-        // indicator users glance at. It hides when `.connected` so
-        // the steady state is no chrome at all — only non-healthy
-        // states surface. Visible on every tab, and visible inside
-        // pushed surfaces too (ChatView / GroupChatView / Settings
-        // sub-pages), because `.safeAreaInset(.top)` on the TabView
-        // root propagates through to every contained NavigationStack.
+        // The relay connection state used to sit here too as a full-
+        // width "Connecting…" strip. It overlapped pushed-view nav
+        // bars (back arrow + Save buttons in Settings sub-pages
+        // disappeared behind it) and felt loud for what's usually a
+        // 2–5s transient state on cold launch. The compact equivalent
+        // is now a single toolbar item inside ContactsListView's nav
+        // bar — invisible at `.connected`, a small spinner during
+        // connect, a tappable red badge on `.failed`. The other tabs
+        // get no indicator; Settings → Trusted relays is the canonical
+        // detail surface.
         .safeAreaInset(edge: .top, spacing: 0) {
             VStack(spacing: 0) {
                 if store.keychainWriteFailing {
@@ -196,10 +198,6 @@ struct ContentView: View {
                 if !store.shouldMaskAppContents {
                     screenshotDegradedBanner
                 }
-                RelayStatusBar(
-                    state: store.relayState,
-                    onReconnect: { store.forceReconnectRelays() },
-                )
             }
         }
     }

@@ -109,12 +109,10 @@ struct ContactsListView: View {
                 }
             }
             ToolbarItem(placement: .principal) {
-                // Brand lockup — small logo + wordmark, no inline
-                // status. The live connection indicator lives in the
-                // global `RelayStatusBar` strip above the nav bar
-                // (ContentView), so it stays visible inside chats,
-                // inside Profile, inside Settings — one canonical
-                // place. The principal slot stays clean and the
+                // Brand lockup — small logo + wordmark. The live
+                // connection indicator is the separate trailing
+                // toolbar item below (visible only on non-connected
+                // states), so the principal slot stays clean and the
                 // wordmark sits centred regardless of relay state.
                 // `.navigationTitle("Pizzini")` below drives the
                 // back-button label on pushed surfaces (ChatView,
@@ -132,6 +130,24 @@ struct ContactsListView: View {
                 }
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel("Pizzini")
+            }
+            // Compact relay-state indicator. Replaces the previous
+            // full-width "Connecting…" strip that lived above every
+            // tab's nav bar via `.safeAreaInset(.top)` — that design
+            // overlapped pushed-view nav bars on Settings sub-pages
+            // and felt loud for the routine 2–5s cold-launch wait.
+            // This sits inside the nav bar's trailing items:
+            //   • `.connected` → nothing rendered (steady state has
+            //     zero chrome).
+            //   • `.connecting` / `.connectingToTor` / `.idle` →
+            //     small inline ProgressView (no text, no tap action).
+            //   • `.failed` → red badge with exclamation icon, tap
+            //     fires `forceReconnectRelays`.
+            // The Chats list is the canonical place to glance at
+            // connection state; Settings → Trusted relays is the
+            // full per-relay detail surface.
+            ToolbarItem(placement: .topBarTrailing) {
+                relayStateIndicator
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -354,12 +370,45 @@ struct ContactsListView: View {
         }
     }
 
-    // Relay connection status used to render here as an inline
-    // toolbar pill (the now-removed `relayBadge`). It moved to a
-    // global `RelayStatusBar` strip above the nav bar in ContentView
-    // — same signal, but visible inside chats / Profile / Settings
-    // too instead of only on this screen. Keep that strip the single
-    // source of truth for connection state.
+    // ─── Relay state indicator (nav bar toolbar item) ─────────────────
+    // Shown only on this screen. Three visual modes:
+    //   • `.connected`           — `EmptyView` (no chrome).
+    //   • connecting / idle /
+    //     connectingToTor        — small inline ProgressView (mini
+    //                              size, tinted to the system accent
+    //                              so it reads as "working", not
+    //                              "broken"). No text, no tap action.
+    //   • `.failed`              — red 22×22 circle with a white
+    //                              exclamation glyph; tap fires
+    //                              `forceReconnectRelays`. The colour
+    //                              is the only signal that this is a
+    //                              non-self-resolving state.
+    @ViewBuilder
+    private var relayStateIndicator: some View {
+        switch store.relayState {
+        case .connected:
+            EmptyView()
+        case .idle, .connecting, .connectingToTor:
+            ProgressView()
+                .controlSize(.mini)
+                .accessibilityLabel("Pizzini is connecting")
+        case .failed:
+            Button {
+                store.forceReconnectRelays()
+            } label: {
+                ZStack {
+                    Circle()
+                        .fill(Color.red)
+                        .frame(width: 22, height: 22)
+                    Image(systemName: "exclamationmark")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(.white)
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Pizzini is not connected. Tap to retry.")
+        }
+    }
 }
 
 private struct ContactRow: View {
