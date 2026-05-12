@@ -569,6 +569,7 @@ public final class RelayClient: @unchecked Sendable {
                     targetPort: targetPort
                 )
             case .cancelled:
+                relayLog.notice("nwconn → .cancelled — setting state=.idle on \(self.lastTargetHost.prefix(12), privacy: .public)…")
                 self.state = .idle
             default:
                 break
@@ -909,6 +910,8 @@ public final class RelayClient: @unchecked Sendable {
     /// re-sent automatically after a reconnect.
     public func registerPush(token: Data) {
         pushToken = token
+        let st = state
+        relayLog.notice("registerPush called on \(self.lastTargetHost.prefix(12), privacy: .public)… (state=\(String(describing: st), privacy: .public), token=\(token.count) bytes)")
         if state == .connected {
             sendRegisterPush(token: token)
         }
@@ -925,6 +928,8 @@ public final class RelayClient: @unchecked Sendable {
     /// — the relay has no record either way once the socket dropped.
     public func deregisterPush() {
         pushToken = nil
+        let st = state
+        relayLog.notice("deregisterPush called on \(self.lastTargetHost.prefix(12), privacy: .public)… (state=\(String(describing: st), privacy: .public), connection=\(self.connection != nil, privacy: .public))")
         guard state == .connected, let connection else { return }
         var payload = Data()
         payload.append(Self.frameTypeDeregisterPush)
@@ -988,6 +993,8 @@ public final class RelayClient: @unchecked Sendable {
         lastFrameSentAt = Date()
         connection.send(content: frame, completion: .contentProcessed { [weak self] error in
             if let error {
+                let host = self?.lastTargetHost.prefix(12) ?? ""
+                relayLog.error("writeFrame send error on \(host, privacy: .public)…: \(String(describing: error), privacy: .public)")
                 self?.state = .failed("\(error)")
             }
         })
@@ -1060,6 +1067,7 @@ public final class RelayClient: @unchecked Sendable {
                 self.drainFrames()
             }
             if isComplete {
+                relayLog.notice("receive isComplete=true — peer sent FIN — setting state=.idle on \(self.lastTargetHost.prefix(12), privacy: .public)… (buffer=\(self.readBuffer.count) bytes pending)")
                 self.state = .idle
                 return
             }
