@@ -22,13 +22,17 @@ import UIKit
 /// a 5-second timeout, so a memory-bomb or hang never blocks the main
 /// actor. A rendered thumbnail row carries a visible `eye` badge — the
 /// user can see at a glance which rows went through Pizzini's parser.
+// Every member is `nonisolated` so the guard helpers can run inside a
+// `Task.detached` without crossing the file's default main-actor
+// isolation. The enum holds only pure functions + immutable
+// constants; there is no shared mutable state to protect.
 enum AttachmentThumbnail {
     /// Pre-decode size cap. Files larger than this fall back to the
     /// existing Save-to-Files / QuickLook affordances. JPEG / PNG /
     /// HEIC photos straight from a modern phone camera land between
     /// 1.5 and 4 MB; 5 MB covers the common case while keeping a
     /// hard ceiling on memory pressure for a single decode.
-    static let maxByteSize: UInt64 = 5 * 1024 * 1024
+    nonisolated static let maxByteSize: UInt64 = 5 * 1024 * 1024
 
     /// Whitelist of file extensions eligible for in-process decode.
     /// Deliberately narrower than `AttachmentTierClassifier.mediaExtensions`
@@ -36,11 +40,11 @@ enum AttachmentThumbnail {
     /// `.mediaStripAndWarn` for send-time stripping. The wider strip
     /// list is fine because the strip pipeline runs in the AVAsset /
     /// ImageIO sandbox; the thumbnail decode runs in our process.
-    static let allowedExtensions: Set<String> = [
+    nonisolated static let allowedExtensions: Set<String> = [
         "jpg", "jpeg", "png", "heic", "heif",
     ]
 
-    static func isAllowedExtension(_ filename: String) -> Bool {
+    nonisolated static func isAllowedExtension(_ filename: String) -> Bool {
         let lower = filename.lowercased()
         let ext = lower.split(separator: ".").last.map(String.init) ?? ""
         return allowedExtensions.contains(ext)
@@ -55,7 +59,7 @@ enum AttachmentThumbnail {
     /// - PNG: `89 50 4E 47 0D 0A 1A 0A` at offset 0.
     /// - HEIC: 4-byte big-endian box length, then `ftyp` at offset 4,
     ///   then a brand code at offset 8 (we accept the HEIC/HEIF brands).
-    static func hasValidMagic(prefix bytes: Data) -> Bool {
+    nonisolated static func hasValidMagic(prefix bytes: Data) -> Bool {
         if bytes.count >= 3,
            bytes[0] == 0xFF, bytes[1] == 0xD8, bytes[2] == 0xFF {
             return true
@@ -81,7 +85,7 @@ enum AttachmentThumbnail {
     /// `hevc`/`hevx` are HEVC video and are NOT accepted — the
     /// extension whitelist already excludes video, and the brand
     /// check is the second layer of that.
-    private static let heicBrands: Set<Data> = [
+    nonisolated private static let heicBrands: Set<Data> = [
         Data("heic".utf8),
         Data("heix".utf8),
         Data("mif1".utf8),
@@ -92,7 +96,7 @@ enum AttachmentThumbnail {
     /// timed out, or any guard tripped. The caller has already done
     /// the whitelist + magic-byte + size checks; this function adds
     /// the timeout and process-isolation layer.
-    static func decode(_ data: Data) async -> UIImage? {
+    nonisolated static func decode(_ data: Data) async -> UIImage? {
         let task = Task.detached(priority: .utility) { () -> UIImage? in
             UIImage(data: data)
         }
@@ -117,7 +121,7 @@ enum AttachmentThumbnail {
     /// Used by the row to decide whether to even show the "Show
     /// preview" affordance — a row whose filename or size disqualifies
     /// it falls back to the existing Save / QuickLook affordance set.
-    static func canAttempt(filename: String, byteSize: UInt64, url: URL?) -> Bool {
+    nonisolated static func canAttempt(filename: String, byteSize: UInt64, url: URL?) -> Bool {
         guard isAllowedExtension(filename) else { return false }
         guard byteSize <= maxByteSize else { return false }
         guard let url else { return false }
