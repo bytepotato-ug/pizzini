@@ -2015,14 +2015,13 @@ final class ChatStore: NSObject {
         Storage.upsertSettings(state)
     }
 
-    /// Toggle in-app QuickLook previews for received attachments.
-    /// Default is OFF — strict mode keeps the parser surface fully
-    /// out-of-process. ON lets users tap a "Preview" button on inbound
-    /// attachment rows and view the file via `QLPreviewController`,
-    /// whose actual rendering still runs in Apple's QuickLook XPC.
-    func setQuickLookPreviewEnabled(_ enabled: Bool) {
-        guard state.quickLookPreviewEnabled != enabled else { return }
-        state.quickLookPreviewEnabled = enabled
+    /// Switch the attachment-preview tier. Default `.off` — strict
+    /// mode, no bytes parsed. `.quickLook` adds Apple's sandboxed
+    /// QuickLook XPC; `.inlineThumbnail` parses incoming bytes
+    /// in-process behind the `AttachmentThumbnail` guard set.
+    func setAttachmentPreviewMode(_ mode: AttachmentPreviewMode) {
+        guard state.attachmentPreviewMode != mode else { return }
+        state.attachmentPreviewMode = mode
         Storage.upsertSettings(state)
     }
 
@@ -2099,7 +2098,7 @@ final class ChatStore: NSObject {
         let preservedAutoLock = state.autoLockTimeout
         let preservedBiometric = state.biometricLockEnabled
         let preservedOnboarding = state.onboardingCompleted
-        let preservedQuickLook = state.quickLookPreviewEnabled
+        let preservedPreviewMode = state.attachmentPreviewMode
         let preservedPanicMode = state.panicModeEnabled
         let preservedContactsBeforeGroups = state.contactsBeforeGroups
         let preservedInAppHaptics = state.inAppHapticsEnabled
@@ -2118,7 +2117,7 @@ final class ChatStore: NSObject {
             onboardingCompleted: preservedOnboarding,
             biometricLockEnabled: preservedBiometric,
             autoLockTimeout: preservedAutoLock,
-            quickLookPreviewEnabled: preservedQuickLook,
+            attachmentPreviewMode: preservedPreviewMode,
             panicModeEnabled: preservedPanicMode,
             contactsBeforeGroups: preservedContactsBeforeGroups,
             inAppHapticsEnabled: preservedInAppHaptics,

@@ -270,7 +270,11 @@ final class SQLiteStorage {
             onboardingCompleted: stmt.columnBool(1),
             biometricLockEnabled: stmt.columnBool(2),
             autoLockTimeout: autoLock,
-            quickLookPreviewEnabled: stmt.columnBool(4),
+            // INTEGER column on disk. 0/1 are legacy Bool values
+            // (`.off` / `.quickLook`); 2 = `.inlineThumbnail` (added
+            // post-migration). Unknown values fall back to `.off`
+            // rather than crash — strict mode is the safe default.
+            attachmentPreviewMode: AttachmentPreviewMode(legacyInt: stmt.columnInt(4)),
             panicModeEnabled: stmt.columnBool(5),
             qrBlockEffective: stmt.columnOptionalInt64(6).map { $0 != 0 },
             qrBlockTestedOSVersion: stmt.columnText(7),
@@ -314,7 +318,7 @@ final class SQLiteStorage {
             .bind(s.onboardingCompleted, at: 2)
             .bind(s.biometricLockEnabled, at: 3)
             .bind(s.autoLockTimeout.rawValue, at: 4)
-            .bind(s.quickLookPreviewEnabled, at: 5)
+            .bind(s.attachmentPreviewMode.legacyIntValue, at: 5)
             .bind(s.panicModeEnabled, at: 6)
             .bind(s.qrBlockEffective.map { $0 ? Int(1) : Int(0) }, at: 7)
             .bind(s.qrBlockTestedOSVersion, at: 8)

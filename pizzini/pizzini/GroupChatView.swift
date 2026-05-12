@@ -277,7 +277,7 @@ struct GroupChatView: View {
                                 for: row, in: group, previousRow: prior,
                             ),
                             resolveURL: { info in store.attachmentURL(for: info) },
-                            quickLookEnabled: store.state.quickLookPreviewEnabled,
+                            previewMode: store.state.attachmentPreviewMode,
                             onInfoTap: { section in faqAnchor = section },
                             status: rowStatus(for: row),
                             readByAll: rowReadByAll(for: row),
@@ -768,8 +768,8 @@ private struct GroupChatBubble: View {
     /// `AttachmentRowCard` Save-to-Files / Preview affordances work
     /// identically in 1:1 and group chats.
     let resolveURL: (AttachmentInfo) -> URL?
-    /// Honours `state.quickLookPreviewEnabled` like the 1:1 row.
-    let quickLookEnabled: Bool
+    /// Three-tier preview opt-in, mirrors the 1:1 row.
+    let previewMode: AttachmentPreviewMode
     /// FAQ deep-link callback for the receive-side warning banners
     /// inside `AttachmentRowCard`.
     let onInfoTap: ((FAQSection) -> Void)?
@@ -870,7 +870,7 @@ private struct GroupChatBubble: View {
                 bubbleColor: bubbleColor,
                 resolveURL: resolveURL,
                 captionText: message.text,
-                quickLookEnabled: quickLookEnabled,
+                previewMode: previewMode,
                 onInfoTap: onInfoTap,
             )
             .overlay(focusedMatchRing)

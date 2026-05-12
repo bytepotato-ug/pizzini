@@ -536,7 +536,7 @@ struct ChatView: View {
                         entry: entry,
                         status: rowStatus(forEntry: entry),
                         resolveURL: { info in store.attachmentURL(for: info) },
-                        quickLookEnabled: store.state.quickLookPreviewEnabled,
+                        previewMode: store.state.attachmentPreviewMode,
                         onInfoTap: { section in faqAnchor = section },
                         // In-chat find: when the user has an active
                         // query, every matched bubble gets a yellow
@@ -922,10 +922,10 @@ struct ChatRow: View {
     /// concrete URL. Closure rather than direct ChatStore access so the
     /// row stays cheap to construct in tests / previews.
     let resolveURL: (AttachmentInfo) -> URL?
-    /// Honours the user's `quickLookPreviewEnabled` setting — when true
-    /// AND the row is an inbound attachment, we render a Preview button
-    /// that opens QLPreviewController in addition to Save to Files.
-    let quickLookEnabled: Bool
+    /// Three-tier attachment-preview opt-in. `.off` is the strict
+    /// default. `.quickLook` adds the QLPreviewController button.
+    /// `.inlineThumbnail` adds the tap-to-decode in-process render.
+    let previewMode: AttachmentPreviewMode
     /// Bubble (i) info-button taps up to the parent ChatView so it
     /// can present the FAQ sheet at the right anchor.
     let onInfoTap: ((FAQSection) -> Void)?
@@ -953,7 +953,7 @@ struct ChatRow: View {
         entry: PersistedMessage,
         status: OutboxEntry.Status? = nil,
         resolveURL: @escaping (AttachmentInfo) -> URL? = { _ in nil },
-        quickLookEnabled: Bool = false,
+        previewMode: AttachmentPreviewMode = .off,
         onInfoTap: ((FAQSection) -> Void)? = nil,
         highlightQuery: String? = nil,
         isFocusedMatch: Bool = false,
@@ -962,7 +962,7 @@ struct ChatRow: View {
         self.entry = entry
         self.status = status
         self.resolveURL = resolveURL
-        self.quickLookEnabled = quickLookEnabled
+        self.previewMode = previewMode
         self.onInfoTap = onInfoTap
         self.highlightQuery = highlightQuery
         self.isFocusedMatch = isFocusedMatch
@@ -984,7 +984,7 @@ struct ChatRow: View {
                         bubbleColor: bubbleColor,
                         resolveURL: resolveURL,
                         captionText: entry.text,
-                        quickLookEnabled: quickLookEnabled,
+                        previewMode: previewMode,
                         onInfoTap: onInfoTap,
                     )
                     .overlay(focusedMatchRing)
@@ -1163,20 +1163,22 @@ private struct DoubleCheckmark: View {
 }
 
 /// Card view for an attachment chat row. Renders filename + size + an
-/// icon (NEVER a thumbnail — see Pegasus 2021 / "no in-app preview"
-/// hard rule), tier-appropriate warning banner, and either a Save-to-
-/// Files button (inbound) or a status hint (outbound — the file came
-/// from the user's own picker, no need to save it again).
+/// icon, the tier-appropriate warning banner, Save-to-Files, and —
+/// only when the user has explicitly opted in — a tier-2 QuickLook
+/// button or a tier-3 inline thumbnail. Default tier `.off` keeps the
+/// parser surface fully out-of-process (Pegasus 2021 hard rule).
 struct AttachmentRowCard: View {
     let info: AttachmentInfo
     let side: ChatBubbleSide
     let bubbleColor: Color
     let resolveURL: (AttachmentInfo) -> URL?
     let captionText: String
-    /// User's `quickLookPreviewEnabled` setting — when true AND this is
-    /// an inbound row, we render a Preview button that pops
-    /// QLPreviewController. Default false (strict mode).
-    let quickLookEnabled: Bool
+    /// Three-tier preview opt-in. `.off` shows filename + Save-to-Files
+    /// only. `.quickLook` adds a Preview button that pops
+    /// QLPreviewController (Apple XPC). `.inlineThumbnail` adds the
+    /// tap-to-decode in-process thumbnail surface (whitelisted MIMEs +
+    /// size + magic-byte guards in `AttachmentThumbnail`).
+    let previewMode: AttachmentPreviewMode
     /// Bubble taps on the (i) info button up to the parent ChatView
     /// so the FAQ sheet is presented from a single place. Nil means
     /// "no info button" (e.g. a row in a context where deep-linking
@@ -1192,7 +1194,7 @@ struct AttachmentRowCard: View {
         bubbleColor: Color,
         resolveURL: @escaping (AttachmentInfo) -> URL?,
         captionText: String,
-        quickLookEnabled: Bool = false,
+        previewMode: AttachmentPreviewMode = .off,
         onInfoTap: ((FAQSection) -> Void)? = nil
     ) {
         self.info = info
@@ -1200,7 +1202,7 @@ struct AttachmentRowCard: View {
         self.bubbleColor = bubbleColor
         self.resolveURL = resolveURL
         self.captionText = captionText
-        self.quickLookEnabled = quickLookEnabled
+        self.previewMode = previewMode
         self.onInfoTap = onInfoTap
     }
 
@@ -1230,6 +1232,25 @@ struct AttachmentRowCard: View {
             if info.isInbound, let banner = receiveBanner {
                 bannerView(banner)
             }
+            // Tier-3 inline thumbnail. Only renders on inbound rows
+            // that pass the format/size guards — outbound rows came
+            // from the user's own picker (no parser-surface concern)
+            // and unsupported types fall through to the affordance
+            // strip below.
+            if previewMode == .inlineThumbnail,
+               info.isInbound,
+               let resolvedURL = resolveURL(info),
+               AttachmentThumbnail.canAttempt(
+                   filename: info.filename,
+                   byteSize: info.byteSize,
+                   url: resolvedURL,
+               ) {
+                InlineThumbnailView(
+                    url: resolvedURL,
+                    byteSize: info.byteSize,
+                    filename: info.filename,
+                )
+            }
             // Save-to-Files / Preview show on BOTH sides as long as
             // the sandbox copy still exists. The cleanup pass GCs
             // outbound copies after the 7-day TTL same as inbound;
@@ -1238,7 +1259,7 @@ struct AttachmentRowCard: View {
             if resolveURL(info) != nil {
                 HStack(spacing: 8) {
                     saveToFilesButton
-                    if quickLookEnabled {
+                    if previewMode != .off {
                         previewButton
                     }
                 }

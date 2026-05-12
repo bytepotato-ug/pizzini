@@ -113,16 +113,23 @@ struct SettingsView: View {
                 )) {
                     Label("Contacts before groups", systemImage: "list.bullet.indent")
                 }
-                Toggle(isOn: Binding(
-                    get: { store.state.quickLookPreviewEnabled },
-                    set: { store.setQuickLookPreviewEnabled($0) }
-                )) {
-                    Label("In-app preview for attachments", systemImage: "eye")
+                Picker(
+                    selection: Binding(
+                        get: { store.state.attachmentPreviewMode },
+                        set: { store.setAttachmentPreviewMode($0) }
+                    ),
+                ) {
+                    Text("Off (filename only)").tag(AttachmentPreviewMode.off)
+                    Text("QuickLook (Apple sandbox)").tag(AttachmentPreviewMode.quickLook)
+                    Text("Inline thumbnail (in-process)").tag(AttachmentPreviewMode.inlineThumbnail)
+                } label: {
+                    Label("Attachment preview", systemImage: "eye")
                 }
+                .pickerStyle(.navigationLink)
             } header: {
                 Text("Chats")
             } footer: {
-                Text("Panic mode: three fast taps in a chat instantly delete it — no undo. List order: 1:1 chats above groups (or below). In-app preview: off keeps received files out of Pizzini until you tap Save to Files.")
+                Text("Panic mode: three fast taps in a chat instantly delete it — no undo. List order: 1:1 chats above groups (or below). Attachment preview: Off renders no bytes inside Pizzini — you save to Files first. QuickLook hands the file to Apple's sandboxed previewer. Inline thumbnail renders JPEG/PNG/HEIC in Pizzini's process on tap — trades some parser hardening for convenience.")
             }
 
             if store.state.qrBlockEffective == false {

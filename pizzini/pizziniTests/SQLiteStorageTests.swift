@@ -28,7 +28,7 @@ struct SQLiteStorageTests {
             onboardingCompleted: true,
             biometricLockEnabled: true,
             autoLockTimeout: .fiveMinutes,
-            quickLookPreviewEnabled: true,
+            attachmentPreviewMode: .inlineThumbnail,
             panicModeEnabled: true,
             qrBlockEffective: false,
             qrBlockTestedOSVersion: "26.0.1",
@@ -42,7 +42,7 @@ struct SQLiteStorageTests {
         #expect(loaded?.onboardingCompleted == true)
         #expect(loaded?.biometricLockEnabled == true)
         #expect(loaded?.autoLockTimeout == .fiveMinutes)
-        #expect(loaded?.quickLookPreviewEnabled == true)
+        #expect(loaded?.attachmentPreviewMode == .inlineThumbnail)
         #expect(loaded?.panicModeEnabled == true)
         #expect(loaded?.qrBlockEffective == false)
         #expect(loaded?.qrBlockTestedOSVersion == "26.0.1")

@@ -476,6 +476,44 @@ enum AutoLockTimeout: String, Codable, CaseIterable, Sendable {
     }
 }
 
+/// Three tiers of opt-in for received-attachment rendering. Stored in
+/// `AppState.attachmentPreviewMode`. Off is the default for every new
+/// install AND every upgrade — the strict no-parse posture is the
+/// baseline; the user has to flip something to get bytes parsed by
+/// Pizzini or by QuickLook.
+///
+/// `.inlineThumbnail` lives behind a separate explicit opt-in from
+/// `.quickLook` because it parses incoming bytes inside Pizzini's
+/// process (subject to the MIME whitelist + magic-byte + size-cap
+/// guards in `AttachmentThumbnail`), whereas `.quickLook` only ever
+/// hands a file URL to Apple's QuickLook XPC.
+enum AttachmentPreviewMode: String, Codable, Sendable, CaseIterable {
+    case off
+    case quickLook
+    case inlineThumbnail
+
+    /// SQLCipher migration: the `settings.quicklook_preview_enabled`
+    /// INTEGER column stored 0/1 before the three-tier rollout (legacy
+    /// Bool); 2 is the new `.inlineThumbnail` value. Unknown integers
+    /// land on `.off` — the strict default is the safe failure mode
+    /// for an unexpected row.
+    init(legacyInt value: Int) {
+        switch value {
+        case 1: self = .quickLook
+        case 2: self = .inlineThumbnail
+        default: self = .off
+        }
+    }
+
+    var legacyIntValue: Int {
+        switch self {
+        case .off: return 0
+        case .quickLook: return 1
+        case .inlineThumbnail: return 2
+        }
+    }
+}
+
 /// Everything the UI needs that lives outside the libsignal store. Encoded
 /// to JSON, sealed into Keychain. Bumping `version` lets us migrate.
 ///
@@ -489,15 +527,17 @@ struct AppState: Codable, Sendable {
     var onboardingCompleted: Bool
     var biometricLockEnabled: Bool
     var autoLockTimeout: AutoLockTimeout
-    /// When true, received attachments get an extra "Preview" button
-    /// that opens `QLPreviewController` in-app. Default OFF — the
-    /// strict-mode UX (filename + Save to Files only) keeps the parser
-    /// surface fully out-of-process for the highest-risk users.
-    /// Turning it on doesn't expose us to zero-click attacks (the user
-    /// still has to tap explicitly) and the actual rendering happens
-    /// in QuickLook's XPC, but it does widen the in-process integration
-    /// surface a hair vs the strict default.
-    var quickLookPreviewEnabled: Bool
+    /// Three-tier opt-in for how received attachments render. Default
+    /// `.off` — filename + icon + Save-to-Files only; Pizzini never
+    /// parses incoming bytes. `.quickLook` adds a Preview button that
+    /// pops `QLPreviewController` (Apple's sandboxed XPC). Tier 3,
+    /// `.inlineThumbnail`, renders a tap-to-decode thumbnail in
+    /// Pizzini's own process for whitelisted image MIMEs only — see
+    /// `AttachmentThumbnail` for the size cap / magic-byte / timeout
+    /// guards that gate the decode. Tier-3 widens the parser surface
+    /// in exchange for one-tap visual identification; opt-in is
+    /// explicit on every install.
+    var attachmentPreviewMode: AttachmentPreviewMode
     /// When true, three fast taps anywhere on the chat-content area
     /// inside an open chat instantly deletes that chat (the
     /// per-contact log; the contact and the encryption session
@@ -595,7 +635,7 @@ struct AppState: Codable, Sendable {
         onboardingCompleted: Bool = false,
         biometricLockEnabled: Bool = false,
         autoLockTimeout: AutoLockTimeout = .immediately,
-        quickLookPreviewEnabled: Bool = false,
+        attachmentPreviewMode: AttachmentPreviewMode = .off,
         panicModeEnabled: Bool = false,
         qrBlockEffective: Bool? = nil,
         qrBlockTestedOSVersion: String? = nil,
@@ -612,7 +652,7 @@ struct AppState: Codable, Sendable {
         self.onboardingCompleted = onboardingCompleted
         self.biometricLockEnabled = biometricLockEnabled
         self.autoLockTimeout = autoLockTimeout
-        self.quickLookPreviewEnabled = quickLookPreviewEnabled
+        self.attachmentPreviewMode = attachmentPreviewMode
         self.panicModeEnabled = panicModeEnabled
         self.qrBlockEffective = qrBlockEffective
         self.qrBlockTestedOSVersion = qrBlockTestedOSVersion
@@ -624,6 +664,13 @@ struct AppState: Codable, Sendable {
         self.blockedIdentities = blockedIdentities
     }
 
+    /// Legacy JSON keys that earlier builds wrote but the current
+    /// build no longer encodes. Read at decode time for migration, in
+    /// a separate container so `encode(to:)` doesn't re-emit them.
+    private enum LegacyCodingKeys: String, CodingKey {
+        case quickLookPreviewEnabled
+    }
+
     private enum CodingKeys: String, CodingKey {
         case version
         case relayHost
@@ -631,7 +678,7 @@ struct AppState: Codable, Sendable {
         case onboardingCompleted
         case biometricLockEnabled
         case autoLockTimeout
-        case quickLookPreviewEnabled
+        case attachmentPreviewMode
         case panicModeEnabled
         case qrBlockEffective
         case qrBlockTestedOSVersion
@@ -651,7 +698,25 @@ struct AppState: Codable, Sendable {
         onboardingCompleted = try c.decodeIfPresent(Bool.self, forKey: .onboardingCompleted) ?? false
         biometricLockEnabled = try c.decodeIfPresent(Bool.self, forKey: .biometricLockEnabled) ?? false
         autoLockTimeout = try c.decodeIfPresent(AutoLockTimeout.self, forKey: .autoLockTimeout) ?? .immediately
-        quickLookPreviewEnabled = try c.decodeIfPresent(Bool.self, forKey: .quickLookPreviewEnabled) ?? false
+        // Three-tier mode supersedes the prior `quickLookPreviewEnabled`
+        // Bool. Newer blobs carry the explicit enum; older blobs carry
+        // the Bool, where true → `.quickLook`, false / absent → `.off`.
+        // Preserves the user's existing choice across the upgrade — a
+        // user who opted into QuickLook stays opted in, a user who
+        // never opted in stays on the strict default. The legacy key
+        // is read via a separate `LegacyKeys` container so it doesn't
+        // pollute the synthesized `encode(to:)`; the field is not
+        // re-emitted on next write.
+        if let mode = try c.decodeIfPresent(AttachmentPreviewMode.self, forKey: .attachmentPreviewMode) {
+            attachmentPreviewMode = mode
+        } else {
+            let legacyContainer = try decoder.container(keyedBy: LegacyCodingKeys.self)
+            if let legacy = try legacyContainer.decodeIfPresent(Bool.self, forKey: .quickLookPreviewEnabled) {
+                attachmentPreviewMode = legacy ? .quickLook : .off
+            } else {
+                attachmentPreviewMode = .off
+            }
+        }
         panicModeEnabled = try c.decodeIfPresent(Bool.self, forKey: .panicModeEnabled) ?? false
         qrBlockEffective = try c.decodeIfPresent(Bool.self, forKey: .qrBlockEffective)
         qrBlockTestedOSVersion = try c.decodeIfPresent(String.self, forKey: .qrBlockTestedOSVersion)
