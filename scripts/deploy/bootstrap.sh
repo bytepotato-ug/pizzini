@@ -264,12 +264,29 @@ fi
 # own SSH key to /root or rotate the box password.
 install -d -m 0750 -o root -g root /etc/sudoers.d
 cat > /etc/sudoers.d/90-pizzini-admin <<'SUDOEOF'
-# Pizzini relay break-glass account — installed by scripts/deploy/bootstrap.sh.
-# Capability-restricted NOPASSWD: a remote RCE landing as pizzini-admin
-# cannot escalate to arbitrary root via sudo. Full root recovery
-# requires the provider's rescue console (a separate, physical-key
-# trust path).
-pizzini-admin ALL=(ALL) NOPASSWD: /bin/systemctl, /usr/bin/systemctl, /bin/journalctl, /usr/bin/journalctl, /usr/sbin/nft list ruleset, /usr/bin/apt-get update, /usr/bin/apt-get upgrade -y, /usr/bin/apt-get dist-upgrade -y, /usr/bin/tail, /usr/bin/less
+# Pizzini relay shell account — installed by scripts/deploy/bootstrap.sh.
+#
+# Full NOPASSWD: ALL. The rationale: pizzini-admin authenticates by
+# SSH key only (`PasswordAuthentication no`, `PermitRootLogin no` in
+# 90-pizzini-hardening.conf). There is no realistic path to a
+# pizzini-admin shell on this box without that key — the relay binary
+# runs as a different user (pizzini-relay) under a systemd sandbox,
+# no web service runs as pizzini-admin, and no cron jobs are
+# installed for it. The capability-restrict that lived here briefly
+# (systemctl + journalctl + apt-get + tail + less only) was
+# theoretical defense-in-depth that imposed real operational pain:
+# every relay-protocol bump needs a binary refresh, every config
+# tweak needs a sudoers update, and routing the operator through
+# the provider's web console for each one didn't scale.
+#
+# What still hardens this box and survives:
+#   * Root SSH off, password auth off (90-pizzini-hardening.conf)
+#   * fail2ban on sshd
+#   * nftables drop-by-default in + out
+#   * AppArmor on tor; systemd sandbox on the relay service
+#   * Onion-only inbound (no 7777 on the public internet)
+#   * The relay binary runs as pizzini-relay, not pizzini-admin
+pizzini-admin ALL=(ALL) NOPASSWD: ALL
 SUDOEOF
 chmod 0440 /etc/sudoers.d/90-pizzini-admin
 # Validate the sudoers drop-in before continuing — a syntax error
@@ -282,71 +299,26 @@ if ! visudo -cf /etc/sudoers.d/90-pizzini-admin >/dev/null 2>&1; then
     exit 1
 fi
 
-# Path-restricted binary-update grant. The 90-pizzini-admin drop-in
-# above intentionally excludes `install` / `cp` / `tee` so a
-# compromised pizzini-admin shell can't overwrite system binaries.
-# But that also blocks the legitimate "scp new pizzini-relay binary +
-# systemctl restart" deploy workflow — every relay-protocol bump
-# needs a binary refresh, and routing operators through the Hetzner
-# web console for each update doesn't scale.
-#
-# The compromise: allow ONE specific install invocation with
-# hard-coded mode (0755), owner (root:root), source path
-# (/tmp/pizzini-relay-new) and destination path
-# (/usr/local/bin/pizzini-relay). Sudoers compares the resolved
-# command line against the literal pattern, so a compromised
-# pizzini-admin can replace the relay binary at that exact path but
-# cannot:
-#   * write elsewhere in /usr/local/bin or /usr/bin
-#   * change ownership to a non-root user
-#   * symlink-pivot the destination (sudoers evaluates the literal
-#     path string, not the resolved path; combined with the systemd
-#     unit pointing at the literal /usr/local/bin/pizzini-relay path,
-#     a sym/hard-link planted there gets overwritten on next deploy)
-#
-# The deploy flow is then:
-#   scp pizzini-relay pizzini-admin@host:/tmp/pizzini-relay-new
-#   ssh pizzini-admin@host 'sudo install -m 0755 -o root -g root \
-#       /tmp/pizzini-relay-new /usr/local/bin/pizzini-relay \
-#       && sudo systemctl restart pizzini-relay'
-cat > /etc/sudoers.d/91-pizzini-relay-update <<'SUDOEOF'
-# Pizzini relay binary update — installed by scripts/deploy/bootstrap.sh.
-# Single path-restricted NOPASSWD entry so binary refreshes don't
-# require the provider's web console. See the bootstrap.sh comment
-# block for the threat-model reasoning.
-pizzini-admin ALL=(ALL) NOPASSWD: /usr/bin/install -m 0755 -o root -g root /tmp/pizzini-relay-new /usr/local/bin/pizzini-relay
-SUDOEOF
-chmod 0440 /etc/sudoers.d/91-pizzini-relay-update
-if ! visudo -cf /etc/sudoers.d/91-pizzini-relay-update >/dev/null 2>&1; then
-    echo "[bootstrap] 91-pizzini-relay-update failed validation — removing" >&2
-    rm -f /etc/sudoers.d/91-pizzini-relay-update
+# Pre-hardening sanity check: pizzini-admin's authorized_keys must
+# parse as valid SSH public keys. The 0-byte guard above catches
+# "no keys at all"; this catches "garbage in the file" — a corrupted
+# seed_authorized_keys would otherwise let sshd hardening lock us
+# out the moment we disable root login. `ssh-keygen -l -f` exits
+# non-zero if ANY line is malformed.
+if ! ssh-keygen -l -f /home/pizzini-admin/.ssh/authorized_keys >/dev/null 2>&1; then
+    echo "[bootstrap] refusing to harden sshd: pizzini-admin authorized_keys contains malformed lines" >&2
+    ssh-keygen -l -f /home/pizzini-admin/.ssh/authorized_keys 2>&1 | head -10 >&2
     exit 1
 fi
-
-# ---- 12b. sshd hardening ----
-install -d -m 0755 -o root -g root /etc/ssh/sshd_config.d
-cat > /etc/ssh/sshd_config.d/90-pizzini-hardening.conf <<'SSHEOF'
-# Pizzini relay sshd hardening — installed by scripts/deploy/bootstrap.sh.
-PermitRootLogin no
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-ChallengeResponseAuthentication no
-PermitEmptyPasswords no
-X11Forwarding no
-AllowAgentForwarding no
-AllowTcpForwarding no
-PrintMotd no
-ClientAliveInterval 60
-ClientAliveCountMax 3
-SSHEOF
-chmod 0644 /etc/ssh/sshd_config.d/90-pizzini-hardening.conf
-
-if ! sshd -t; then
-    echo "[bootstrap] sshd config invalid — leaving prior config active" >&2
+# Second pre-hardening sanity: pizzini-admin must be able to sudo
+# non-interactively. With NOPASSWD: ALL this is trivially true, but
+# the check is cheap and guards against a future sudoers tightening
+# that accidentally requires a password.
+if ! runuser -l pizzini-admin -c 'sudo -n true' 2>/dev/null; then
+    echo "[bootstrap] refusing to harden sshd: pizzini-admin cannot sudo non-interactively" >&2
+    runuser -l pizzini-admin -c 'sudo -n true' 2>&1 | head -5 >&2
     exit 1
 fi
-# `reload` not `restart` so the active SSH session isn't dropped.
-systemctl reload ssh
 
 # ---- 13. fail2ban for sshd ----
 install -d -m 0755 -o root -g root /etc/fail2ban/jail.d
@@ -501,6 +473,47 @@ if (( selftest_rc != 0 )); then
     exit 1
 fi
 echo "[bootstrap] self-test: PASSED — operator can run \`sudo install … && sudo systemctl restart pizzini-relay\`."
+
+# ---- 15c. sshd hardening (LAST — only after the self-test passed) ----
+#
+# Deliberately moved to the very end. Two prior incidents (USA box,
+# May 2026) ended with the operator locked out because sshd was
+# hardened mid-bootstrap and a subsequent step failed before the
+# operator-path self-test got to run. Doing the hardening LAST
+# means:
+#
+#   * Every prior step (sudoers seeded, authorized_keys parses
+#     clean, pizzini-admin can sudo, services started, self-test
+#     passed) has been verified before we disable root SSH.
+#   * If anything failed earlier, `exit 1` fires while root SSH
+#     is still permitted — operator fixes whatever broke and
+#     re-runs without needing the provider's web console.
+#
+# `sshd -t` validates the config syntactically; `reload` (not
+# `restart`) keeps any active SSH session alive across the
+# transition. The hardening still applies to the NEXT connection.
+install -d -m 0755 -o root -g root /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/90-pizzini-hardening.conf <<'SSHEOF'
+# Pizzini relay sshd hardening — installed by scripts/deploy/bootstrap.sh.
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PermitEmptyPasswords no
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+PrintMotd no
+ClientAliveInterval 60
+ClientAliveCountMax 3
+SSHEOF
+chmod 0644 /etc/ssh/sshd_config.d/90-pizzini-hardening.conf
+if ! sshd -t; then
+    echo "[bootstrap] sshd config invalid — leaving prior config active" >&2
+    rm -f /etc/ssh/sshd_config.d/90-pizzini-hardening.conf
+    exit 1
+fi
+systemctl reload ssh
 
 # ---- 16. final report ----
 echo
