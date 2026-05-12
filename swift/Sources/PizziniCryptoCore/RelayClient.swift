@@ -232,10 +232,32 @@ public final class RelayClient: @unchecked Sendable {
     public static let deliveryTokenLen: Int = 16 + 4 + 64
 
     public weak var delegate: RelayClientDelegate?
+    /// The onion host this client was last asked to dial. Captured in
+    /// `connect(to:port:)` so per-transition diagnostic log lines can
+    /// identify which fleet member fired the event without the reader
+    /// having to cross-reference timestamps against ChatStore's
+    /// "connecting to Relay X" pre-dial line.
+    private var lastTargetHost: String = ""
     public private(set) var state: State = .idle {
         didSet {
             guard oldValue != state else { return }
             let snapshot = state
+            // Diagnostic — every state transition. Without this, the
+            // `.connected → .idle` flap that occasionally hits one
+            // member of a multi-relay fleet (`pizziniN…` going dark
+            // seconds after the relay-attest line) is invisible:
+            // none of the four `.idle`-write sites in this file log
+            // anything, so the only signal in the Console.app dump
+            // is the perRelayState dict mutating in ChatStore, which
+            // is too far downstream to tell us WHICH write fired.
+            // %{public}@ formatting because the relay onion is a
+            // public address (already on the wire in the SOCKS
+            // CONNECT) and the transition itself is the entire
+            // diagnostic value.
+            let hostPrefix = lastTargetHost.prefix(12)
+            relayLog.notice(
+                "state: \(hostPrefix, privacy: .public)… \(String(describing: oldValue), privacy: .public) → \(String(describing: snapshot), privacy: .public)"
+            )
             let delegate = self.delegate
             let client = self
             queue.async {
@@ -307,6 +329,7 @@ public final class RelayClient: @unchecked Sendable {
 
     public func connect(to host: String, port: UInt16) {
         disconnect()
+        lastTargetHost = host
         state = .connecting
         socksRetries = 0
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
