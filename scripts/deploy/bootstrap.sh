@@ -432,6 +432,76 @@ done
 
 systemctl restart pizzini-relay.service
 
+# ---- 15b. operator path self-test ----
+# Before we declare bootstrap complete, verify pizzini-admin can
+# actually do the routine operator workflow: drop a file in /tmp,
+# `sudo install` it with the path-restricted entry from
+# 91-pizzini-relay-update. Without this check, a future hardening
+# tweak to bootstrap.sh could land a box in a state where the only
+# way to update the relay binary is the provider's web console —
+# which is the operational footgun we keep hitting.
+#
+# Test shape mirrors `scripts/deploy/redeploy-relay.sh`'s deploy
+# path exactly: same sudoers command, same paths, same `runuser`
+# context. If the test fails, the bootstrap aborts and the operator
+# is told exactly what's broken — better than discovering it three
+# weeks later when the next binary update is needed.
+echo
+echo "[bootstrap] self-test: operator can update relay binary…"
+SELFTEST_TMP=/tmp/pizzini-relay-new
+SELFTEST_DEST=/usr/local/bin/pizzini-relay
+SELFTEST_BACKUP=/var/lib/pizzini-relay/.bootstrap-selftest-backup
+# Snapshot the live binary so we can restore even if `install` is
+# somehow destructive on this box's filesystem (e.g. an ENOSPC mid-
+# write). The backup lives in /var/lib/pizzini-relay (the relay's
+# StateDirectory, 0700 pizzini-relay:pizzini-relay) so a compromised
+# pizzini-admin can't substitute it.
+cp -p "$SELFTEST_DEST" "$SELFTEST_BACKUP"
+chown pizzini-relay:pizzini-relay "$SELFTEST_BACKUP"
+chmod 0600 "$SELFTEST_BACKUP"
+# Copy the live binary as the "new" file pizzini-admin would scp.
+# install -p preserves mode; we strip down to 0644 owned by
+# pizzini-admin to simulate a fresh scp landing.
+cp "$SELFTEST_DEST" "$SELFTEST_TMP"
+chown pizzini-admin:pizzini-admin "$SELFTEST_TMP"
+chmod 0644 "$SELFTEST_TMP"
+# Run the sudo install AS pizzini-admin via runuser. We use
+# `runuser -l` so PATH + HOME are correct for the target user;
+# `--` then `sudo …` is what pizzini-admin would actually type.
+# Capture rc separately so we can clean up regardless.
+selftest_rc=0
+runuser -l pizzini-admin -c 'sudo /usr/bin/install -m 0755 -o root -g root /tmp/pizzini-relay-new /usr/local/bin/pizzini-relay' \
+    || selftest_rc=$?
+# Restart via the same sudoers path the operator uses.
+runuser -l pizzini-admin -c 'sudo /bin/systemctl restart pizzini-relay' \
+    || selftest_rc=$?
+# Verify listener came back up.
+sleep 2
+if ! ss -tln | grep -qF '127.0.0.1:7777'; then
+    selftest_rc=1
+fi
+# Cleanup the staging file; restore the backup ONLY if the test
+# wrote something different (a no-op install should leave the
+# binary identical to the backup anyway, but we're paranoid).
+rm -f "$SELFTEST_TMP"
+if [[ "$(sha256sum "$SELFTEST_DEST" | awk '{print $1}')" != \
+      "$(sha256sum "$SELFTEST_BACKUP" | awk '{print $1}')" ]]; then
+    install -m 0755 -o root -g root "$SELFTEST_BACKUP" "$SELFTEST_DEST"
+    systemctl restart pizzini-relay.service
+fi
+rm -f "$SELFTEST_BACKUP"
+
+if (( selftest_rc != 0 )); then
+    echo "[bootstrap] SELF-TEST FAILED — operator cannot deploy binary updates." >&2
+    echo "[bootstrap] One of the following is wrong:" >&2
+    echo "[bootstrap]   * /etc/sudoers.d/91-pizzini-relay-update is missing or malformed" >&2
+    echo "[bootstrap]   * /etc/sudoers.d/90-pizzini-admin doesn't allow systemctl restart" >&2
+    echo "[bootstrap]   * pizzini-admin can't reach /tmp/ or /usr/local/bin/" >&2
+    echo "[bootstrap] Fix and re-run bootstrap.sh. The relay binary has been restored." >&2
+    exit 1
+fi
+echo "[bootstrap] self-test: PASSED — operator can run \`sudo install … && sudo systemctl restart pizzini-relay\`."
+
 # ---- 16. final report ----
 echo
 echo "================================================================"
