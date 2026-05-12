@@ -50,7 +50,14 @@ if [[ "$(git rev-parse --abbrev-ref HEAD)" != "main" ]]; then
     exit 1
 fi
 
-if ! git diff --quiet HEAD -- || [[ -n "$(git ls-files --others --exclude-standard | grep -v -E '^(vendor/|.cargo/)' || true)" ]]; then
+# Untracked-file exclusions:
+#   vendor/, .cargo/        — build artifacts from scripts/build-relay-release.sh
+#   scripts/update-macbook.sh — bootstrap chicken-and-egg: a fresh
+#       clone that doesn't have this file yet would have an operator
+#       hand-paste it before running, which then makes the script see
+#       ITSELF as untracked and abort. Once origin's commit lands the
+#       file as tracked, the exclusion is a no-op.
+if ! git diff --quiet HEAD -- || [[ -n "$(git ls-files --others --exclude-standard | grep -v -E '^(vendor/|.cargo/|scripts/update-macbook.sh$)' || true)" ]]; then
     if (( FORCE == 1 )); then
         STASH_MSG="update-macbook.sh auto-stash $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         warn "working tree dirty — stashing as: $STASH_MSG"
