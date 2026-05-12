@@ -24,9 +24,21 @@ struct LockOverlayView: View {
             Color(.systemBackground).ignoresSafeArea()
             VStack(spacing: 24) {
                 Spacer()
-                Image(systemName: "lock.shield")
-                    .font(.system(size: 96))
-                    .foregroundStyle(.tint)
+                // Pizzini brand logo above the "locked" label.
+                // Reinforces the user is in the right app before
+                // they authenticate — Face ID UX prompts can be
+                // mimicked by malicious apps, so the user seeing
+                // "this is the Pizzini lock screen, with the
+                // Pizzini logo" before tapping unlock is a real
+                // signal.
+                Image("AppLogo")
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 96, height: 96)
+                    .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                    .shadow(color: .black.opacity(0.15), radius: 6, x: 0, y: 3)
+                    .accessibilityLabel("Pizzini logo")
                 Text("Pizzini is locked")
                     .font(.title2.bold())
                 Text(subtitleText)

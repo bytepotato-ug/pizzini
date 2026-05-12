@@ -1,8 +1,17 @@
 import CryptoKit
 import Foundation
+import os
 import PizziniCryptoCore
 import PizziniDB
 import Security
+
+/// At-rest key derivation log channel. Console.app filter:
+/// `subsystem:app.pizzini category:dbkey`. The messages emitted
+/// here are static strings (no sensitive interpolation) because
+/// anything covering the actual key material or Argon2id output
+/// would be a leak — we only log policy decisions ("params below
+/// floor", etc.).
+private let dbKeyLog = Logger(subsystem: "app.pizzini", category: "dbkey")
 
 /// Derives the SQLCipher database key.
 ///
@@ -343,7 +352,7 @@ enum DBKey {
             parallelism: stored.parallelism,
         )
         if paramsFailMinimumStrength(params) {
-            NSLog("[pizzini.dbkey] stored Argon2id params below floor — using production")
+            dbKeyLog.notice("stored Argon2id params below floor — using production")
             return .production
         }
         return params
@@ -354,8 +363,9 @@ enum DBKey {
     /// Production is M=64 MiB, T=3, P=1. The floor leaves room for
     /// future hardware-aware lowering on truly resource-constrained
     /// devices while still refusing anything that's brute-forceable
-    /// in seconds.
-    private static func paramsFailMinimumStrength(_ p: Argon2id.Params) -> Bool {
+    /// in seconds. Internal (not private) so tests can pin the
+    /// boundary — see `DBKeyParamsFloorTests`.
+    static func paramsFailMinimumStrength(_ p: Argon2id.Params) -> Bool {
         if p.memoryKiB < 32 * 1024 { return true }  // < 32 MiB
         if p.timeIterations < 2 { return true }
         return false

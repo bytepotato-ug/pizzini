@@ -265,6 +265,13 @@ struct Contact: Codable, Identifiable, Sendable {
     /// header shows the "compare safety number" call to action and the
     /// list-row badge stays warning-coloured until set.
     var verifiedAt: Date?
+    /// Per-contact mute: when true, incoming messages from this peer
+    /// don't bump the unread badge or fire haptics, and the relay's
+    /// "New message" push for this peer is suppressed at receive time.
+    /// The chat row still updates and the contact-list row still
+    /// surfaces newest-first; "mute" is purely the attention-grab
+    /// surface, not message delivery.
+    var mutedAt: Date?
 
     init(
         id: UUID = UUID(),
@@ -283,7 +290,8 @@ struct Contact: Codable, Identifiable, Sendable {
         peerVerifyKey: Data? = nil,
         lastBundleServedAt: Date? = nil,
         addedVia: ContactSource = .qrScan,
-        verifiedAt: Date? = nil
+        verifiedAt: Date? = nil,
+        mutedAt: Date? = nil
     ) {
         self.id = id
         self.identityPub = identityPub
@@ -302,6 +310,7 @@ struct Contact: Codable, Identifiable, Sendable {
         self.lastBundleServedAt = lastBundleServedAt
         self.addedVia = addedVia
         self.verifiedAt = verifiedAt
+        self.mutedAt = mutedAt
     }
 
     /// Three-state shorthand for verification status used by the UI.
@@ -343,6 +352,7 @@ struct Contact: Codable, Identifiable, Sendable {
         case readReceiptsMode
         case peerVerifyKey, lastBundleServedAt
         case addedVia, verifiedAt
+        case mutedAt
     }
 
     init(from decoder: Decoder) throws {
@@ -382,6 +392,7 @@ struct Contact: Codable, Identifiable, Sendable {
         // in person" trust.
         self.addedVia = try c.decodeIfPresent(ContactSource.self, forKey: .addedVia) ?? .unknown
         self.verifiedAt = try c.decodeIfPresent(Date.self, forKey: .verifiedAt)
+        self.mutedAt = try c.decodeIfPresent(Date.self, forKey: .mutedAt)
     }
 
     /// Explicit encode because the legacy `readReceiptsEnabled`
@@ -408,6 +419,7 @@ struct Contact: Codable, Identifiable, Sendable {
         try c.encodeIfPresent(lastBundleServedAt, forKey: .lastBundleServedAt)
         try c.encode(addedVia, forKey: .addedVia)
         try c.encodeIfPresent(verifiedAt, forKey: .verifiedAt)
+        try c.encodeIfPresent(mutedAt, forKey: .mutedAt)
     }
 
     var unreadCount: Int {
@@ -427,7 +439,16 @@ struct Contact: Codable, Identifiable, Sendable {
 }
 
 extension AppState {
-    var totalUnread: Int { contacts.reduce(0) { $0 + $1.unreadCount } }
+    /// Sum of unread message counts across non-muted contacts. Drives
+    /// the app-icon badge. Muted contacts still surface unread counts
+    /// in their own row (so the user can see "I have N unread from
+    /// Alice"), but they don't push that count to the home-screen
+    /// badge — that's the entire point of muting.
+    var totalUnread: Int {
+        contacts.reduce(0) { acc, c in
+            c.mutedAt == nil ? acc + c.unreadCount : acc
+        }
+    }
 }
 
 enum AutoLockTimeout: String, Codable, CaseIterable, Sendable {
@@ -540,6 +561,24 @@ struct AppState: Codable, Sendable {
     /// every contact whose `readReceiptsMode == .followDefault`.
     var defaultReadReceiptsEnabled: Bool
 
+    /// App-wide notifications mute. When true, the NSE refuses to
+    /// bump the badge, the main app fires no haptic on receive, and
+    /// the user sees no attention-grab surface until they open the
+    /// app themselves. Messages still arrive and persist. The user-
+    /// facing copy is "Pause notifications" (Settings → Notifications).
+    /// Default OFF — privacy-first posture, but not the *attention*-
+    /// first posture; users opt-in when they want quiet hours.
+    var notificationsMuted: Bool
+
+    /// Persistent block list. Identity-pub bytes of peers the user
+    /// has explicitly blocked. Survives `deleteContact` → re-add
+    /// cycles, so a removed peer who later re-pairs the same
+    /// identityPub stays blocked. Inbound bundles, tokens, sealed
+    /// SENDs, and BUNDLE_REQUESTs from a blocked identity are
+    /// dropped at the receive-side gate. Distinct from `deleteContact`
+    /// (which only removes the row).
+    var blockedIdentities: [Data]
+
     static let currentVersion = 1
     // Empty = use the bundled trusted-onion fleet from
     // `RelayRegistry.trusted` (D5 default). A non-empty value is a
@@ -563,7 +602,9 @@ struct AppState: Codable, Sendable {
         groups: [ChatGroup] = [],
         contactsBeforeGroups: Bool = true,
         inAppHapticsEnabled: Bool = false,
-        defaultReadReceiptsEnabled: Bool = false
+        defaultReadReceiptsEnabled: Bool = false,
+        notificationsMuted: Bool = false,
+        blockedIdentities: [Data] = []
     ) {
         self.version = version
         self.relayHost = relayHost
@@ -579,6 +620,8 @@ struct AppState: Codable, Sendable {
         self.contactsBeforeGroups = contactsBeforeGroups
         self.inAppHapticsEnabled = inAppHapticsEnabled
         self.defaultReadReceiptsEnabled = defaultReadReceiptsEnabled
+        self.notificationsMuted = notificationsMuted
+        self.blockedIdentities = blockedIdentities
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -596,6 +639,8 @@ struct AppState: Codable, Sendable {
         case contactsBeforeGroups
         case inAppHapticsEnabled
         case defaultReadReceiptsEnabled
+        case notificationsMuted
+        case blockedIdentities
     }
 
     init(from decoder: Decoder) throws {
@@ -614,6 +659,8 @@ struct AppState: Codable, Sendable {
         contactsBeforeGroups = try c.decodeIfPresent(Bool.self, forKey: .contactsBeforeGroups) ?? true
         inAppHapticsEnabled = try c.decodeIfPresent(Bool.self, forKey: .inAppHapticsEnabled) ?? false
         defaultReadReceiptsEnabled = try c.decodeIfPresent(Bool.self, forKey: .defaultReadReceiptsEnabled) ?? false
+        notificationsMuted = try c.decodeIfPresent(Bool.self, forKey: .notificationsMuted) ?? false
+        blockedIdentities = try c.decodeIfPresent([Data].self, forKey: .blockedIdentities) ?? []
         // Pre-existing JSON blobs from earlier builds may carry the
         // `notifyPeerOnScreenshot`, `blockQRScreenshots`,
         // `blockChatScreenshots`, and `blockAppScreenshots` keys.

@@ -1,6 +1,15 @@
 import Foundation
+import os
 import PizziniCryptoCore
 import PizziniDB
+
+/// SQLCipher store + at-rest key-rotation log channel. Console.app
+/// filter: `subsystem:app.pizzini category:storage`. Error bodies
+/// are `privacy: .private` so the SQLCipher / SQLite error text
+/// (which can include column names, constraint identifiers, file
+/// paths) is redacted in sysdiagnose, matching the threat-model
+/// concern documented in `PrivateLog.swift`.
+private let storageLog = Logger(subsystem: "app.pizzini", category: "storage")
 
 /// SQLCipher-backed implementation of Pizzini's on-disk store.
 ///
@@ -127,9 +136,9 @@ final class SQLiteStorage {
         if DBKey.rotationDue() {
             do {
                 _ = try DBKey.rotateKeyMaterial(liveDB: db, params: params)
-                NSLog("[pizzini.dbkey] at-rest key rotated (USP #8)")
+                storageLog.notice("at-rest key rotated (USP #8)")
             } catch {
-                NSLog("[pizzini.dbkey] at-rest key rotation FAILED: \(error)")
+                storageLog.error("at-rest key rotation FAILED: \(String(describing: error), privacy: .private)")
             }
         }
     }
@@ -249,7 +258,7 @@ final class SQLiteStorage {
                    auto_lock_timeout, quicklook_preview_enabled, panic_mode_enabled,
                    qr_block_effective, qr_block_tested_os_version,
                    contacts_before_groups, in_app_haptics_enabled,
-                   default_read_receipts_enabled
+                   default_read_receipts_enabled, notifications_muted
             FROM settings WHERE id = 1;
         """)
         guard try stmt.step() else { return nil }
@@ -269,6 +278,8 @@ final class SQLiteStorage {
             contactsBeforeGroups: stmt.columnBool(8),
             inAppHapticsEnabled: stmt.columnBool(9),
             defaultReadReceiptsEnabled: stmt.columnBool(10),
+            notificationsMuted: stmt.columnBool(11),
+            blockedIdentities: try loadBlockedIdentities(),
         )
     }
 
@@ -282,8 +293,8 @@ final class SQLiteStorage {
                 auto_lock_timeout, quicklook_preview_enabled, panic_mode_enabled,
                 qr_block_effective, qr_block_tested_os_version,
                 contacts_before_groups, in_app_haptics_enabled,
-                default_read_receipts_enabled
-            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                default_read_receipts_enabled, notifications_muted
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 relay_host = excluded.relay_host,
                 onboarding_completed = excluded.onboarding_completed,
@@ -295,7 +306,8 @@ final class SQLiteStorage {
                 qr_block_tested_os_version = excluded.qr_block_tested_os_version,
                 contacts_before_groups = excluded.contacts_before_groups,
                 in_app_haptics_enabled = excluded.in_app_haptics_enabled,
-                default_read_receipts_enabled = excluded.default_read_receipts_enabled;
+                default_read_receipts_enabled = excluded.default_read_receipts_enabled,
+                notifications_muted = excluded.notifications_muted;
         """)
         try stmt
             .bind(s.relayHost, at: 1)
@@ -309,7 +321,34 @@ final class SQLiteStorage {
             .bind(s.contactsBeforeGroups, at: 9)
             .bind(s.inAppHapticsEnabled, at: 10)
             .bind(s.defaultReadReceiptsEnabled, at: 11)
+            .bind(s.notificationsMuted, at: 12)
             .run()
+    }
+
+    // MARK: - Block list (v4)
+
+    func loadBlockedIdentities() throws -> [Data] {
+        let stmt = try db.prepare("SELECT identity_pub FROM blocked_identities ORDER BY blocked_at ASC;")
+        var out: [Data] = []
+        while try stmt.step() {
+            if let bytes = stmt.columnBlob(0) {
+                out.append(bytes)
+            }
+        }
+        return out
+    }
+
+    func upsertBlockedIdentity(_ identityPub: Data, at date: Date = Date()) throws {
+        let stmt = try db.prepare("""
+            INSERT INTO blocked_identities (identity_pub, blocked_at) VALUES (?, ?)
+            ON CONFLICT(identity_pub) DO UPDATE SET blocked_at = excluded.blocked_at;
+        """)
+        try stmt.bind(identityPub, at: 1).bind(date, at: 2).run()
+    }
+
+    func removeBlockedIdentity(_ identityPub: Data) throws {
+        try db.prepare("DELETE FROM blocked_identities WHERE identity_pub = ?;")
+            .bindAll(identityPub).run()
     }
 
     // MARK: - Device store (libsignal blob)
@@ -336,7 +375,7 @@ final class SQLiteStorage {
                    last_message_at, last_seen_at, added_at,
                    last_refill_request_sent_at, last_refill_request_handled_at,
                    ttl_seconds, read_receipts_mode, peer_verify_key, last_bundle_served_at,
-                   added_via, verified_at
+                   added_via, verified_at, muted_at
             FROM contacts ORDER BY added_at ASC;
         """)
         var contacts: [Contact] = []
@@ -374,6 +413,7 @@ final class SQLiteStorage {
                 lastBundleServedAt: stmt.columnOptionalInt64(12).map { $0.dateFromEpochMs },
                 addedVia: source,
                 verifiedAt: stmt.columnOptionalInt64(14).map { $0.dateFromEpochMs },
+                mutedAt: stmt.columnOptionalInt64(15).map { $0.dateFromEpochMs },
             )
             c.log = try loadMessages(contactId: idData)
             c.deliveryTokensForPeer = try loadDeliveryTokens(contactId: idData)
@@ -406,8 +446,8 @@ final class SQLiteStorage {
                 last_refill_request_sent_at, last_refill_request_handled_at,
                 ttl_seconds, read_receipts_enabled, read_receipts_mode,
                 peer_verify_key, last_bundle_served_at,
-                added_via, verified_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                added_via, verified_at, muted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 identity_pub = excluded.identity_pub,
                 display_name = excluded.display_name,
@@ -421,7 +461,8 @@ final class SQLiteStorage {
                 read_receipts_mode = excluded.read_receipts_mode,
                 peer_verify_key = excluded.peer_verify_key,
                 last_bundle_served_at = excluded.last_bundle_served_at,
-                verified_at = excluded.verified_at;
+                verified_at = excluded.verified_at,
+                muted_at = excluded.muted_at;
         """)
         try stmt
             .bind(c.id.data, at: 1)
@@ -440,6 +481,7 @@ final class SQLiteStorage {
             .bind(c.lastBundleServedAt, at: 14)
             .bind(c.addedVia.rawValue, at: 15)
             .bind(c.verifiedAt, at: 16)
+            .bind(c.mutedAt, at: 17)
             .run()
     }
 
@@ -643,13 +685,15 @@ final class SQLiteStorage {
             if !stmt.columnIsNull(10), let aid = stmt.columnBlob(10) {
                 // `.textFamily` is the most innocuous fallback if a
                 // tier round-trip ever fails (e.g. a new enum case
-                // was rolled back). We log to NSLog so the
-                // degradation isn't silent, but we keep the message
-                // visible to the user — a missing tier is much
-                // less bad than a missing chat row.
+                // was rolled back). We log the degradation so it
+                // isn't silent, but we keep the message visible to
+                // the user — a missing tier is much less bad than a
+                // missing chat row. The raw value is `.private`
+                // because a corrupt-row scenario could land
+                // attacker-controlled bytes in this column.
                 let tierRaw = stmt.columnText(14) ?? ""
                 let tier = AttachmentTier(rawValue: tierRaw) ?? {
-                    NSLog("[pizzini.storage] unknown attachment tier '\(tierRaw)', falling back to textFamily")
+                    storageLog.error("unknown attachment tier '\(tierRaw, privacy: .private)', falling back to textFamily")
                     return .textFamily
                 }()
                 attachment = AttachmentInfo(
@@ -989,6 +1033,17 @@ final class SQLiteStorage {
             store.entries[mid] = entry
         }
         return store
+    }
+
+    /// Convenience passthrough to `Database.transaction` so the
+    /// Storage facade can wrap batched per-row writes (notably the
+    /// group fan-out path) in a single fsync round-trip without
+    /// reaching past the SQLiteStorage abstraction. Nestable: a
+    /// nested call inside an existing transaction is a no-op
+    /// passthrough (see `Database.transaction`).
+    @discardableResult
+    func transaction<T>(_ body: (Database) throws -> T) throws -> T {
+        try db.transaction(body)
     }
 
     func upsertOutboxEntry(_ e: OutboxEntry) throws {

@@ -452,7 +452,7 @@ extension ChatStore {
             return false
         }
         state.groups[gIdx].pendingInvitation = false
-        NSLog(
+        pzLog(
             "[pizzini.group] accept \(short(groupId)):"
                 + " enrolling local chain and broadcasting SKDM",
         )
@@ -471,7 +471,7 @@ extension ChatStore {
     func declineGroupInvitation(groupId: Data) -> Bool {
         guard let gIdx = groupIndex(forId: groupId) else { return false }
         guard state.groups[gIdx].pendingInvitation else { return false }
-        NSLog("[pizzini.group] decline \(short(groupId)): removing local group state")
+        pzLog("[pizzini.group] decline \(short(groupId)): removing local group state")
         state.groups.remove(at: gIdx)
         Storage.deleteGroup(id: groupId)
         return true
@@ -622,7 +622,7 @@ extension ChatStore {
         let recipients = state.groups[gIdx].activeMembers
             .map(\.peerId)
             .filter { $0 != myCard.peerId }
-        NSLog(
+        pzLog(
             "[pizzini.group] sendGroupMessage \(short(groupId)):"
                 + " \(plaintext.count) B plaintext, ciphertext \(ciphertext.count) B,"
                 + " fanning out to \(recipients.count) member(s):"
@@ -634,8 +634,33 @@ extension ChatStore {
         // `OutboxStore.groupMessageStatus(forId:)`.
         let groupMessageId = ChatStore.makeGroupMessageId()
         let now = Date()
-        // Fan-out timing leak (audit LOW-5): tight loop; relay can
-        // correlate. Documented limitation; jitter is v2 work.
+        // Fan-out timing jitter (audit MED-1 metadata finding): the
+        // legacy tight loop fired N sealed SENDs back-to-back over one
+        // HELLO'd connection, letting a passive relay reconstruct
+        // group membership perfectly from the timing burst. Each leg
+        // now ships on its own dispatch-after with a random offset in
+        // [0, fanoutJitterCap]; over the cover-frame ticker's 30 s
+        // budget this dissolves a burst-of-N into N independent
+        // sealed SENDs indistinguishable from N separate 1:1 sends.
+        // Synchronously persist outbox entries up-front so a force-
+        // quit during the jitter window doesn't lose the row.
+        let fanoutJitterCap: TimeInterval = 25.0
+        // Collect every leg's OutboxEntry first, then persist them all
+        // in a single transaction. With FULL synchronous mode each
+        // per-row upsert was its own fsync; for a group of N members
+        // that was N disk round-trips serially blocking the MainActor.
+        // The batched form is one fsync. Atomicity is strictly
+        // stronger — either every leg persists or none do, so a
+        // crash mid-fanout never leaves a partial group send.
+        var entriesToPersist: [OutboxEntry] = []
+        struct LegContext: Sendable {
+            let messageId: Data
+            let recipient: Data
+            let sealed: Data
+            let token: Data
+            let ttl: UInt32
+        }
+        var legContexts: [LegContext] = []
         for recipient in recipients {
             guard let cIdx = state.contacts.firstIndex(where: { $0.identityPub == recipient }),
                   let token = popDeliveryTokenPublic(forContactAt: cIdx)
@@ -651,11 +676,7 @@ extension ChatStore {
                     messageId: messageId,
                     plaintext: inner,
                 )
-                // Persist the outbox entry BEFORE the relay handoff —
-                // a force-quit between encryptSealed and persist would
-                // otherwise lose the entry and the row would render as
-                // "no status" forever even though the bytes were sent.
-                var entry = OutboxEntry(
+                let entry = OutboxEntry(
                     messageId: messageId,
                     recipientPeerId: recipient,
                     sealedCiphertext: sealed,
@@ -669,14 +690,33 @@ extension ChatStore {
                     groupMessageId: groupMessageId,
                 )
                 outbox.entries[messageId] = entry
-                Storage.upsertOutboxEntry(entry)
-                broadcastToRelays { $0.sendSealed(toPeer: recipient, sealedCiphertext: sealed, ttlSeconds: ttl, token: token) }
-                entry.relayedAt = now
-                entry.token = Data() // F-505: scrub once relayed
-                outbox.entries[messageId] = entry
-                Storage.upsertOutboxEntry(entry)
+                entriesToPersist.append(entry)
+                legContexts.append(LegContext(
+                    messageId: messageId,
+                    recipient: recipient,
+                    sealed: sealed,
+                    token: token,
+                    ttl: ttl,
+                ))
             } catch {
-                NSLog("[pizzini] group fan-out failed for \(short(recipient)): \(error)")
+                pzLog("[pizzini] group fan-out failed for \(short(recipient)): \(error)")
+            }
+        }
+        // One fsync for the whole group send instead of N. Atomic by
+        // construction.
+        Storage.batchUpsertOutboxEntries(entriesToPersist)
+        for leg in legContexts {
+            let delay = Double.random(in: 0...fanoutJitterCap)
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                guard let self else { return }
+                self.broadcastToRelays { $0.sendSealed(toPeer: leg.recipient, sealedCiphertext: leg.sealed, ttlSeconds: leg.ttl, token: leg.token) }
+                if var updated = self.outbox.entries[leg.messageId] {
+                    updated.relayedAt = Date()
+                    updated.token = Data() // F-505: scrub once relayed
+                    self.outbox.entries[leg.messageId] = updated
+                    Storage.upsertOutboxEntry(updated)
+                }
             }
         }
         // Append our own log row. Self-attributed messages render
@@ -835,7 +875,7 @@ extension ChatStore {
                         options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication],
                     )
                 } catch {
-                    NSLog("[pizzini] outbound sandbox write failed: \(error)")
+                    pzLog("[pizzini] outbound sandbox write failed: \(error)")
                     return nil
                 }
                 guard let root = try? AttachmentSandbox.root() else { return nil }
@@ -985,7 +1025,7 @@ extension ChatStore {
                     outbox.entries[messageId] = entry
                     Storage.upsertOutboxEntry(entry)
                 } catch {
-                    NSLog(
+                    pzLog(
                         "[pizzini] group attachment fan-out failed for \(short(recipient))"
                             + " chunk \(i)/\(chunks.count): \(error)",
                     )
@@ -1068,12 +1108,12 @@ extension ChatStore {
     func handleGroupFileChunk(payload: Data, fromPeer sender: Data) {
         guard let session else { return }
         guard let parsed = GroupEnvelope.decodeGroupFileChunk(payload) else {
-            NSLog("[pizzini.group] groupFileChunk ← \(short(sender)): malformed body")
+            pzLog("[pizzini.group] groupFileChunk ← \(short(sender)): malformed body")
             return
         }
         let (groupId, ciphertext) = parsed
         guard let gIdx = groupIndex(forId: groupId) else {
-            NSLog(
+            pzLog(
                 "[pizzini.group] groupFileChunk ← \(short(sender)):"
                     + " unknown group \(short(groupId)), dropping",
             )
@@ -1081,7 +1121,7 @@ extension ChatStore {
         }
         // CRITICAL-2 membership gate.
         guard state.groups[gIdx].acceptsIncomingMessage(from: sender) else {
-            NSLog(
+            pzLog(
                 "[pizzini.group] groupFileChunk ← \(short(sender)) for \(short(groupId)):"
                     + " DROPPED — sender is not an active member",
             )
@@ -1089,7 +1129,7 @@ extension ChatStore {
         }
         // pendingInvitation: advance chain but drop without rendering.
         if state.groups[gIdx].pendingInvitation {
-            NSLog(
+            pzLog(
                 "[pizzini.group] groupFileChunk ← \(short(sender)) for \(short(groupId)):"
                     + " group is pendingInvitation — chunk dropped without rendering",
             )
@@ -1111,7 +1151,7 @@ extension ChatStore {
         do {
             envelope = try FileChunkEnvelope.decode(plaintext)
         } catch {
-            NSLog(
+            pzLog(
                 "[pizzini.group] groupFileChunk ← \(short(sender)) for \(short(groupId)):"
                     + " malformed FileChunkEnvelope — \(error). Dropped.",
             )
@@ -1124,7 +1164,7 @@ extension ChatStore {
         let routingKey = sender + envelope.attachmentId
         if let prior = groupAttachmentRouting[routingKey] {
             if prior != groupId {
-                NSLog(
+                pzLog(
                     "[pizzini.group] groupFileChunk ← \(short(sender)):"
                         + " groupId flip mid-attachment for aid=\(short(envelope.attachmentId))"
                         + " (prior=\(short(prior)) new=\(short(groupId))) — discarding partial",
@@ -1157,12 +1197,12 @@ extension ChatStore {
             )
             Storage.upsertGroup(state.groups[gIdx])
             maybeFireBackgroundHaptic(forIncoming: .group(groupId: groupId))
-            NSLog(
+            pzLog(
                 "[pizzini.group] received attachment \(safeName) (\(completion.totalSize) bytes,"
                     + " tier=\(completion.tier.rawValue)) for group \(short(groupId)) from \(short(sender))",
             )
         case .rejected(let reason):
-            NSLog("[pizzini.group] group reassembler rejected chunk: \(reason)")
+            pzLog("[pizzini.group] group reassembler rejected chunk: \(reason)")
         }
     }
 
@@ -1250,7 +1290,7 @@ extension ChatStore {
         do {
             skdm = try session.senderKeyDistributionCreate(distributionId: myDist)
         } catch {
-            NSLog("[pizzini.group] resendMyKeys \(short(groupId)): mint failed — \(error)")
+            pzLog("[pizzini.group] resendMyKeys \(short(groupId)): mint failed — \(error)")
             return false
         }
         persistSession()
@@ -1260,7 +1300,7 @@ extension ChatStore {
         // Wipe the "already shipped" set so every active member is
         // re-attempted regardless of prior success.
         state.groups[gIdx].mySkdmRecipients = []
-        NSLog(
+        pzLog(
             "[pizzini.group] resendMyKeys \(short(groupId)):"
                 + " re-broadcasting current SKDM (\(skdm.count) B)"
                 + " to \(recipients.count) member(s)",
@@ -1374,7 +1414,7 @@ extension ChatStore {
             // include this op's effects already (the snapshot
             // reflects post-AddMember state). For ops we genuinely
             // miss, slice 5 will own a per-group catch-up handshake.
-            NSLog(
+            pzLog(
                 "[pizzini.group] groupOp ← \(short(sender)):"
                     + " dropped (no local ChatGroup for \(short(op.groupId)))",
             )
@@ -1384,7 +1424,7 @@ extension ChatStore {
         // Forwarding non-Create ops is legitimate (it's how AddMember
         // ops reach members who weren't added by us).
         if op.operatorIdentity != sender {
-            NSLog(
+            pzLog(
                 "[pizzini.group] groupOp ← \(short(sender)):"
                     + " forwarding on behalf of \(short(op.operatorIdentity))",
             )
@@ -1394,24 +1434,24 @@ extension ChatStore {
 
         switch outcome {
         case let .applied(epoch):
-            NSLog(
+            pzLog(
                 "[pizzini.group] groupOp ← \(short(sender)):"
                     + " APPLIED \(opKindLabel(op.kind)) at epoch \(epoch),"
                     + " group now has \(state.groups[gIdx].activeMembers.count) active member(s)",
             )
             applyPostMutationSideEffects(groupAt: gIdx, sideEffects: sx, session: session)
         case let .queued(epoch):
-            NSLog(
+            pzLog(
                 "[pizzini.group] groupOp ← \(short(sender)):"
                     + " queued (epoch \(epoch) > expected \(state.groups[gIdx].currentEpoch + 1))",
             )
         case .rejectedDuplicate:
-            NSLog(
+            pzLog(
                 "[pizzini.group] groupOp ← \(short(sender)):"
                     + " duplicate, ignored",
             )
         case let .rejectedEquivocation(epoch):
-            NSLog(
+            pzLog(
                 "[pizzini.group] groupOp ← \(short(sender)):"
                     + " EQUIVOCATION at epoch \(epoch)",
             )
@@ -1420,11 +1460,11 @@ extension ChatStore {
                 "Group integrity warning: divergent op observed at epoch \(epoch).",
             )
         case .rejectedSignature:
-            NSLog("[pizzini.group] groupOp ← \(short(sender)): signature rejected")
+            pzLog("[pizzini.group] groupOp ← \(short(sender)): signature rejected")
         case .rejectedAuthorization:
-            NSLog("[pizzini.group] groupOp ← \(short(sender)): unauthorised operator")
+            pzLog("[pizzini.group] groupOp ← \(short(sender)): unauthorised operator")
         case let .rejectedMalformed(reason):
-            NSLog("[pizzini.group] groupOp ← \(short(sender)): malformed — \(reason)")
+            pzLog("[pizzini.group] groupOp ← \(short(sender)): malformed — \(reason)")
         case let .rejectedMemberSetMismatch(local, claimed):
             // USP #5. The operator signed an op witnessing a member
             // set that doesn't match our local view — surfaces as a
@@ -1433,7 +1473,7 @@ extension ChatStore {
             // disagreed with ours. UI string is deliberately
             // similar to the equivocation copy so the user doesn't
             // need to learn two new vocab words.
-            NSLog(
+            pzLog(
                 "[pizzini.group] groupOp ← \(short(sender)):"
                     + " MEMBER SET MISMATCH at epoch \(op.epoch)"
                     + " (local=\(short(local)), claimed=\(short(claimed)))",
@@ -1469,39 +1509,39 @@ extension ChatStore {
     func handleGroupBootstrap(payload: Data, fromPeer sender: Data) {
         guard let myCard else { return }
         guard let parsed = GroupEnvelope.decodeBootstrap(payload) else {
-            NSLog("[pizzini.group] bootstrap ← \(short(sender)): malformed body")
+            pzLog("[pizzini.group] bootstrap ← \(short(sender)): malformed body")
             return
         }
         let (envelopeGroupId, bootstrapBytes) = parsed
         guard let bootstrap = GroupBootstrap.decode(bootstrapBytes) else {
-            NSLog("[pizzini.group] bootstrap ← \(short(sender)): malformed bootstrap blob")
+            pzLog("[pizzini.group] bootstrap ← \(short(sender)): malformed bootstrap blob")
             return
         }
         // Body's groupId-prefix MUST match the snapshot's own groupId
         // — defence against a relay corruption / accidental code mix-up.
         guard envelopeGroupId == bootstrap.groupId else {
-            NSLog("[pizzini.group] bootstrap ← \(short(sender)): groupId prefix mismatch")
+            pzLog("[pizzini.group] bootstrap ← \(short(sender)): groupId prefix mismatch")
             return
         }
         // Trust anchor #1: forwarding is not allowed for bootstraps.
         // Trust anchor #2: the issuing operator must be in our 1:1
         // contacts.
         guard sender == bootstrap.operatorIdentity else {
-            NSLog(
+            pzLog(
                 "[pizzini.group] bootstrap ← \(short(sender)):"
                     + " rejected — sender \(short(sender)) forwarding on behalf of \(short(bootstrap.operatorIdentity))",
             )
             return
         }
         guard state.contacts.contains(where: { $0.identityPub == bootstrap.operatorIdentity }) else {
-            NSLog(
+            pzLog(
                 "[pizzini.group] bootstrap ← \(short(sender)):"
                     + " rejected — operator \(short(bootstrap.operatorIdentity)) not in 1:1 contacts",
             )
             return
         }
         guard (try? bootstrap.verifySignature()) == true else {
-            NSLog("[pizzini.group] bootstrap ← \(short(sender)): signature INVALID")
+            pzLog("[pizzini.group] bootstrap ← \(short(sender)): signature INVALID")
             return
         }
         // USP #5 self-consistency: the admin's signed `members[]`
@@ -1512,7 +1552,7 @@ extension ChatStore {
         // admin's key; this check proves the admin's claim about
         // their own state is at least self-consistent.
         guard bootstrap.verifyMemberSetRoot() else {
-            NSLog(
+            pzLog(
                 "[pizzini.group] bootstrap ← \(short(sender)):"
                     + " member-set root MISMATCH — refusing to bootstrap"
                     + " (groupId=\(short(bootstrap.groupId)))",
@@ -1525,12 +1565,12 @@ extension ChatStore {
             $0.peerId == bootstrap.operatorIdentity
                 && $0.role == .admin && $0.status != .removed
         }) else {
-            NSLog("[pizzini.group] bootstrap ← \(short(sender)): operator not an active admin in snapshot")
+            pzLog("[pizzini.group] bootstrap ← \(short(sender)): operator not an active admin in snapshot")
             return
         }
         // We must be in the snapshot's member list.
         guard bootstrap.members.contains(where: { $0.peerId == myCard.peerId }) else {
-            NSLog("[pizzini.group] bootstrap ← \(short(sender)): local user not in snapshot")
+            pzLog("[pizzini.group] bootstrap ← \(short(sender)): local user not in snapshot")
             return
         }
         // If we already have the group, this is a no-op. Future-work:
@@ -1538,7 +1578,7 @@ extension ChatStore {
         // discrepancies; for now we trust our existing op-chain
         // state.
         if let existing = groupIndex(forId: bootstrap.groupId) {
-            NSLog(
+            pzLog(
                 "[pizzini.group] bootstrap ← \(short(sender)):"
                     + " already have group \(short(bootstrap.groupId))"
                     + " (currentEpoch=\(state.groups[existing].currentEpoch),"
@@ -1548,11 +1588,11 @@ extension ChatStore {
             return
         }
         guard let group = bootstrap.intoChatGroup(localIdentityPub: myCard.peerId) else {
-            NSLog("[pizzini.group] bootstrap ← \(short(sender)): structural rejection")
+            pzLog("[pizzini.group] bootstrap ← \(short(sender)): structural rejection")
             return
         }
         state.groups.append(group)
-        NSLog(
+        pzLog(
             "[pizzini.group] bootstrap ← \(short(sender)):"
                 + " invitation received for \(short(bootstrap.groupId))"
                 + " at epoch \(bootstrap.currentEpoch)"
@@ -1575,12 +1615,12 @@ extension ChatStore {
     func handleGroupKeyDistribution(payload: Data, fromPeer sender: Data) {
         guard let session, !readyRelays.isEmpty else { return }
         guard let parsed = GroupEnvelope.decodeKeyDistribution(payload) else {
-            NSLog("[pizzini.group] SKDM ← \(short(sender)): malformed body")
+            pzLog("[pizzini.group] SKDM ← \(short(sender)): malformed body")
             return
         }
         let (groupId, skdm) = parsed
         guard let gIdx = groupIndex(forId: groupId) else {
-            NSLog(
+            pzLog(
                 "[pizzini.group] SKDM ← \(short(sender)):"
                     + " dropped — no local ChatGroup for \(short(groupId))"
                     + " (CRITICAL-3 gate)",
@@ -1590,14 +1630,14 @@ extension ChatStore {
         guard state.groups[gIdx].members.contains(where: {
             $0.peerId == sender && $0.status != .removed
         }) else {
-            NSLog(
+            pzLog(
                 "[pizzini.group] SKDM ← \(short(sender)):"
                     + " dropped — sender is not an active member of \(short(groupId))"
                     + " (CRITICAL-3 gate)",
             )
             return
         }
-        NSLog(
+        pzLog(
             "[pizzini.group] SKDM ← \(short(sender)):"
                 + " group=\(short(groupId)) bytes=\(skdm.count)",
         )
@@ -1608,7 +1648,7 @@ extension ChatStore {
                 skdm: skdm,
             )
         } catch {
-            NSLog(
+            pzLog(
                 "[pizzini.group] SKDM ← \(short(sender)):"
                     + " install FAILED for \(short(groupId)) — \(error)",
             )
@@ -1621,7 +1661,7 @@ extension ChatStore {
             $0.peerId == sender && $0.status == .pendingSKDM
         }) {
             state.groups[gIdx].members[mIdx].status = .active
-            NSLog(
+            pzLog(
                 "[pizzini.group] SKDM ← \(short(sender)):"
                     + " installed, member flipped to .active in \(short(groupId))",
             )
@@ -1643,12 +1683,12 @@ extension ChatStore {
     func handleGroupChat(payload: Data, fromPeer sender: Data, pairwiseMessageId: Data) {
         guard let session else { return }
         guard let parsed = GroupEnvelope.decodeGroupChat(payload) else {
-            NSLog("[pizzini.group] groupChat ← \(short(sender)): malformed body")
+            pzLog("[pizzini.group] groupChat ← \(short(sender)): malformed body")
             return
         }
         let (groupId, ciphertext) = parsed
         guard let gIdx = groupIndex(forId: groupId) else {
-            NSLog(
+            pzLog(
                 "[pizzini.group] groupChat ← \(short(sender)):"
                     + " unknown group \(short(groupId)), dropping",
             )
@@ -1658,7 +1698,7 @@ extension ChatStore {
         guard state.groups[gIdx].members.contains(where: {
             $0.peerId == sender && $0.status != .removed
         }) else {
-            NSLog(
+            pzLog(
                 "[pizzini.group] groupChat ← \(short(sender)) for \(short(groupId)):"
                     + " DROPPED — sender is not an active member",
             )
@@ -1671,7 +1711,7 @@ extension ChatStore {
         // log — accepting later doesn't surface a backlog of
         // messages from before the user joined.
         if state.groups[gIdx].pendingInvitation {
-            NSLog(
+            pzLog(
                 "[pizzini.group] groupChat ← \(short(sender)) for \(short(groupId)):"
                     + " group is pendingInvitation — message dropped without rendering",
             )
@@ -1691,7 +1731,7 @@ extension ChatStore {
             surfaceUndecryptable(groupAt: gIdx, sender: sender, error: error)
             return
         }
-        NSLog(
+        pzLog(
             "[pizzini.group] groupChat ← \(short(sender)) for \(short(groupId)):"
                 + " decrypted \(plaintext.count) B",
         )
@@ -1770,7 +1810,7 @@ extension ChatStore {
         guard let myCard else { return }
         // Idempotent — only enrol if we haven't already.
         if state.groups[gIdx].myCurrentDistributionId != nil {
-            NSLog("[pizzini.group] enrol \(short(state.groups[gIdx].id)): already enrolled, skipping")
+            pzLog("[pizzini.group] enrol \(short(state.groups[gIdx].id)): already enrolled, skipping")
             return
         }
         let groupId = state.groups[gIdx].id
@@ -1779,7 +1819,7 @@ extension ChatStore {
         do {
             skdm = try session.senderKeyDistributionCreate(distributionId: dist)
         } catch {
-            NSLog("[pizzini.group] enrol \(short(groupId)): SKDM mint failed — \(error)")
+            pzLog("[pizzini.group] enrol \(short(groupId)): SKDM mint failed — \(error)")
             return
         }
         state.groups[gIdx].myCurrentDistributionId = dist
@@ -1792,7 +1832,7 @@ extension ChatStore {
         persistSession()
         let recipients = state.groups[gIdx].activeMembers
             .filter { $0.peerId != myCard.peerId }
-        NSLog(
+        pzLog(
             "[pizzini.group] enrol \(short(groupId)): minted dist, broadcasting SKDM (\(skdm.count) B)"
                 + " to \(recipients.count) member(s): "
                 + recipients.map { short($0.peerId) }.joined(separator: ", "),
@@ -1908,7 +1948,7 @@ extension ChatStore {
         do {
             skdm = try session.senderKeyDistributionCreate(distributionId: myDist)
         } catch {
-            NSLog(
+            pzLog(
                 "[pizzini.group] reciprocal SKDM \(short(groupId)):"
                     + " SKDM mint failed — \(error)",
             )
@@ -2094,15 +2134,15 @@ extension ChatStore {
         session: Session,
     ) {
         guard let bytes = try? bootstrap.encoded() else {
-            NSLog("[pizzini.group] bootstrap → \(short(recipient)): encode failed")
+            pzLog("[pizzini.group] bootstrap → \(short(recipient)): encode failed")
             return
         }
         guard let cIdx = state.contacts.firstIndex(where: { $0.identityPub == recipient }) else {
-            NSLog("[pizzini.group] bootstrap → \(short(recipient)): no contact")
+            pzLog("[pizzini.group] bootstrap → \(short(recipient)): no contact")
             return
         }
         guard let token = popDeliveryTokenPublic(forContactAt: cIdx) else {
-            NSLog("[pizzini.group] bootstrap → \(short(recipient)): no delivery token")
+            pzLog("[pizzini.group] bootstrap → \(short(recipient)): no delivery token")
             return
         }
         var inner = Data([RelayClient.InnerEnvelopeKind.groupBootstrap.rawValue])
@@ -2115,9 +2155,9 @@ extension ChatStore {
                 plaintext: inner,
             )
             broadcastToRelays { $0.sendSealed(toPeer: recipient, sealedCiphertext: sealed, ttlSeconds: state.contacts[cIdx].ttlSeconds, token: token) }
-            NSLog("[pizzini.group] bootstrap → \(short(recipient)): sealed=\(sealed.count) B, sent")
+            pzLog("[pizzini.group] bootstrap → \(short(recipient)): sealed=\(sealed.count) B, sent")
         } catch {
-            NSLog("[pizzini.group] bootstrap → \(short(recipient)): seal failed — \(error)")
+            pzLog("[pizzini.group] bootstrap → \(short(recipient)): seal failed — \(error)")
         }
     }
 

@@ -33,11 +33,20 @@ struct PasscodeSetupView: View {
         NavigationStack {
             Form {
                 Section {
+                    // No `.textContentType(.newPassword)` on either field
+                    // — that hint asks iOS to offer "Save to iCloud
+                    // Keychain" + "Suggest strong password" overlays,
+                    // which for a local lock-screen passcode is wrong on
+                    // every axis: we don't want it iCloud-synced (defeats
+                    // the device-pin contract), the Argon2id derivation
+                    // is ours and a Keychain entry can't replay it, and
+                    // the AutoFill overlay machinery triggers the
+                    // per-keystroke "variant selector cell index number
+                    // could not be found" UIKit chatter on iOS 26.
                     SecureField(
                         mode == .real ? "New passcode" : "New duress passcode",
                         text: $entry,
                     )
-                    .textContentType(.newPassword)
                     .keyboardType(.asciiCapable)
                     .hardenedTextInput()
                     .focused($focusedField, equals: .entry)
@@ -45,10 +54,8 @@ struct PasscodeSetupView: View {
                     .onSubmit { focusedField = .confirm }
 
                     SecureField("Confirm", text: $confirm)
-                        .textContentType(.newPassword)
                         .keyboardType(.asciiCapable)
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
+                        .hardenedTextInput()
                         .focused($focusedField, equals: .confirm)
                         .submitLabel(.done)
                         .onSubmit(save)

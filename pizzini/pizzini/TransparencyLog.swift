@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import PizziniTor
 
 /// USP #1, second half: client-side parser + verifier for the
 /// operator-signed transparency log of relay binary deploys.
@@ -321,11 +322,22 @@ extension TransparencyLog {
     /// Rejects (without overwriting the cache) if the new log
     /// represents a rollback vs the existing cache.
     ///
-    /// `urlSession` is injectable for tests; defaults to the
-    /// shared session in production.
+    /// `urlSession` is injectable for tests. Production callers
+    /// pass `nil` and the session is built based on the URL host:
+    ///
+    ///   • `.onion` host → Tor SOCKS5 (default `OnionTrafficOnly`).
+    ///   • Clearnet host → `URLSession.shared`. The Tor daemon
+    ///     refuses clearnet via the SOCKS port at the proxy layer
+    ///     (defence-in-depth in case RelayClient forgets to dial
+    ///     an `.onion`), so a Tor-routed fetch of a github.com log
+    ///     URL fails with "Refusing to connect to non-hidden-
+    ///     service hostname." Until the operator ships an onion
+    ///     mirror of the transparency log, we accept the IP-leak
+    ///     trade-off for content-signed integrity. See
+    ///     `docs/threat-model.md` "Known limitations".
     static func fetchAndCache(
         from url: URL? = TransparencyLogConfig.logURL,
-        urlSession: URLSession = .shared,
+        urlSession: URLSession? = nil,
     ) async throws -> [SignedEntry] {
         guard let url else { throw FetchError.urlNotConfigured }
 
@@ -336,9 +348,31 @@ extension TransparencyLog {
         request.timeoutInterval = 30
         request.cachePolicy = .reloadIgnoringLocalCacheData
 
+        let session: URLSession
+        if let urlSession {
+            session = urlSession
+        } else if url.host?.hasSuffix(".onion") == true {
+            // Onion target: route through Tor SOCKS so the relay
+            // operator + every middle-man hop sees only "a Tor exit
+            // fetched the log." The signed-entry chain protects
+            // integrity end-to-end.
+            do {
+                session = try torSession()
+            } catch {
+                throw FetchError.http("Tor not ready: \(error.localizedDescription)")
+            }
+        } else {
+            // Clearnet target: fall through to `URLSession.shared`.
+            // The Tor daemon's `OnionTrafficOnly` flag (see
+            // PizziniTor/TorController.makeConfiguration) refuses
+            // clearnet on the SOCKS port outright, so trying Tor
+            // here would produce a hard error. The IP-leak is
+            // documented in the threat model.
+            session = .shared
+        }
         let (data, response): (Data, URLResponse)
         do {
-            (data, response) = try await urlSession.data(for: request)
+            (data, response) = try await session.data(for: request)
         } catch {
             throw FetchError.http("network error: \(error.localizedDescription)")
         }
@@ -392,5 +426,38 @@ extension TransparencyLog {
         }
 
         return entries
+    }
+
+    /// Build a `URLSession` that routes every request through Tor's
+    /// local SOCKS5 port. The Tor daemon must be bootstrapped — this
+    /// throws otherwise. Audit notes that the transparency-log fetch
+    /// was the only non-Tor egress in the app; the fix routes it
+    /// through the same anonymising plane the relay traffic already
+    /// uses, so a Cloudflare/GitHub observer learns nothing more
+    /// about the user than "a Tor exit fetched the log."
+    ///
+    /// The session is constructed on every fetch (rather than
+    /// cached) so a Tor restart with a new SOCKS port — rare, but
+    /// possible after a network swap — is automatically picked up
+    /// without a stale-handle bug.
+    private static func torSession() throws -> URLSession {
+        let port = TorController.shared.socksPort
+        let config = URLSessionConfiguration.ephemeral
+        // `kCFNetworkProxies*` are macOS-only constants; on iOS the
+        // same dictionary still works at runtime when we supply the
+        // string keys directly. `URLSessionConfiguration` forwards
+        // them to CFNetwork's stream layer, and the documented
+        // SOCKS5 handshake fires on connect.
+        config.connectionProxyDictionary = [
+            "SOCKSEnable": 1,
+            "SOCKSProxy": "127.0.0.1",
+            "SOCKSPort": Int(port),
+            "kCFStreamPropertySOCKSVersion": "kCFStreamSocketSOCKSVersion5",
+        ]
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 60
+        return URLSession(configuration: config)
     }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import os.log
 import PizziniCryptoCore
 import PizziniTor
 import SwiftUI
@@ -96,12 +97,19 @@ final class ChatStore: NSObject {
     }
 
     /// Append a diagnostic event to the in-memory ring buffer AND
-    /// emit the same text to NSLog so `Console.app` users still
-    /// see it. Trims the buffer to `diagBufferCap` from the front.
-    /// Always called from `@MainActor`-bound code so the array
-    /// mutation is race-free.
+    /// emit the same text via os_log at .debug level (only enabled
+    /// on a debug build / when the user has attached Console.app
+    /// to a non-release build, mirroring DeviceIntegrity's logging
+    /// policy at F-NEW-905). Trims the buffer to `diagBufferCap`
+    /// from the front. Always called from `@MainActor`-bound code
+    /// so the array mutation is race-free.
+    ///
+    /// NSLog had been the historical choice, but NSLog lines from
+    /// release builds remain in `sysdiagnose` archives a coercer
+    /// can exfiltrate over Lightning. os_log .debug is dropped at
+    /// the kernel level on release devices.
     func diagLog(_ category: String, _ message: String) {
-        NSLog("[pizzini.\(category)] \(message)")
+        os_log(.debug, "[pizzini.%{public}@] %{public}@", category, message)
         diagEvents.append(DiagEvent(
             timestamp: Date(),
             category: category,
@@ -123,7 +131,21 @@ final class ChatStore: NSObject {
     private(set) var keychainWriteFailing: Bool = false
     var myCard: ContactCard? {
         guard let myId = myIdentityPublicCached else { return nil }
-        return ContactCard(peerId: myId, host: state.relayHost, port: Self.relayPort)
+        // Privacy-narrowing: refuse to encode a BYO custom relay
+        // into outbound QRs. A BYO host is the user's own choice for
+        // *their* routing and is allowed to be anything (dev
+        // 127.0.0.1, community-run onions). Encoding it into a card
+        // a stranger then scans pins them to the same relay — for a
+        // journalist on a community relay pairing with a source,
+        // that narrows the source's anonymity set to "uses the same
+        // relay as this journalist." Always emit the bundled-fleet
+        // sentinel (empty host) instead; the peer's app will use its
+        // own fleet picker (`RelayRegistry.trusted`). The
+        // *informational* host comment at addContact (line 818) is
+        // load-bearing for this — peers ignore the host anyway, but
+        // we now strip it at emit time so a future regression can't
+        // silently widen the leak.
+        return ContactCard(peerId: myId, host: "", port: Self.relayPort)
     }
 
     // Internal — module-level access so extensions
@@ -172,15 +194,13 @@ final class ChatStore: NSObject {
     /// each fresh socket gets one timer; cancelled on disconnect.
     private var retryTimer: Timer?
     /// Auto-reconnect task scheduled when the aggregate relay state
-    /// transitions to `.failed`. Without this, a cold-launch
-    /// bootstrap failure leaves the user staring at the
-    /// "tap to reconnect" pill — which they'd then tap and the
-    /// second attempt would work, because tor's been bootstrapping
-    /// in the background the whole time. Self-healing reconnect
-    /// makes the failure-on-first-attempt invisible: the same
-    /// "wait a few seconds and try again" happens automatically.
-    /// Cancelled on teardown and on any non-failed state
-    /// transition.
+    /// transitions to `.failed`. Covers the steady-state cases where
+    /// the network glitched (carrier handoff, captive portal,
+    /// tor circuit died) — the user shouldn't have to manually
+    /// reconnect for any of those. Cold-launch first-attempt success
+    /// is delivered upstream by `TorController.prepareHiddenService`,
+    /// not by this mechanism. Cancelled on teardown and on any
+    /// non-failed state transition.
     private var autoReconnectTask: Task<Void, Never>?
     /// Current backoff for `autoReconnectTask`. Starts at the
     /// floor, doubles on each consecutive failure, capped at the
@@ -189,6 +209,13 @@ final class ChatStore: NSObject {
     /// without pounding the network if the user's offline for an
     /// extended period.
     private var autoReconnectBackoff: TimeInterval = autoReconnectBackoffFloor
+    /// 5 s production floor. A real failure (broken network, tor down,
+    /// relay down) shouldn't get hammered at sub-second cadence —
+    /// the auto-reconnect is a self-healing convenience, not a
+    /// busy-wait. Cold-launch first-attempt success is delivered by
+    /// `TorController.prepareHiddenService(_:)`, not by aggressive
+    /// retrying: by the time the first SOCKS5 CONNECT goes out, tor
+    /// already has the HS descriptor cached.
     private static let autoReconnectBackoffFloor: TimeInterval = 5
     private static let autoReconnectBackoffCeiling: TimeInterval = 60
     /// Phase 2 attachment reassembly state. Lives in-process: a force-
@@ -223,6 +250,12 @@ final class ChatStore: NSObject {
         case group(groupId: Data)
     }
     var activeSurface: ActiveSurface = .none
+    /// Most-recent identityPub the user attempted to add via QR/paste
+    /// but was rejected because the peer is on the block list. The
+    /// scan/paste UI reads this on change to surface "this contact is
+    /// blocked — unblock first" rather than silently no-op'ing the
+    /// add. Cleared by the UI on dismissal.
+    var lastBlockedAddAttempt: Data?
     /// First-chunk capture of `(peer + attachmentId) → groupId` so a
     /// later completion knows which `ChatGroup.log` to append to.
     /// Set on every accepted group-file-chunk; verified for stability
@@ -266,7 +299,7 @@ final class ChatStore: NSObject {
             // a sysdiagnose collector would surface); the byte
             // count is enough for "did the migration fire" without
             // leaking the input.
-            NSLog("[pizzini] migrating legacy relayHost (len=\(trimmed.count)) → fleet mode")
+            pzLog("[pizzini] migrating legacy relayHost (len=\(trimmed.count)) → fleet mode")
             self.state.relayHost = ""
             Storage.upsertSettings(self.state)
         } else if !trimmed.isEmpty, trimmed != self.state.relayHost {
@@ -311,15 +344,15 @@ final class ChatStore: NSObject {
                 self.transparencyLog = fresh
                 self.transparencyLogLastFetched = Date()
                 self.transparencyLogError = nil
-                NSLog(
+                pzLog(
                     "[pizzini.translog] refreshed: \(fresh.count) entries, \(TransparencyLog.verifiedCount(in: fresh)) verified",
                 )
             } catch let err as TransparencyLog.FetchError {
                 self.transparencyLogError = err
-                NSLog("[pizzini.translog] fetch failed: \(err)")
+                pzLog("[pizzini.translog] fetch failed: \(err)")
             } catch {
                 self.transparencyLogError = .http(error.localizedDescription)
-                NSLog("[pizzini.translog] fetch failed (unexpected): \(error)")
+                pzLog("[pizzini.translog] fetch failed (unexpected): \(error)")
             }
         }
     }
@@ -362,7 +395,7 @@ final class ChatStore: NSObject {
         // first, but we double-guard here in case `setRelayHost` is
         // ever bypassed (e.g. a future direct mutation of `state`).
         guard let canonical = OnionHost.canonical(trimmed) else {
-            NSLog("[pizzini] BYO relayHost (len=\(trimmed.count)) failed onion validation; using fleet")
+            pzLog("[pizzini] BYO relayHost (len=\(trimmed.count)) failed onion validation; using fleet")
             return RelayRegistry.trusted
         }
         return [RelayDescriptor(label: "Custom relay", host: canonical, port: Self.relayPort)]
@@ -407,7 +440,7 @@ final class ChatStore: NSObject {
             relays.append(client)
             relayDescriptors.append(descriptor)
             perRelayState[descriptor.host] = .idle
-            NSLog("[pizzini] connecting to \(descriptor.label) @ \(descriptor.host):\(descriptor.port)")
+            pzLog("[pizzini] connecting to \(descriptor.label) @ \(descriptor.host):\(descriptor.port)")
             client.connect(to: descriptor.host, port: descriptor.port)
         }
         // Push primary is re-elected lazily as relays cross into
@@ -572,11 +605,8 @@ final class ChatStore: NSObject {
     ///     states is normal during a Tor bootstrap and shouldn't
     ///     accumulate backoff.
     ///
-    /// Without this, the first cold-launch Tor bootstrap that times
-    /// out leaves the user on the "tap to reconnect" pill — a
-    /// failure path the audit flagged as ultra-bad UX. The handler
-    /// runs on MainActor (called from the `relayClient` delegate
-    /// hop), so direct property mutation is sound.
+    /// The handler runs on MainActor (called from the `relayClient`
+    /// delegate hop), so direct property mutation is sound.
     private func handleAggregateRelayStateTransition(
         from prev: RelayClient.State,
         to next: RelayClient.State,
@@ -592,7 +622,7 @@ final class ChatStore: NSObject {
             // re-fire connectRelay on its own deadline.)
             if case .failed = prev { return }
             let delay = autoReconnectBackoff
-            NSLog("[pizzini] aggregate state .failed; auto-reconnecting in \(Int(delay)) s")
+            pzLog("[pizzini] aggregate state .failed; auto-reconnecting in \(Int(delay)) s")
             autoReconnectBackoff = min(
                 autoReconnectBackoff * 2,
                 Self.autoReconnectBackoffCeiling,
@@ -607,7 +637,7 @@ final class ChatStore: NSObject {
                 // reconnected, or the prior attempt might have
                 // self-recovered between schedule and fire.
                 if case .failed = self.relayState {
-                    NSLog("[pizzini] auto-reconnect firing")
+                    pzLog("[pizzini] auto-reconnect firing")
                     self.connectRelay()
                 }
             }
@@ -641,14 +671,14 @@ final class ChatStore: NSObject {
     func forceReconnectRelays() {
         switch relayState {
         case .failed:
-            NSLog("[pizzini] manual reconnect requested")
+            pzLog("[pizzini] manual reconnect requested")
             // Reset auto-reconnect backoff: the user's explicit
             // intervention means the NEXT failure should retry
             // quickly, not wait for the accumulated 60 s cap.
             autoReconnectBackoff = Self.autoReconnectBackoffFloor
             connectRelay()
         case .connected, .connecting, .connectingToTor, .idle:
-            NSLog("[pizzini] reconnect requested but state is \(relayState); ignoring")
+            pzLog("[pizzini] reconnect requested but state is \(relayState); ignoring")
         }
     }
 
@@ -695,10 +725,23 @@ final class ChatStore: NSObject {
     /// on the next foreground bootstrap() call.
     func disconnectForBackground() {
         guard !relays.isEmpty else { return }
-        NSLog("[pizzini] relay disconnect for background (\(relays.count) clients)")
-        teardownRelay()
+        pzLog("[pizzini] backgrounding — relay teardown scheduled in \(Int(Self.backgroundRelayGrace)) s, tor stop in \(Int(Self.torBackgroundGrace)) s")
+        scheduleRelayTeardown()
         scheduleTorBackgroundStop()
     }
+
+    /// Background grace before the RELAY SOCKET is torn down.
+    /// Shorter than `torBackgroundGrace` because we want to give
+    /// iOS room to soft-background us briefly (app-switcher peek,
+    /// Control Centre pull-down, glancing at a push notification)
+    /// without firing a teardown → reconnect cycle the user sees
+    /// as a "Connecting…" flash on the global status bar. 10 s is
+    /// well inside iOS's "definitely not suspended yet" envelope
+    /// (~30 s on healthy devices); if the user comes back within
+    /// the window AND the socket is still `.connected`, we skip
+    /// the reconnect entirely and the foreground transition is
+    /// visually instant.
+    private static let backgroundRelayGrace: TimeInterval = 10
 
     /// Background grace before Tor itself is stopped. 30 s lines up
     /// with iOS's standard "soft background" allowance and the
@@ -711,11 +754,19 @@ final class ChatStore: NSObject {
     /// reference — `asyncAfter` alone has no cancellation handle.
     private var torStopWorkItem: DispatchWorkItem?
 
+    /// Pending relay-socket teardown. Same cancellation pattern as
+    /// `torStopWorkItem`. Distinct from it because the relay-socket
+    /// grace is shorter (10 s) than the tor grace (30 s) — we want
+    /// to tolerate a quick app-switcher peek without a reconnect
+    /// flash, but a longer background should still let the socket
+    /// die cleanly before iOS suspends us.
+    private var relayTeardownWorkItem: DispatchWorkItem?
+
     private func scheduleTorBackgroundStop() {
         torStopWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard self != nil else { return }
-            NSLog("[pizzini] tor stop (background grace expired)")
+            pzLog("[pizzini] tor stop (background grace expired)")
             TorController.shared.stop()
         }
         torStopWorkItem = work
@@ -725,6 +776,24 @@ final class ChatStore: NSObject {
     private func cancelTorBackgroundStop() {
         torStopWorkItem?.cancel()
         torStopWorkItem = nil
+    }
+
+    private func scheduleRelayTeardown() {
+        relayTeardownWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard !self.relays.isEmpty else { return }
+            pzLog("[pizzini] relay teardown (background grace expired)")
+            self.teardownRelay()
+            self.relayTeardownWorkItem = nil
+        }
+        relayTeardownWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.backgroundRelayGrace, execute: work)
+    }
+
+    private func cancelRelayTeardown() {
+        relayTeardownWorkItem?.cancel()
+        relayTeardownWorkItem = nil
     }
 
     /// F-704: shared disconnect path used by `disconnectForBackground`
@@ -758,20 +827,48 @@ final class ChatStore: NSObject {
         autoReconnectTask = nil
     }
 
-    /// Build a fresh relay connection on every foreground entry. We
-    /// don't inspect the prior state — see `disconnectForBackground`
-    /// for why trusting `relayState` across a suspension cycle is a
-    /// bug.
+    /// Foreground-entry handler. Three cases:
+    ///
+    /// 1. **Inside the relay grace window AND socket still
+    ///    `.connected`.** The teardown timer hadn't fired yet, the
+    ///    socket survived the brief background (iOS hasn't suspended
+    ///    us in this window), and there's nothing to do — cancel the
+    ///    teardown, leave the live socket in place. User gets
+    ///    visually instant foreground entry, no `Connecting…` flash.
+    ///
+    /// 2. **Inside the window BUT socket isn't `.connected`.** The
+    ///    socket dropped during background (rare — usually means a
+    ///    cover-frame send failed mid-suspend, surfacing as `.failed`
+    ///    later). Cancel the teardown, then do a full reconnect.
+    ///
+    /// 3. **Grace window expired (teardown already ran, relays
+    ///    empty), or we never backgrounded with a socket alive.**
+    ///    Standard reconnect path.
     func reconnectAfterBackground() {
-        NSLog("[pizzini] relay reconnect on foreground")
-        // Cancel any pending background tor-stop from the previous
-        // suspend. If Tor is still running, `connectRelay()` →
-        // `RelayClient.connect()` → `TorController.shared.bootstrap()`
-        // returns the cached SOCKS port immediately (no fresh
-        // bootstrap). If the grace window already fired and Tor is
-        // gone, bootstrap() starts cleanly from cache — typically
-        // sub-5s.
+        // Always cancel the tor-stop — Tor is a fleet-wide singleton
+        // we want to keep alive across any foreground transition.
         cancelTorBackgroundStop()
+
+        // Case 1: grace window still active + healthy socket.
+        if let pendingTeardown = relayTeardownWorkItem,
+           !pendingTeardown.isCancelled,
+           !relays.isEmpty,
+           case .connected = relayState
+        {
+            cancelRelayTeardown()
+            pzLog("[pizzini] foreground within grace window — relay socket kept alive")
+            return
+        }
+
+        // Case 2 + 3: teardown if anything's still hanging around,
+        // then full reconnect. `teardownRelay` is safe to call with
+        // an empty relays array; `connectRelay` is idempotent
+        // against in-flight state.
+        cancelRelayTeardown()
+        if !relays.isEmpty {
+            teardownRelay()
+        }
+        pzLog("[pizzini] relay reconnect on foreground")
         connectRelay()
     }
 
@@ -807,6 +904,15 @@ final class ChatStore: NSObject {
     /// silently break our connection.
     func addContact(card: ContactCard, displayName: String?, source: ContactSource) {
         guard let session else { return }
+        // Block list is a strict gate: the user has previously said
+        // "never again" about this identityPub. Refuse the add. The
+        // caller (QRScannerView / paste) is responsible for surfacing
+        // the rejection — `addContact` is fire-and-forget today, so
+        // we publish via `lastBlockedAddAttempt` for the UI to read.
+        if isIdentityBlocked(card.peerId) {
+            lastBlockedAddAttempt = card.peerId
+            return
+        }
         if state.contacts.contains(where: { $0.identityPub == card.peerId }) {
             requestBundleWithHashcash(fromPeer: card.peerId)
             return
@@ -969,13 +1075,13 @@ final class ChatStore: NSObject {
         let now = Date()
         if let last = decoyLastEmitByPeer[fromPeer],
            now.timeIntervalSince(last) < ChatStore.decoyPerPeerCooldown {
-            NSLog("[pizzini] BUNDLE_REQUEST decoy from \(short(fromPeer)) suppressed by per-peer cooldown")
+            pzLog("[pizzini] BUNDLE_REQUEST decoy from \(short(fromPeer)) suppressed by per-peer cooldown")
             return
         }
         // Prune aggregate window to entries in the last 60s.
         decoyAggregateRecent.removeAll { now.timeIntervalSince($0) >= 60 }
         if decoyAggregateRecent.count >= ChatStore.decoyAggregateBudgetPerMinute {
-            NSLog("[pizzini] BUNDLE_REQUEST decoy from \(short(fromPeer)) suppressed by aggregate budget")
+            pzLog("[pizzini] BUNDLE_REQUEST decoy from \(short(fromPeer)) suppressed by aggregate budget")
             return
         }
         decoyLastEmitByPeer[fromPeer] = now
@@ -1310,7 +1416,7 @@ final class ChatStore: NSObject {
                         options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication],
                     )
                 } catch {
-                    NSLog("[pizzini] outbound sandbox write failed: \(error)")
+                    pzLog("[pizzini] outbound sandbox write failed: \(error)")
                     return nil
                 }
                 guard let root = try? AttachmentSandbox.root() else { return nil }
@@ -1568,7 +1674,7 @@ final class ChatStore: NSObject {
         guard let idx = contactIndex(forIdentity: peer) else { return }
         if let last = state.contacts[idx].lastRefillRequestHandledAt,
            Date().timeIntervalSince(last) < Contact.refillCooldown {
-            NSLog("[pizzini] refill rate-limited for \(self.short(peer))")
+            pzLog("[pizzini] refill rate-limited for \(self.short(peer))")
             return
         }
         var tokens: [Data] = []
@@ -1577,7 +1683,7 @@ final class ChatStore: NSObject {
             do {
                 tokens.append(try session.mintDeliveryToken())
             } catch {
-                NSLog("[pizzini] mintDeliveryToken failed: \(error)")
+                pzLog("[pizzini] mintDeliveryToken failed: \(error)")
                 return
             }
         }
@@ -1667,6 +1773,63 @@ final class ChatStore: NSObject {
         Storage.upsertSettings(state)
     }
 
+    /// Toggle per-contact mute. When muted, inbound messages from this
+    /// peer don't fire haptics or bump the NSE badge floor; delivery
+    /// and persistence are unchanged.
+    func setContactMuted(_ contact: Contact, muted: Bool) {
+        guard let idx = contactIndex(forIdentity: contact.identityPub) else { return }
+        state.contacts[idx].mutedAt = muted ? Date() : nil
+        Storage.upsertContact(state.contacts[idx])
+        refreshAppBadge()
+    }
+
+    /// App-wide notifications mute. Suppresses the NSE badge bump and
+    /// in-app haptic without affecting message delivery.
+    func setNotificationsMuted(_ muted: Bool) {
+        guard state.notificationsMuted != muted else { return }
+        state.notificationsMuted = muted
+        Storage.upsertSettings(state)
+        refreshAppBadge()
+    }
+
+    /// Block a peer by identityPub. Stronger than `deleteContact`:
+    /// survives re-pair, dropped at every receive-side gate.
+    /// Idempotent.
+    func blockIdentity(_ identityPub: Data) {
+        if !state.blockedIdentities.contains(identityPub) {
+            state.blockedIdentities.append(identityPub)
+        }
+        Storage.blockIdentity(identityPub)
+        // Hard-tear the in-memory contact row if present so the chat
+        // stops surfacing in the list immediately. We KEEP delivery
+        // tokens minted to this peer in case the user unblocks
+        // later — but a fresh BUNDLE_RESPONSE is still required, so
+        // the unblock flow is "scan them again". Tokens we hold for
+        // sending TO them stay; tokens they hold for sending to US
+        // stop working at the relay because we never serve them
+        // another bundle.
+        if let idx = contactIndex(forIdentity: identityPub) {
+            let contactId = state.contacts[idx].id
+            state.contacts.remove(at: idx)
+            Storage.deleteContact(id: contactId)
+        }
+    }
+
+    /// Lift a block. The peer remains unknown until they re-pair —
+    /// blocking removes the contact row, so an unblock is "stop
+    /// dropping at the gate" not "restore the relationship".
+    func unblockIdentity(_ identityPub: Data) {
+        state.blockedIdentities.removeAll { $0 == identityPub }
+        Storage.unblockIdentity(identityPub)
+    }
+
+    /// True iff this peer's identityPub is on the block list. Hot
+    /// path — every inbound BUNDLE_RESPONSE / TOKEN_ISSUE / SEND
+    /// passes through this gate.
+    func isIdentityBlocked(_ identityPub: Data) -> Bool {
+        state.blockedIdentities.contains(identityPub)
+    }
+
     @MainActor
     private func emitReadReceiptIfEnabled(forContactAt idx: Int) {
         let contact = state.contacts[idx]
@@ -1702,11 +1865,11 @@ final class ChatStore: NSObject {
         // re-connect / chat re-open will retry with a fresh
         // receipt covering the same (or newer) highest messageId.
         guard relayState == .connected else {
-            NSLog("[pizzini] deferring read receipt — relay not connected (state=\(relayState))")
+            pzLog("[pizzini] deferring read receipt — relay not connected (state=\(relayState))")
             return
         }
         guard let token = popDeliveryToken(forContactAt: idx) else {
-            NSLog("[pizzini] cannot emit read receipt: out of tokens")
+            pzLog("[pizzini] cannot emit read receipt: out of tokens")
             return
         }
         var inner = Data([RelayClient.InnerEnvelopeKind.readReceipt.rawValue])
@@ -1730,7 +1893,7 @@ final class ChatStore: NSObject {
                 )
             }
         } catch {
-            NSLog("[pizzini] read-receipt encrypt failed: \(error)")
+            pzLog("[pizzini] read-receipt encrypt failed: \(error)")
         }
     }
 
@@ -1860,6 +2023,12 @@ final class ChatStore: NSObject {
         // a user who set "default read receipts off" doesn't have
         // them silently turn back on after a duress-style reset.
         let preservedDefaultReadReceipts = state.defaultReadReceiptsEnabled
+        let preservedNotificationsMuted = state.notificationsMuted
+        // The block list is by identityPub, not contact id. Its
+        // purpose is to outlive the contact row, so a peer the user
+        // blocked then "removed" can't simply re-pair around the
+        // block. Preserve across identity reset.
+        let preservedBlocked = state.blockedIdentities
         let resetState = AppState(
             relayHost: preservedHost,
             onboardingCompleted: preservedOnboarding,
@@ -1870,6 +2039,8 @@ final class ChatStore: NSObject {
             contactsBeforeGroups: preservedContactsBeforeGroups,
             inAppHapticsEnabled: preservedInAppHaptics,
             defaultReadReceiptsEnabled: preservedDefaultReadReceipts,
+            notificationsMuted: preservedNotificationsMuted,
+            blockedIdentities: preservedBlocked,
         )
         // F-703: write the post-reset AppState to Keychain BEFORE wiping
         // the device-store / outbox / legacy slots. The previous order
@@ -2051,6 +2222,20 @@ final class ChatStore: NSObject {
     /// Settings → "Haptic on new messages".
     func maybeFireBackgroundHaptic(forIncoming incoming: ActiveSurface) {
         guard state.inAppHapticsEnabled else { return }
+        // Suppress when the user has paused notifications app-wide —
+        // the haptic IS a notification, and silencing it here is the
+        // counterpart to the NSE badge-suppress bit we publish via
+        // SharedAppGroup.
+        if state.notificationsMuted { return }
+        // Per-contact / per-group mute: a haptic for a muted peer is
+        // the attention-grab surface the user said they don't want.
+        // Group surfaces don't have their own mute today (ChatGroup
+        // doesn't carry mutedAt) — only the 1:1 branch checks.
+        if case .oneOnOne(let peerIdentity) = incoming,
+           let idx = contactIndex(forIdentity: peerIdentity),
+           state.contacts[idx].mutedAt != nil {
+            return
+        }
         // Suppress when the message arrived in the chat the user is
         // already in — those rows render right under their thumb;
         // an extra haptic is redundant noise.
@@ -2061,7 +2246,23 @@ final class ChatStore: NSObject {
     func refreshAppBadge() {
         let count = state.totalUnread
         UNUserNotificationCenter.current().setBadgeCount(count) { _ in }
-        SharedAppGroup.defaults?.set(count, forKey: SharedAppGroup.unreadCountKey)
+        // The NSE caps its bumps at `nseBadgeFloor + nseBadgeCap` so a
+        // flood of pushes while the app is dead can't inflate the
+        // badge into an oracle. Updating the floor on every refresh
+        // collapses the cap back to the truth value the moment the
+        // main app touches state.
+        if let defaults = SharedAppGroup.defaults {
+            defaults.set(count, forKey: SharedAppGroup.unreadCountKey)
+            defaults.set(count, forKey: SharedAppGroup.nseBadgeFloorKey)
+            // The user can pause NSE bumps entirely with the
+            // global-mute toggle (Settings → Notifications); writing
+            // the bit on every refresh keeps the NSE's view in sync
+            // even if the user toggled it while the app was active.
+            defaults.set(
+                state.notificationsMuted,
+                forKey: SharedAppGroup.suppressBadgeKey,
+            )
+        }
     }
 
     private func appendSystem(_ text: String, to idx: Int) {
@@ -2229,7 +2430,7 @@ extension ChatStore: RelayClientDelegate {
         // to be considered the audited build.
         Task { @MainActor in
             self.relayStatus = status
-            NSLog(
+            pzLog(
                 "[pizzini] relay attest: v\(status.crateVersion) commit=\(status.gitSha)"
                     + " dirty=\(status.gitDirty) sha256=\(self.hex(status.binarySha256))",
             )
@@ -2250,12 +2451,18 @@ extension ChatStore: RelayClientDelegate {
         // onto MainActor at the end.
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
+            // Block-list gate: a blocked peer's TOKEN_ISSUE batch is
+            // dropped before we even verify it. Mirrors the receive-
+            // side gates at SEND and BUNDLE_RESPONSE.
+            if await self.isIdentityBlocked(fromPeer) {
+                return
+            }
             // Read the peer's verify_key under MainActor isolation,
             // do the verifies off-actor, then re-enter MainActor for
             // the stash update.
             let verifyKey: Data? = await self.peerVerifyKey(forIdentity: fromPeer)
             guard let verifyKey else {
-                NSLog(
+                pzLog(
                     "[pizzini] dropped TOKEN_ISSUE from \(self.short(fromPeer)): no peerVerifyKey on contact (re-pair to refresh)"
                 )
                 return
@@ -2267,13 +2474,13 @@ extension ChatStore: RelayClientDelegate {
                     if try Session.verifyDeliveryToken(verifyKey: verifyKey, token: token) {
                         verified.append(token)
                     } else {
-                        NSLog(
+                        pzLog(
                             "[pizzini] dropping batch from \(self.short(fromPeer)): token signature did not verify against bundle-published verify_key"
                         )
                         return
                     }
                 } catch {
-                    NSLog(
+                    pzLog(
                         "[pizzini] dropping batch from \(self.short(fromPeer)): verify error \(error)"
                     )
                     return
@@ -2316,7 +2523,7 @@ extension ChatStore: RelayClientDelegate {
             tokens: stash,
         )
         persistContactSlice(at: idx)
-        NSLog(
+        pzLog(
             "[pizzini] received \(verified.count) verified tokens from \(short(fromPeer)); stash now \(stash.count)"
         )
     }
@@ -2328,7 +2535,7 @@ extension ChatStore: RelayClientDelegate {
         do {
             received = try session.decryptSealed(sealedCiphertext)
         } catch {
-            NSLog("[pizzini] sealed decrypt failed: \(error) (sealed=\(sealedCiphertext.count) bytes, isAckFrame=\(isAckFrame))")
+            pzLog("[pizzini] sealed decrypt failed: \(error) (sealed=\(sealedCiphertext.count) bytes, isAckFrame=\(isAckFrame))")
             return
         }
         // Persist BEFORE dispatching to per-kind handlers. The libsignal
@@ -2337,6 +2544,15 @@ extension ChatStore: RelayClientDelegate {
         // or the peer's NEXT inbound to us reuses a chain key we've
         // already consumed and the whole conversation desyncs.
         persistSession()
+        // Block-list gate: a sealed SEND from a blocked peer is
+        // dropped after the ratchet step (so the libsignal session
+        // for THIS peer stays consistent even though we no longer
+        // surface their traffic). We do NOT emit an ACK — the
+        // sender's outbox eventually marks the leg failed, which
+        // is the intended "they no longer hear from me" signal.
+        if self.isIdentityBlocked(received.peer) {
+            return
+        }
         guard let idx = self.contactIndex(forIdentity: received.peer) else {
             self.diagLog("relay", "DROPPED sealed frame from UNKNOWN PEER \(self.short(received.peer))"
                 + " — they are not in this device's contacts (you must QR-pair before they can"
@@ -2351,7 +2567,7 @@ extension ChatStore: RelayClientDelegate {
             // app-level state. The ratchet already returned us to
             // a quiescent state in this case (libsignal's
             // DuplicatedMessage path doesn't mutate the session).
-            NSLog(
+            pzLog(
                 "[pizzini] duplicate sealed frame from \(self.short(received.peer)) — re-emitting ACK"
             )
             self.emitAck(for: received.messageId, toPeer: received.peer, via: client)
@@ -2509,11 +2725,11 @@ extension ChatStore: RelayClientDelegate {
             maybeFireBackgroundHaptic(
                 forIncoming: .oneOnOne(peerIdentity: state.contacts[idx].identityPub),
             )
-            NSLog(
+            pzLog(
                 "[pizzini] received attachment \(safeName) (\(completion.totalSize) bytes, tier=\(completion.tier.rawValue))"
             )
         case .rejected(let reason):
-            NSLog("[pizzini] reassembler rejected chunk: \(reason)")
+            pzLog("[pizzini] reassembler rejected chunk: \(reason)")
         }
         // Always ACK — the sender needs to flip ✓→✓✓ on every chunk
         // it submitted, regardless of reassembler outcome. Duplicates
@@ -2536,7 +2752,7 @@ extension ChatStore: RelayClientDelegate {
         let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
         let p = url.path
         guard p.hasPrefix(rootPath) else {
-            NSLog("[pizzini] attachment URL not under sandbox: \(p)")
+            pzLog("[pizzini] attachment URL not under sandbox: \(p)")
             return nil
         }
         return String(p.dropFirst(rootPath.count))
@@ -2613,12 +2829,12 @@ extension ChatStore: RelayClientDelegate {
     @MainActor
     private func handleAckPayload(_ payload: Data, contactIdx idx: Int) {
         guard payload.count == 16 else {
-            NSLog("[pizzini] malformed ACK from \(self.short(state.contacts[idx].identityPub))")
+            pzLog("[pizzini] malformed ACK from \(self.short(state.contacts[idx].identityPub))")
             return
         }
         let messageId = Data(payload)
         guard var entry = outbox.entries[messageId] else {
-            NSLog("[pizzini] ACK for unknown messageId \(messageId.map { String(format: "%02x", $0) }.joined())")
+            pzLog("[pizzini] ACK for unknown messageId \(messageId.map { String(format: "%02x", $0) }.joined())")
             return
         }
         entry.deliveredAt = Date()
@@ -2651,7 +2867,7 @@ extension ChatStore: RelayClientDelegate {
                     continue
                 }
                 guard let token = popDeliveryToken(forContactAt: idx) else {
-                    NSLog("[pizzini] cannot retry \(short(entry.recipientPeerId)): out of tokens")
+                    pzLog("[pizzini] cannot retry \(short(entry.recipientPeerId)): out of tokens")
                     continue
                 }
                 broadcastToRelays {
@@ -2695,7 +2911,7 @@ extension ChatStore: RelayClientDelegate {
         // we reap here on the same 30s tick so the leak is bounded.
         let staleAttachments = reassembler.staleEntries(now: now)
         for stale in staleAttachments {
-            NSLog(
+            pzLog(
                 "[pizzini] discarding stale partial attachment from \(short(stale.peer)): \(stale.claimedFilename)"
             )
             reassembler.discard(peer: stale.peer, attachmentId: stale.attachmentId)
@@ -2707,7 +2923,7 @@ extension ChatStore: RelayClientDelegate {
         // attachment rather than colliding with the GC'd chain.
         let staleGroupAttachments = groupReassembler.staleEntries(now: now)
         for stale in staleGroupAttachments {
-            NSLog(
+            pzLog(
                 "[pizzini] discarding stale partial group attachment from \(short(stale.peer)): \(stale.claimedFilename)"
             )
             groupReassembler.discard(peer: stale.peer, attachmentId: stale.attachmentId)
@@ -2730,7 +2946,7 @@ extension ChatStore: RelayClientDelegate {
               let idx = contactIndex(forIdentity: toPeer)
         else { return }
         guard let token = popDeliveryToken(forContactAt: idx) else {
-            NSLog("[pizzini] cannot emit ACK to \(self.short(toPeer)): out of tokens")
+            pzLog("[pizzini] cannot emit ACK to \(self.short(toPeer)): out of tokens")
             return
         }
         var inner = Data([RelayClient.InnerEnvelopeKind.ack.rawValue])
@@ -2760,12 +2976,23 @@ extension ChatStore: RelayClientDelegate {
                 )
             }
         } catch {
-            NSLog("[pizzini] failed to emit ACK to \(self.short(toPeer)): \(error)")
+            pzLog("[pizzini] failed to emit ACK to \(self.short(toPeer)): \(error)")
         }
     }
 
     nonisolated func relayClient(_ client: RelayClient, didReceiveBundleRequestFrom fromPeer: Data) {
         Task { @MainActor in
+            // Block-list gate: a BUNDLE_REQUEST from a blocked peer
+            // is dropped without a decoy emission. The decoy is the
+            // anti-probe defense for *unknown* requesters; for a
+            // blocked one, the user has explicitly opted out of
+            // ever pairing with them again, and silence is the
+            // intended posture. Emitting a decoy here would also
+            // mint a TOKEN_ISSUE batch into the blocked peer's
+            // contact-graph view.
+            if self.isIdentityBlocked(fromPeer) {
+                return
+            }
             guard let idx = self.contactIndex(forIdentity: fromPeer),
                   let session = self.session
             else {
@@ -2776,7 +3003,7 @@ extension ChatStore: RelayClientDelegate {
                 // same-timing decoy when the requester isn't in our
                 // contacts, so the relay sees identical outbound
                 // bandwidth + latency for known-vs-unknown.
-                NSLog("[pizzini] BUNDLE_REQUEST from unknown peer \(self.short(fromPeer)) — emitting decoy")
+                pzLog("[pizzini] BUNDLE_REQUEST from unknown peer \(self.short(fromPeer)) — emitting decoy")
                 self.emitBundleResponseDecoy(toFakePeer: fromPeer, via: client)
                 return
             }
@@ -2790,7 +3017,7 @@ extension ChatStore: RelayClientDelegate {
             if let last = self.state.contacts[idx].lastBundleServedAt,
                Date().timeIntervalSince(last) < Contact.refillCooldown
             {
-                NSLog(
+                pzLog(
                     "[pizzini] BUNDLE_REQUEST from \(self.short(fromPeer)) rate-limited; last served \(last)"
                 )
                 return
@@ -2818,7 +3045,7 @@ extension ChatStore: RelayClientDelegate {
                     self.requestBundleWithHashcash(fromPeer: fromPeer)
                 }
             } catch {
-                NSLog("[pizzini] publishBundle failed: \(error)")
+                pzLog("[pizzini] publishBundle failed: \(error)")
             }
         }
     }
@@ -2829,10 +3056,16 @@ extension ChatStore: RelayClientDelegate {
         bundle: Data
     ) {
         Task { @MainActor in
+            // Block-list gate: BUNDLE_RESPONSE from a blocked peer is
+            // dropped before initiateSession does any work. The
+            // libsignal session state for this peer is untouched.
+            if self.isIdentityBlocked(fromPeer) {
+                return
+            }
             guard let session = self.session,
                   let idx = self.contactIndex(forIdentity: fromPeer)
             else {
-                NSLog("[pizzini] dropped BUNDLE_RESPONSE from unknown peer \(self.short(fromPeer))")
+                pzLog("[pizzini] dropped BUNDLE_RESPONSE from unknown peer \(self.short(fromPeer))")
                 return
             }
             do {
@@ -2844,11 +3077,26 @@ extension ChatStore: RelayClientDelegate {
                 // a malformed bundle whose token batches we can't verify.
                 let verifyKey = try Session.extractBundleVerifyKey(bundle)
                 try session.initiateSession(peerIdentity: fromPeer, bundle: bundle)
+                // A bundle carrying a fresh verify_key invalidates every
+                // token in our stash: the relay will reject anything
+                // signed under the previous key once the peer's next
+                // HELLO updates `verify_keys[peer_id]` server-side.
+                // Drop the stash atomically with the overwrite so sends
+                // don't quietly burn dead tokens; the refill-on-low
+                // path will repopulate from the next TOKEN_ISSUE batch.
+                let priorVerifyKey = self.state.contacts[idx].peerVerifyKey
+                if priorVerifyKey != nil, priorVerifyKey != verifyKey {
+                    self.state.contacts[idx].deliveryTokensForPeer = []
+                    Storage.replaceDeliveryTokens(
+                        contactId: self.state.contacts[idx].id,
+                        tokens: [],
+                    )
+                }
                 self.state.contacts[idx].peerVerifyKey = verifyKey
                 self.state.contacts[idx].sessionEstablished = true
                 self.persistContactSlice(at: idx)
             } catch {
-                NSLog("[pizzini] initiateSession failed: \(error)")
+                pzLog("[pizzini] initiateSession failed: \(error)")
             }
         }
     }

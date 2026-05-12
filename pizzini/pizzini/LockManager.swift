@@ -85,7 +85,17 @@ final class LockManager {
     /// by `unlockAfterDuress`.
     private(set) var wipeInFlight: Bool = false
 
-    private var backgroundedAt: Date?
+    /// CLOCK_UPTIME_RAW seconds since boot at the moment the scene
+    /// went to background. Monotonic — a user who manually winds the
+    /// device clock backward in Settings.app cannot extend the unlock
+    /// window. Wall-clock `Date()` would be coercer-tamperable.
+    private var backgroundedAtUptime: TimeInterval?
+
+    private static func uptimeSeconds() -> TimeInterval {
+        // CLOCK_UPTIME_RAW counts seconds since boot, excludes sleep,
+        // and is not affected by wall-clock adjustments.
+        TimeInterval(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1_000_000_000.0
+    }
 
     private init() {
         // Cold launch: lock if EITHER Face ID is enabled OR an app
@@ -137,7 +147,7 @@ final class LockManager {
     }
 
     func handleDidEnterBackground() {
-        backgroundedAt = Date()
+        backgroundedAtUptime = Self.uptimeSeconds()
     }
 
     func handleWillEnterForeground() {
@@ -145,10 +155,10 @@ final class LockManager {
         // shield stays up until handleDidActivate clears it, so any
         // re-render in this window is still safe.
         guard isLockGateActive else {
-            backgroundedAt = nil
+            backgroundedAtUptime = nil
             return
         }
-        // **Fail closed.** If `backgroundedAt` is nil — which can
+        // **Fail closed.** If `backgroundedAtUptime` is nil — which can
         // happen on a scene reattach without an intervening
         // didEnterBackground (Stage Manager bring-back, watchdog
         // termination + scene-restoration path, etc.) — default to
@@ -157,16 +167,44 @@ final class LockManager {
         // unnecessary biometric prompt in that edge case; the
         // alternative is exposing chat content to whoever picked up
         // the device.
-        guard let backgroundedAt else {
+        guard let backgroundedAtUptime else {
             isLocked = true
+            dismissPresentedModals()
             return
         }
-        let elapsed = Date().timeIntervalSince(backgroundedAt)
+        let elapsed = Self.uptimeSeconds() - backgroundedAtUptime
         let timeout = ChatStore.shared.state.autoLockTimeout.seconds
         if elapsed >= timeout {
             isLocked = true
+            dismissPresentedModals()
         }
-        self.backgroundedAt = nil
+        self.backgroundedAtUptime = nil
+    }
+
+    /// **Route-guard for sheets and full-screen covers.** The in-body
+    /// `LockOverlayView` lives inside ContentView's ZStack, but
+    /// SwiftUI sheets/covers present at the *window* level — above
+    /// the ZStack root. So a `MyQRSheet` or attachment-picker that
+    /// was on screen when the user backgrounded the phone stays
+    /// visible *above* the lock overlay on return. Without this
+    /// dismissal the lock screen is decorative for those surfaces.
+    ///
+    /// Reaches into UIKit because there is no SwiftUI primitive for
+    /// "dismiss whatever modal happens to be presented." Calling
+    /// `dismiss(animated:)` on the root view controller cascades
+    /// through every layer of presentation in one shot. Animated
+    /// false so the user never sees the dismissal half-frame —
+    /// the lock overlay should be in place before any glimpse of
+    /// the freed view tree.
+    private func dismissPresentedModals() {
+        let scenes = UIApplication.shared.connectedScenes
+        for scene in scenes {
+            guard let windowScene = scene as? UIWindowScene else { continue }
+            for window in windowScene.windows {
+                guard let root = window.rootViewController else { continue }
+                root.dismiss(animated: false)
+            }
+        }
     }
 
     func handleDidActivate() {

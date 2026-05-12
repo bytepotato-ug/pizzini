@@ -76,7 +76,7 @@ struct PhotoVideoPicker: UIViewControllerRepresentable {
             provider.loadDataRepresentation(forTypeIdentifier: utype) { [weak self] data, error in
                 guard let self else { return }
                 if let error {
-                    NSLog("[pizzini] PHPicker loadDataRepresentation error: \(error)")
+                    pzLog("[pizzini] PHPicker loadDataRepresentation error: \(error)")
                     DispatchQueue.main.async { self.parent.onCancel() }
                     return
                 }
@@ -96,7 +96,7 @@ struct PhotoVideoPicker: UIViewControllerRepresentable {
                 do {
                     try data.write(to: tmp, options: [.atomic])
                 } catch {
-                    NSLog("[pizzini] PHPicker tmp write failed: \(error)")
+                    pzLog("[pizzini] PHPicker tmp write failed: \(error)")
                     DispatchQueue.main.async { self.parent.onCancel() }
                     return
                 }
@@ -208,7 +208,7 @@ struct DocumentPicker: UIViewControllerRepresentable {
             do {
                 try FileManager.default.copyItem(at: url, to: tmp)
             } catch {
-                NSLog("[pizzini] DocumentPicker copy failed: \(error)")
+                pzLog("[pizzini] DocumentPicker copy failed: \(error)")
                 parent.onCancel()
                 return
             }

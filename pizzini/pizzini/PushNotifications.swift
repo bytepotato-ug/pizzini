@@ -1,7 +1,15 @@
 import Foundation
+import os
 import SwiftUI
 import UIKit
 import UserNotifications
+
+/// Push / APNs lifecycle log channel. Console.app filter:
+/// `subsystem:app.pizzini category:push`. Error bodies are
+/// `privacy: .private` so they're redacted in sysdiagnose
+/// (matches the threat-model concern documented in
+/// `PrivateLog.swift`) but stay readable in dev.
+private let pushLog = Logger(subsystem: "app.pizzini", category: "push")
 
 /// `UIApplicationDelegateAdaptor` host. SwiftUI's `App` doesn't surface
 /// the AppDelegate hooks we need for APNs token registration, so we
@@ -35,8 +43,14 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         do {
             try Storage.bootstrap()
         } catch {
-            NSLog("[pizzini] Storage.bootstrap failed: \(error)")
+            pushLog.fault("Storage.bootstrap failed: \(String(describing: error), privacy: .private)")
         }
+        // Tor bootstrap is owned by RelayClient.startTorConnection on
+        // ChatStore.init → connectRelay. We don't kick it earlier
+        // here: cold-launch correctness comes from
+        // `TorController.prepareHiddenService(_:)` priming the HS
+        // descriptor cache before the first SOCKS5 CONNECT, not from
+        // shaving the 1-2 s tor warmup off the launch path.
         UNUserNotificationCenter.current().delegate = self
         // Window-level privacy shield: covers sheets and popovers in the
         // multitasking snapshot, which an in-body overlay can't do.
@@ -68,7 +82,47 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // initial onboarding the iOS Settings app is the path to
         // re-prompt (UNUserNotificationCenter caches the first
         // decision; you can only re-prompt via the OS settings).
+        //
+        // **But we DO re-register for remote notifications on every
+        // launch where the user previously authorized.** Apple's
+        // documented behaviour: `registerForRemoteNotifications()`
+        // is the only way iOS delivers (or refreshes) the device
+        // token via `didRegisterForRemoteNotificationsWithDeviceToken`.
+        // iOS rotates tokens occasionally and invalidates them when
+        // the app is reinstalled / restored to a new device; without
+        // this re-registration call, `pushTokenCached` stays nil
+        // forever after the first launch, no token reaches the
+        // relay, and APNs wake-ups silently never arrive. The
+        // permission prompt does NOT re-appear — `registerForRemote
+        // Notifications` is a no-op when authorization isn't
+        // granted; we gate on the cached `getNotificationSettings`
+        // status so we only call it for users who said yes.
+        rerequestPushTokenIfAuthorized()
         return true
+    }
+
+    /// Re-trigger the device-token delivery callback on every launch
+    /// where the user has previously granted notification permission.
+    /// Idempotent on iOS's side (returns the cached token unless
+    /// it's been rotated). Off the main thread because
+    /// `getNotificationSettings` is async; the actual
+    /// `registerForRemoteNotifications` call hops back to MainActor
+    /// because UIApplication's API requires it.
+    private func rerequestPushTokenIfAuthorized() {
+        Task { @MainActor in
+            let settings = await UNUserNotificationCenter.current().notificationSettings()
+            switch settings.authorizationStatus {
+            case .authorized, .provisional, .ephemeral:
+                UIApplication.shared.registerForRemoteNotifications()
+            case .notDetermined, .denied:
+                // Onboarding will prompt for `notDetermined` users;
+                // denied users explicitly opted out and re-prompting
+                // would be obnoxious.
+                break
+            @unknown default:
+                break
+            }
+        }
     }
 
     func application(
@@ -84,7 +138,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         _ application: UIApplication,
         didFailToRegisterForRemoteNotificationsWithError error: Error
     ) {
-        NSLog("[pizzini] APNs registration failed: \(error)")
+        pushLog.error("APNs registration failed: \(String(describing: error), privacy: .private)")
     }
 
     /// Show alerts even when the app is foregrounded — useful for dev
@@ -110,7 +164,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             let granted = try await UNUserNotificationCenter.current()
                 .requestAuthorization(options: [.alert, .sound, .badge])
             guard granted else {
-                NSLog("[pizzini] notification authorization not granted")
+                pushLog.notice("notification authorization not granted")
                 return false
             }
             await MainActor.run {
@@ -118,7 +172,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             }
             return true
         } catch {
-            NSLog("[pizzini] requestAuthorization failed: \(error)")
+            pushLog.error("requestAuthorization failed: \(String(describing: error), privacy: .private)")
             return false
         }
     }

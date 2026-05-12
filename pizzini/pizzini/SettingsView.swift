@@ -59,44 +59,11 @@ struct SettingsView: View {
 
             Section {
                 Toggle(isOn: Binding(
-                    get: { store.state.panicModeEnabled },
-                    set: { store.setPanicModeEnabled($0) }
+                    get: { store.state.notificationsMuted },
+                    set: { store.setNotificationsMuted($0) }
                 )) {
-                    Label("Panic mode", systemImage: "exclamationmark.octagon")
+                    Label("Pause notifications", systemImage: "bell.slash")
                 }
-            } header: {
-                Text("Panic mode")
-            } footer: {
-                Text("Three fast taps in a chat instantly delete it. No undo.")
-            }
-
-            Section {
-                Toggle(isOn: Binding(
-                    get: { store.state.contactsBeforeGroups },
-                    set: { store.setContactsBeforeGroups($0) }
-                )) {
-                    Label("Contacts before groups", systemImage: "list.bullet.indent")
-                }
-            } header: {
-                Text("Chat list")
-            } footer: {
-                Text("On: 1:1 chats appear above groups. Off: groups appear above 1:1 chats. Pending invitations always pin to the top.")
-            }
-
-            Section {
-                Toggle(isOn: Binding(
-                    get: { store.state.quickLookPreviewEnabled },
-                    set: { store.setQuickLookPreviewEnabled($0) }
-                )) {
-                    Label("In-app preview", systemImage: "eye")
-                }
-            } header: {
-                Text("Attachments")
-            } footer: {
-                Text("Off keeps received files out of Pizzini until you tap Save to Files.")
-            }
-
-            Section {
                 Toggle(isOn: Binding(
                     get: { store.state.inAppHapticsEnabled },
                     set: { store.setInAppHapticsEnabled($0) }
@@ -106,7 +73,7 @@ struct SettingsView: View {
             } header: {
                 Text("Notifications")
             } footer: {
-                Text("On: a soft haptic fires when a new message lands in a chat other than the one you're in. No banner, no sound, no preview — same posture as Signal / WhatsApp / Threema. The badge and chat list always update either way.")
+                Text("Pause: messages still arrive and persist, but the app icon badge and in-app haptic stay silent. Per-chat mute in each contact's ⋯ menu is independent. The haptic fires when a new message lands in a chat other than the one you're in — no banner, no sound, no preview.")
             }
 
             Section {
@@ -116,10 +83,46 @@ struct SettingsView: View {
                 )) {
                     Label("Send read receipts", systemImage: "eye")
                 }
+                NavigationLink {
+                    BlockedContactsView(store: store)
+                } label: {
+                    SettingsRow(
+                        icon: "hand.raised.slash",
+                        title: "Blocked contacts",
+                        value: store.state.blockedIdentities.isEmpty
+                            ? "None"
+                            : "\(store.state.blockedIdentities.count)",
+                    )
+                }
             } header: {
                 Text("Privacy")
             } footer: {
-                Text("Off by default. When on, contacts you've enabled will see when you open their messages (✓✓ flips to 👁). Per-chat override in each contact's ⋯ menu lets you opt in or out for individual chats regardless of this setting.")
+                Text("Read receipts off by default. When on, contacts you've enabled will see when you open their messages (✓✓ flips to 👁). Per-chat override in each contact's ⋯ menu. Blocked contacts can't reach you even if they try to re-pair.")
+            }
+
+            Section {
+                Toggle(isOn: Binding(
+                    get: { store.state.panicModeEnabled },
+                    set: { store.setPanicModeEnabled($0) }
+                )) {
+                    Label("Panic mode", systemImage: "exclamationmark.octagon")
+                }
+                Toggle(isOn: Binding(
+                    get: { store.state.contactsBeforeGroups },
+                    set: { store.setContactsBeforeGroups($0) }
+                )) {
+                    Label("Contacts before groups", systemImage: "list.bullet.indent")
+                }
+                Toggle(isOn: Binding(
+                    get: { store.state.quickLookPreviewEnabled },
+                    set: { store.setQuickLookPreviewEnabled($0) }
+                )) {
+                    Label("In-app preview for attachments", systemImage: "eye")
+                }
+            } header: {
+                Text("Chats")
+            } footer: {
+                Text("Panic mode: three fast taps in a chat instantly delete it — no undo. List order: 1:1 chats above groups (or below). In-app preview: off keeps received files out of Pizzini until you tap Save to Files.")
             }
 
             if store.state.qrBlockEffective == false {
@@ -164,6 +167,37 @@ struct SettingsView: View {
                 }
             } footer: {
                 Text("Delete all chats, reset your identity.")
+            }
+
+            // Brand footer — small logo + wordmark + build version.
+            // Lives at the bottom of the form (was the top; moved here
+            // to keep first-screen real estate for actionable controls
+            // and match the App Store "About" pattern where build
+            // metadata trails the settings stack).
+            Section {
+                VStack(spacing: 8) {
+                    Image("AppLogo")
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 72, height: 72)
+                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .shadow(color: .black.opacity(0.12), radius: 4, x: 0, y: 2)
+                        .accessibilityLabel("Pizzini logo")
+                    Text("Pizzini")
+                        .font(.title3.bold())
+                    if let version = Bundle.main.object(
+                        forInfoDictionaryKey: "CFBundleShortVersionString",
+                    ) as? String {
+                        Text("Version \(version)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 16)
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets())
             }
         }
         .navigationTitle("Settings")

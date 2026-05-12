@@ -45,7 +45,14 @@ struct PasscodeEntryView: View {
                     .padding(.horizontal, 32)
 
                 SecureField("Passcode", text: $entry)
-                    .textContentType(.password)
+                    // No `.textContentType(.password)` here, deliberately.
+                    // That hint integrates the field with iCloud Keychain
+                    // AutoFill — *exactly* what we don't want for the
+                    // app's local lock passcode: the whole point is that
+                    // this string never leaves the device. Bonus: drops
+                    // the per-keystroke "variant selector cell index
+                    // number could not be found" UIKit chatter on iOS 26
+                    // that the password-AutoFill machinery triggers.
                     .keyboardType(.asciiCapable)
                     .hardenedTextInput()
                     .padding(.horizontal, 16)

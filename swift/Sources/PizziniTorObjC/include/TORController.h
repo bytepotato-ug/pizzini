@@ -103,6 +103,13 @@ TOR_EXTERN NSString * const TORControllerErrorDomain;
 // Observers
 - (id)addObserverForCircuitEstablished:(void (^)(BOOL established))block;
 - (id)addObserverForStatusEvents:(BOOL (^)(NSString *type, NSString *severity, NSString *action, NSDictionary<NSString *, NSString *> * __nullable arguments))block;
+/// Generic event-line observer. The block receives every async reply
+/// frame tor's control port emits (`650` event lines AND `2xx` command
+/// replies); pick out the events you care about by matching `codes`
+/// and parsing `lines`. Set `*stop = YES` to detach. Used by HS_DESC
+/// matching in `TorController.prepareHiddenService(_:)`, where there's
+/// no dedicated typed-observer pair on this class.
+- (id)addObserver:(TORObserverBlock)observer;
 - (void)removeObserver:(nullable id)observer;
 
 @end

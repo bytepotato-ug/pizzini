@@ -151,6 +151,10 @@ struct GroupChatView: View {
         // pattern from commit 52ac407.
         .navigationTitle(group?.displayName ?? "Group")
         .navigationBarTitleDisplayMode(.inline)
+        // Hide the floating tab pill while a group chat is on screen.
+        // Same reasoning as 1:1 ChatView — the composer owns the
+        // bottom of the surface.
+        .toolbar(.hidden, for: .tabBar)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -391,11 +395,31 @@ struct GroupChatView: View {
     /// rolled-up status icon. False (NOT nil) when no outbox entries
     /// remain — post-GC the row stays at ✓✓ rather than claiming
     /// "read by all" without confirmation.
+    ///
+    /// Render-time per-contact override gate, mirroring the F-405
+    /// 1:1 fix: legs whose recipient is *currently* effective-off
+    /// (e.g. user later flipped a member to `.alwaysOff`) are filtered
+    /// out of the aggregation rather than required-and-unreadable.
+    /// This matches the receive-side gate at ChatStore.swift:2564
+    /// which already drops fresh receipts from those peers; without
+    /// the matching read-side filter, legs stamped *before* the
+    /// toggle kept lighting the eye after the user opted out.
     private func rowReadByAll(for row: PersistedMessage) -> Bool {
         guard row.side == .me, row.kind != .system,
               let gmid = row.groupMessageId
         else { return false }
-        return store.outbox.groupMessageReadByAll(forId: gmid)
+        let globalDefault = store.state.defaultReadReceiptsEnabled
+        let trackedLegs = store.outbox.entries.values.filter { entry in
+            guard entry.groupMessageId == gmid else { return false }
+            guard let cIdx = store.state.contacts.firstIndex(
+                where: { $0.identityPub == entry.recipientPeerId },
+            ) else { return false }
+            return store.state.contacts[cIdx].effectiveReadReceiptsEnabled(
+                globalDefault: globalDefault,
+            )
+        }
+        guard !trackedLegs.isEmpty else { return false }
+        return trackedLegs.allSatisfy { $0.readAt != nil }
     }
 
     /// Jump the chat scroll to the absolute bottom after the user
@@ -576,60 +600,26 @@ struct GroupChatView: View {
     }
 
     private var composer: some View {
-        HStack(spacing: 8) {
-            Button {
-                showAttachSheet = true
-            } label: {
-                Image(systemName: "paperclip")
-                    .padding(.horizontal, 4)
-            }
-            .buttonStyle(.bordered)
-            .disabled(!canSend)
-            .accessibilityLabel("Attach a file")
-            .confirmationDialog(
-                "Attach a file",
-                isPresented: $showAttachSheet,
-                titleVisibility: .hidden,
-            ) {
+        // Same shared `MessageComposer` 1:1 ChatView uses. `canSend`
+        // gates membership/sender-chain readiness (the entire
+        // composer); `sendEnabled` gates draft/attachment presence
+        // (just the send button). Background is supplied by the
+        // outer `.safeAreaInset` VStack — see ChatView for the same
+        // pattern.
+        MessageComposer(
+            draft: $draft,
+            showAttachSheet: $showAttachSheet,
+            placeholder: attachmentDraft == nil ? "Message" : "add a caption (optional)",
+            composerDisabled: !canSend,
+            sendDisabled: !sendEnabled,
+            onSend: send,
+            attachDialog: {
                 Button("Photo or video") { showPhotoPicker = true }
                 Button("File") { showDocumentPicker = true }
                 Button("Cancel", role: .cancel) {}
-            }
-
-            TextField(
-                attachmentDraft == nil ? "Message" : "add a caption (optional)",
-                text: $draft,
-                axis: .vertical,
-            )
-                // F-NEW-801 + F-NEW-802 fix: explicit hardening on the
-                // composer, not inherited from the (removed) parent
-                // `.searchable` modifier's side effect. Survives the
-                // search bar's lifecycle and keeps the strict posture
-                // even if a future refactor moves the modifier up.
-                .hardenedTextInput(autocap: .sentences)
-                .textFieldStyle(.roundedBorder)
-                .focused($composerFocused)
-                // Multi-line composer: return inserts a newline. Don't
-                // override `.submitLabel` to `.send` here — that styles
-                // the keyboard's return key as a blue send glyph and
-                // misleads users into thinking it'll submit (it can't,
-                // axis: .vertical absorbs the keypress for the
-                // newline). The visible send button next to the field
-                // is the only way to send. ChatView's composer is
-                // single-line and keeps `.submitLabel(.send)` because
-                // there return actually submits.
-            Button(action: send) {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.title2)
-            }
-            .disabled(!canSend || !sendEnabled)
-        }
-        .padding(8)
-        // NB: no `.background(.bar)` here — the surrounding
-        // `.safeAreaInset` content (this composer + the optional
-        // attachment-preview banner above it) shares one `.bar`
-        // background on its outer VStack so the inset reads as a
-        // single docked surface.
+            },
+            focused: $composerFocused,
+        )
     }
 
     /// True when the local user is still an active member of this

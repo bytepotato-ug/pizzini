@@ -671,6 +671,44 @@ async fn main() -> std::io::Result<()> {
     spawn_verify_keys_gc(verify_keys.clone());
     spawn_push_tokens_gc(push_tokens.clone());
 
+    // Health endpoint — separate listener on `PIZZINI_RELAY_HEALTH_BIND`
+    // (default `127.0.0.1:7778`). Replies with a one-line JSON snapshot
+    // so an operator's systemd watchdog / monitoring agent can probe
+    // liveness without speaking the binary relay protocol. Bound to
+    // loopback by default; the production posture is "Tor terminates
+    // the public surface, the health port is operator-local."
+    let health_bind_str = std::env::var("PIZZINI_RELAY_HEALTH_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:7778".to_string());
+    if !health_bind_str.eq_ignore_ascii_case("off") {
+        match health_bind_str.parse::<SocketAddr>() {
+            Ok(health_bind) => {
+                let routes_h = routes.clone();
+                let pending_h = pending.clone();
+                let push_tokens_h = push_tokens.clone();
+                let verify_keys_h = verify_keys.clone();
+                let replays_h = replays.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = run_health_server(
+                        health_bind,
+                        routes_h,
+                        pending_h,
+                        push_tokens_h,
+                        verify_keys_h,
+                        replays_h,
+                    )
+                    .await
+                    {
+                        eprintln!("[pizzini-relay] health server exited: {e}");
+                    }
+                });
+                println!("  health endpoint: http://{health_bind}/healthz (set PIZZINI_RELAY_HEALTH_BIND=off to disable)");
+            }
+            Err(e) => {
+                eprintln!("  health endpoint: PIZZINI_RELAY_HEALTH_BIND={health_bind_str:?} invalid: {e} — disabled");
+            }
+        }
+    }
+
     // Concurrent-connection cap. The accept loop blocks on
     // `acquire_owned()` once `max_conns` connections are live —
     // surplus TCP SYNs back up in the kernel accept queue (and
@@ -680,46 +718,130 @@ async fn main() -> std::io::Result<()> {
     // exit, returning capacity exactly when the connection closes.
     let conn_limit = Arc::new(Semaphore::new(max_conns));
 
+    // Graceful-shutdown signal. SIGINT (Ctrl-C) and SIGTERM (systemd
+    // `systemctl stop`) both end the accept loop and let spawned
+    // per-connection tasks drain naturally as their clients close
+    // sockets. Previous behaviour was `loop { accept }` with no
+    // signal handling — `systemctl stop` waited the full
+    // `TimeoutStopSec` and then SIGKILLed, losing whatever frames
+    // were in flight. New shape: select between accept and signal;
+    // signal-side branch breaks the loop, the function returns, and
+    // tokio's runtime drop waits for in-flight tasks to finish.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
-        let (stream, peer_addr) = listener.accept().await?;
-        // Block until a permit is available. `acquire_owned()` cannot
-        // fail unless the semaphore is closed, which we never do —
-        // `.expect()` here is a documented-impossible panic.
-        let permit = conn_limit
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("connection-limit semaphore is never closed");
+        tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => {
+                println!("[pizzini-relay] SIGINT received; draining and shutting down");
+                break;
+            }
+            _ = sigterm.recv() => {
+                println!("[pizzini-relay] SIGTERM received; draining and shutting down");
+                break;
+            }
+            accept = listener.accept() => {
+                let (stream, peer_addr) = accept?;
+                // Block until a permit is available. `acquire_owned()` cannot
+                // fail unless the semaphore is closed, which we never do —
+                // `.expect()` here is a documented-impossible panic.
+                let permit = conn_limit
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("connection-limit semaphore is never closed");
+                let routes = routes.clone();
+                let push_tokens = push_tokens.clone();
+                let pending = pending.clone();
+                let verify_keys = verify_keys.clone();
+                let replays = replays.clone();
+                let hello_replays = hello_replays.clone();
+                let apns = apns.clone();
+                let status_snapshot = status_snapshot.clone();
+                tokio::spawn(async move {
+                    // Move the permit into the task so it lives exactly as
+                    // long as the connection. The `_` prefix keeps clippy
+                    // from suggesting we drop it explicitly — it must hold
+                    // until the task ends.
+                    let _conn_permit = permit;
+                    if let Err(e) = handle_connection(
+                        stream,
+                        routes,
+                        push_tokens,
+                        pending,
+                        verify_keys,
+                        replays,
+                        hello_replays,
+                        apns,
+                        status_snapshot,
+                        peer_addr,
+                    )
+                    .await
+                    {
+                        eprintln!("[{peer_addr}] connection closed: {e}");
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Minimal HTTP/1.1 health endpoint. Replies with one of:
+///   `GET /healthz`  → `200 {"status":"ok",...counters...}`
+///   anything else   → `404 not found`
+/// Hand-rolled rather than pulling in hyper/axum: this is one
+/// request shape and the relay's only build-time HTTP dep is
+/// already implicit via reqwest in the APNs path. A 200-byte
+/// response keeps the surface small.
+async fn run_health_server(
+    bind: SocketAddr,
+    routes: Routes,
+    pending: Pending,
+    push_tokens: PushTokens,
+    verify_keys: VerifyKeys,
+    replays: Replays,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind(bind).await?;
+    loop {
+        let (mut stream, _) = listener.accept().await?;
         let routes = routes.clone();
-        let push_tokens = push_tokens.clone();
         let pending = pending.clone();
+        let push_tokens = push_tokens.clone();
         let verify_keys = verify_keys.clone();
         let replays = replays.clone();
-        let hello_replays = hello_replays.clone();
-        let apns = apns.clone();
-        let status_snapshot = status_snapshot.clone();
         tokio::spawn(async move {
-            // Move the permit into the task so it lives exactly as
-            // long as the connection. The `_` prefix keeps clippy
-            // from suggesting we drop it explicitly — it must hold
-            // until the task ends.
-            let _conn_permit = permit;
-            if let Err(e) = handle_connection(
-                stream,
-                routes,
-                push_tokens,
-                pending,
-                verify_keys,
-                replays,
-                hello_replays,
-                apns,
-                status_snapshot,
-                peer_addr,
-            )
-            .await
-            {
-                eprintln!("[{peer_addr}] connection closed: {e}");
-            }
+            let mut buf = [0u8; 1024];
+            let n = match stream.read(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let is_healthz = req
+                .lines()
+                .next()
+                .map(|line| line.starts_with("GET /healthz"))
+                .unwrap_or(false);
+            let body = if is_healthz {
+                let connections = routes.lock().await.len();
+                let pending_total = pending.lock().await.total_frames();
+                let push_total = push_tokens.lock().await.len();
+                let verify_total = verify_keys.lock().await.len();
+                let replay_total = replays.lock().await.len();
+                format!(
+                    "{{\"status\":\"ok\",\"connections\":{connections},\"pending_frames\":{pending_total},\"push_tokens\":{push_total},\"verify_keys\":{verify_total},\"replay_entries\":{replay_total}}}\n"
+                )
+            } else {
+                String::from("not found\n")
+            };
+            let status_line = if is_healthz { "200 OK" } else { "404 Not Found" };
+            let resp = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.shutdown().await;
         });
     }
 }

@@ -119,13 +119,19 @@ impl ReplayStore {
 
     /// True if `(peer_id, nonce)` is already in the replay set —
     /// caller should refuse the frame as a replay.
+    ///
+    /// Fires on every accepted SEND/ACK and is therefore the hottest
+    /// read on the relay. Previously this was an O(n) linear scan
+    /// across `map.keys()` because `HashMap<(Vec<u8>, Vec<u8>), _>`
+    /// doesn't admit a `(&[u8], &[u8])` probe. At 30-day TTL the set
+    /// reaches multi-million entries on any active fleet; a single
+    /// SEND was paying tens-of-microseconds per match. The owned-key
+    /// build below allocates ~80 bytes per probe and replaces a
+    /// million-iter scan with one hash lookup — net win at any
+    /// realistic load.
     pub fn contains(&self, peer_id: &[u8], nonce: &[u8]) -> bool {
-        // Allocation-free probe via tuple-reference lookup pattern.
-        // HashMap doesn't accept a (&[u8], &[u8]); we own the bytes
-        // for the (rare-relative-to-lookup) insert path.
-        self.map
-            .keys()
-            .any(|(p, n)| p.as_slice() == peer_id && n.as_slice() == nonce)
+        let key = (peer_id.to_vec(), nonce.to_vec());
+        self.map.contains_key(&key)
     }
 
     /// Insert `(peer_id, nonce)` with `first_seen_unix = now` and

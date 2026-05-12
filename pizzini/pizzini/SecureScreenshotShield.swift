@@ -1,5 +1,15 @@
+import os
 import SwiftUI
 import UIKit
+
+/// Screenshot-mask self-test log channel. Console.app filter:
+/// `subsystem:app.pizzini category:screencap`. A failed self-test
+/// is `.fault` so it surfaces in unified logging even on release
+/// (an attacker-extractable sysdiagnose seeing "self-test FAILED"
+/// is fine — it tells them nothing useful about the user's data,
+/// only that this device's UIKit revision broke our mask). The
+/// OS version string is `.private` out of caution.
+private let screenCapLog = Logger(subsystem: "app.pizzini", category: "screencap")
 
 /// Subclassed secure `UITextField` used by `WindowSecureMask` (in
 /// production) and by `SecureScreenshotSelfTest` (at launch) to host
@@ -93,15 +103,12 @@ enum SecureScreenshotSelfTest {
         let effective = run()
         store.setQRBlockEffective(effective, osVersion: currentOS)
         if !effective {
-            NSLog(
-                "[pizzini] SecureScreenshotSelfTest FAILED on iOS \(currentOS) — "
-                    + "isSecureTextEntry no longer masks captured frames. "
-                    + "WindowSecureMask is now a no-op; investigate.",
+            screenCapLog.fault(
+                "SecureScreenshotSelfTest FAILED on iOS \(currentOS, privacy: .private) — isSecureTextEntry no longer masks captured frames. WindowSecureMask is now a no-op; investigate."
             )
         } else {
-            NSLog(
-                "[pizzini] SecureScreenshotSelfTest passed on iOS \(currentOS). "
-                    + "WindowSecureMask is active.",
+            screenCapLog.notice(
+                "SecureScreenshotSelfTest passed on iOS \(currentOS, privacy: .private). WindowSecureMask is active."
             )
         }
     }

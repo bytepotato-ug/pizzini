@@ -6,6 +6,7 @@
 //
 //   TorController.shared
 //       │  bootstrap() async throws -> UInt16
+//       │  prepareHiddenService(_:) async throws
 //       │  bootstrapProgress: Int           (0-100, observable)
 //       │  isReady: Bool
 //       │  stop()
@@ -19,6 +20,37 @@
 //   protocol over a unix socket whose path lives in the data
 //   directory. Authentication is via the cookie file tor writes
 //   on startup (cookieAuthentication = YES).
+//
+// ─── What "ready" means in this codebase ────────────────────────────
+//
+// `bootstrap()` returns when tor emits CIRCUIT_ESTABLISHED — i.e. the
+// FIRST general-purpose circuit is open. That is enough to dial a
+// public-internet target but NOT enough to dial a hidden service:
+// the first .onion CONNECT additionally needs (1) an HS-descriptor
+// fetched off the HSDirs, (2) an introduction circuit, and (3) a
+// rendezvous circuit. Cold launch, even with a warm consensus cache,
+// fails the first SOCKS5 CONNECT until those three exist. The next
+// attempt 5-15 s later finds the descriptor cached and succeeds —
+// which is the "the app only connects after I tap Reconnect" symptom
+// we shipped against.
+//
+// The fix is two halves:
+//   - `bootstrap()` still resolves on CIRCUIT_ESTABLISHED, since that
+//     is the well-defined "tor is functioning" milestone.
+//   - `prepareHiddenService(_:)` is the missing step on the relay
+//     dial path. RelayClient calls it between bootstrap() and the
+//     SOCKS handshake; it issues a `HSFETCH` over the control port,
+//     waits for the matching `HS_DESC RECEIVED` event, and only
+//     then returns. The SOCKS5 CONNECT that follows skips the
+//     descriptor-lookup phase entirely; the intro/rendezvous
+//     handshake still takes a few seconds but is well inside the
+//     time tor's SocksTimeout (2 min) and our own retry window
+//     allow. Cold-launch first-attempt success is the observable
+//     property.
+//
+// Future readers: do NOT collapse `prepareHiddenService` back into
+// `bootstrap()`. The daemon is a fleet-wide singleton; the HS step
+// is per-onion. Two relays in the trusted fleet need two HSFETCHes.
 //
 // Concurrency:
 //   - All public methods are safe to call from any task. The first
@@ -36,6 +68,14 @@
 import Foundation
 import os
 import PizziniTorObjC
+
+/// Debug logger for the embedded tor lifecycle. Subsystem +
+/// category match `app.pizzini.tor` so Console.app can filter to
+/// just our tor activity (`subsystem:app.pizzini.tor`). All
+/// significant phase transitions log here with wall-clock-style
+/// elapsed-since-bootstrap-start markers so the gap between "tor
+/// printed BOOTSTRAP 0%" and "we gave up" stops being invisible.
+private let torLog = Logger(subsystem: "app.pizzini.tor", category: "lifecycle")
 
 /// Errors surfaced from `TorController.bootstrap()`.
 public enum TorControllerError: Error, LocalizedError, Sendable {
@@ -56,6 +96,34 @@ public enum TorControllerError: Error, LocalizedError, Sendable {
     case authenticationFailed
     /// Caller cancelled the bootstrap via task cancellation.
     case cancelled
+    /// `prepareHiddenService(_:)` could not get tor to cache an HS
+    /// descriptor for the target onion. `reason` is the HS_DESC FAILED
+    /// `REASON=` field (e.g. `NOT_FOUND`, `QUERY_NO_HSDIR`) or
+    /// `hsDescTimedOut`. Distinguished from `bootstrapTimedOut` because
+    /// the daemon itself is up — the HS endpoint is what's unreachable.
+    case hsDescriptorUnavailable(onion: String, reason: String)
+    /// Caller invoked `prepareHiddenService(_:)` before `bootstrap()`
+    /// returned. Programmer error in the relay-client flow.
+    case notBootstrapped
+}
+
+/// What `TorController.purgeStaleControlFiles(in:)` removed before
+/// starting a fresh TORThread. `anyRemoved` is set when at least
+/// one leftover control file from a previous app process was found
+/// and unlinked.
+///
+/// Public so the iOS app test target can assert against the
+/// cleanup outcome — see `StaleControlFilesPurgeTests` in
+/// `pizziniTests`. The fields are stable contract.
+public struct StaleControlFilesPurge: Equatable, Sendable {
+    public let cookieRemoved: Bool
+    public let portRemoved: Bool
+    public var anyRemoved: Bool { cookieRemoved || portRemoved }
+
+    public init(cookieRemoved: Bool, portRemoved: Bool) {
+        self.cookieRemoved = cookieRemoved
+        self.portRemoved = portRemoved
+    }
 }
 
 @MainActor
@@ -118,6 +186,35 @@ public final class TorController: ObservableObject {
     /// is broken" patience.
     nonisolated private static let bootstrapHardDeadline: TimeInterval = 4 * 60
 
+    /// How long we wait for tor to create its `control_auth_cookie`
+    /// and `controlport` files in the data directory after
+    /// `TORThread.start()` returns. iOS Simulator cold-start with no
+    /// cached consensus can stall tor's main loop for 10-20 s while
+    /// libevent finishes setting up — *before* it writes either file.
+    /// Empirical: 30 s covers a worst-case sim cold-start, and the
+    /// poll itself is cheap (100 ms cadence, two `FileManager`
+    /// lookups). The previous 15 s here was the silent culprit in
+    /// many "first launch never connects" reports.
+    nonisolated private static let startupFilePollDeadline: TimeInterval = 30
+
+    /// How long we keep retrying the control-port TCP connect after
+    /// tor's control listener writes its `controlport` file.
+    /// **This is the most load-bearing single timeout in the cold-
+    /// start path.** Even after tor logs "Control listener listening
+    /// on port N", its libevent loop is busy setting up directory
+    /// fetches, guard contexts, etc. and doesn't actually drain the
+    /// accept queue for another 10-15 s on iOS Simulator. The
+    /// previous 10 s here gave up while tor was still warming up,
+    /// flipped RelayClient to `.failed`, and the user saw the
+    /// "tap to reconnect" pill before the auto-reconnect timer
+    /// fired — even though tor would have accepted us if we'd
+    /// waited a few more seconds. 60 s gives a 4× margin over the
+    /// empirical worst case, and we still bail fast (sub-second
+    /// retry cadence) once tor's control listener wakes up. If we
+    /// ever wait the full 60 s, tor has genuinely failed to start —
+    /// at which point a user-visible failure is the correct UX.
+    nonisolated private static let controllerConnectDeadline: TimeInterval = 60
+
     /// Tor's C runtime (`tor_run_main`) can only be invoked once per
     /// process — TORThread enforces this via an `abort()` in its
     /// initialiser (release-safe; the upstream NSAssert is compiled
@@ -157,6 +254,42 @@ public final class TorController: ObservableObject {
     /// same one. Cleared on `stop()` so the next foreground-cycle
     /// `bootstrap()` starts a fresh task.
     private var pendingBootstrap: Task<UInt16, Error>?
+
+    /// Per-onion HSFETCH coalescing. Keyed by the bare v3 onion
+    /// label (no `.onion` suffix, lowercase). Concurrent callers
+    /// of `prepareHiddenService(_:)` for the same target share one
+    /// in-flight fetch instead of stacking HSFETCHes on top of each
+    /// other. Cleared on `stop()`.
+    private var hsFetchTasks: [String: Task<Void, Error>] = [:]
+
+    /// Onions we've already primed in the current tor session. tor
+    /// caches HS descriptors locally for hours, so re-issuing
+    /// HSFETCH on every warm reconnect (background → foreground,
+    /// relay drop + recover, manual Reconnect) adds ~0.7 s of
+    /// "Connecting…" with zero functional benefit. We track which
+    /// addresses have already been prepared and short-circuit on
+    /// the fast path. Invalidated when tor itself restarts via
+    /// `stop()`; tor's own cache eviction handles descriptor TTL
+    /// transparently (a SOCKS5 CONNECT against an evicted cache
+    /// makes tor re-fetch on demand, slowing that one connect
+    /// but not breaking it).
+    private var preparedOnions: Set<String> = []
+
+    /// Hard deadline for a single HSFETCH. **The first HSFETCH after
+    /// a fresh bootstrap is the load-bearing one** — tor's HSDir
+    /// circuit pool is empty, so the descriptor lookup pays for the
+    /// 3-hop circuit build (~5 s) plus the HSDir round-trip
+    /// (variable, 5-25 s depending on which HSDir tor picks first).
+    /// Empirically on an iOS device cold launch we've seen the
+    /// full path complete in ~28-30 s; the previous 25 s budget
+    /// fired *just* before tor would have emitted HS_DESC RECEIVED,
+    /// stranded the observer, and the descriptor landed in cache
+    /// silently — letting the next attempt (auto-reconnect 5 s
+    /// later) succeed in <1 s. 90 s gives a 3× margin over the
+    /// observed worst case so the first attempt actually catches
+    /// the event instead of timing out 5 s short. UI stays at
+    /// `.connecting` during the wait, no `.failed` flash.
+    nonisolated private static let hsFetchDeadline: TimeInterval = 90
 
     private init() {}
 
@@ -199,7 +332,77 @@ public final class TorController: ObservableObject {
     public func stop() {
         pendingBootstrap?.cancel()
         pendingBootstrap = nil
+        hsFetchTasks.values.forEach { $0.cancel() }
+        hsFetchTasks.removeAll()
+        // Tor itself is shut down — its descriptor cache goes with
+        // it. The "prepared" set must clear so the next bootstrap
+        // re-primes from scratch.
+        preparedOnions.removeAll()
         stopInternal()
+    }
+
+    /// Prime tor's hidden-service descriptor cache for `onionHost`.
+    /// Call after `bootstrap()` returned and before opening a SOCKS5
+    /// CONNECT against the same onion.
+    ///
+    /// **Why this exists.** Tor's `BOOTSTRAP=100` / `CIRCUIT_ESTABLISHED`
+    /// event means tor can build circuits — it does NOT mean tor can
+    /// satisfy a `.onion` connect. The hidden-service dial path
+    /// additionally needs:
+    ///   * an HS descriptor fetched off the HSDirs (5–10 s cold),
+    ///   * an introduction circuit to one of the descriptor's intro
+    ///     points (3–5 s),
+    ///   * a rendezvous circuit (3–5 s, parallel to the previous).
+    /// A SOCKS5 CONNECT issued before the descriptor is cached either
+    /// blocks for ~30 s (best case) or returns `REP=0x06 TTL expired`
+    /// once tor's `MaxClientCircuitsPending` watchdog fires. Either
+    /// way, the first cold-launch attempt fails. This call kicks off
+    /// step 1 explicitly (`HSFETCH`) and only resumes once the matching
+    /// `HS_DESC RECEIVED` event arrives. The follow-up SOCKS5 CONNECT
+    /// goes straight into intro/rendezvous and completes inside the
+    /// retry window already built into RelayClient.
+    ///
+    /// Concurrent callers for the same onion share one in-flight
+    /// fetch (we coalesce on `hsFetchTasks`). Cancelling the awaiting
+    /// task does NOT cancel the underlying HSFETCH — tor caches the
+    /// descriptor either way, and the next caller will see RECEIVED
+    /// from the cache.
+    public func prepareHiddenService(_ onionHost: String) async throws {
+        let address = Self.stripOnionSuffix(onionHost).lowercased()
+        guard isReady, let controller = torController else {
+            throw TorControllerError.notBootstrapped
+        }
+
+        // Fast path: tor's local cache holds the descriptor from an
+        // earlier prime in this tor session. Skip the round-trip.
+        if preparedOnions.contains(address) {
+            torLog.debug("hsfetch: skip (descriptor already primed this tor session) addr=\(address.prefix(8), privacy: .public)…")
+            return
+        }
+
+        // Coalesce. The hsFetchTasks map is keyed by onion address;
+        // two concurrent RelayClient connects against the same relay
+        // share a single in-flight fetch. Two different onions get
+        // two parallel HSFETCHes — tor handles them independently.
+        if let inflight = hsFetchTasks[address] {
+            try await inflight.value
+            return
+        }
+        let task = Task<Void, Error> { [weak self] in
+            guard let self else { throw TorControllerError.cancelled }
+            try await self.runHsFetch(address: address, on: controller)
+            // Mark prepared only on success — failed fetches must
+            // retry on the next call.
+            self.preparedOnions.insert(address)
+        }
+        hsFetchTasks[address] = task
+        do {
+            try await task.value
+            hsFetchTasks[address] = nil
+        } catch {
+            hsFetchTasks[address] = nil
+            throw error
+        }
     }
 
     // ─── Internals ────────────────────────────────────────────────────
@@ -224,20 +427,25 @@ public final class TorController: ObservableObject {
     }
 
     private func runBootstrap() async throws -> UInt16 {
+        let bootstrapStart = Date()
+        torLog.info("bootstrap: begin")
         // Reuse the existing tor thread if one is already running.
         // TORThread enforces one-per-process; `TORThread.active`
         // returns the live instance (or nil before the first start).
         // On a reconnect after `stop()`, this skips re-creating tor
         // and goes straight to controller re-auth.
         let dataDir: URL
+        let reusedThread: Bool
         if let existing = torThread ?? TORThread.active {
             torThread = existing
+            reusedThread = true
             if let cached = bootstrappedDataDir {
                 dataDir = cached
             } else {
                 dataDir = try resolveDataDirectory()
             }
         } else {
+            reusedThread = false
             // Double-check that no TORThread is alive in the process
             // before we ask C-tor to allocate a fresh one. The
             // composite `torThread ?? TORThread.active` test above
@@ -252,12 +460,20 @@ public final class TorController: ObservableObject {
                 "TORThread.active != nil but torThread is nil — TORThread retain dropped while tor is still running. tor_run_main() is single-shot per process."
             )
             dataDir = try resolveDataDirectory()
+            // Delete the cookie + controlport files left behind by a
+            // previous app-process launch. See `purgeStaleControlFiles`
+            // below for why this is load-bearing.
+            let purge = Self.purgeStaleControlFiles(in: dataDir)
+            if purge.anyRemoved {
+                torLog.info("bootstrap: removed stale control files (cookie=\(purge.cookieRemoved) port=\(purge.portRemoved)) from previous session")
+            }
             let config = makeConfiguration(dataDir: dataDir)
             let thread = TORThread(configuration: config)
             torThread = thread
             thread.start()
         }
         bootstrappedDataDir = dataDir
+        torLog.info("bootstrap: thread \(reusedThread ? "reused" : "started") dataDir=\(dataDir.lastPathComponent, privacy: .public)")
         let config = makeConfiguration(dataDir: dataDir)
 
         // tor writes the cookie + control-port file lazily during
@@ -268,41 +484,54 @@ public final class TorController: ObservableObject {
         // file that's missing or still empty produces a controller
         // with nil host / port=0 whose subsequent `connect()` falls
         // through and returns NO with `*error == nil`, surfacing as
-        // a useless `GenericObjCError.nilError` to Swift. 15 s is
-        // generous — happy-path tor writes both files within ~50 ms
-        // of TORThread.start(), but iOS Simulator cold launches can
-        // stall for several seconds before tor's first I/O lands.
+        // a useless `GenericObjCError.nilError` to Swift.
         let cookieURL = dataDir.appendingPathComponent("control_auth_cookie")
         guard let controlPortFile = config.controlPortFile else {
             // `autoControlPort = YES` always sets this; the guard is
             // belt-and-braces for a future TORConfiguration change.
+            torLog.error("bootstrap: controlPortFile is nil — TORConfiguration misconfigured")
             throw TorControllerError.missingCookie
         }
         do {
-            try await waitForFile(at: cookieURL, deadline: 15.0)
-            try await waitForControlPortFile(at: controlPortFile, deadline: 15.0)
+            let phaseStart = Date()
+            try await waitForFile(at: cookieURL, deadline: Self.startupFilePollDeadline)
+            torLog.info("bootstrap: cookie file appeared after \(Self.fmtElapsed(from: phaseStart)) (total \(Self.fmtElapsed(from: bootstrapStart)))")
+            let phase2Start = Date()
+            try await waitForControlPortFile(at: controlPortFile, deadline: Self.startupFilePollDeadline)
+            torLog.info("bootstrap: controlport file appeared after \(Self.fmtElapsed(from: phase2Start)) (total \(Self.fmtElapsed(from: bootstrapStart)))")
         } catch {
-            NSLog("[pizzini-tor] startup files did not appear within 15 s — tor likely crashed. cookie=\(cookieURL.path) controlport=\(controlPortFile.path). Check iOS console for tor's stderr.")
+            torLog.error("bootstrap: startup files did not appear within \(Int(Self.startupFilePollDeadline)) s — tor likely crashed. cookie=\(cookieURL.path, privacy: .public) controlport=\(controlPortFile.path, privacy: .public)")
             throw TorControllerError.missingCookie
         }
         guard let cookie = try? Data(contentsOf: cookieURL), !cookie.isEmpty else {
+            torLog.error("bootstrap: cookie file present but unreadable / empty")
             throw TorControllerError.missingCookie
         }
+        torLog.debug("bootstrap: cookie loaded (\(cookie.count) bytes)")
 
         let controller = TORController(controlPortFile: controlPortFile)
         torController = controller
 
         // TORController's init also calls `[self connect:nil]`
         // synchronously, but at that point tor has only written the
-        // controlport file — its `listen()` on the control socket
-        // typically lags a few hundred ms behind, so that first
-        // attempt fails with ECONNREFUSED (code 61) and the error
-        // is swallowed by the `nil` error pointer. Retry with a
-        // 200 ms cadence up to 10 s. Calling `connect()` on an
-        // already-connected controller is a no-op (it short-
-        // circuits on `_channel != nil`).
-        try await retryControllerConnect(controller, deadline: 10.0)
+        // controlport file — its `listen()` on the control socket is
+        // bound but tor's libevent main loop on iOS Simulator
+        // cold-start can take 10-15 s to actually drain the accept
+        // queue (it's busy fetching consensus, picking guards,
+        // etc.). Each attempt either returns immediately (success)
+        // or fails with ECONNREFUSED in microseconds; we retry on a
+        // 200 ms cadence so we land within a tick of tor's listener
+        // waking up.
+        let connectPhaseStart = Date()
+        do {
+            try await retryControllerConnect(controller, deadline: Self.controllerConnectDeadline)
+            torLog.info("bootstrap: control-port TCP connect ready after \(Self.fmtElapsed(from: connectPhaseStart)) (total \(Self.fmtElapsed(from: bootstrapStart)))")
+        } catch {
+            torLog.error("bootstrap: control-port TCP connect failed after \(Int(Self.controllerConnectDeadline)) s — tor's libevent loop never accepted. error=\(String(describing: error), privacy: .public)")
+            throw error
+        }
 
+        let authStart = Date()
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             controller.authenticate(with: cookie) { success, error in
                 if success {
@@ -314,6 +543,7 @@ public final class TorController: ObservableObject {
                 }
             }
         }
+        torLog.info("bootstrap: authenticate OK after \(Self.fmtElapsed(from: authStart)) (total \(Self.fmtElapsed(from: bootstrapStart)))")
 
         // Subscribe to STATUS_CLIENT events to drive bootstrapProgress.
         // The observer must capture self weakly — TORController retains
@@ -334,6 +564,8 @@ public final class TorController: ObservableObject {
             // SUMMARY="..."`. We only care about progress integers.
             guard type == "STATUS_CLIENT", action == "BOOTSTRAP" else { return false }
             guard let raw = arguments?["PROGRESS"], let pct = Int(raw) else { return false }
+            let tag = arguments?["TAG"] ?? ""
+            torLog.debug("bootstrap: progress=\(pct)% tag=\(tag, privacy: .public)")
             Task { @MainActor [weak self] in
                 self?.bootstrapProgress = pct
             }
@@ -354,13 +586,21 @@ public final class TorController: ObservableObject {
         // usable first-hop). The deadline lives inside the same
         // continuation as a sibling timer task so we don't have to
         // hand the non-Sendable TORController to a task group.
-        try await awaitCircuitEstablished(on: controller)
+        let circuitStart = Date()
+        do {
+            try await awaitCircuitEstablished(on: controller)
+            torLog.info("bootstrap: CIRCUIT_ESTABLISHED after \(Self.fmtElapsed(from: circuitStart)) (total \(Self.fmtElapsed(from: bootstrapStart)))")
+        } catch {
+            torLog.error("bootstrap: CIRCUIT_ESTABLISHED wait failed after \(Self.fmtElapsed(from: circuitStart)) — error=\(String(describing: error), privacy: .public)")
+            throw error
+        }
 
         // Drive progress to 100 even if the BOOTSTRAP event arrived
         // out of order with respect to CIRCUIT_ESTABLISHED. The UI
         // shouldn't ever see "ready" while still showing 87%.
         bootstrapProgress = 100
         isReady = true
+        torLog.info("bootstrap: ready (total \(Self.fmtElapsed(from: bootstrapStart)))")
         return Self.fixedSocksPort
     }
 
@@ -573,6 +813,160 @@ public final class TorController: ObservableObject {
         }
     }
 
+    /// Single-fire bridge between the HS_DESC observer, the HSFETCH
+    /// command-failure path, and the deadline timer in `runHsFetch`.
+    /// Shares its locking shape with `BootstrapResumer` so the
+    /// warm-cache observer-fires-synchronously race is closed the
+    /// same way.
+    final class HsFetchResumer: @unchecked Sendable {
+        private let controller: TORController
+        private let continuation: CheckedContinuation<Void, Error>
+        private let address: String
+        private struct State: @unchecked Sendable {
+            var done: Bool = false
+            var observerToken: Any? = nil
+        }
+        private let lock = OSAllocatedUnfairLock<State>(initialState: State())
+
+        init(
+            controller: TORController,
+            continuation: CheckedContinuation<Void, Error>,
+            address: String,
+        ) {
+            self.controller = controller
+            self.continuation = continuation
+            self.address = address
+        }
+
+        func bind(observerToken token: Any) {
+            let boxed = TokenBox(token)
+            let alreadyResolved: Bool = lock.withLock { state in
+                if state.done { return true }
+                state.observerToken = boxed.unwrap()
+                return false
+            }
+            if alreadyResolved {
+                Self.removeObserverUnsafe(controller, boxed.unwrap())
+            }
+        }
+
+        func resolveSuccess() {
+            let outcome = claim()
+            guard outcome.winner else { return }
+            if let t = outcome.token {
+                Self.removeObserverUnsafe(controller, t)
+            }
+            torLog.info("hsfetch: RECEIVED address=\(self.address.prefix(8), privacy: .public)…")
+            continuation.resume()
+        }
+
+        func resolveFailure(reason: String) {
+            let outcome = claim()
+            guard outcome.winner else { return }
+            if let t = outcome.token {
+                Self.removeObserverUnsafe(controller, t)
+            }
+            torLog.error("hsfetch: FAILED address=\(self.address.prefix(8), privacy: .public)… reason=\(reason, privacy: .public)")
+            continuation.resume(
+                throwing: TorControllerError.hsDescriptorUnavailable(
+                    onion: address,
+                    reason: reason,
+                ),
+            )
+        }
+
+        func resolveTimeout(after seconds: TimeInterval) {
+            let outcome = claim()
+            guard outcome.winner else { return }
+            if let t = outcome.token {
+                Self.removeObserverUnsafe(controller, t)
+            }
+            torLog.error("hsfetch: TIMEOUT address=\(self.address.prefix(8), privacy: .public)… after \(Int(seconds))s")
+            continuation.resume(
+                throwing: TorControllerError.hsDescriptorUnavailable(
+                    onion: address,
+                    reason: "hsDescTimedOut after \(Int(seconds))s",
+                ),
+            )
+        }
+
+        /// Parse one `650 HS_DESC ...` event line and, if it matches
+        /// the awaited address, resume the continuation. Returns
+        /// false unconditionally (we never want to monopolise the
+        /// reply line — other observers, e.g. the bootstrap-progress
+        /// STATUS_CLIENT watcher, may share the dispatch).
+        @discardableResult
+        static func consume(
+            eventLine: String,
+            address: String,
+            resumer: HsFetchResumer,
+        ) -> Bool {
+            // Format: "HS_DESC <ACTION> <HSAddress> <AuthType> [<HsDir>] [REASON=... ...]"
+            // We need ACTION (1), HSAddress (2), and any REASON token
+            // that follows. `split(separator:maxSplits:)` keeps the
+            // remainder intact for cheap REASON scanning.
+            guard eventLine.hasPrefix("HS_DESC ") else { return false }
+            let parts = eventLine.split(separator: " ", omittingEmptySubsequences: true)
+            guard parts.count >= 3 else { return false }
+            let action = String(parts[1])
+            let hsAddress = String(parts[2]).lowercased()
+            // Log EVERY HS_DESC event we see — including ones for
+            // other onions, or actions we don't act on. Without this,
+            // a tor that's emitting REQUESTED but never RECEIVED
+            // looks identical from outside to a tor that's silent;
+            // we want to be able to tell those two cases apart in
+            // the next log dump.
+            let matches = (hsAddress == address)
+            torLog.debug("hsfetch: observed HS_DESC \(action, privacy: .public) addr=\(hsAddress.prefix(8), privacy: .public)… match=\(matches)")
+            guard matches else { return false }
+            switch action {
+            case "RECEIVED":
+                resumer.resolveSuccess()
+            case "FAILED":
+                let reason: String = {
+                    for tok in parts.dropFirst(3) where tok.hasPrefix("REASON=") {
+                        return String(tok.dropFirst("REASON=".count))
+                    }
+                    return "unknown"
+                }()
+                resumer.resolveFailure(reason: reason)
+            default:
+                // REQUESTED / IGNORE / UPLOAD / UPLOADED / CREATED:
+                // intermediate or unrelated to our wait condition.
+                break
+            }
+            return false
+        }
+
+        private struct TokenBox: @unchecked Sendable {
+            private let value: Any
+            init(_ value: Any) { self.value = value }
+            func unwrap() -> Any { value }
+        }
+        private struct ClaimOutcome: @unchecked Sendable {
+            let winner: Bool
+            let token: Any?
+        }
+        private func claim() -> ClaimOutcome {
+            lock.withLock { state in
+                if state.done {
+                    return ClaimOutcome(winner: false, token: nil)
+                }
+                state.done = true
+                let t = state.observerToken
+                state.observerToken = nil
+                return ClaimOutcome(winner: true, token: t)
+            }
+        }
+
+        nonisolated(unsafe) private static func removeObserverUnsafe(
+            _ c: TORController,
+            _ token: Any,
+        ) {
+            c.removeObserver(token)
+        }
+    }
+
 
     private func resolveDataDirectory() throws -> URL {
         let fm = FileManager.default
@@ -670,6 +1064,173 @@ public final class TorController: ObservableObject {
         throw TorControllerError.controllerConnectFailed(
             underlying: lastError ?? TorControllerError.authenticationFailed
         )
+    }
+
+    /// Format an elapsed duration since `start` as `"%.2f s"`. Used
+    /// throughout the bootstrap path's `torLog` lines so a future
+    /// reader can spot which phase ate the budget on a slow cold
+    /// start without needing to subtract timestamps by hand.
+    nonisolated static func fmtElapsed(from start: Date) -> String {
+        let s = Date().timeIntervalSince(start)
+        return String(format: "%.2fs", s)
+    }
+
+    /// Remove tor's `control_auth_cookie` and `controlport` files
+    /// from `dataDir` if they exist. Called by `runBootstrap` BEFORE
+    /// starting a fresh `TORThread`.
+    ///
+    /// **Why this exists.** On real devices the data directory
+    /// (`Library/Caches/tor/`) persists across app launches, but
+    /// `ControlPort auto` makes tor pick a random control-port
+    /// number every startup. A leftover `controlport` file from
+    /// the previous session points at a port no one is listening
+    /// on; `waitForControlPortFile` finds it instantly; the
+    /// controller is built with the dead port; the subsequent
+    /// connect spends its full deadline dialing nothing while the
+    /// live tor sits on a different port we never learn about.
+    /// Deleting both files first forces tor to rewrite them with
+    /// the live port + a fresh cookie.
+    ///
+    /// This is the load-bearing fix for the "first launch shows
+    /// 'connecting to Tor… 0%' for 60 seconds then flashes the
+    /// reconnect pill" symptom.
+    ///
+    /// Public (not private) so the cleanup contract — exactly
+    /// which filenames, exactly which directory, only these two —
+    /// is pinned by `StaleControlFilesPurgeTests` in the iOS app
+    /// test target. The `fileManager` parameter is for tests to
+    /// stay scoped to a tmp dir; production callers take the
+    /// default.
+    public nonisolated static func purgeStaleControlFiles(
+        in dataDir: URL,
+        fileManager: FileManager = .default
+    ) -> StaleControlFilesPurge {
+        let cookieURL = dataDir.appendingPathComponent("control_auth_cookie")
+        let portURL = dataDir.appendingPathComponent("controlport")
+        let cookieExists = fileManager.fileExists(atPath: cookieURL.path)
+        let portExists = fileManager.fileExists(atPath: portURL.path)
+        if cookieExists {
+            try? fileManager.removeItem(at: cookieURL)
+        }
+        if portExists {
+            try? fileManager.removeItem(at: portURL)
+        }
+        return StaleControlFilesPurge(
+            cookieRemoved: cookieExists,
+            portRemoved: portExists,
+        )
+    }
+
+    /// Drop a trailing `.onion` suffix if present (case-insensitive)
+    /// so the bare 56-char base32 label can be compared against the
+    /// `HSAddress` field tor reports in `HS_DESC` events.
+    nonisolated static func stripOnionSuffix(_ host: String) -> String {
+        let lower = host.lowercased()
+        if lower.hasSuffix(".onion") {
+            return String(lower.dropLast(6))
+        }
+        return lower
+    }
+
+    /// Issue an HSFETCH and wait for the matching HS_DESC RECEIVED
+    /// (success) or HS_DESC FAILED (throws). Implementation note:
+    /// we subscribe to the `HS_DESC` event *first*, then send
+    /// `HSFETCH` — the reverse order has a race where tor could
+    /// emit the RECEIVED event before our observer is registered,
+    /// stranding the caller until the deadline.
+    private func runHsFetch(address: String, on controller: TORController) async throws {
+        let fetchStart = Date()
+        torLog.info("hsfetch: begin address=\(address.prefix(8), privacy: .public)…")
+        // Extend the active event subscription to include HS_DESC.
+        // listenForEvents() REPLACES the active set, so we have to
+        // re-issue every currently-subscribed event (STATUS_CLIENT
+        // for bootstrap progress) plus the new HS_DESC.
+        let current = controller.events.array.compactMap { $0 as? String }
+        if !current.contains("HS_DESC") {
+            let merged = current + ["HS_DESC"]
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                controller.listen(forEvents: merged) { success, error in
+                    if success {
+                        cont.resume()
+                    } else if let error {
+                        cont.resume(throwing: error)
+                    } else {
+                        cont.resume(throwing: TorControllerError.authenticationFailed)
+                    }
+                }
+            }
+            torLog.debug("hsfetch: subscribed to HS_DESC events")
+        }
+
+        let deadline = Self.hsFetchDeadline
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            let resumer = HsFetchResumer(
+                controller: controller,
+                continuation: cont,
+                address: address,
+            )
+
+            // Generic event observer. Matches "HS_DESC ACTION
+            // <address> ..." lines. Stays on the controller's
+            // observer list until resolver fires (which detaches
+            // the token). Block runs on TORController's serial
+            // control queue, off the MainActor — explicit
+            // `@Sendable` opts out of Swift 6's automatic
+            // enclosing-actor inference.
+            let token = controller.addObserver { @Sendable codes, lines, _ in
+                guard codes.first?.intValue == 650 else { return false }
+                guard let lineData = lines.first as? Data,
+                      let line = String(data: lineData, encoding: .utf8)
+                else { return false }
+                return HsFetchResumer.consume(eventLine: line, address: address, resumer: resumer)
+            }
+            resumer.bind(observerToken: token)
+
+            // Fire HSFETCH. The sync `250 OK` ack is fire-and-forget;
+            // the real signal is the async `650 HS_DESC RECEIVED`
+            // (or `FAILED`) the generic observer above picks up.
+            // tor accepts both `.onion` and bare-label arguments;
+            // we send the bare label for symmetry with the HS_DESC
+            // event format.
+            torLog.debug("hsfetch: dispatching HSFETCH \(address.prefix(8), privacy: .public)…")
+            controller.sendCommand(
+                "HSFETCH",
+                arguments: [address],
+                data: nil,
+            ) { @Sendable codes, lines, stop in
+                guard let firstCode = codes.first?.intValue else { return false }
+                if firstCode == 250 {
+                    // Fetch initiated. The async HS_DESC event
+                    // will resolve via the observer above.
+                    torLog.debug("hsfetch: 250 OK ack received")
+                    stop.pointee = true
+                    return true
+                }
+                if firstCode >= 400 {
+                    // tor rejected the command (unknown HS, malformed
+                    // address, control port misconfigured, …). Surface
+                    // as a failure so the caller doesn't sit on the
+                    // deadline.
+                    stop.pointee = true
+                    let msg = (lines.first as? Data).flatMap {
+                        String(data: $0, encoding: .utf8)
+                    } ?? "HSFETCH rejected (\(firstCode))"
+                    torLog.error("hsfetch: tor rejected HSFETCH — \(msg, privacy: .public)")
+                    resumer.resolveFailure(reason: msg)
+                    return true
+                }
+                return false
+            }
+
+            // Hard deadline. Detached so it survives if the calling
+            // task is cancelled — tor will still cache whatever it
+            // ends up fetching, and the next prepareHiddenService
+            // call against the same address sees the cache hit.
+            Task.detached { [resumer] in
+                try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))
+                resumer.resolveTimeout(after: deadline)
+            }
+        }
     }
 
     /// Like `waitForFile`, but tor's controlport file is written in

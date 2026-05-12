@@ -5,8 +5,13 @@ import UIKit
 struct ContactsListView: View {
     @Bindable var store: ChatStore
     @Binding var showScanner: Bool
-    @Binding var showMyQR: Bool
     let onPasteContact: (String) -> Void
+    /// Empty-state shortcut: tell the host to switch to the Profil
+    /// tab so a brand-new user can show THEIR QR to the person they
+    /// want to pair with. Without it the empty-state "Show my QR"
+    /// button would either disappear or open a sheet that duplicates
+    /// the tab.
+    let onRevealMyQR: () -> Void
 
     /// Confirmation-dialog state for the `+` add-contact action sheet.
     /// Local to the toolbar — no need to plumb up to ContentView.
@@ -68,14 +73,11 @@ struct ContactsListView: View {
         .navigationTitle("Pizzini")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarLeading) {
-                Button {
-                    showMyQR = true
-                } label: {
-                    Image(systemName: "qrcode")
-                }
-                .accessibilityLabel("Show my QR")
-            }
+            // Profil + Einstellungen used to live in this toolbar (QR
+            // top-leading, gear top-trailing). They moved to the
+            // bottom-pill `TabView` in ContentView — keeping them here
+            // would double up the navigation. What stays: `+` for
+            // add-contact / new-group, relay status, search.
             ToolbarItem(placement: .topBarLeading) {
                 Button {
                     showAddContactDialog = true
@@ -107,7 +109,29 @@ struct ContactsListView: View {
                 }
             }
             ToolbarItem(placement: .principal) {
-                relayBadge
+                // Brand lockup — small logo + wordmark, no inline
+                // status. The live connection indicator lives in the
+                // global `RelayStatusBar` strip above the nav bar
+                // (ContentView), so it stays visible inside chats,
+                // inside Profile, inside Settings — one canonical
+                // place. The principal slot stays clean and the
+                // wordmark sits centred regardless of relay state.
+                // `.navigationTitle("Pizzini")` below drives the
+                // back-button label on pushed surfaces (ChatView,
+                // GroupChatView).
+                HStack(spacing: 6) {
+                    Image("AppLogo")
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 24, height: 24)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .accessibilityHidden(true)
+                    Text("Pizzini")
+                        .font(.headline)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Pizzini")
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -117,14 +141,6 @@ struct ContactsListView: View {
                     Image(systemName: "magnifyingglass")
                 }
                 .accessibilityLabel("Search chats and messages")
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                NavigationLink {
-                    SettingsView(store: store)
-                } label: {
-                    Image(systemName: "gearshape")
-                }
-                .accessibilityLabel("Settings")
             }
         }
     }
@@ -201,7 +217,7 @@ struct ContactsListView: View {
                 .controlSize(.large)
 
                 Button {
-                    showMyQR = true
+                    onRevealMyQR()
                 } label: {
                     Label("Show my QR", systemImage: "qrcode")
                         .frame(maxWidth: .infinity)
@@ -338,66 +354,12 @@ struct ContactsListView: View {
         }
     }
 
-    /// Surface a connection status only when something is wrong.
-    /// A persistent green "connected" pill trains the eye to ignore it,
-    /// so when it eventually flips orange the user misses that too —
-    /// industry pattern (Signal, WhatsApp, iMessage) is to stay silent
-    /// on the happy path and only banner when reconnecting / offline.
-    /// "relay" is also wire-speak; users see "connection" instead.
-    ///
-    /// The `.failed` badge is tappable: tap retries the connection.
-    /// Disabled while a reconnect is already in flight (any non-
-    /// `.failed`, non-`.connected` state) so a frustrated tap-spam
-    /// can't pile up duplicate connect calls.
-    @ViewBuilder
-    private var relayBadge: some View {
-        switch store.relayState {
-        case .connected:
-            EmptyView()
-        case let .connectingToTor(progress):
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.mini)
-                Text("connecting to Tor… \(progress)%")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            .accessibilityLabel("Connecting to Tor, \(progress) percent")
-        case .idle, .connecting:
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.mini)
-                Text("connecting…")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            .accessibilityLabel("Connecting")
-        case .failed:
-            Button {
-                store.forceReconnectRelays()
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.caption2)
-                        .foregroundStyle(.red)
-                    Text("tap to reconnect")
-                        .font(.caption2)
-                        .foregroundStyle(.red)
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(
-                    Capsule()
-                        .fill(Color.red.opacity(0.10))
-                )
-                .overlay(
-                    Capsule()
-                        .stroke(Color.red.opacity(0.25), lineWidth: 0.5)
-                )
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("No connection. Tap to reconnect.")
-            .accessibilityHint("Retries the relay connection.")
-        }
-    }
+    // Relay connection status used to render here as an inline
+    // toolbar pill (the now-removed `relayBadge`). It moved to a
+    // global `RelayStatusBar` strip above the nav bar in ContentView
+    // — same signal, but visible inside chats / Profile / Settings
+    // too instead of only on this screen. Keep that strip the single
+    // source of truth for connection state.
 }
 
 private struct ContactRow: View {

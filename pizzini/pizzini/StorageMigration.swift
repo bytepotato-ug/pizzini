@@ -48,7 +48,7 @@ enum StorageMigration {
             try setMetaFlag(storage: storage)
             return
         }
-        NSLog("[pizzini.migration] Keychain → SQLCipher migration starting")
+        pzLog("[pizzini.migration] Keychain → SQLCipher migration starting")
 
         try storage.db.transaction { _ in
             try migrateAppState(into: storage)
@@ -73,7 +73,7 @@ enum StorageMigration {
         // copies permanently behind the marker's short-circuit.
         deleteAllLegacySlots()
         try setMetaFlag(storage: storage)
-        NSLog("[pizzini.migration] Keychain → SQLCipher migration complete")
+        pzLog("[pizzini.migration] Keychain → SQLCipher migration complete")
     }
 
     /// Idempotent delete of every legacy Keychain slot. Each row is

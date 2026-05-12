@@ -8,7 +8,14 @@
 
 import Foundation
 import Network
+import os
 import PizziniTor
+
+/// Debug logger for the relay-client transport phases (Tor bootstrap
+/// gate → HS-descriptor prime → SOCKS5 handshake → HELLO). Filter
+/// for it in Console.app via `subsystem:app.pizzini.relay`. Pairs
+/// with `subsystem:app.pizzini.tor` for the full cold-start picture.
+private let relayLog = Logger(subsystem: "app.pizzini.relay", category: "connect")
 
 /// USP #1: snapshot of the running relay binary's identity.
 /// Returned by `RelayClient.requestStatus()` and delivered to the
@@ -365,11 +372,21 @@ public final class RelayClient: @unchecked Sendable {
 
     /// .onion target. Multi-step setup:
     ///   1. Ensure embedded Tor is bootstrapped → get SOCKS port
-    ///   2. Open NWConnection to 127.0.0.1:<socksPort>
-    ///   3. SOCKS5 greeting + CONNECT to <host>:<port>
-    ///   4. Drop into the relay HELLO + scheduleRead
+    ///   2. Prime tor's HS-descriptor cache for `<host>` (see below)
+    ///   3. Open NWConnection to 127.0.0.1:<socksPort>
+    ///   4. SOCKS5 greeting + CONNECT to <host>:<port>
+    ///   5. Drop into the relay HELLO + scheduleRead
     /// Any failure on the way maps to `state = .failed(...)` and the
     /// host's retry timer picks it up on the next tick.
+    ///
+    /// Step 2 is the difference between a working cold launch and the
+    /// historic "first tap to Reconnect" symptom: tor's BOOTSTRAP=100
+    /// event only proves the daemon can build *some* circuit, not that
+    /// it knows how to reach this particular onion. Without an
+    /// HSFETCH, the first SOCKS5 CONNECT is the one that triggers the
+    /// HS-descriptor lookup, and tor returns `REP=0x01` or `0x06`
+    /// before the lookup completes. See
+    /// `TorController.prepareHiddenService(_:)` for the contract.
     private func startTorConnection(host: String, port: NWEndpoint.Port) {
         let target = host
         let targetPort = port.rawValue
@@ -382,11 +399,16 @@ public final class RelayClient: @unchecked Sendable {
         // returned) in the meantime.
         Task { [weak self] in
             guard let self else { return }
+            let dialStart = Date()
+            let hostPrefix = target.prefix(8)
+            relayLog.info("dial: start host=\(hostPrefix, privacy: .public)…:\(targetPort)")
 
             // Already bootstrapped? Skip the Tor UI phase entirely.
             // RelayClient's caller already moved state to .connecting;
             // we leave it there.
             let alreadyReady = await TorController.shared.isReady
+            relayLog.debug("dial: TorController.isReady=\(alreadyReady)")
+            let socksPort: UInt16
             if !alreadyReady {
                 self.queue.async { [weak self] in
                     guard let self else { return }
@@ -414,47 +436,78 @@ public final class RelayClient: @unchecked Sendable {
                     }
                 }
 
-                let socksPort: UInt16
                 do {
                     socksPort = try await TorController.shared.bootstrap()
+                    relayLog.info("dial: bootstrap done after \(Self.fmtElapsed(from: dialStart)) socksPort=\(socksPort)")
                 } catch {
                     progressTask.cancel()
+                    relayLog.error("dial: bootstrap threw after \(Self.fmtElapsed(from: dialStart)) — error=\(String(describing: error), privacy: .public)")
                     self.queue.async {
                         self.state = .failed("tor bootstrap failed: \(error)")
                     }
                     return
                 }
                 progressTask.cancel()
-
-                self.queue.async {
-                    self.state = .connecting
-                    self.openSocksConnection(
-                        socksPort: socksPort,
-                        targetHost: target,
-                        targetPort: targetPort
-                    )
-                }
             } else {
                 // Tor is already up. `bootstrap()` returns the cached
                 // SOCKS port immediately; no progress emission needed.
-                let socksPort: UInt16
                 do {
                     socksPort = try await TorController.shared.bootstrap()
+                    relayLog.debug("dial: bootstrap cached (sub-ms)")
                 } catch {
+                    relayLog.error("dial: cached-bootstrap unexpectedly threw — \(String(describing: error), privacy: .public)")
                     self.queue.async {
                         self.state = .failed("tor bootstrap failed: \(error)")
                     }
                     return
                 }
+            }
+
+            // Step 2: warm tor's HS-descriptor cache for this onion
+            // BEFORE the SOCKS5 CONNECT goes out. On cold launch
+            // this is the load-bearing call — without it, the
+            // SOCKS5 CONNECT races tor's directory machinery and
+            // loses. On a warm reconnect (descriptor still cached
+            // from a previous run) tor returns RECEIVED quickly
+            // off its on-disk cache and we add ~1 s of latency to
+            // the dial, which is below the user-perceptible
+            // threshold. UI state stays at `.connecting` for this
+            // phase — surfacing a separate "Fetching service…"
+            // bucket is more accurate but noisier than the win is
+            // worth.
+            self.queue.async {
+                self.state = .connecting
+            }
+            let prepStart = Date()
+            do {
+                try await TorController.shared.prepareHiddenService(target)
+                relayLog.info("dial: prepareHiddenService done after \(Self.fmtElapsed(from: prepStart))")
+            } catch {
+                relayLog.error("dial: prepareHiddenService failed after \(Self.fmtElapsed(from: prepStart)) — \(String(describing: error), privacy: .public)")
                 self.queue.async {
-                    self.openSocksConnection(
-                        socksPort: socksPort,
-                        targetHost: target,
-                        targetPort: targetPort
-                    )
+                    self.state = .failed("hs descriptor unavailable: \(error)")
                 }
+                return
+            }
+
+            self.queue.async {
+                relayLog.info("dial: opening SOCKS5 connection (total dial elapsed \(Self.fmtElapsed(from: dialStart)))")
+                self.openSocksConnection(
+                    socksPort: socksPort,
+                    targetHost: target,
+                    targetPort: targetPort
+                )
             }
         }
+    }
+
+    /// Same `%.2fs` format as TorController's helper — kept private
+    /// to this module so the RelayClient diagnostic lines round-trip
+    /// timing data in the same shape `tor.lifecycle` does. Reader
+    /// pasting an `app.pizzini.*` filter into Console.app sees one
+    /// continuous timeline across the two subsystems.
+    private static func fmtElapsed(from start: Date) -> String {
+        String(format: "%.2fs", Date().timeIntervalSince(start))
     }
 
     private func openSocksConnection(
@@ -473,15 +526,19 @@ public final class RelayClient: @unchecked Sendable {
             using: .tcp
         )
         self.connection = conn
+        relayLog.debug("socks: TCP open → 127.0.0.1:\(socksPort)")
 
         conn.stateUpdateHandler = { [weak self] s in
             guard let self else { return }
             switch s {
             case .ready:
+                relayLog.debug("socks: TCP ready, starting SOCKS5 handshake")
                 self.beginSocksHandshake(on: conn, socksPort: socksPort, targetHost: targetHost, targetPort: targetPort)
-            case .waiting:
+            case .waiting(let err):
+                relayLog.debug("socks: TCP waiting (\(String(describing: err), privacy: .public))")
                 self.state = .connecting
             case .failed(let err):
+                relayLog.error("socks: TCP failed — \(String(describing: err), privacy: .public)")
                 self.handleSocksFailure(
                     reason: "socks tcp: \(err)",
                     socksPort: socksPort,
@@ -622,6 +679,7 @@ public final class RelayClient: @unchecked Sendable {
                     if !trailing.isEmpty {
                         self.readBuffer.append(trailing)
                     }
+                    relayLog.info("socks: REP=0x00 success — sending HELLO")
                     self.sendHello()
                     if let token = self.pushToken {
                         self.sendRegisterPush(token: token)
@@ -683,9 +741,9 @@ public final class RelayClient: @unchecked Sendable {
             // is effectively a single ongoing connection attempt.
             state = .connecting
             let attempt = socksRetries
+            relayLog.notice("socks: retry \(attempt)/\(Self.maxSocksRetries) in \(Int(Self.socksRetryDelay))s — \(reason, privacy: .public)")
             queue.asyncAfter(deadline: .now() + Self.socksRetryDelay) { [weak self] in
                 guard let self else { return }
-                NSLog("[pizzini] socks5 retry \(attempt)/\(Self.maxSocksRetries) (\(reason))")
                 self.openSocksConnection(
                     socksPort: socksPort,
                     targetHost: targetHost,
@@ -696,6 +754,7 @@ public final class RelayClient: @unchecked Sendable {
         }
         // Out of retries — surface the last failure to the host so the
         // user-facing retry timer / Reconnect button can pick it up.
+        relayLog.error("socks: out of retries — surfacing .failed with reason=\(reason, privacy: .public)")
         state = .failed(reason)
     }
 

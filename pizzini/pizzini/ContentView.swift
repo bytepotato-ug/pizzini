@@ -10,12 +10,23 @@ import UIKit
 import PizziniCryptoCore
 
 struct ContentView: View {
+    /// Tabs in the floating bottom bar. `TabKind` rather than `Tab` to
+    /// avoid colliding with SwiftUI's `Tab` view in iOS 26's typed
+    /// `TabView` initialiser. Stable raw cases keep a future
+    /// `@SceneStorage` tab-restoration value sound across app updates.
+    /// Order matches on-screen left-to-right.
+    enum TabKind: Hashable {
+        case chats
+        case profile
+        case settings
+    }
+
     @State private var store = ChatStore.shared
     @State private var lockManager = LockManager.shared
     @State private var captureMonitor = ScreenCaptureMonitor.shared
     @State private var integrity = DeviceIntegrityMonitor.shared
+    @State private var selectedTab: TabKind = .chats
     @State private var showScanner = false
-    @State private var showMyQR = false
     @State private var pendingCard: ContactCard?
     @State private var pendingName: String = ""
     /// FAQ deep-link target for the integrity banner's (i) button. Nil
@@ -35,41 +46,7 @@ struct ContentView: View {
                 if let err = store.initError {
                     errorState(err)
                 } else {
-                    NavigationStack {
-                        ContactsListView(
-                            store: store,
-                            showScanner: $showScanner,
-                            showMyQR: $showMyQR,
-                            onPasteContact: promptForName(decoding:)
-                        )
-                    }
-                    // F-602: surface chronic Keychain.write failures the
-                    // user would otherwise never see. The banner sits
-                    // inside the chat-content branch (above the nav bar
-                    // via .safeAreaInset) so it shows during normal use
-                    // but doesn't double up on the initError state. The
-                    // copy mirrors the audit's recommended message.
-                    .safeAreaInset(edge: .top, spacing: 0) {
-                        VStack(spacing: 0) {
-                            if store.keychainWriteFailing {
-                                keychainFailureBanner
-                            }
-                            if integrity.isCompromised {
-                                integrityBanner
-                            }
-                            // View-level fallback for the screenshot
-                            // mask. `WindowSecureMask` silently no-ops
-                            // when `SecureScreenshotSelfTest` failed on
-                            // this iOS major — without this persistent
-                            // banner the user has no in-app signal
-                            // that screenshot protection is degraded
-                            // (only a Settings notice they may never
-                            // see). Surface it where they'll notice.
-                            if !store.shouldMaskAppContents {
-                                screenshotDegradedBanner
-                            }
-                        }
-                    }
+                    tabSurface
                 }
             }
 
@@ -158,11 +135,72 @@ struct ContentView: View {
         } message: { card in
             Text("Fingerprint \(card.fingerprintShort)\nVerify it matches the QR you scanned in person.")
         }
-        .sheet(isPresented: $showMyQR) {
-            MyQRSheet(card: store.myCard, onDone: { showMyQR = false })
-        }
         .sheet(item: $integrityFAQ) { anchor in
             FAQView(initialSection: anchor) { integrityFAQ = nil }
+        }
+    }
+
+    /// iOS 26 floating-pill `TabView`. Each tab is its own
+    /// `NavigationStack` so pushed surfaces (ChatView, SettingsView's
+    /// sub-pages) live inside the tab, and tapping the same tab again
+    /// pops to root — the iOS convention. The global banners
+    /// (keychain failure, integrity, screenshot degraded) live on the
+    /// TabView container via `.safeAreaInset(.top)` so they show
+    /// regardless of which tab is active. The floating pill at the
+    /// bottom doesn't clip them.
+    private var tabSurface: some View {
+        TabView(selection: $selectedTab) {
+            Tab("Chats", systemImage: "bubble.left.and.bubble.right.fill", value: TabKind.chats) {
+                NavigationStack {
+                    ContactsListView(
+                        store: store,
+                        showScanner: $showScanner,
+                        onPasteContact: promptForName(decoding:),
+                        onRevealMyQR: { selectedTab = .profile }
+                    )
+                }
+            }
+            Tab("Profil", systemImage: "person.crop.circle", value: TabKind.profile) {
+                NavigationStack {
+                    ProfileView(card: store.myCard)
+                }
+            }
+            Tab("Einstellungen", systemImage: "gearshape", value: TabKind.settings) {
+                NavigationStack {
+                    SettingsView(store: store)
+                }
+            }
+        }
+        // F-602 + integrity + screenshot-degraded banners. Hoisted to
+        // the TabView so they're visible in every tab — previously they
+        // sat above ContactsListView only, which meant a user reading
+        // Settings or their QR wouldn't see a fresh "Storage
+        // unavailable" warning.
+        //
+        // The `RelayStatusBar` sits at the bottom of the inset stack
+        // (closest to the nav bar) so the relay state is the live
+        // indicator users glance at. It hides when `.connected` so
+        // the steady state is no chrome at all — only non-healthy
+        // states surface. Visible on every tab, and visible inside
+        // pushed surfaces too (ChatView / GroupChatView / Settings
+        // sub-pages), because `.safeAreaInset(.top)` on the TabView
+        // root propagates through to every contained NavigationStack.
+        .safeAreaInset(edge: .top, spacing: 0) {
+            VStack(spacing: 0) {
+                if store.keychainWriteFailing {
+                    keychainFailureBanner
+                }
+                if integrity.isCompromised {
+                    integrityBanner
+                }
+                if !store.shouldMaskAppContents {
+                    screenshotDegradedBanner
+                }
+                RelayStatusBar(
+                    state: store.relayState,
+                    onReconnect: { store.forceReconnectRelays() },
+                )
+            }
         }
     }
 
@@ -312,17 +350,18 @@ struct ContentView: View {
     }
 }
 
-/// Pairing-QR sheet. The QR encodes the user's long-term peer-id +
-/// relay endpoint — both technically public, but a photograph of this
-/// code is enough to deanonymize the user on the relay (link "real
-/// face" → "peer-id observable in traffic"). The strict-scan +
-/// hashcash + contact-gate stack already prevents a stolen QR from
-/// being used to *pair* without consent, so the residual risk is
-/// purely deanonymization. We surface that explicitly: blur by
-/// default, plain-language warning, tap-to-reveal, tap-again-to-hide.
-private struct MyQRSheet: View {
+/// Profil tab. Surfaces the user's pairing QR + identity details. The
+/// QR encodes the long-term peer-id + relay endpoint — both technically
+/// public, but a photograph is enough to deanonymize the user on the
+/// relay. We render that risk explicitly: blur by default, plain-
+/// language warning, tap-to-reveal, tap-again-to-hide, auto-rehide on
+/// scene deactivate (F-802).
+///
+/// Renders as a tab root (no sheet chrome) — the enclosing
+/// `NavigationStack` inside the Profil tab supplies the title and the
+/// safe-area handling for the bottom tab pill.
+struct ProfileView: View {
     let card: ContactCard?
-    let onDone: () -> Void
 
     /// Hidden by default. The user has to make an explicit reveal
     /// gesture, after reading the warning above the surface. Re-tap
@@ -332,48 +371,40 @@ private struct MyQRSheet: View {
     @State private var copyConfirmation = false
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(spacing: 24) {
-                    privacyWarning
-                    qrSurface
-                    if revealed {
-                        usageHint
-                        actions
-                    }
-                }
-                .padding(.horizontal, 24)
-                .padding(.top, 8)
-                .padding(.bottom, 32)
-            }
-            .navigationTitle("Your QR code")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done", action: onDone)
+        ScrollView {
+            VStack(spacing: 24) {
+                privacyWarning
+                qrSurface
+                if revealed {
+                    usageHint
+                    actions
                 }
             }
-            // Cover the QR sheet during a screen recording or external
-            // display — this is the highest-leak surface in the app
-            // (a single capture deanonymises the user), so the shield
-            // applies even if `revealed == false`. Done button stays
-            // available in the toolbar.
-            .screenCaptureShielded()
-            // F-802: re-hide the QR whenever the scene deactivates
-            // (background, Control Centre pull-down, incoming call,
-            // app-switcher peek). The privacy shield masks the
-            // multitasking SNAPSHOT but the sheet itself remains
-            // presented across foreground transitions, so without this
-            // a bystander grabbing the unlocked phone seconds after
-            // the user resumes captures the deanonymising QR. Matches
-            // the verbal promise the privacy-warning copy makes.
-            .onReceive(
-                NotificationCenter.default.publisher(
-                    for: UIScene.willDeactivateNotification,
-                ),
-            ) { _ in
-                revealed = false
-            }
+            .padding(.horizontal, 24)
+            .padding(.top, 8)
+            .padding(.bottom, 32)
+        }
+        .navigationTitle("Your QR code")
+        .navigationBarTitleDisplayMode(.inline)
+        // Cover this surface during a screen recording or external
+        // display — this is the highest-leak surface in the app
+        // (a single capture deanonymises the user), so the shield
+        // applies even if `revealed == false`.
+        .screenCaptureShielded()
+        // F-802: re-hide the QR whenever the scene deactivates
+        // (background, Control Centre pull-down, incoming call,
+        // app-switcher peek). The privacy shield masks the
+        // multitasking SNAPSHOT but the tab itself remains mounted
+        // across foreground transitions, so without this a bystander
+        // grabbing the unlocked phone seconds after the user resumes
+        // captures the deanonymising QR. Matches the verbal promise
+        // the privacy-warning copy makes.
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIScene.willDeactivateNotification,
+            ),
+        ) { _ in
+            revealed = false
         }
     }
 
@@ -477,7 +508,18 @@ private struct MyQRSheet: View {
         if let card {
             VStack(spacing: 8) {
                 Button {
-                    UIPasteboard.general.string = card.encoded
+                    // localOnly + 60-second expiration: keeps the identity
+                    // off Universal Clipboard (would otherwise sync to
+                    // every macOS device on the same iCloud account)
+                    // and auto-clears the system pasteboard if the user
+                    // forgets to paste-and-go.
+                    UIPasteboard.general.setItems(
+                        [[UIPasteboard.typeAutomatic: card.encoded]],
+                        options: [
+                            .localOnly: true,
+                            .expirationDate: Date().addingTimeInterval(60),
+                        ],
+                    )
                     copyConfirmation = true
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                         copyConfirmation = false

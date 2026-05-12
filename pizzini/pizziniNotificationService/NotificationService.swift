@@ -28,9 +28,27 @@ final class NotificationService: UNNotificationServiceExtension {
             contentHandler(request.content)
             return
         }
+        // Rate-limit the bump so a coercer who can see the locked
+        // home-screen can't read the badge as an authoritative
+        // "messages keep coming" oracle for the user. Cap the
+        // extension's contribution at +NSEBadgeCap between main-app
+        // resyncs. On resume the main app overwrites this with the
+        // real `state.totalUnread`, so the cap is invisible in normal
+        // use; it only bounds the visible counter when the app is dead
+        // and a flood of pushes arrives. Also drops the cap when the
+        // user is in `panicModeEnabled` (the per-chat mute / privacy-
+        // first posture extends to badge-as-oracle): no NSE bump at
+        // all, the badge stays at whatever the main app last wrote.
         let suite = UserDefaults(suiteName: SharedAppGroup.identifier)
+        let panicLockBadge = suite?.bool(forKey: SharedAppGroup.suppressBadgeKey) ?? false
+        if panicLockBadge {
+            contentHandler(bestAttemptContent)
+            return
+        }
         let current = suite?.integer(forKey: SharedAppGroup.unreadCountKey) ?? 0
-        let next = current + 1
+        let nseFloor = suite?.integer(forKey: SharedAppGroup.nseBadgeFloorKey) ?? 0
+        let cap = nseFloor + SharedAppGroup.nseBadgeCap
+        let next = min(current + 1, cap)
         suite?.set(next, forKey: SharedAppGroup.unreadCountKey)
         bestAttemptContent.badge = NSNumber(value: next)
         contentHandler(bestAttemptContent)
@@ -53,4 +71,17 @@ final class NotificationService: UNNotificationServiceExtension {
 enum SharedAppGroup {
     static let identifier = "group.com.bytepotato.pizzini"
     static let unreadCountKey = "unreadCount"
+    /// Per-resync floor: the main app writes `state.totalUnread` here
+    /// every time it refreshes the badge. The NSE will cap its
+    /// contribution at `floor + nseBadgeCap`, so a flood of pushes
+    /// while the app is dead can never inflate the badge past a
+    /// small constant offset above the last truthful value.
+    static let nseBadgeFloorKey = "nseBadgeFloor"
+    /// Hard ceiling on how many bumps the NSE may add between
+    /// main-app resyncs.
+    static let nseBadgeCap = 5
+    /// Sticky bit set by the main app when the user wants the NSE to
+    /// stop touching the badge entirely (used by the per-chat mute
+    /// + global-mute paths). Reset on next main-app resume.
+    static let suppressBadgeKey = "suppressBadgeBump"
 }

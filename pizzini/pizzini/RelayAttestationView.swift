@@ -283,7 +283,13 @@ struct RelayAttestationView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             if copyable {
                 Button {
-                    UIPasteboard.general.string = value
+                    UIPasteboard.general.setItems(
+                        [[UIPasteboard.typeAutomatic: value]],
+                        options: [
+                            .localOnly: true,
+                            .expirationDate: Date().addingTimeInterval(60),
+                        ],
+                    )
                 } label: {
                     Image(systemName: "doc.on.doc")
                         .foregroundStyle(.secondary)

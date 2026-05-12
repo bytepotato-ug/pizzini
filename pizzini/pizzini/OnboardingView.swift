@@ -147,9 +147,19 @@ struct OnboardingView: View {
     private var welcomeStep: some View {
         VStack(spacing: 18) {
             Spacer()
-            Image(systemName: "lock.fill")
-                .font(.system(size: 72))
-                .foregroundStyle(.tint)
+            // Real app logo. Beats an SF Symbol lock here — the
+            // welcome screen is the user's first paint of the
+            // brand, and recognising the icon they just tapped on
+            // the home screen reduces "did I open the right app?"
+            // friction.
+            Image("AppLogo")
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 128, height: 128)
+                .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+                .shadow(color: .black.opacity(0.15), radius: 8, x: 0, y: 4)
+                .accessibilityLabel("Pizzini logo")
             Text("Welcome to Pizzini")
                 .font(.largeTitle.bold())
                 .multilineTextAlignment(.center)

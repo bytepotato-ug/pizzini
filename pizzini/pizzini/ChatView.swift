@@ -28,6 +28,7 @@ struct ChatView: View {
     @State private var renameDraft = ""
     @State private var confirmDeleteChat = false
     @State private var confirmDeleteContact = false
+    @State private var confirmBlockContact = false
     @State private var showAttachSheet = false
     @State private var showPhotoPicker = false
     @State private var showDocumentPicker = false
@@ -170,6 +171,12 @@ struct ChatView: View {
             .screenCaptureShielded()
             .navigationTitle(contact.displayName)
             .navigationBarTitleDisplayMode(.inline)
+            // Hide the floating tab pill while a chat is on screen.
+            // The composer + keyboard already own the bottom of the
+            // view; leaving the pill visible would either clip the
+            // textfield or float over draft text. iOS pops it back in
+            // automatically on `.popToRoot`.
+            .toolbar(.hidden, for: .tabBar)
             .onAppear {
                 store.activeSurface = .oneOnOne(peerIdentity: contact.identityPub)
                 store.markRead(contactID: contactID)
@@ -343,12 +350,24 @@ struct ChatView: View {
                                 Image(systemName: "eye")
                             }
                         }
+                        Button {
+                            store.setContactMuted(contact, muted: contact.mutedAt == nil)
+                        } label: {
+                            if contact.mutedAt != nil {
+                                Label("Unmute", systemImage: "bell.fill")
+                            } else {
+                                Label("Mute", systemImage: "bell.slash")
+                            }
+                        }
                         Button(role: .destructive) {
                             confirmDeleteChat = true
                         } label: { Label("Delete chat", systemImage: "trash") }
                         Button(role: .destructive) {
                             confirmDeleteContact = true
                         } label: { Label("Delete contact", systemImage: "person.crop.circle.badge.minus") }
+                        Button(role: .destructive) {
+                            confirmBlockContact = true
+                        } label: { Label("Block", systemImage: "hand.raised.slash") }
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
@@ -384,6 +403,18 @@ struct ChatView: View {
                     let captured = contact
                     dismiss()
                     store.deleteContact(captured)
+                }
+                Button("Cancel", role: .cancel) {}
+            }
+            .confirmationDialog(
+                "Block this contact? They won't be able to reach you again unless you unblock them. Unlike Delete, blocking persists even if they try to re-pair.",
+                isPresented: $confirmBlockContact,
+                titleVisibility: .visible
+            ) {
+                Button("Block", role: .destructive) {
+                    let captured = contact.identityPub
+                    dismiss()
+                    store.blockIdentity(captured)
                 }
                 Button("Cancel", role: .cancel) {}
             }
@@ -573,57 +604,23 @@ struct ChatView: View {
     }
 
     private func composer(disabled: Bool, contact: Contact) -> some View {
-        HStack {
-            Button {
-                showAttachSheet = true
-            } label: {
-                Image(systemName: "paperclip")
-                    .padding(.horizontal, 4)
-            }
-            .buttonStyle(.bordered)
-            .disabled(disabled)
-            .accessibilityLabel("Attach a file")
-            .confirmationDialog(
-                "Attach a file",
-                isPresented: $showAttachSheet,
-                titleVisibility: .hidden,
-            ) {
+        // Layout / styling lives in `MessageComposer`; this call-site
+        // only owns the placeholder copy (caption vs message), the
+        // send action, and the attachment-dialog buttons.
+        MessageComposer(
+            draft: $draft,
+            showAttachSheet: $showAttachSheet,
+            placeholder: attachmentDraft == nil ? "type a message" : "add a caption (optional)",
+            composerDisabled: disabled,
+            sendDisabled: !canSend,
+            onSend: { sendDraft(contact: contact) },
+            attachDialog: {
                 Button("Photo or video") { showPhotoPicker = true }
                 Button("File") { showDocumentPicker = true }
                 Button("Cancel", role: .cancel) {}
-            }
-
-            TextField(
-                attachmentDraft == nil ? "type a message" : "add a caption (optional)",
-                text: $draft,
-                axis: .vertical,
-            )
-                // F-NEW-801: harden the 1:1 composer — the single
-                // highest-volume sensitive-content input in the app.
-                // Without these flags every message trains
-                // ~/Library/Keyboard/dynamic-text.dat. `.sentences`
-                // autocap keeps the first-letter UX nicety without
-                // re-enabling autocorrect.
-                .hardenedTextInput(autocap: .sentences)
-                .textFieldStyle(.roundedBorder)
-                .focused($composerFocused)
-                .disabled(disabled)
-                // Multi-line composer: Return inserts a newline. The
-                // visible send button next to the field is the only
-                // way to send — `.submitLabel(.send)` + `.onSubmit`
-                // would mislead users since `axis: .vertical` absorbs
-                // the keypress for the newline anyway. Matches the
-                // GroupChatView composer's behaviour.
-            Button {
-                sendDraft(contact: contact)
-            } label: {
-                Image(systemName: "paperplane.fill")
-                    .padding(.horizontal, 4)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(disabled || !canSend)
-        }
-        .padding()
+            },
+            focused: $composerFocused,
+        )
     }
 
     /// Send is enabled if there's an attachment OR a non-blank caption.

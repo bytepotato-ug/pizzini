@@ -21,7 +21,7 @@ enum Schema {
     /// Current schema version — read by SQLiteStorage at open time
     /// to decide whether the migration runner needs to fire. Bump
     /// when adding a new migration; never decrease.
-    static let currentVersion: Int32 = 3
+    static let currentVersion: Int32 = 4
 
     /// All migrations, ordered. Index `i` is `from version i`.
     /// Migration 0 → 1 is the initial schema; subsequent entries
@@ -31,6 +31,7 @@ enum Schema {
         Migration(from: 0, to: 1, sql: v1InitialSchema),
         Migration(from: 1, to: 2, sql: v2ContactProvenanceAndVerification),
         Migration(from: 2, to: 3, sql: v3ReadReceiptsModeAndDefault),
+        Migration(from: 3, to: 4, sql: v4MuteAndBlockList),
     ]
 
     private static let v1InitialSchema = """
@@ -270,6 +271,39 @@ enum Schema {
     UPDATE contacts SET read_receipts_mode = 'always_on'  WHERE read_receipts_enabled = 1;
     UPDATE contacts SET read_receipts_mode = 'always_off' WHERE read_receipts_enabled = 0;
     ALTER TABLE settings  ADD COLUMN default_read_receipts_enabled INTEGER NOT NULL DEFAULT 0;
+    """
+
+    /// v4 — per-contact mute, app-wide notification mute, persistent
+    /// block list.
+    ///
+    /// `contacts.muted_at` is a wall-clock epoch (ms) when the user
+    /// muted this peer. NULL = unmuted. When non-NULL, inbound
+    /// messages from this peer don't fire haptics or bump the NSE
+    /// badge. Delivery and persistence are unchanged.
+    ///
+    /// `settings.notifications_muted` is the global counterpart.
+    /// When 1, the NSE refuses to bump the badge at all and the
+    /// in-app haptic is suppressed even on unmuted contacts. Default
+    /// 0 (notifications on) so the upgrade is invisible to users who
+    /// haven't asked for quiet.
+    ///
+    /// `blocked_identities` is a denylist keyed on the 33-byte
+    /// libsignal IdentityKey wire form. It survives `deleteContact`
+    /// → re-add cycles: even after the contact row is gone, an
+    /// inbound BUNDLE_RESPONSE / TOKEN_ISSUE / SEND from a blocked
+    /// identityPub is dropped at the receive-side gate. Block is
+    /// strictly stronger than delete — delete is "I don't want this
+    /// in my list right now," block is "I don't want this person to
+    /// reach me again." Distinct table rather than a column on
+    /// `contacts` because the block list outlives any specific
+    /// contact row.
+    private static let v4MuteAndBlockList = """
+    ALTER TABLE contacts ADD COLUMN muted_at INTEGER;
+    ALTER TABLE settings ADD COLUMN notifications_muted INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE blocked_identities (
+        identity_pub BLOB    PRIMARY KEY NOT NULL,
+        blocked_at   INTEGER NOT NULL
+    ) STRICT;
     """
 }
 

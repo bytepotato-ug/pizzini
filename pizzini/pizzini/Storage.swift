@@ -66,7 +66,7 @@ enum Storage {
             state.groups = try store.loadGroups()
             return state
         } catch {
-            NSLog("[pizzini.storage] loadAppState failed: \(error). Returning defaults.")
+            pzLog("[pizzini.storage] loadAppState failed: \(error). Returning defaults.")
             return AppState()
         }
     }
@@ -76,7 +76,7 @@ enum Storage {
         guard let store = SQLiteStorage.shared else { return .empty }
         do { return try store.loadOutbox() }
         catch {
-            NSLog("[pizzini.storage] loadOutbox failed: \(error). Returning empty.")
+            pzLog("[pizzini.storage] loadOutbox failed: \(error). Returning empty.")
             return .empty
         }
     }
@@ -108,7 +108,7 @@ enum Storage {
             try store.saveDeviceStore(blob)
             return true
         } catch {
-            NSLog("[pizzini.storage] device_store UPSERT failed: \(error)")
+            pzLog("[pizzini.storage] device_store UPSERT failed: \(error)")
             throw StorageError.databaseWriteFailed(detail: "\(error)")
         }
     }
@@ -171,7 +171,7 @@ enum Storage {
             }
             return true
         } catch {
-            NSLog("[pizzini.storage] persist(appState:) failed: \(error)")
+            pzLog("[pizzini.storage] persist(appState:) failed: \(error)")
             return false
         }
     }
@@ -183,31 +183,31 @@ enum Storage {
     static func upsertSettings(_ s: AppState) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.upsertSettings(s) }
-        catch { NSLog("[pizzini.storage] upsertSettings failed: \(error)") }
+        catch { pzLog("[pizzini.storage] upsertSettings failed: \(error)") }
     }
 
     static func upsertContact(_ c: Contact) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.upsertContact(c) }
-        catch { NSLog("[pizzini.storage] upsertContact failed: \(error)") }
+        catch { pzLog("[pizzini.storage] upsertContact failed: \(error)") }
     }
 
     static func deleteContact(id: UUID) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.deleteContact(id: id) }
-        catch { NSLog("[pizzini.storage] deleteContact failed: \(error)") }
+        catch { pzLog("[pizzini.storage] deleteContact failed: \(error)") }
     }
 
     static func upsertGroup(_ g: ChatGroup) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.upsertGroup(g) }
-        catch { NSLog("[pizzini.storage] upsertGroup failed: \(error)") }
+        catch { pzLog("[pizzini.storage] upsertGroup failed: \(error)") }
     }
 
     static func deleteGroup(id: Data) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.deleteGroup(id: id) }
-        catch { NSLog("[pizzini.storage] deleteGroup failed: \(error)") }
+        catch { pzLog("[pizzini.storage] deleteGroup failed: \(error)") }
     }
 
     // MARK: - Messages (per-row)
@@ -215,37 +215,37 @@ enum Storage {
     static func appendContactMessage(contactId: UUID, _ m: PersistedMessage) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.appendContactMessage(contactId: contactId, m) }
-        catch { NSLog("[pizzini.storage] appendContactMessage failed: \(error)") }
+        catch { pzLog("[pizzini.storage] appendContactMessage failed: \(error)") }
     }
 
     static func updateContactMessage(contactId: UUID, _ m: PersistedMessage) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.updateContactMessage(contactId: contactId, m) }
-        catch { NSLog("[pizzini.storage] updateContactMessage failed: \(error)") }
+        catch { pzLog("[pizzini.storage] updateContactMessage failed: \(error)") }
     }
 
     static func deleteAllContactMessages(contactId: UUID) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.deleteAllContactMessages(contactId: contactId) }
-        catch { NSLog("[pizzini.storage] deleteAllContactMessages failed: \(error)") }
+        catch { pzLog("[pizzini.storage] deleteAllContactMessages failed: \(error)") }
     }
 
     static func appendGroupMessage(groupId: Data, _ m: PersistedMessage) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.appendGroupMessage(groupId: groupId, m) }
-        catch { NSLog("[pizzini.storage] appendGroupMessage failed: \(error)") }
+        catch { pzLog("[pizzini.storage] appendGroupMessage failed: \(error)") }
     }
 
     static func updateGroupMessage(groupId: Data, _ m: PersistedMessage) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.updateGroupMessage(groupId: groupId, m) }
-        catch { NSLog("[pizzini.storage] updateGroupMessage failed: \(error)") }
+        catch { pzLog("[pizzini.storage] updateGroupMessage failed: \(error)") }
     }
 
     static func deleteAllGroupMessages(groupId: Data) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.deleteAllGroupMessages(groupId: groupId) }
-        catch { NSLog("[pizzini.storage] deleteAllGroupMessages failed: \(error)") }
+        catch { pzLog("[pizzini.storage] deleteAllGroupMessages failed: \(error)") }
     }
 
     // MARK: - Delivery tokens
@@ -253,7 +253,7 @@ enum Storage {
     static func replaceDeliveryTokens(contactId: UUID, tokens: [Data]) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.replaceDeliveryTokens(contactId: contactId, tokens: tokens) }
-        catch { NSLog("[pizzini.storage] replaceDeliveryTokens failed: \(error)") }
+        catch { pzLog("[pizzini.storage] replaceDeliveryTokens failed: \(error)") }
     }
 
     static func popDeliveryToken(contactId: UUID) -> Data? {
@@ -276,7 +276,7 @@ enum Storage {
         guard let store = SQLiteStorage.shared else { return nil }
         do { return try store.commitDeliveryTokenSpend(contactId: contactId, entryBuilder: entryBuilder) }
         catch {
-            NSLog("[pizzini.storage] commitDeliveryTokenSpend failed: \(error)")
+            pzLog("[pizzini.storage] commitDeliveryTokenSpend failed: \(error)")
             return nil
         }
     }
@@ -284,7 +284,21 @@ enum Storage {
     static func appendDeliveryTokens(contactId: UUID, tokens: [Data]) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.appendDeliveryTokens(contactId: contactId, tokens: tokens) }
-        catch { NSLog("[pizzini.storage] appendDeliveryTokens failed: \(error)") }
+        catch { pzLog("[pizzini.storage] appendDeliveryTokens failed: \(error)") }
+    }
+
+    // MARK: - Block list (v4)
+
+    static func blockIdentity(_ identityPub: Data) {
+        guard let store = SQLiteStorage.shared else { return }
+        do { try store.upsertBlockedIdentity(identityPub) }
+        catch { pzLog("[pizzini.storage] blockIdentity failed: \(error)") }
+    }
+
+    static func unblockIdentity(_ identityPub: Data) {
+        guard let store = SQLiteStorage.shared else { return }
+        do { try store.removeBlockedIdentity(identityPub) }
+        catch { pzLog("[pizzini.storage] unblockIdentity failed: \(error)") }
     }
 
     // MARK: - Outbox (per-row)
@@ -292,19 +306,42 @@ enum Storage {
     static func upsertOutboxEntry(_ e: OutboxEntry) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.upsertOutboxEntry(e) }
-        catch { NSLog("[pizzini.storage] upsertOutboxEntry failed: \(error)") }
+        catch { pzLog("[pizzini.storage] upsertOutboxEntry failed: \(error)") }
+    }
+
+    /// Batched outbox upsert under one BEGIN IMMEDIATE / COMMIT.
+    /// Used by the group fan-out path where N legs (or N × chunk_count
+    /// for attachments) would otherwise each fsync their own
+    /// transaction. With FULL synchronous mode every per-row commit
+    /// is a separate fsync; batching collapses them into one disk
+    /// round-trip. Crash semantics preserve atomicity — either all
+    /// legs of a group send are persisted or none are. That's a
+    /// strictly stronger guarantee than the per-row writes it
+    /// replaces.
+    static func batchUpsertOutboxEntries(_ entries: [OutboxEntry]) {
+        guard let store = SQLiteStorage.shared else { return }
+        guard !entries.isEmpty else { return }
+        do {
+            try store.transaction { _ in
+                for e in entries {
+                    try store.upsertOutboxEntry(e)
+                }
+            }
+        } catch {
+            pzLog("[pizzini.storage] batchUpsertOutboxEntries failed: \(error)")
+        }
     }
 
     static func deleteOutboxEntry(messageId: Data) {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.deleteOutboxEntry(messageId: messageId) }
-        catch { NSLog("[pizzini.storage] deleteOutboxEntry failed: \(error)") }
+        catch { pzLog("[pizzini.storage] deleteOutboxEntry failed: \(error)") }
     }
 
     static func clearOutbox() {
         guard let store = SQLiteStorage.shared else { return }
         do { try store.clearOutbox() }
-        catch { NSLog("[pizzini.storage] clearOutbox failed: \(error)") }
+        catch { pzLog("[pizzini.storage] clearOutbox failed: \(error)") }
     }
 
     // MARK: - Reset
@@ -403,6 +440,8 @@ enum Storage {
                         groups: [],
                         contactsBeforeGroups: true,
                         inAppHapticsEnabled: false,
+                        notificationsMuted: false,
+                        blockedIdentities: [],
                     )
                 } else {
                     // Non-duress reset path (Settings → "Reset
@@ -422,12 +461,19 @@ enum Storage {
                         groups: [],
                         contactsBeforeGroups: snapshot.contactsBeforeGroups,
                         inAppHapticsEnabled: snapshot.inAppHapticsEnabled,
+                        defaultReadReceiptsEnabled: snapshot.defaultReadReceiptsEnabled,
+                        notificationsMuted: snapshot.notificationsMuted,
+                        // Identity reset wipes contacts — but the block
+                        // list is by identityPub, not contact id, and
+                        // its whole purpose is to outlive contact rows.
+                        // Preserve.
+                        blockedIdentities: snapshot.blockedIdentities,
                     )
                 }
                 _ = persist(appState: preserved)
             }
         } catch {
-            NSLog("[pizzini.storage] eraseAndReinitialize failed: \(error)")
+            pzLog("[pizzini.storage] eraseAndReinitialize failed: \(error)")
         }
     }
 
@@ -460,10 +506,19 @@ enum Storage {
                     groups: [],
                     contactsBeforeGroups: preserved.contactsBeforeGroups,
                     inAppHapticsEnabled: preserved.inAppHapticsEnabled,
+                    defaultReadReceiptsEnabled: preserved.defaultReadReceiptsEnabled,
+                    notificationsMuted: preserved.notificationsMuted,
+                    blockedIdentities: preserved.blockedIdentities,
                 ))
+                // Re-persist the block-list rows: `wipeAndReopen()`
+                // truncated the table, and `persist(appState:)` only
+                // writes the settings/contacts/groups paths.
+                for id in preserved.blockedIdentities {
+                    blockIdentity(id)
+                }
             }
         } catch {
-            NSLog("[pizzini.storage] resetEverything failed: \(error)")
+            pzLog("[pizzini.storage] resetEverything failed: \(error)")
         }
     }
 }
