@@ -180,32 +180,105 @@ if ! getent passwd pizzini-admin >/dev/null; then
     echo "[bootstrap] created user pizzini-admin"
 fi
 install -d -m 0700 -o pizzini-admin -g pizzini-admin /home/pizzini-admin/.ssh
-# Seed authorized_keys from whichever account is running this script
-# AND from root's existing authorized_keys, deduped. If the operator
-# ran the script as a non-root sudo'er, $SUDO_USER's keys also get
-# included so they retain access via pizzini-admin.
-{
-    [[ -r /root/.ssh/authorized_keys ]] && cat /root/.ssh/authorized_keys
+# Seed authorized_keys from EVERY plausible source of root's current
+# SSH keys so the post-PermitRootLogin-no fallback works regardless
+# of how the operator originally landed in /root:
+#
+#   1. /root/.ssh/authorized_keys                — the conventional file
+#   2. /root/.ssh/authorized_keys2               — legacy second file
+#   3. /etc/ssh/authorized_keys/root             — distro-overridden path
+#      (Hetzner Cloud cloud-init / Cherry Servers etc. sometimes
+#      drop keys here via AuthorizedKeysFile inside sshd_config.d)
+#   4. `sshd -G | grep authorizedkeysfile`        — whatever sshd
+#      actually resolves at runtime, expanded for the root user.
+#   5. $SUDO_USER's authorized_keys              — when bootstrap was
+#      run via `sudo bash -s` from a non-root login.
+#
+# A bare $SUDO_USER absent + /root/.ssh/authorized_keys missing path
+# (an AuthorizedKeysCommand-only host, for example) would otherwise
+# leave pizzini-admin without keys and the guard below would abort
+# AFTER nftables / fail2ban / apparmor were already applied — half-
+# configured state. The expanded lookup eliminates that footgun.
+seed_authorized_keys() {
+    [[ -r /root/.ssh/authorized_keys  ]] && cat /root/.ssh/authorized_keys
+    [[ -r /root/.ssh/authorized_keys2 ]] && cat /root/.ssh/authorized_keys2
+    [[ -r /etc/ssh/authorized_keys/root ]] && cat /etc/ssh/authorized_keys/root
+    # Resolve sshd's actual AuthorizedKeysFile setting and substitute
+    # the standard tokens for root. `sshd -G` prints effective config
+    # post-Match-block evaluation; pre-Match (global) is enough for
+    # the AuthorizedKeysFile token.
+    if command -v sshd >/dev/null 2>&1; then
+        local akf
+        akf="$(sshd -G 2>/dev/null | awk '/^authorizedkeysfile / { for (i=2;i<=NF;i++) print $i }')"
+        if [[ -n "$akf" ]]; then
+            while IFS= read -r path; do
+                # %h → home (/root), %u → user (root), %% → literal %
+                local expanded="${path//%h//root}"
+                expanded="${expanded//%u/root}"
+                expanded="${expanded//%%/%}"
+                # Skip paths that aren't absolute (relative to home) —
+                # ssh prepends $home automatically; we already did %h.
+                case "$expanded" in
+                    /*) [[ -r "$expanded" ]] && cat "$expanded" ;;
+                esac
+            done <<< "$akf"
+        fi
+    fi
     if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        local sudo_user_home
         sudo_user_home="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
         [[ -r "$sudo_user_home/.ssh/authorized_keys" ]] && cat "$sudo_user_home/.ssh/authorized_keys"
     fi
-} | awk 'NF && !seen[$0]++' > /home/pizzini-admin/.ssh/authorized_keys
+}
+seed_authorized_keys | awk 'NF && !seen[$0]++' > /home/pizzini-admin/.ssh/authorized_keys
 chown pizzini-admin:pizzini-admin /home/pizzini-admin/.ssh/authorized_keys
 chmod 0600 /home/pizzini-admin/.ssh/authorized_keys
-# Passwordless sudo so the operator can recover if they get locked
-# out of the primary account. Drop a single-line drop-in (NOT the
-# whole sudoers file) so we don't accidentally clobber distro
-# defaults.
-install -d -m 0750 -o root -g root /etc/sudoers.d
-cat > /etc/sudoers.d/90-pizzini-admin <<'SUDOEOF'
-pizzini-admin ALL=(ALL) NOPASSWD: ALL
-SUDOEOF
-chmod 0440 /etc/sudoers.d/90-pizzini-admin
 # Final guard: only proceed if pizzini-admin actually has at least
 # one key. Otherwise disabling root login *would* lock the box.
+# We do this BEFORE installing the sudoers drop-in below — bailing
+# here leaves the system without an unnecessary NOPASSWD entry, and
+# with sshd still permitting root, so the operator can re-run after
+# fixing their key state.
 if [[ ! -s /home/pizzini-admin/.ssh/authorized_keys ]]; then
     echo "[bootstrap] refusing to harden sshd: pizzini-admin has no SSH keys (would lock you out)" >&2
+    echo "[bootstrap]   seed sources tried: /root/.ssh/authorized_keys, /root/.ssh/authorized_keys2, /etc/ssh/authorized_keys/root, sshd -G AuthorizedKeysFile, SUDO_USER home" >&2
+    exit 1
+fi
+# Capability-restricted sudo. The pre-fix `NOPASSWD: ALL` made any
+# remote code execution that landed as `pizzini-admin` an instant
+# root escalation; cap to the smallest set of commands the
+# break-glass story actually needs:
+#
+#   * systemctl  — restart / status / journal-style ops
+#   * journalctl — read service logs to diagnose
+#   * apt-get update / upgrade — apply security patches manually if
+#     unattended-upgrades got stuck
+#   * nft list ruleset — inspect the firewall without mutating it
+#   * tail / less of /var/log — read log files unrelated to journald
+#
+# Anything destructive beyond service restarts (useradd,
+# usermod, partition ops, mount changes) still requires the
+# operator to first log in as root via a recovery image or
+# Hetzner / Cherry Servers' rescue console. That's a deliberate
+# operational handcuff: a pwned shell user can't, e.g., add their
+# own SSH key to /root or rotate the box password.
+install -d -m 0750 -o root -g root /etc/sudoers.d
+cat > /etc/sudoers.d/90-pizzini-admin <<'SUDOEOF'
+# Pizzini relay break-glass account — installed by scripts/deploy/bootstrap.sh.
+# Capability-restricted NOPASSWD: a remote RCE landing as pizzini-admin
+# cannot escalate to arbitrary root via sudo. Full root recovery
+# requires the provider's rescue console (a separate, physical-key
+# trust path).
+pizzini-admin ALL=(ALL) NOPASSWD: /bin/systemctl, /usr/bin/systemctl, /bin/journalctl, /usr/bin/journalctl, /usr/sbin/nft list ruleset, /usr/bin/apt-get update, /usr/bin/apt-get upgrade -y, /usr/bin/apt-get dist-upgrade -y, /usr/bin/tail, /usr/bin/less
+SUDOEOF
+chmod 0440 /etc/sudoers.d/90-pizzini-admin
+# Validate the sudoers drop-in before continuing — a syntax error
+# in a sudoers.d file can break sudo entirely. `visudo -cf` parses
+# without applying. If it rejects our file, remove it and fall
+# back to passwordful sudo so we don't soft-lock the operator.
+if ! visudo -cf /etc/sudoers.d/90-pizzini-admin >/dev/null 2>&1; then
+    echo "[bootstrap] sudoers drop-in failed validation — removing" >&2
+    rm -f /etc/sudoers.d/90-pizzini-admin
     exit 1
 fi
 
@@ -265,21 +338,40 @@ systemctl restart unattended-upgrades
 # ---- 15. enable + start services ----
 systemctl daemon-reload
 systemctl enable tor.service pizzini-relay.service >/dev/null 2>&1
-# Wipe any cached tor state from a previous (failed or partial) run.
-# Tor caches the last HS-descriptor upload timestamp in
-# /var/lib/tor/state — if a prior run uploaded then we restart for
-# whatever reason (config change, AppArmor reload, …), tor will
-# read the cached "last uploaded at T" and reschedule the next
-# upload for T + random(60-120min), so the freshly-started instance
-# refuses to publish for over an hour. On a clean bootstrap there's
-# nothing valuable in the state file (no introduction-point pinning
-# for v3, no PoW state we care about) so prune it unconditionally.
+# Clear ONLY tor's network-consensus caches before the final
+# restart — the consensus / microdesc tail is what slows a cold
+# start (tor refetches from authorities) and is safely recomputed.
+#
+# CRITICALLY: `/var/lib/tor/state` is NOT deleted.
+#
+# The state file holds the v3 hidden-service `HidServRevCounter`
+# (rend-spec-v3 §2.5.1.2): HSDirs that have already cached a
+# previous descriptor for our service reject any descriptor whose
+# revision-counter is ≤ the cached one. Pruning state resets that
+# counter to 0; clients that hit a stale HSDir then can't resolve
+# our onion until the cache expires (~3h on the descriptor TTL,
+# longer on slow HSDirs). The previous version of this script did
+# `rm -f /var/lib/tor/state`, which produced a deploy-window
+# resolvability gap every time the bootstrap touched tor. The new
+# logic preserves state across reboots / config changes.
+#
+# The legacy cached-* files (descriptors / microdescs / extrainfo /
+# rend) ARE pruned: those are network-side data with no per-service
+# replay invariant to protect, and a stale consensus is the most
+# common reason a re-bootstrapped relay can't reach its directory
+# authorities on the first attempt.
 systemctl stop tor.service tor@default.service 2>/dev/null || true
-rm -f /var/lib/tor/state \
-      /var/lib/tor/cached-descriptors{,.new} \
-      /var/lib/tor/cached-microdescs{,.new} \
-      /var/lib/tor/cached-extrainfo{,.new} \
+rm -f /var/lib/tor/cached-descriptors  /var/lib/tor/cached-descriptors.new \
+      /var/lib/tor/cached-microdescs   /var/lib/tor/cached-microdescs.new  \
+      /var/lib/tor/cached-extrainfo    /var/lib/tor/cached-extrainfo.new   \
       /var/lib/tor/cached-rend
+# Tiny safety net: if /var/lib/tor/state is missing on the very
+# first run (fresh install, tor hasn't started yet), that's fine
+# — tor will create one. If it's present, leave it alone so the
+# revision counter survives.
+if [[ -f /var/lib/tor/state ]]; then
+    echo "[bootstrap] preserving /var/lib/tor/state (HS revision counter)"
+fi
 systemctl reset-failed tor.service tor@default.service 2>/dev/null || true
 systemctl restart tor.service
 
