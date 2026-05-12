@@ -338,6 +338,15 @@ const FRAME_TYPE_STATUS_RESPONSE: u8 = 9;
 /// padded sealed envelopes (USP #4-lite), this hides both message
 /// timing and length at the wire layer.
 const FRAME_TYPE_COVER: u8 = 10;
+/// Client → relay request to drop our APNs device token from the
+/// relay's persistent push-token store. Sent by iOS when the client
+/// elects a different relay as push-primary so the old primary
+/// (which still holds the token until the TTL purge fires 30 days
+/// later) stops emitting duplicate APNs wake-ups for every inbound
+/// SEND. Body is empty — the relay knows which peer issued the
+/// frame from the authenticated HELLO. Idempotent: a no-op when
+/// the peer has no entry in the store.
+const FRAME_TYPE_DEREGISTER_PUSH: u8 = 11;
 /// Fixed payload size for COVER frames (post-frame-type body).
 /// Sized to roughly match the smallest padded sealed_ciphertext
 /// bucket (256 bytes) so the wire byte-count of a heartbeat is
@@ -989,6 +998,36 @@ async fn read_loop(
                     ),
                     Err(e) => dev_peer_elog!(
                         "REGISTER_PUSH from {}: in-memory only — persist failed: {e}",
+                        short_hex(self_id),
+                    ),
+                }
+            }
+            FRAME_TYPE_DEREGISTER_PUSH => {
+                // No body — the peer is identified by the authenticated
+                // HELLO. Drop our cached token so a subsequent
+                // `maybe_send_push` is a no-op until this relay is
+                // re-elected as push-primary (which would carry a
+                // fresh REGISTER_PUSH). Idempotent — a peer that has
+                // no entry just no-ops here.
+                if frame.len() != 1 {
+                    eprintln!(
+                        "malformed DEREGISTER_PUSH from {}: trailing {} bytes",
+                        short_hex(self_id),
+                        frame.len() - 1
+                    );
+                    continue;
+                }
+                match push_tokens.lock().await.remove(self_id) {
+                    Ok(true) => dev_peer_log!(
+                        "DEREGISTER_PUSH from {}: token dropped",
+                        short_hex(self_id),
+                    ),
+                    Ok(false) => dev_peer_log!(
+                        "DEREGISTER_PUSH from {}: no entry (no-op)",
+                        short_hex(self_id),
+                    ),
+                    Err(e) => dev_peer_elog!(
+                        "DEREGISTER_PUSH from {}: persist failed: {e}",
                         short_hex(self_id),
                     ),
                 }

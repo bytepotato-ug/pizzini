@@ -2,39 +2,39 @@
 # Build the pizzini-relay binary deterministically and report its
 # SHA-256 (USP #1: reproducible builds + transparency log).
 #
-# Two operators running this script on the same git commit, on the
-# same Rust toolchain version, MUST get the same hex digest. If
-# they don't, this build script has acquired a non-reproducible
-# input — investigate before publishing the digest to the
-# transparency log.
+# Two operators running this script on the same git commit MUST get
+# the same hex digest. If they don't, this build script has
+# acquired a non-reproducible input — investigate before
+# publishing the digest to the transparency log.
 #
-# What this script does that a vanilla `cargo build --release`
-# doesn't:
+# The relay runs on `x86_64-unknown-linux-gnu` (Hetzner / Cherry
+# Servers); macOS / arm64 / musl native builds produce DIFFERENT
+# binaries that cannot match the production hash. To keep "two
+# operators get the same digest" honest across host platforms, we
+# always build inside a pinned Docker image that fixes:
 #
-#   * Pins the toolchain via `rust-toolchain.toml` (sister file at
-#     the repo root). Cargo picks it up automatically; the explicit
-#     `rustup which cargo` echo confirms the chosen version.
-#   * Refuses if the working tree has uncommitted changes — a dirty
-#     build cannot be independently reproduced from public source,
-#     so the resulting digest would never roundtrip.
-#   * Builds with `--locked --frozen` so a hidden Cargo.lock update
-#     or network fetch (e.g. someone slipping a yanked dep) fails
-#     the build loud instead of silently producing a different
-#     binary.
-#   * Strips DWARF path prefixes via `--remap-path-prefix` so the
-#     debug-info section is independent of the builder's $HOME
-#     and $REPO. Combined with `strip = "symbols"` from the
-#     workspace `[profile.release]` (already locked in), this
-#     removes the last two path-leak vectors.
-#   * Computes SHA-256 over the final binary and prints both that
-#     hash and the git SHA so the operator can paste both into the
-#     transparency log entry.
+#   * the target triple        — `x86_64-unknown-linux-gnu`
+#   * the rust toolchain       — from `rust-toolchain.toml`
+#   * the OS distribution      — debian bookworm
+#   * the system packages      — `protobuf-compiler` + `pkg-config`,
+#                                 required by the libsignal
+#                                 `sparsepostquantumratchet` build.rs
+#   * the path-remap sentinels — `/work` for the repo, `/build-home`
+#                                 for $HOME, both inside the container
+#                                 so the host's actual paths never
+#                                 reach the DWARF section
+#   * SOURCE_DATE_EPOCH        — pinned to the commit timestamp so
+#                                 any embedded build clock is
+#                                 deterministic
+#   * `cargo vendor`           — every crate fetched offline from
+#                                 the committed `vendor/` directory,
+#                                 closing the `--frozen` git-deps
+#                                 refresh hole
 #
-# The relay's own STATUS_RESPONSE frame re-derives the SHA-256 at
-# startup by reading /proc/self/exe; the value below MUST match
-# what the running relay reports — if they ever disagree, the
-# self-attestation code in the binary was tampered with after
-# this script ran.
+# Operators on a Linux host with all the above already installed
+# can opt out of the docker wrapper with `PIZZINI_RELEASE_NO_DOCKER=1`,
+# but the canonical path is `Docker required` — the hash published
+# to the transparency log is the docker-built one.
 
 set -euo pipefail
 
@@ -49,36 +49,143 @@ if ! git diff --quiet HEAD --; then
     echo "       Reproducible builds require a clean checkout. Commit or stash first." >&2
     exit 1
 fi
-if [[ -n "$(git status --porcelain)" ]]; then
-    echo "error: untracked files present. Clean the tree before building for release." >&2
-    git status --short >&2
+# Untracked files inside the repo root would also taint a build,
+# but `cargo vendor` (re-)generates the `vendor/` directory which
+# IS untracked by design; ignore it specifically so the script can
+# be re-run from a clean tree where the only delta is the vendored
+# dependency tree.
+UNTRACKED="$(git ls-files --others --exclude-standard | grep -v '^vendor/' || true)"
+if [[ -n "$UNTRACKED" ]]; then
+    echo "error: untracked files present (other than vendor/). Clean the tree before building for release." >&2
+    echo "$UNTRACKED" >&2
     exit 1
 fi
 
 GIT_SHA="$(git rev-parse HEAD)"
 SHORT_SHA="$(git rev-parse --short HEAD)"
+
+# Pin SOURCE_DATE_EPOCH to the commit timestamp so any "embedded
+# build time" anywhere in the dep tree (cargo metadata, build.rs
+# scripts that bake a `BUILT_AT` constant, etc.) is deterministic.
+SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct HEAD)"
+export SOURCE_DATE_EPOCH
+
+if [[ -z "${PIZZINI_RELEASE_NO_DOCKER:-}" ]]; then
+    # Outer invocation: re-exec ourselves inside the pinned
+    # `rust:1.95.0-bookworm-slim` image with the repo bind-mounted
+    # at /work. The inner invocation sets PIZZINI_RELEASE_NO_DOCKER
+    # so we don't recurse, and INSIDE_DOCKER so it knows to use
+    # the in-container paths for the path-remap.
+    #
+    # If docker isn't available, fail fast with a clear message:
+    # building outside the pinned image silently produces a
+    # different hash and breaks the reproducibility promise.
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "error: docker not found. Reproducible relay builds run inside a pinned image." >&2
+        echo "       Install docker, or set PIZZINI_RELEASE_NO_DOCKER=1 to opt out (you" >&2
+        echo "       MUST then be on x86_64-linux with the same rustc + protoc as the" >&2
+        echo "       canonical builder, or the published hash will not match)." >&2
+        exit 1
+    fi
+    echo "==> Reproducible relay build (inside docker)"
+    echo "    repo  : $REPO_ROOT"
+    echo "    commit: $GIT_SHA"
+    # `cargo vendor` once on the host (outside the container) so the
+    # offline build inside docker has every dep on disk. Idempotent;
+    # produces `vendor/` + `.cargo/config.toml`-equivalent stdout we
+    # capture into `.cargo/config-vendor.toml`.
+    if [[ ! -d "$REPO_ROOT/vendor" ]]; then
+        echo "==> cargo vendor (one-time)"
+        mkdir -p "$REPO_ROOT/.cargo"
+        cargo vendor --locked vendor > "$REPO_ROOT/.cargo/config-vendor.toml"
+    fi
+    docker run --rm \
+        --user "$(id -u):$(id -g)" \
+        -e PIZZINI_RELEASE_NO_DOCKER=1 \
+        -e INSIDE_DOCKER=1 \
+        -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+        -e CARGO_HOME=/work/.cargo \
+        -e HOME=/build-home \
+        -v "$REPO_ROOT":/work:rw \
+        -w /work \
+        rust:1.95.0-bookworm-slim \
+        bash -lc '
+            set -euo pipefail
+            apt-get update -qq
+            apt-get install -y --no-install-recommends protobuf-compiler pkg-config >/dev/null
+            mkdir -p /build-home
+            # Inside-container path-remap: every host-side path
+            # disappears, replaced by the fixed sentinels.
+            export RUSTFLAGS="--remap-path-prefix=/work=/build --remap-path-prefix=/build-home=/build-home"
+            # The .cargo/config-vendor.toml from `cargo vendor`
+            # points at /work/vendor — use it via $CARGO_HOME so
+            # cargo offlines through the vendored tree.
+            mkdir -p /work/.cargo
+            cp /work/.cargo/config-vendor.toml /work/.cargo/config.toml
+            export CARGO_NET_OFFLINE=true
+            exec /work/scripts/build-relay-release.sh
+        '
+    BIN_PATH="$REPO_ROOT/target/x86_64-unknown-linux-gnu/release/pizzini-relay"
+    BIN_PATH="${BIN_PATH:-$REPO_ROOT/target/release/pizzini-relay}"
+    if [[ ! -f "$BIN_PATH" ]]; then
+        BIN_PATH="$REPO_ROOT/target/release/pizzini-relay"
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        BIN_SHA256="$(sha256sum "$BIN_PATH" | awk '{print $1}')"
+    else
+        BIN_SHA256="$(shasum -a 256 "$BIN_PATH" | awk '{print $1}')"
+    fi
+    BIN_SIZE_BYTES="$(wc -c <"$BIN_PATH" | awk '{print $1}')"
+    echo
+    echo "==> Docker-built relay complete."
+    echo "    binary    : $BIN_PATH"
+    echo "    size      : $BIN_SIZE_BYTES bytes"
+    echo "    sha256    : $BIN_SHA256"
+    echo "    git commit: $GIT_SHA ($SHORT_SHA)"
+    echo
+    echo "Transparency-log entry to publish (single line):"
+    echo "{\"git_sha\":\"$GIT_SHA\",\"binary_sha256\":\"$BIN_SHA256\",\"binary_size\":$BIN_SIZE_BYTES}"
+    exit 0
+fi
+
+# Inner invocation (or `PIZZINI_RELEASE_NO_DOCKER=1` opt-out path).
+# `INSIDE_DOCKER=1` flips path-remap to the container-internal
+# values; opt-out path uses the host's $REPO_ROOT and $HOME, which
+# is only correct on the canonical x86_64-linux builder image.
 echo "==> Reproducible relay build"
 echo "    repo  : $REPO_ROOT"
 echo "    commit: $GIT_SHA"
-echo "    cargo : $(rustup which cargo)"
-echo "    rustc : $(rustup which rustc)"
+echo "    cargo : $(command -v cargo)"
+echo "    rustc : $(command -v rustc)"
+echo "    target: x86_64-unknown-linux-gnu"
 
 # 2. Build flags. The remap-path-prefix invocations replace the
 #    builder-specific absolute paths embedded in DWARF debug info
 #    (which would otherwise differ between $HOME=/Users/alice
 #    and $HOME=/home/bob and silently make the binaries diverge).
-#    The path "/build" is a fixed sentinel every reproducer agrees
-#    on.
-export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$REPO_ROOT=/build --remap-path-prefix=$HOME=/build-home"
-# Belt + braces: cargo refuses to update the lockfile or hit the
-# network. Either condition would mean the build is taking input
-# from somewhere other than the committed source.
+#    Inside docker we use the in-container path "/work" + "/build-home"
+#    constants; on the opt-out path we substitute the host's actual
+#    paths, which is only valid on the canonical builder.
+if [[ -n "${INSIDE_DOCKER:-}" ]]; then
+    export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=/work=/build --remap-path-prefix=/build-home=/build-home"
+else
+    export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$REPO_ROOT=/build --remap-path-prefix=$HOME=/build-home"
+fi
+# Cargo refuses to update the lockfile. `--offline` (set via
+# CARGO_NET_OFFLINE in the docker wrapper) closes the network
+# entirely; `--locked --frozen` keeps the lockfile + vendored
+# tree authoritative even on the opt-out path.
 export CARGO_NET_OFFLINE="${CARGO_NET_OFFLINE:-true}"
 
-echo "==> cargo build --release --locked --frozen --bin pizzini-relay"
-cargo build --release --locked --frozen --bin pizzini-relay
+echo "==> cargo build --release --locked --frozen --target x86_64-unknown-linux-gnu --bin pizzini-relay"
+cargo build --release --locked --frozen --target x86_64-unknown-linux-gnu --bin pizzini-relay
 
-BIN_PATH="$REPO_ROOT/target/release/pizzini-relay"
+BIN_PATH="$REPO_ROOT/target/x86_64-unknown-linux-gnu/release/pizzini-relay"
+if [[ ! -f "$BIN_PATH" ]]; then
+    # Older toolchain configs default the target dir name; check
+    # both before giving up.
+    BIN_PATH="$REPO_ROOT/target/release/pizzini-relay"
+fi
 if [[ ! -f "$BIN_PATH" ]]; then
     echo "error: expected binary at $BIN_PATH but it does not exist" >&2
     exit 1

@@ -192,6 +192,22 @@ impl PushTokenStore {
         self.persist()
     }
 
+    /// Remove an entry for `peer_id` and persist. Returns `true` if
+    /// an entry existed and was removed, `false` if the peer was
+    /// already absent. Used by the DEREGISTER_PUSH frame so a
+    /// client that elected a new push-primary can release the old
+    /// relay's claim — without this, after a primary reshuffle
+    /// every relay that was ever primary still holds a token and
+    /// `maybe_send_push` fires duplicates on every inbound SEND.
+    pub fn remove(&mut self, peer_id: &[u8]) -> io::Result<bool> {
+        if self.map.remove(peer_id).is_some() {
+            self.persist()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Drop entries whose `last_refreshed_unix` is older than
     /// `max_age` from now. Persists if any were dropped. Returns the
     /// count of dropped entries for logging. F-NEW-208 — the previous
@@ -378,6 +394,33 @@ mod tests {
         assert_eq!(store.len(), 0);
         assert!(dir.join(KEY_FILE_NAME).exists());
         assert!(!dir.join(TOKENS_FILE_NAME).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_drops_entry_and_persists() {
+        let dir = fresh_state_dir("remove");
+        let peer = vec![0xEE; 33];
+        {
+            let mut store = PushTokenStore::load_or_create(&dir).unwrap();
+            store.insert(peer.clone(), vec![0xFF; 32]).unwrap();
+            let removed = store.remove(&peer).unwrap();
+            assert!(removed, "remove should return true for existing entry");
+            assert_eq!(store.get_cloned(&peer), None);
+            assert_eq!(store.len(), 0);
+        }
+        // Reopen — removal must be persisted, not in-memory only.
+        let store = PushTokenStore::load_or_create(&dir).unwrap();
+        assert_eq!(store.get_cloned(&peer), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_missing_returns_false() {
+        let dir = fresh_state_dir("remove-missing");
+        let mut store = PushTokenStore::load_or_create(&dir).unwrap();
+        let removed = store.remove(&[0x00; 33]).unwrap();
+        assert!(!removed, "remove should return false for absent entry");
         let _ = fs::remove_dir_all(&dir);
     }
 }
