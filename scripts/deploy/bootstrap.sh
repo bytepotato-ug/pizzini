@@ -282,6 +282,47 @@ if ! visudo -cf /etc/sudoers.d/90-pizzini-admin >/dev/null 2>&1; then
     exit 1
 fi
 
+# Path-restricted binary-update grant. The 90-pizzini-admin drop-in
+# above intentionally excludes `install` / `cp` / `tee` so a
+# compromised pizzini-admin shell can't overwrite system binaries.
+# But that also blocks the legitimate "scp new pizzini-relay binary +
+# systemctl restart" deploy workflow — every relay-protocol bump
+# needs a binary refresh, and routing operators through the Hetzner
+# web console for each update doesn't scale.
+#
+# The compromise: allow ONE specific install invocation with
+# hard-coded mode (0755), owner (root:root), source path
+# (/tmp/pizzini-relay-new) and destination path
+# (/usr/local/bin/pizzini-relay). Sudoers compares the resolved
+# command line against the literal pattern, so a compromised
+# pizzini-admin can replace the relay binary at that exact path but
+# cannot:
+#   * write elsewhere in /usr/local/bin or /usr/bin
+#   * change ownership to a non-root user
+#   * symlink-pivot the destination (sudoers evaluates the literal
+#     path string, not the resolved path; combined with the systemd
+#     unit pointing at the literal /usr/local/bin/pizzini-relay path,
+#     a sym/hard-link planted there gets overwritten on next deploy)
+#
+# The deploy flow is then:
+#   scp pizzini-relay pizzini-admin@host:/tmp/pizzini-relay-new
+#   ssh pizzini-admin@host 'sudo install -m 0755 -o root -g root \
+#       /tmp/pizzini-relay-new /usr/local/bin/pizzini-relay \
+#       && sudo systemctl restart pizzini-relay'
+cat > /etc/sudoers.d/91-pizzini-relay-update <<'SUDOEOF'
+# Pizzini relay binary update — installed by scripts/deploy/bootstrap.sh.
+# Single path-restricted NOPASSWD entry so binary refreshes don't
+# require the provider's web console. See the bootstrap.sh comment
+# block for the threat-model reasoning.
+pizzini-admin ALL=(ALL) NOPASSWD: /usr/bin/install -m 0755 -o root -g root /tmp/pizzini-relay-new /usr/local/bin/pizzini-relay
+SUDOEOF
+chmod 0440 /etc/sudoers.d/91-pizzini-relay-update
+if ! visudo -cf /etc/sudoers.d/91-pizzini-relay-update >/dev/null 2>&1; then
+    echo "[bootstrap] 91-pizzini-relay-update failed validation — removing" >&2
+    rm -f /etc/sudoers.d/91-pizzini-relay-update
+    exit 1
+fi
+
 # ---- 12b. sshd hardening ----
 install -d -m 0755 -o root -g root /etc/ssh/sshd_config.d
 cat > /etc/ssh/sshd_config.d/90-pizzini-hardening.conf <<'SSHEOF'
