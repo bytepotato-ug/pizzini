@@ -99,13 +99,25 @@ if [[ -z "${PIZZINI_RELEASE_NO_DOCKER:-}" ]]; then
         mkdir -p "$REPO_ROOT/.cargo"
         cargo vendor --locked vendor > "$REPO_ROOT/.cargo/config-vendor.toml"
     fi
+    # Run docker as root inside the container so `apt-get update +
+    # install protobuf-compiler pkg-config` works (the rust:bookworm
+    # base image doesn't ship protoc, and apt-get needs root for
+    # /var/lib/apt). A `--user $(id -u):$(id -g)` invocation would
+    # keep target/ host-owned but would also fail at apt-get with
+    # "Permission denied" on /var/lib/apt/lists/partial. We restore
+    # host ownership on the bind-mounted artifacts at the end of the
+    # container's bash script so the host doesn't need to sudo to
+    # clean up target/.
+    HOST_UID="$(id -u)"
+    HOST_GID="$(id -g)"
     docker run --rm \
-        --user "$(id -u):$(id -g)" \
         -e PIZZINI_RELEASE_NO_DOCKER=1 \
         -e INSIDE_DOCKER=1 \
         -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
         -e CARGO_HOME=/work/.cargo \
         -e HOME=/build-home \
+        -e HOST_UID="$HOST_UID" \
+        -e HOST_GID="$HOST_GID" \
         -v "$REPO_ROOT":/work:rw \
         -w /work \
         rust:1.95.0-bookworm \
@@ -123,7 +135,13 @@ if [[ -z "${PIZZINI_RELEASE_NO_DOCKER:-}" ]]; then
             mkdir -p /work/.cargo
             cp /work/.cargo/config-vendor.toml /work/.cargo/config.toml
             export CARGO_NET_OFFLINE=true
-            exec /work/scripts/build-relay-release.sh
+            # Capture rc so we always chown back even on build failure;
+            # otherwise the host is left with a root-owned target/
+            # tree that requires sudo to clean.
+            rc=0
+            /work/scripts/build-relay-release.sh || rc=$?
+            chown -R "$HOST_UID:$HOST_GID" /work/target /work/vendor /work/.cargo 2>/dev/null || true
+            exit "$rc"
         '
     BIN_PATH="$REPO_ROOT/target/x86_64-unknown-linux-gnu/release/pizzini-relay"
     BIN_PATH="${BIN_PATH:-$REPO_ROOT/target/release/pizzini-relay}"
