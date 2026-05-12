@@ -586,6 +586,7 @@ struct ChatView: View {
             TextField(
                 attachmentDraft == nil ? "type a message" : "add a caption (optional)",
                 text: $draft,
+                axis: .vertical,
             )
                 // F-NEW-801: harden the 1:1 composer — the single
                 // highest-volume sensitive-content input in the app.
@@ -596,9 +597,13 @@ struct ChatView: View {
                 .hardenedTextInput(autocap: .sentences)
                 .textFieldStyle(.roundedBorder)
                 .focused($composerFocused)
-                .submitLabel(.send)
                 .disabled(disabled)
-                .onSubmit { sendDraft(contact: contact) }
+                // Multi-line composer: Return inserts a newline. The
+                // visible send button next to the field is the only
+                // way to send — `.submitLabel(.send)` + `.onSubmit`
+                // would mislead users since `axis: .vertical` absorbs
+                // the keypress for the newline anyway. Matches the
+                // GroupChatView composer's behaviour.
             Button {
                 sendDraft(contact: contact)
             } label: {
