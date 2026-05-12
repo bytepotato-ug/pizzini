@@ -121,7 +121,7 @@ if [[ -z "${PIZZINI_RELEASE_NO_DOCKER:-}" ]]; then
         -v "$REPO_ROOT":/work:rw \
         -w /work \
         rust:1.95.0-bookworm \
-        bash -lc '
+        bash -c '
             set -euo pipefail
             apt-get update -qq
             apt-get install -y --no-install-recommends protobuf-compiler pkg-config >/dev/null
