@@ -21,18 +21,20 @@ enum Schema {
     /// Current schema version — read by SQLiteStorage at open time
     /// to decide whether the migration runner needs to fire. Bump
     /// when adding a new migration; never decrease.
-    static let currentVersion: Int32 = 5
+    static let currentVersion: Int32 = 1
 
     /// All migrations, ordered. Index `i` is `from version i`.
     /// Migration 0 → 1 is the initial schema; subsequent entries
     /// run in order without ever skipping. Never edit a published
     /// migration; always append.
+    ///
+    /// Pre-launch reset: there are no users to migrate, so the
+    /// schema collapsed back to a single v1 carrying the final
+    /// post-v5 shape (delivery-token v2 chain column, no legacy
+    /// `delivery_tokens` table, no v1 token bookkeeping on
+    /// contacts). The migration list will grow again post-launch.
     static let migrations: [Migration] = [
         Migration(from: 0, to: 1, sql: v1InitialSchema),
-        Migration(from: 1, to: 2, sql: v2ContactProvenanceAndVerification),
-        Migration(from: 2, to: 3, sql: v3ReadReceiptsModeAndDefault),
-        Migration(from: 3, to: 4, sql: v4MuteAndBlockList),
-        Migration(from: 4, to: 5, sql: v5HashChainOutboundToken),
     ]
 
     private static let v1InitialSchema = """
@@ -54,17 +56,19 @@ enum Schema {
     --    itself catches a typo like 'true'-the-string vs 1-the-bool
     --    at insert time.
     CREATE TABLE settings (
-        id                          INTEGER PRIMARY KEY CHECK(id = 1),
-        relay_host                  TEXT    NOT NULL,
-        onboarding_completed        INTEGER NOT NULL,
-        biometric_lock_enabled      INTEGER NOT NULL,
-        auto_lock_timeout           TEXT    NOT NULL,
-        quicklook_preview_enabled   INTEGER NOT NULL,
-        panic_mode_enabled          INTEGER NOT NULL,
-        qr_block_effective          INTEGER,
-        qr_block_tested_os_version  TEXT,
-        contacts_before_groups      INTEGER NOT NULL,
-        in_app_haptics_enabled      INTEGER NOT NULL
+        id                              INTEGER PRIMARY KEY CHECK(id = 1),
+        relay_host                      TEXT    NOT NULL,
+        onboarding_completed            INTEGER NOT NULL,
+        biometric_lock_enabled          INTEGER NOT NULL,
+        auto_lock_timeout               TEXT    NOT NULL,
+        quicklook_preview_enabled       INTEGER NOT NULL,
+        panic_mode_enabled              INTEGER NOT NULL,
+        qr_block_effective              INTEGER,
+        qr_block_tested_os_version      TEXT,
+        contacts_before_groups          INTEGER NOT NULL,
+        in_app_haptics_enabled          INTEGER NOT NULL,
+        default_read_receipts_enabled   INTEGER NOT NULL DEFAULT 0,
+        notifications_muted             INTEGER NOT NULL DEFAULT 0
     ) STRICT;
 
     -- 3. device_store: opaque libsignal session blob (identity +
@@ -76,7 +80,10 @@ enum Schema {
         updated_at INTEGER NOT NULL
     ) STRICT;
 
-    -- 4. contacts
+    -- 4. contacts. Delivery-token v2: outbound chain state lives
+    --    inline (88-byte BLOB) — see `HashChainToken.encodeChain`.
+    --    No legacy per-token queue; the chain seed alone covers
+    --    every future SEND to this peer.
     CREATE TABLE contacts (
         id                              BLOB    PRIMARY KEY NOT NULL,
         identity_pub                    BLOB    UNIQUE NOT NULL,
@@ -85,23 +92,23 @@ enum Schema {
         last_message_at                 INTEGER,
         last_seen_at                    INTEGER,
         added_at                        INTEGER NOT NULL,
-        last_refill_request_sent_at     INTEGER,
-        last_refill_request_handled_at  INTEGER,
+        last_chain_served_at            INTEGER,
         ttl_seconds                     INTEGER NOT NULL,
-        read_receipts_enabled           INTEGER NOT NULL,
+        read_receipts_mode              TEXT    NOT NULL DEFAULT 'follow_default',
         peer_verify_key                 BLOB,
-        last_bundle_served_at           INTEGER
+        last_bundle_served_at           INTEGER,
+        added_via                       TEXT    NOT NULL DEFAULT 'qr_scan',
+        verified_at                     INTEGER,
+        muted_at                        INTEGER,
+        outbound_token_chain            BLOB
     ) STRICT;
     CREATE INDEX idx_contacts_identity ON contacts(identity_pub);
 
-    -- 5. delivery_tokens: FIFO queue per contact. position is
-    --    monotonic — pop = MIN(position), refill appends.
-    CREATE TABLE delivery_tokens (
-        contact_id BLOB    NOT NULL,
-        position   INTEGER NOT NULL,
-        token      BLOB    NOT NULL,
-        PRIMARY KEY (contact_id, position),
-        FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
+    -- 5. blocked_identities: persistent block list keyed by
+    --    identityPub. Outlives any individual contact row.
+    CREATE TABLE blocked_identities (
+        identity_pub BLOB    PRIMARY KEY NOT NULL,
+        blocked_at   INTEGER NOT NULL
     ) STRICT;
 
     -- 6. groups
@@ -211,108 +218,6 @@ enum Schema {
     CREATE INDEX idx_outbox_recipient  ON outbox(recipient_peer_id);
     CREATE INDEX idx_outbox_attachment ON outbox(attachment_id)    WHERE attachment_id    IS NOT NULL;
     CREATE INDEX idx_outbox_group      ON outbox(group_message_id) WHERE group_message_id IS NOT NULL;
-    """
-
-    /// v2 — Pizzini safety-number verification.
-    ///
-    /// Two new contact columns track the provenance of the identity
-    /// and whether the user has compared the symmetric 60-digit
-    /// safety number with the peer out-of-band:
-    ///
-    ///   * `added_via` — how the row entered the contact list. One of
-    ///     'qr_scan' (camera scanned the QR in person), 'pasted_text'
-    ///     (URL pasted from clipboard, no guarantee about the channel
-    ///     that carried it), or 'unknown' (pre-v2 row whose provenance
-    ///     was not recorded). The column is `NOT NULL` so future code
-    ///     never has to handle a three-valued logic on this axis.
-    ///     Existing rows backfill to 'qr_scan' because v1 only ever
-    ///     materialised contacts through the in-person QR scanner —
-    ///     marking them 'unknown' would falsely downgrade users who
-    ///     had verified in person before the verification UI shipped.
-    ///
-    ///   * `verified_at` — wall-clock epoch (ms) when the user clicked
-    ///     "matches" on the safety-number screen. NULL means
-    ///     unverified. Setting / unsetting this is the only authority
-    ///     on the green-checkmark badge across the app.
-    ///
-    /// Both columns are independent: a `pasted_text` row CAN reach
-    /// `verified_at != NULL` (and is then full-trust); a `qr_scan` row
-    /// stays "scanned but not SAS-verified" until the user does the
-    /// out-of-band comparison.
-    private static let v2ContactProvenanceAndVerification = """
-    ALTER TABLE contacts ADD COLUMN added_via TEXT NOT NULL DEFAULT 'qr_scan';
-    ALTER TABLE contacts ADD COLUMN verified_at INTEGER;
-    """
-
-    /// v3 — three-state per-contact read-receipts override + a global
-    /// default at the settings level.
-    ///
-    /// `read_receipts_mode` is a string enum that mirrors
-    /// `ReadReceiptsMode` in Models.swift:
-    ///   * 'follow_default' — use settings.default_read_receipts_enabled.
-    ///   * 'always_on'      — per-chat opt-in.
-    ///   * 'always_off'     — per-chat opt-out.
-    /// Default value is computed from the legacy per-contact bool:
-    ///   * `read_receipts_enabled = 1` → `always_on` so the user's
-    ///     explicit opt-in is preserved across the migration.
-    ///   * `read_receipts_enabled = 0` → `always_off` so a user who
-    ///     had explicitly turned receipts OFF for a chat cannot have
-    ///     them silently re-enabled the moment the new global default
-    ///     gets toggled on. `follow_default` would have been a privacy
-    ///     regression for this case.
-    ///
-    /// Legacy `read_receipts_enabled` column is left in place rather
-    /// than dropped (SQLite < 3.35 has no `DROP COLUMN`; running on
-    /// SQLCipher we vendor the older version conservatively). The
-    /// legacy column is `NOT NULL` with no default value, so
-    /// `SQLiteStorage.upsertContact` still binds it (derived from the
-    /// mode) at INSERT time; new code never reads it.
-    private static let v3ReadReceiptsModeAndDefault = """
-    ALTER TABLE contacts  ADD COLUMN read_receipts_mode TEXT NOT NULL DEFAULT 'follow_default';
-    UPDATE contacts SET read_receipts_mode = 'always_on'  WHERE read_receipts_enabled = 1;
-    UPDATE contacts SET read_receipts_mode = 'always_off' WHERE read_receipts_enabled = 0;
-    ALTER TABLE settings  ADD COLUMN default_read_receipts_enabled INTEGER NOT NULL DEFAULT 0;
-    """
-
-    /// v4 — per-contact mute, app-wide notification mute, persistent
-    /// block list.
-    ///
-    /// `contacts.muted_at` is a wall-clock epoch (ms) when the user
-    /// muted this peer. NULL = unmuted. When non-NULL, inbound
-    /// messages from this peer don't fire haptics or bump the NSE
-    /// badge. Delivery and persistence are unchanged.
-    ///
-    /// `settings.notifications_muted` is the global counterpart.
-    /// When 1, the NSE refuses to bump the badge at all and the
-    /// in-app haptic is suppressed even on unmuted contacts. Default
-    /// 0 (notifications on) so the upgrade is invisible to users who
-    /// haven't asked for quiet.
-    ///
-    /// `blocked_identities` is a denylist keyed on the 33-byte
-    /// libsignal IdentityKey wire form. It survives `deleteContact`
-    /// → re-add cycles: even after the contact row is gone, an
-    /// inbound BUNDLE_RESPONSE / TOKEN_ISSUE / SEND from a blocked
-    /// identityPub is dropped at the receive-side gate. Block is
-    /// strictly stronger than delete — delete is "I don't want this
-    /// in my list right now," block is "I don't want this person to
-    /// reach me again." Distinct table rather than a column on
-    /// `contacts` because the block list outlives any specific
-    /// contact row.
-    private static let v4MuteAndBlockList = """
-    ALTER TABLE contacts ADD COLUMN muted_at INTEGER;
-    ALTER TABLE settings ADD COLUMN notifications_muted INTEGER NOT NULL DEFAULT 0;
-    CREATE TABLE blocked_identities (
-        identity_pub BLOB    PRIMARY KEY NOT NULL,
-        blocked_at   INTEGER NOT NULL
-    ) STRICT;
-    """
-
-    /// v5 — delivery-token v2 outbound chain. Nullable 88-byte BLOB
-    /// column on `contacts` holding `HashChainToken.encodeChain`
-    /// output. Nil for pre-v2 contacts; populated once the peer ships
-    /// a `chainSeedDelivery` sealed envelope.
-    private static let v5HashChainOutboundToken = """
-    ALTER TABLE contacts ADD COLUMN outbound_token_chain BLOB;
     """
 }
 

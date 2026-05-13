@@ -220,15 +220,6 @@ public final class Session: @unchecked Sendable {
         return Data(pt.prefix(Int(ptLen)))
     }
 
-    /// Mint a single delivery token (84 bytes). Each is one-use against
-    /// the relay's per-recipient replay set. Phase 3 hands out a stash
-    /// of 1024 to each newly-paired contact.
-    public func mintDeliveryToken() throws -> Data {
-        try readBlob(initialCap: 128) { handle, buf, cap, len in
-            pizzini_store_mint_delivery_token(handle, buf, cap, len)
-        }
-    }
-
     /// Recipient's published delivery-token verify key (33 bytes —
     /// libsignal-native PublicKey serialize() form). Deterministic per
     /// IdentityKeyPair via HKDF, so a Keychain restore reconstructs it
@@ -334,38 +325,6 @@ public final class Session: @unchecked Sendable {
         }
         guard rc == PIZZINI_OK else { throw CryptoCoreError.internalError }
         return Data(buf.prefix(Int(len)))
-    }
-
-    /// Verify a delivery token's XEd25519 signature against an issuer's
-    /// bundle-published verify key. F-202/F-401: the iOS receiver of a
-    /// TOKEN_ISSUE batch authenticates each token end-to-end before
-    /// adding it to the per-contact stash, defeating relay swap.
-    ///
-    /// `verifyKey` is the 33-byte bundle field; `token` is the 84-byte
-    /// `nonce16 || expiry_be_u32 || sig64`. Returns `true` on a valid
-    /// signature, `false` if the signature does not match. Throws
-    /// `CryptoCoreError.invalidArgument` for length/null mismatches.
-    public static func verifyDeliveryToken(verifyKey: Data, token: Data) throws -> Bool {
-        let rc = verifyKey.withUnsafeBytes { vkPtr -> Int32 in
-            token.withUnsafeBytes { tokPtr -> Int32 in
-                pizzini_verify_delivery_token(
-                    vkPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                    UInt(verifyKey.count),
-                    tokPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                    UInt(token.count),
-                )
-            }
-        }
-        switch rc {
-        case PIZZINI_OK:
-            return true
-        case PIZZINI_ERR_BAD_SIGNATURE:
-            return false
-        case PIZZINI_ERR_INVALID_ARG:
-            throw CryptoCoreError.invalidArgument
-        default:
-            throw CryptoCoreError.internalError
-        }
     }
 
     /// Verify an XEd25519 signature `sig` over `message`, claimed to

@@ -663,7 +663,7 @@ extension ChatStore {
         var legContexts: [LegContext] = []
         for recipient in recipients {
             guard let cIdx = state.contacts.firstIndex(where: { $0.identityPub == recipient }),
-                  let token = popDeliveryTokenPublic(forContactAt: cIdx)
+                  let token = v2TokenWire(forContactAt: cIdx)
             else {
                 skipped.append(short(recipient))
                 continue
@@ -985,7 +985,7 @@ extension ChatStore {
                     perRecipientSkippedChunks[recipient, default: 0] += 1
                     continue
                 }
-                guard let token = popDeliveryTokenPublic(forContactAt: cIdx) else {
+                guard let token = v2TokenWire(forContactAt: cIdx) else {
                     // Silent-drop per the brief. The diagLog buffer in
                     // Settings → Diagnostics surfaces it for users
                     // debugging "why did Bob's screen show a partial
@@ -2064,7 +2064,7 @@ extension ChatStore {
             diagLog("group", "groupOp → \(short(recipient)): NO CONTACT (1:1 unpaired)")
             return
         }
-        guard let token = popDeliveryTokenPublic(forContactAt: cIdx) else {
+        guard let token = v2TokenWire(forContactAt: cIdx) else {
             diagLog("group", "groupOp → \(short(recipient)): NO DELIVERY TOKEN"
                 + " (stash empty for this peer); op dropped — outbox+retry pending v2")
             return
@@ -2101,7 +2101,7 @@ extension ChatStore {
                 + " NO CONTACT (1:1 unpaired) — recipient cannot decrypt our messages")
             return
         }
-        guard let token = popDeliveryTokenPublic(forContactAt: cIdx) else {
+        guard let token = v2TokenWire(forContactAt: cIdx) else {
             diagLog("group", "SKDM \(short(groupId)) → \(short(recipient)):"
                 + " NO DELIVERY TOKEN (stash empty for this peer);"
                 + " SKDM dropped, recipient cannot decrypt")
@@ -2141,7 +2141,7 @@ extension ChatStore {
             pzLog("[pizzini.group] bootstrap → \(short(recipient)): no contact")
             return
         }
-        guard let token = popDeliveryTokenPublic(forContactAt: cIdx) else {
+        guard let token = v2TokenWire(forContactAt: cIdx) else {
             pzLog("[pizzini.group] bootstrap → \(short(recipient)): no delivery token")
             return
         }

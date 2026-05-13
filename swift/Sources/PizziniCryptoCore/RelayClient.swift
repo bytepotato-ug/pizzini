@@ -62,15 +62,6 @@ public protocol RelayClientDelegate: AnyObject, Sendable {
         didReceiveBundleFrom fromPeer: Data,
         bundle: Data
     )
-    /// Peer minted delivery tokens for us to use when sending TO them
-    /// (Phase 3). Sent right after their BUNDLE_RESPONSE on first
-    /// contact and in response to a sealed token-refill-request.
-    /// Each token is 84 bytes (nonce + expiry + sig).
-    func relayClient(
-        _ client: RelayClient,
-        didReceiveTokenIssueFrom fromPeer: Data,
-        tokens: [Data]
-    )
     /// USP #1: relay answered our `requestStatus()` with the
     /// running binary's self-attestation snapshot.
     func relayClient(_ client: RelayClient, didReceiveStatus status: RelayStatus)
@@ -122,7 +113,10 @@ public final class RelayClient: @unchecked Sendable {
     public enum InnerEnvelopeKind: UInt8 {
         case chat = 0x01
         case ack = 0x02
-        case tokenRefillRequest = 0x03
+        // 0x03 was tokenRefillRequest in v1; no longer in use under
+        // hash-chained delivery tokens. v2 chain seeds ride
+        // `chainSeedDelivery` (0x0B), refresh is initiated via
+        // BUNDLE_REQUEST instead of a sealed refill ping.
         case readReceipt = 0x04
         /// Chunked file transfer (Phase 2). Each chunk rides a *separate*
         /// sealed envelope (its own per-chunk replay nonce + delivery
@@ -199,7 +193,9 @@ public final class RelayClient: @unchecked Sendable {
     private static let frameTypeBundleResponse: UInt8 = 4
     private static let frameTypeRegisterPush: UInt8 = 5
     private static let frameTypeAck: UInt8 = 6
-    private static let frameTypeTokenIssue: UInt8 = 7
+    // 7 was FRAME_TYPE_TOKEN_ISSUE in v1; removed alongside hash-chain
+    // token cutover. The wire slot is reserved — don't reuse for an
+    // unrelated frame type without a matching relay-side decision.
     /// USP #1: client → relay "what build are you running?". Empty
     /// payload (just the frame type). Match `FRAME_TYPE_STATUS_REQUEST`
     /// in `relay/src/main.rs`.
@@ -244,8 +240,6 @@ public final class RelayClient: @unchecked Sendable {
     /// Hard ceiling on the per-message TTL the sender can request; the
     /// relay clamps to this server-side too. 7 days.
     public static let maxTTLSeconds: UInt32 = 7 * 24 * 60 * 60
-    /// Wire size of a single delivery token (nonce16 + expiry_be_u32 + sig64).
-    public static let deliveryTokenLen: Int = 16 + 4 + 64
 
     public weak var delegate: RelayClientDelegate?
     /// The onion host this client was last asked to dial. Captured in
@@ -910,22 +904,6 @@ public final class RelayClient: @unchecked Sendable {
         writeFrame(payload, on: connection)
     }
 
-    /// TOKEN_ISSUE: ship 1024 fresh delivery tokens minted for `to` so
-    /// they can use them as the rate-limit gate when sending TO us.
-    public func sendTokenIssue(toPeer to: Data, tokens: [Data]) {
-        guard let connection, state == .connected else { return }
-        var payload = Data()
-        payload.append(Self.frameTypeTokenIssue)
-        appendU16Blob(&payload, to)
-        appendU16Blob(&payload, myIdentity)
-        var countBE = UInt32(tokens.count).bigEndian
-        withUnsafeBytes(of: &countBE) { payload.append(contentsOf: $0) }
-        for t in tokens {
-            payload.append(t)
-        }
-        writeFrame(payload, on: connection)
-    }
-
     /// USP #1: ask the relay which build it is running. The relay
     /// replies asynchronously via `didReceiveStatus`. The query is
     /// idempotent — issuing it on every reconnect is the recommended
@@ -1195,28 +1173,6 @@ public final class RelayClient: @unchecked Sendable {
             )
             DispatchQueue.main.async {
                 delegate?.relayClient(client, didReceiveStatus: status)
-            }
-        case Self.frameTypeTokenIssue:
-            guard cursor.u16Blob() != nil else { return }
-            guard let from = cursor.u16Blob() else { return }
-            guard let count = cursor.u32() else { return }
-            // **Cap `count` against the actual remaining buffer**
-            // before `reserveCapacity` (F-NEW-201). The wire field
-            // is a u32; a malicious relay (or paired peer) can ship
-            // `count = u32::MAX` in a 79-byte frame and we'd attempt
-            // a ~64 GiB allocation, crashing the app via iOS jetsam.
-            // Each token is `deliveryTokenLen` bytes, so the maximum
-            // valid `count` is bounded by `cursor.buf.count / 84`.
-            let maxValidCount = cursor.buf.count / Self.deliveryTokenLen
-            guard Int(count) <= maxValidCount else { return }
-            var tokens: [Data] = []
-            tokens.reserveCapacity(Int(count))
-            for _ in 0..<count {
-                guard let tok = cursor.take(Self.deliveryTokenLen) else { return }
-                tokens.append(tok)
-            }
-            DispatchQueue.main.async {
-                delegate?.relayClient(client, didReceiveTokenIssueFrom: from, tokens: tokens)
             }
         default:
             break

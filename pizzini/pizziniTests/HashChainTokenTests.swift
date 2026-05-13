@@ -310,16 +310,6 @@ struct HashChainTokenTests {
         #expect(HashChainToken.decodeSeedDelivery(wire) == nil)
     }
 
-    @Test("cutover flag is shippable in either state (no dual-path guard fails)")
-    func cutoverFlagIsShippable() {
-        // We allow the flag to be either true or false at compile
-        // time — the production rollout flips it from false to true
-        // in a dedicated commit after the relay-side validator is
-        // deployed. The test simply pins that the constant exists
-        // and is reachable so a future refactor that renames it
-        // breaks visibly here rather than silently disabling v2.
-        let _ = HashChainToken.cutoverEnabled
-    }
 
     @Test("decodeSeedDelivery accepts a fresh chain")
     func seedDeliveryAcceptsFreshChain() {

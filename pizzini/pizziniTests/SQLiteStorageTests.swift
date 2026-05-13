@@ -83,7 +83,7 @@ struct SQLiteStorageTests {
         #expect(loaded?.outboundTokenChain == nil)
     }
 
-    @Test("contact + log + tokens round-trip")
+    @Test("contact + log round-trip")
     func contactGraphRoundTrip() throws {
         let store = try freshStore()
         let identityPub = Data(repeating: 0x07, count: 33)
@@ -94,7 +94,6 @@ struct SQLiteStorageTests {
             log: [],
             lastMessageAt: Date(),
             addedAt: Date(),
-            deliveryTokensForPeer: [],
             ttlSeconds: 3600,
             readReceiptsMode: .alwaysOn,
             peerVerifyKey: Data(repeating: 0x05, count: 33),
@@ -110,10 +109,6 @@ struct SQLiteStorageTests {
         c.log = [msg]
         try store.upsertContact(c)
         try store.appendContactMessage(contactId: c.id, msg)
-        try store.replaceDeliveryTokens(
-            contactId: c.id,
-            tokens: [Data(repeating: 0x01, count: 84), Data(repeating: 0x02, count: 84)],
-        )
         let loaded = try store.loadContacts()
         #expect(loaded.count == 1)
         let lc = try #require(loaded.first)
@@ -128,7 +123,6 @@ struct SQLiteStorageTests {
         #expect(lc.log.first?.text == "hello")
         #expect(lc.log.first?.kind == .whisper)
         #expect(lc.log.first?.messageId == msg.messageId)
-        #expect(lc.deliveryTokensForPeer.count == 2)
     }
 
     @Test("contact provenance + verification round-trip via v2 columns")
@@ -184,9 +178,6 @@ struct SQLiteStorageTests {
             lastMessageAt: p.lastMessageAt,
             lastSeenAt: p.lastSeenAt,
             addedAt: p.addedAt,
-            deliveryTokensForPeer: p.deliveryTokensForPeer,
-            lastRefillRequestSentAt: p.lastRefillRequestSentAt,
-            lastRefillRequestHandledAt: p.lastRefillRequestHandledAt,
             ttlSeconds: p.ttlSeconds,
             readReceiptsMode: p.readReceiptsMode,
             peerVerifyKey: p.peerVerifyKey,
@@ -201,28 +192,6 @@ struct SQLiteStorageTests {
         #expect(pAfter.verifiedAt == when, "verifiedAt must be writable on update")
     }
 
-    @Test("popDeliveryToken returns FIFO")
-    func tokenFIFO() throws {
-        let store = try freshStore()
-        let c = Contact(
-            identityPub: Data(repeating: 0x08, count: 33),
-            displayName: "Bob",
-            addedAt: Date(),
-            ttlSeconds: 3600,
-        )
-        try store.upsertContact(c)
-        try store.replaceDeliveryTokens(contactId: c.id, tokens: [
-            Data(repeating: 0xA1, count: 84),
-            Data(repeating: 0xA2, count: 84),
-            Data(repeating: 0xA3, count: 84),
-        ])
-        #expect(try store.popDeliveryToken(contactId: c.id)?.first == 0xA1)
-        #expect(try store.popDeliveryToken(contactId: c.id)?.first == 0xA2)
-        try store.appendDeliveryTokens(contactId: c.id, tokens: [Data(repeating: 0xA4, count: 84)])
-        #expect(try store.popDeliveryToken(contactId: c.id)?.first == 0xA3)
-        #expect(try store.popDeliveryToken(contactId: c.id)?.first == 0xA4)
-        #expect(try store.popDeliveryToken(contactId: c.id) == nil)
-    }
 
     // MARK: - Outbox
 

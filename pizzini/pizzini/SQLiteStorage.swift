@@ -376,8 +376,7 @@ final class SQLiteStorage {
     func loadContacts() throws -> [Contact] {
         let stmt = try db.prepare("""
             SELECT id, identity_pub, display_name, session_established,
-                   last_message_at, last_seen_at, added_at,
-                   last_refill_request_sent_at, last_refill_request_handled_at,
+                   last_message_at, last_seen_at, added_at, last_chain_served_at,
                    ttl_seconds, read_receipts_mode, peer_verify_key, last_bundle_served_at,
                    added_via, verified_at, muted_at, outbound_token_chain
             FROM contacts ORDER BY added_at ASC;
@@ -386,18 +385,9 @@ final class SQLiteStorage {
         while try stmt.step() {
             let idData = stmt.columnBlob(0) ?? Data()
             guard let uuid = idData.asUUID() else { continue }
-            let rawSource = stmt.columnText(13) ?? ContactSource.unknown.rawValue
-            // Schema v2 migration backfills 'qr_scan' for pre-v2 rows
-            // and the column is NOT NULL — but a future schema rewrite
-            // could in principle introduce a new variant. Fall back to
-            // `.unknown` instead of crashing the chat list.
+            let rawSource = stmt.columnText(12) ?? ContactSource.unknown.rawValue
             let source = ContactSource(rawValue: rawSource) ?? .unknown
-            let rawMode = stmt.columnText(10) ?? ReadReceiptsMode.followDefault.rawValue
-            // Schema v3 backfills 'always_on' for legacy enabled=1
-            // rows and 'follow_default' for everything else.
-            // Defence-in-depth: an unknown variant from a future
-            // downgrade falls back to `.followDefault` so the
-            // chat list still renders.
+            let rawMode = stmt.columnText(9) ?? ReadReceiptsMode.followDefault.rawValue
             let receiptsMode = ReadReceiptsMode(rawValue: rawMode) ?? .followDefault
             var c = Contact(
                 id: uuid,
@@ -408,22 +398,19 @@ final class SQLiteStorage {
                 lastMessageAt: stmt.columnOptionalInt64(4).map { $0.dateFromEpochMs },
                 lastSeenAt: stmt.columnOptionalInt64(5).map { $0.dateFromEpochMs },
                 addedAt: stmt.columnInt64(6).dateFromEpochMs,
-                deliveryTokensForPeer: [],
-                lastRefillRequestSentAt: stmt.columnOptionalInt64(7).map { $0.dateFromEpochMs },
-                lastRefillRequestHandledAt: stmt.columnOptionalInt64(8).map { $0.dateFromEpochMs },
-                ttlSeconds: UInt32(stmt.columnInt64(9)),
+                lastChainServedAt: stmt.columnOptionalInt64(7).map { $0.dateFromEpochMs },
+                ttlSeconds: UInt32(stmt.columnInt64(8)),
                 readReceiptsMode: receiptsMode,
-                peerVerifyKey: stmt.columnBlob(11),
-                lastBundleServedAt: stmt.columnOptionalInt64(12).map { $0.dateFromEpochMs },
+                peerVerifyKey: stmt.columnBlob(10),
+                lastBundleServedAt: stmt.columnOptionalInt64(11).map { $0.dateFromEpochMs },
                 addedVia: source,
-                verifiedAt: stmt.columnOptionalInt64(14).map { $0.dateFromEpochMs },
-                mutedAt: stmt.columnOptionalInt64(15).map { $0.dateFromEpochMs },
-                outboundTokenChain: stmt.columnBlob(16).flatMap {
+                verifiedAt: stmt.columnOptionalInt64(13).map { $0.dateFromEpochMs },
+                mutedAt: stmt.columnOptionalInt64(14).map { $0.dateFromEpochMs },
+                outboundTokenChain: stmt.columnBlob(15).flatMap {
                     HashChainToken.decodeChain($0)
                 },
             )
             c.log = try loadMessages(contactId: idData)
-            c.deliveryTokensForPeer = try loadDeliveryTokens(contactId: idData)
             contacts.append(c)
         }
         return contacts
@@ -437,34 +424,22 @@ final class SQLiteStorage {
     /// `qr_scan` if the user later rescans would erase the warning
     /// state that previously informed the verification UI.
     func upsertContact(_ c: Contact) throws {
-        // The v3 migration replaced `read_receipts_enabled` (Bool) with
-        // `read_receipts_mode` (3-state enum) but had to leave the legacy
-        // column in place because SQLCipher's ALTER TABLE has no
-        // DROP COLUMN. The legacy column is `NOT NULL` with no default,
-        // so every INSERT must still bind it; we derive a backward-
-        // compatible Bool from the mode (`alwaysOff → 0`, anything else
-        // → 1, mirroring how the v3 backfill mapped `1 → always_on`).
-        // New code never reads this column.
-        let legacyEnabled = c.readReceiptsMode == .alwaysOff ? 0 : 1
         let stmt = try db.prepare("""
             INSERT INTO contacts (
                 id, identity_pub, display_name, session_established,
                 last_message_at, last_seen_at, added_at,
-                last_refill_request_sent_at, last_refill_request_handled_at,
-                ttl_seconds, read_receipts_enabled, read_receipts_mode,
+                last_chain_served_at, ttl_seconds, read_receipts_mode,
                 peer_verify_key, last_bundle_served_at,
                 added_via, verified_at, muted_at, outbound_token_chain
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 identity_pub = excluded.identity_pub,
                 display_name = excluded.display_name,
                 session_established = excluded.session_established,
                 last_message_at = excluded.last_message_at,
                 last_seen_at = excluded.last_seen_at,
-                last_refill_request_sent_at = excluded.last_refill_request_sent_at,
-                last_refill_request_handled_at = excluded.last_refill_request_handled_at,
+                last_chain_served_at = excluded.last_chain_served_at,
                 ttl_seconds = excluded.ttl_seconds,
-                read_receipts_enabled = excluded.read_receipts_enabled,
                 read_receipts_mode = excluded.read_receipts_mode,
                 peer_verify_key = excluded.peer_verify_key,
                 last_bundle_served_at = excluded.last_bundle_served_at,
@@ -480,17 +455,15 @@ final class SQLiteStorage {
             .bind(c.lastMessageAt, at: 5)
             .bind(c.lastSeenAt, at: 6)
             .bind(c.addedAt, at: 7)
-            .bind(c.lastRefillRequestSentAt, at: 8)
-            .bind(c.lastRefillRequestHandledAt, at: 9)
-            .bind(Int(c.ttlSeconds), at: 10)
-            .bind(legacyEnabled, at: 11)
-            .bind(c.readReceiptsMode.rawValue, at: 12)
-            .bind(c.peerVerifyKey, at: 13)
-            .bind(c.lastBundleServedAt, at: 14)
-            .bind(c.addedVia.rawValue, at: 15)
-            .bind(c.verifiedAt, at: 16)
-            .bind(c.mutedAt, at: 17)
-            .bind(c.outboundTokenChain.map { HashChainToken.encodeChain($0) }, at: 18)
+            .bind(c.lastChainServedAt, at: 8)
+            .bind(Int(c.ttlSeconds), at: 9)
+            .bind(c.readReceiptsMode.rawValue, at: 10)
+            .bind(c.peerVerifyKey, at: 11)
+            .bind(c.lastBundleServedAt, at: 12)
+            .bind(c.addedVia.rawValue, at: 13)
+            .bind(c.verifiedAt, at: 14)
+            .bind(c.mutedAt, at: 15)
+            .bind(c.outboundTokenChain.map { HashChainToken.encodeChain($0) }, at: 16)
             .run()
     }
 
@@ -499,164 +472,6 @@ final class SQLiteStorage {
             .bindAll(id.data).run()
     }
 
-    // MARK: - Delivery tokens
-
-    private func loadDeliveryTokens(contactId: Data) throws -> [Data] {
-        let stmt = try db.prepare("""
-            SELECT token FROM delivery_tokens
-            WHERE contact_id = ? ORDER BY position ASC;
-        """)
-        try stmt.bindAll(contactId)
-        var tokens: [Data] = []
-        while try stmt.step() {
-            if let t = stmt.columnBlob(0) { tokens.append(t) }
-        }
-        return tokens
-    }
-
-    /// Replace this contact's entire token queue. Used after a
-    /// fresh issuance (1024 tokens) or any rare path that rewrites
-    /// the whole list. The common case is `popDeliveryToken` /
-    /// `appendDeliveryTokens` which are O(1).
-    func replaceDeliveryTokens(contactId: UUID, tokens: [Data]) throws {
-        try db.transaction { tx in
-            let cid = contactId.data
-            try tx.prepare("DELETE FROM delivery_tokens WHERE contact_id = ?;")
-                .bindAll(cid).run()
-            let ins = try tx.prepare("""
-                INSERT INTO delivery_tokens (contact_id, position, token)
-                VALUES (?, ?, ?);
-            """)
-            for (i, token) in tokens.enumerated() {
-                try ins.bind(cid, at: 1).bind(i, at: 2).bind(token, at: 3).run()
-            }
-        }
-    }
-
-    /// Pop the oldest token (MIN(position)) for `contactId`. Returns
-    /// nil if the queue is empty. The brief's "tokens are popped from
-    /// the front" semantics maps onto the obvious DELETE … RETURNING
-    /// pattern; SQLite has supported `RETURNING` since 3.35
-    /// (well below our SQLCipher 4.6.1 baseline).
-    func popDeliveryToken(contactId: UUID) throws -> Data? {
-        let cid = contactId.data
-        let select = try db.prepare("""
-            SELECT position, token FROM delivery_tokens
-            WHERE contact_id = ? ORDER BY position ASC LIMIT 1;
-        """)
-        try select.bindAll(cid)
-        guard try select.step() else { return nil }
-        let position = select.columnInt64(0)
-        let token = select.columnBlob(1)
-        try db.prepare("""
-            DELETE FROM delivery_tokens WHERE contact_id = ? AND position = ?;
-        """).bindAll(cid, position).run()
-        return token
-    }
-
-    /// Atomic "spend a delivery token AND record the outbox entry
-    /// that consumed it" — both writes happen in a single SQLite
-    /// transaction so a crash mid-flow can never leave the queue
-    /// missing a token without a corresponding outbox row that
-    /// records where it went. The separate-call alternative used
-    /// before had a small but real window between `DELETE FROM
-    /// delivery_tokens` and `INSERT INTO outbox` where a force-kill
-    /// would burn the token irretrievably (the retry walk could
-    /// never re-bind it to an outbox row, and the relay would
-    /// reject any later replay).
-    ///
-    /// `entryBuilder` is invoked INSIDE the transaction with the
-    /// popped token bytes; it must return the fully-formed
-    /// `OutboxEntry` to persist. Returns the assembled entry on
-    /// success or `nil` if the contact's queue was empty — in
-    /// which case the transaction is rolled back and the caller
-    /// must surface "token stash exhausted".
-    func commitDeliveryTokenSpend(
-        contactId: UUID,
-        entryBuilder: (Data) -> OutboxEntry
-    ) throws -> OutboxEntry? {
-        let cid = contactId.data
-        var built: OutboxEntry?
-        try db.transaction { tx in
-            let select = try tx.prepare("""
-                SELECT position, token FROM delivery_tokens
-                WHERE contact_id = ? ORDER BY position ASC LIMIT 1;
-            """)
-            try select.bindAll(cid)
-            guard try select.step() else { return }
-            let position = select.columnInt64(0)
-            guard let token = select.columnBlob(1) else { return }
-            let entry = entryBuilder(token)
-            try tx.prepare("""
-                INSERT INTO outbox (
-                    message_id, recipient_peer_id, sealed_ciphertext, token,
-                    ttl, sent_at, retries, delivered_at, failed_at, relayed_at,
-                    attachment_id, chunk_index, chunk_count, group_message_id, read_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(message_id) DO UPDATE SET
-                    recipient_peer_id = excluded.recipient_peer_id,
-                    sealed_ciphertext = excluded.sealed_ciphertext,
-                    token = excluded.token,
-                    ttl = excluded.ttl,
-                    sent_at = excluded.sent_at,
-                    retries = excluded.retries,
-                    delivered_at = excluded.delivered_at,
-                    failed_at = excluded.failed_at,
-                    relayed_at = excluded.relayed_at,
-                    attachment_id = excluded.attachment_id,
-                    chunk_index = excluded.chunk_index,
-                    chunk_count = excluded.chunk_count,
-                    group_message_id = excluded.group_message_id,
-                    read_at = excluded.read_at;
-            """)
-                .bind(entry.messageId, at: 1)
-                .bind(entry.recipientPeerId, at: 2)
-                .bind(entry.sealedCiphertext, at: 3)
-                .bind(entry.token, at: 4)
-                .bind(Int64(entry.ttl), at: 5)
-                .bind(entry.sentAt, at: 6)
-                .bind(entry.retries, at: 7)
-                .bind(entry.deliveredAt, at: 8)
-                .bind(entry.failedAt, at: 9)
-                .bind(entry.relayedAt, at: 10)
-                .bind(entry.attachmentId, at: 11)
-                .bind(entry.chunkIndex.map { Int($0) }, at: 12)
-                .bind(entry.chunkCount.map { Int($0) }, at: 13)
-                .bind(entry.groupMessageId, at: 14)
-                .bind(entry.readAt, at: 15)
-                .run()
-            try tx.prepare("""
-                DELETE FROM delivery_tokens WHERE contact_id = ? AND position = ?;
-            """).bindAll(cid, position).run()
-            built = entry
-        }
-        return built
-    }
-
-    /// Append a batch of tokens to the end of `contactId`'s queue.
-    func appendDeliveryTokens(contactId: UUID, tokens: [Data]) throws {
-        guard !tokens.isEmpty else { return }
-        let cid = contactId.data
-        try db.transaction { tx in
-            // Probe the current max position so we don't collide
-            // with an existing token (the table's PRIMARY KEY is
-            // (contact_id, position) — a duplicate would throw).
-            let maxStmt = try tx.prepare("""
-                SELECT IFNULL(MAX(position), -1) FROM delivery_tokens WHERE contact_id = ?;
-            """)
-            try maxStmt.bindAll(cid)
-            _ = try maxStmt.step()
-            var nextPos = maxStmt.columnInt64(0) + 1
-            let ins = try tx.prepare("""
-                INSERT INTO delivery_tokens (contact_id, position, token)
-                VALUES (?, ?, ?);
-            """)
-            for token in tokens {
-                try ins.bind(cid, at: 1).bind(nextPos, at: 2).bind(token, at: 3).run()
-                nextPos += 1
-            }
-        }
-    }
 
     // MARK: - Messages (1:1 + group, polymorphic owner)
 

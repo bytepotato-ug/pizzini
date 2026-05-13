@@ -51,7 +51,7 @@ struct DiagnosticsView: View {
                                 Text(contact.displayName)
                                     .font(.body.weight(.medium))
                                 Spacer()
-                                tokenBadge(contact.deliveryTokensForPeer.count)
+                                chainBadge(contact.outboundTokenChain)
                             }
                             Text("\(short(contact.identityPub)) • session: \(contact.sessionEstablished ? "ok" : "pending")")
                                 .font(.caption2)
@@ -60,9 +60,9 @@ struct DiagnosticsView: View {
                     }
                 }
             } header: {
-                Text("Contacts (delivery tokens left)")
+                Text("Contacts (delivery-token chain)")
             } footer: {
-                Text("Each group op or SKDM consumes one delivery token from the recipient's stash. Below \(Contact.refillThreshold) tokens, this device tries to refill on the next exchange. A 0 here for a recipient means this device cannot send them ANYTHING — including group invitations — until a refill round-trip completes.")
+                Text("Each SEND derives one token from this contact's outbound hash chain (peer-minted at pair time; sealed `chainSeedDelivery`). The badge shows tokens remaining; once it reaches 0 we auto-fetch a fresh chain via BUNDLE_REQUEST on the next send. \"none\" means the chain hasn't arrived yet.")
             }
 
             Section {
@@ -141,18 +141,30 @@ struct DiagnosticsView: View {
     }
 
     @ViewBuilder
-    private func tokenBadge(_ count: Int) -> some View {
-        Text("\(count) tok")
-            .font(.caption2.monospaced().weight(.medium))
-            .padding(.horizontal, 6)
-            .padding(.vertical, 1)
-            .background(Capsule().fill(tokenColor(count).opacity(0.18)))
-            .foregroundStyle(tokenColor(count))
+    private func chainBadge(_ chain: HashChainToken.Chain?) -> some View {
+        if let chain {
+            let remaining = chain.length - (chain.nextIndex - 1)
+            Text("\(remaining) / \(chain.length)")
+                .font(.caption2.monospaced().weight(.medium))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(Capsule().fill(chainColor(remaining, total: chain.length).opacity(0.18)))
+                .foregroundStyle(chainColor(remaining, total: chain.length))
+        } else {
+            Text("none")
+                .font(.caption2.monospaced().weight(.medium))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(Capsule().fill(Color.red.opacity(0.18)))
+                .foregroundStyle(.red)
+        }
     }
 
-    private func tokenColor(_ count: Int) -> Color {
-        if count == 0 { return .red }
-        if count < Contact.refillThreshold { return .orange }
+    private func chainColor(_ remaining: Int, total: Int) -> Color {
+        if remaining == 0 { return .red }
+        // Same threshold as `Chain.shouldRotate`: 20% remaining flips
+        // to orange so an operator can see the rotation cycle.
+        if remaining * 5 < total { return .orange }
         return .green
     }
 }

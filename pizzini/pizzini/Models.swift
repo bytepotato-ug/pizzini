@@ -198,19 +198,11 @@ struct Contact: Codable, Identifiable, Sendable {
     /// means "never opened" — every received message is unread.
     var lastSeenAt: Date?
     let addedAt: Date
-    /// Phase 3 delivery-token stash: tokens this peer minted and gave us
-    /// for use when sending TO them. Each is 84 bytes (nonce + expiry +
-    /// XEd25519 sig). Pop from front; refill when it drops below
-    /// `Contact.refillThreshold`.
-    var deliveryTokensForPeer: [Data]
-    /// Last time we *sent* a refill-request to this peer. Rate-limited
-    /// to one request per `Contact.refillCooldown` so a malicious peer
-    /// can't burn our stash with a tight loop.
-    var lastRefillRequestSentAt: Date?
-    /// Last time we *handled* a refill-request from this peer. Same
-    /// rate-limit applied to incoming requests so we don't pay for
-    /// 1024 fresh signatures more than once per cooldown window.
-    var lastRefillRequestHandledAt: Date?
+    /// Last time we minted + shipped a fresh outbound chain to this
+    /// peer (sealed `chainSeedDelivery`). Rate-limits chain rotations
+    /// so a malicious peer can't drive us into a tight mint loop with
+    /// repeated BUNDLE_REQUESTs.
+    var lastChainServedAt: Date?
     /// Per-contact default per-message TTL (seconds). Phase 4 picker.
     /// Default is `Contact.defaultTTLSeconds`; user-adjustable via the
     /// chat ⋯ menu. A reduction here doesn't shrink in-flight messages
@@ -243,19 +235,16 @@ struct Contact: Codable, Identifiable, Sendable {
         case .alwaysOff:     return false
         }
     }
-    /// Peer's published `delivery_token_verify_key` (33 bytes) extracted
-    /// from their BUNDLE_RESPONSE. F-202/F-401: every TOKEN_ISSUE batch
-    /// from this peer is verified against this key before any token is
-    /// added to `deliveryTokensForPeer`, so a malicious relay cannot
-    /// swap legitimate batches for relay-forged bytes. Optional because
-    /// pre-Phase-3 contact rows on disk won't have this — the next
-    /// successful BUNDLE_RESPONSE re-populates it.
+    /// Peer's libsignal `delivery_token_verify_key` (33 bytes) extracted
+    /// from their BUNDLE_RESPONSE. v2 delivery-token validation uses
+    /// the chain root registered with the relay, not this key — but
+    /// the field is still load-bearing for sealed-sender certificate
+    /// verification. Optional because pre-pair rows won't have it.
     var peerVerifyKey: Data?
     /// Last time we *served* a BUNDLE_RESPONSE to this peer. F-404: a
     /// paired peer can otherwise loop BUNDLE_REQUEST and burn one
     /// kyber1024 + one one-time prekey per request; we cap at one fresh
-    /// publish per `Contact.refillCooldown`. The same gate already
-    /// applies to `issueTokens` via `lastRefillRequestHandledAt`.
+    /// publish per `Contact.chainServeCooldown`.
     var lastBundleServedAt: Date?
     /// How this contact's identity entered the device. The verification
     /// UI relies on this to grade the warning — see `ContactSource`.
@@ -291,9 +280,7 @@ struct Contact: Codable, Identifiable, Sendable {
         lastMessageAt: Date? = nil,
         lastSeenAt: Date? = nil,
         addedAt: Date = Date(),
-        deliveryTokensForPeer: [Data] = [],
-        lastRefillRequestSentAt: Date? = nil,
-        lastRefillRequestHandledAt: Date? = nil,
+        lastChainServedAt: Date? = nil,
         ttlSeconds: UInt32 = Contact.defaultTTLSeconds,
         readReceiptsMode: ReadReceiptsMode = .followDefault,
         peerVerifyKey: Data? = nil,
@@ -311,9 +298,7 @@ struct Contact: Codable, Identifiable, Sendable {
         self.lastMessageAt = lastMessageAt
         self.lastSeenAt = lastSeenAt
         self.addedAt = addedAt
-        self.deliveryTokensForPeer = deliveryTokensForPeer
-        self.lastRefillRequestSentAt = lastRefillRequestSentAt
-        self.lastRefillRequestHandledAt = lastRefillRequestHandledAt
+        self.lastChainServedAt = lastChainServedAt
         self.ttlSeconds = ttlSeconds
         self.readReceiptsMode = readReceiptsMode
         self.peerVerifyKey = peerVerifyKey
@@ -344,18 +329,15 @@ struct Contact: Codable, Identifiable, Sendable {
         ("7 days",  7 * 24 * 60 * 60),
     ]
 
-    /// Restock target. Each fresh issuance refills the stash to this
-    /// many tokens. Brief specifies 1024.
-    static let initialIssuance: Int = 1024
-    /// When the stash drops below this we kick a sealed refill request.
-    static let refillThreshold: Int = 256
-    /// Minimum time between refill exchanges. 6h matches the brief.
-    static let refillCooldown: TimeInterval = 6 * 60 * 60
+    /// Minimum time between chain mint+ship operations to one peer.
+    /// Used to rate-limit how often we re-issue a chain in response
+    /// to a peer-initiated BUNDLE_REQUEST.
+    static let chainServeCooldown: TimeInterval = 6 * 60 * 60
 
     private enum CodingKeys: String, CodingKey {
         case id, identityPub, displayName, sessionEstablished, log, lastMessageAt
         case lastSeenAt, addedAt
-        case deliveryTokensForPeer, lastRefillRequestSentAt, lastRefillRequestHandledAt
+        case lastChainServedAt
         case ttlSeconds
         // Legacy bool (decode-only for migration); current field is
         // `readReceiptsMode`.
@@ -377,9 +359,7 @@ struct Contact: Codable, Identifiable, Sendable {
         self.lastMessageAt = try c.decodeIfPresent(Date.self, forKey: .lastMessageAt)
         self.lastSeenAt = try c.decodeIfPresent(Date.self, forKey: .lastSeenAt)
         self.addedAt = try c.decode(Date.self, forKey: .addedAt)
-        self.deliveryTokensForPeer = try c.decodeIfPresent([Data].self, forKey: .deliveryTokensForPeer) ?? []
-        self.lastRefillRequestSentAt = try c.decodeIfPresent(Date.self, forKey: .lastRefillRequestSentAt)
-        self.lastRefillRequestHandledAt = try c.decodeIfPresent(Date.self, forKey: .lastRefillRequestHandledAt)
+        self.lastChainServedAt = try c.decodeIfPresent(Date.self, forKey: .lastChainServedAt)
         self.ttlSeconds = try c.decodeIfPresent(UInt32.self, forKey: .ttlSeconds) ?? Contact.defaultTTLSeconds
         // Backward-compat: new field takes precedence; if absent, fall
         // back to the legacy Bool. Privacy-respecting mapping:
@@ -423,9 +403,7 @@ struct Contact: Codable, Identifiable, Sendable {
         try c.encodeIfPresent(lastMessageAt, forKey: .lastMessageAt)
         try c.encodeIfPresent(lastSeenAt, forKey: .lastSeenAt)
         try c.encode(addedAt, forKey: .addedAt)
-        try c.encode(deliveryTokensForPeer, forKey: .deliveryTokensForPeer)
-        try c.encodeIfPresent(lastRefillRequestSentAt, forKey: .lastRefillRequestSentAt)
-        try c.encodeIfPresent(lastRefillRequestHandledAt, forKey: .lastRefillRequestHandledAt)
+        try c.encodeIfPresent(lastChainServedAt, forKey: .lastChainServedAt)
         try c.encode(ttlSeconds, forKey: .ttlSeconds)
         try c.encode(readReceiptsMode, forKey: .readReceiptsMode)
         try c.encodeIfPresent(peerVerifyKey, forKey: .peerVerifyKey)

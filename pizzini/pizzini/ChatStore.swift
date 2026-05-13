@@ -1102,12 +1102,11 @@ final class ChatStore: NSObject {
     /// F-402: BUNDLE_RESPONSE wire size for the decoy path. A real
     /// Pizzini bundle is 1858 bytes (kyber1024 PK 1568 + 4× signatures
     /// 64 each + 4× public keys 33 each + headers/IDs); we round up to
-    /// 1860 to absorb future tweaks below detection. Token batch size
-    /// is `Contact.initialIssuance × 84` = 86016 bytes.
+    /// 1860 to absorb future tweaks below detection.
     private static let decoyBundleSize = 1860
 
     /// Per-unknown-peer cooldown on the decoy emission. Mirrors the
-    /// `Contact.refillCooldown` on the recognised-peer branch so the
+    /// `Contact.chainServeCooldown` on the recognised-peer branch so the
     /// timing asymmetry between known and unknown is preserved only
     /// for the FIRST request in a cooldown window. Subsequent
     /// requests in the same cooldown silently drop on BOTH branches
@@ -1203,18 +1202,12 @@ final class ChatStore: NSObject {
             SecRandomCopyBytes(kSecRandomDefault, buf.count, buf.baseAddress!)
         }
         client.sendBundle(toPeer: toPeer, bundle: decoyBundle)
-
-        // Same-shape decoy TOKEN_ISSUE: 1024 random 84-byte "tokens".
-        var decoyTokens: [Data] = []
-        decoyTokens.reserveCapacity(Contact.initialIssuance)
-        for _ in 0 ..< Contact.initialIssuance {
-            var tok = Data(count: 84)
-            _ = tok.withUnsafeMutableBytes { buf in
-                SecRandomCopyBytes(kSecRandomDefault, buf.count, buf.baseAddress!)
-            }
-            decoyTokens.append(tok)
-        }
-        client.sendTokenIssue(toPeer: toPeer, tokens: decoyTokens)
+        // Real pair-time path after the bundle is a single sealed
+        // SEND carrying a chainSeedDelivery (88-byte plaintext body
+        // wrapped in sealed-sender envelope). A future refinement can
+        // emit a matching-size decoy SEND; for the current internal
+        // build a bundle-shaped decoy alone is the v2 equivalent of
+        // the legacy paired decoy.
     }
 
     /// Hashcash challenge layout, mirroring `relay::build_hashcash_challenge`:
@@ -1256,154 +1249,30 @@ final class ChatStore: NSObject {
             appendSystem("Session not established yet — waiting for the other side to scan you.", to: idx)
             return
         }
-        // Stash availability is checked up-front for the user-facing
-        // "out of tokens" message, but the actual pop happens
-        // ATOMICALLY with the outbox-row insert below
-        // (`Storage.commitDeliveryTokenSpend`) so a crash between
-        // the two writes can never burn a token without a
-        // corresponding outbox record.
-        // v2 cutover: when the flag is on, v2 is the ONLY send path.
-        // A missing or exhausted chain is recovered by re-fetching the
-        // peer's bundle (which also delivers a fresh chain seed). The
-        // v1 path below is unreachable in cutover mode.
-        if HashChainToken.cutoverEnabled {
-            if let v2Token = mintV2DeliveryToken(forContactAt: idx) {
-                sendV2(
-                    trimmed: trimmed,
-                    forContactAt: idx,
-                    contact: contact,
-                    session: session,
-                    v2Token: v2Token,
-                )
-            } else {
-                refreshChainAndQueue(text: trimmed, forContactAt: idx)
-            }
-            return
-        }
-        guard !state.contacts[idx].deliveryTokensForPeer.isEmpty else {
-            // The stash is empty, so a refill broadcast can't even pay
-            // its own postage. The only honest action is to re-pair —
-            // emit one row that says so, don't follow up with a "asking
-            // for more" row that we know would fail.
-            appendSystem("Out of delivery tokens — re-pair this contact to refresh.", to: idx)
-            return
-        }
-        do {
-            // Phase 2 wire format: sealed envelope on the wire, no
-            // from_id / is_prekey at the relay layer. Phase 4 records
-            // an OutboxEntry per send so retries + delivered (✓✓)
-            // tracking work even across relay restarts.
-            let messageId = Self.makeMessageId()
-            var inner = Data([RelayClient.InnerEnvelopeKind.chat.rawValue])
-            inner.append(Data(trimmed.utf8))
-            let sealed = try session.encryptSealed(
-                peer: contact.identityPub,
-                messageId: messageId,
-                plaintext: inner,
+        // v2 hash-chained tokens: derive one from the outbound chain,
+        // ship the sealed envelope with the 52-byte token blob. If
+        // the chain is missing (e.g. session established but the
+        // peer's `chainSeedDelivery` hasn't landed yet), queue the
+        // text and refresh the bundle — the peer's response carries
+        // a fresh chain, drainPendingV2Sends re-submits the message
+        // once it installs.
+        if let v2Token = mintV2DeliveryToken(forContactAt: idx) {
+            sendV2(
+                trimmed: trimmed,
+                forContactAt: idx,
+                contact: contact,
+                session: session,
+                v2Token: v2Token,
             )
-            let ttl = state.contacts[idx].ttlSeconds
-            let now = Date()
-            // Atomic spend: in ONE SQLite transaction, pop the head
-            // of the delivery-token queue AND insert the outbox row
-            // that captures which token went where. A crash here
-            // can only leave the on-disk state with EITHER both
-            // writes applied OR neither — never the half-applied
-            // shape that would burn a token irretrievably.
-            guard let entry = Storage.commitDeliveryTokenSpend(
-                contactId: state.contacts[idx].id,
-                entryBuilder: { token in
-                    OutboxEntry(
-                        messageId: messageId,
-                        recipientPeerId: contact.identityPub,
-                        sealedCiphertext: sealed,
-                        token: token,
-                        ttl: TimeInterval(ttl),
-                        sentAt: now,
-                        retries: 0,
-                        deliveredAt: nil,
-                        failedAt: nil,
-                        relayedAt: nil,
-                    )
-                }
-            ) else {
-                // Atomic-spend failed because the SQLite delivery-tokens
-                // queue is empty. Same shape as the pre-check above:
-                // emit one chat row, skip the doomed refill broadcast.
-                appendSystem("Out of delivery tokens — re-pair this contact to refresh.", to: idx)
-                return
-            }
-            // Mirror the DB pop into the in-memory stash. The
-            // queue may be in any state (a race-window concurrent
-            // mutation is impossible — MainActor isolation
-            // serialises everything that touches it) but the DB
-            // is authoritative; pop only if non-empty so a
-            // hypothetical drift doesn't underflow.
-            if !state.contacts[idx].deliveryTokensForPeer.isEmpty {
-                state.contacts[idx].deliveryTokensForPeer.removeFirst()
-            }
-            let token = entry.token
-            var entryMut = entry
-            outbox.entries[messageId] = entryMut
-            // CRITICAL: encryptSealed advanced the ratchet; flush that
-            // state to Keychain BEFORE the socket write. The
-            // outbox-then-session-then-send order means a force-quit
-            // mid-send leaves the outbox knowing we tried (so the
-            // retry walk picks it up after restart) AND the libsignal
-            // session pinned at the post-encrypt counter (so the retry
-            // doesn't reuse a chain key the peer has already consumed).
-            persistSession()
-            // Send. NWConnection completion fires async; we treat a
-            // synchronous return + state==.connected as the "✓ relayed"
-            // tier — see `markRelayed` for the explicit completion
-            // hook in the new RelayClient.send completion.
-            // D3 fanout: write the same sealed envelope to every
-            // ready relay. The first one to land at the recipient
-            // wins; libsignal `SealedSenderResult.isDuplicate` drops
-            // the copy-of-N copies that arrive via the alternate
-            // relays.
-            broadcastToRelays {
-                $0.sendSealed(
-                    toPeer: contact.identityPub,
-                    sealedCiphertext: sealed,
-                    ttlSeconds: ttl,
-                    token: token,
-                )
-            }
-            entryMut.relayedAt = now
-            // F-505: scrub the token field once the relay accepts the
-            // bytes. The signed token is no longer needed (further
-            // retries on a relayed entry are capped by F-501 and
-            // wouldn't burn a token even if they fired). Keeping it on
-            // disk widens the post-Keychain-extraction replay surface
-            // for the token's 30-day TTL.
-            entryMut.token = Data()
-            outbox.entries[messageId] = entryMut
-            Storage.upsertOutboxEntry(entryMut)
-
-            let logEntry = PersistedMessage(
-                side: .me,
-                text: trimmed,
-                // Bubble metadata stays "PreKey/Whisper" for now —
-                // sealed-sender hides that detail at the wire level
-                // but the cert-cached SenderCertificate path uses
-                // PreKey on the very first send, Whisper after.
-                kind: state.contacts[idx].sessionEstablished ? .whisper : .preKey,
-                bytes: sealed.count,
-                messageId: messageId,
-            )
-            state.contacts[idx].log.append(logEntry)
-            state.contacts[idx].lastMessageAt = logEntry.timestamp
-            persistContactSliceAndAppended(logEntry, at: idx)
-            maybeRequestRefill(forContactAt: idx, session: session)
-        } catch {
-            appendSystem("Encrypt failed: \(error)", to: idx)
+        } else {
+            refreshChainAndQueue(text: trimmed, forContactAt: idx)
         }
     }
 
-    /// v2 cutover send path. Mirrors the v1 atomic-spend send but uses
-    /// a pre-minted hash-chain token instead of popping the v1 stash.
-    /// Skipped entirely when `HashChainToken.cutoverEnabled == false`
-    /// (current default — caller never reaches us).
+    /// Encrypt + ship one text SEND using a pre-minted v2 token.
+    /// Mirrors the legacy spend-then-send shape but the chain
+    /// advance is already persisted by `mintV2DeliveryToken` before
+    /// we get here.
     @MainActor
     private func sendV2(
         trimmed: String,
@@ -1479,11 +1348,10 @@ final class ChatStore: NSObject {
 
     /// Send a file attachment to `contact`. Phase 2 wire path: chunked
     /// sealed envelopes (`.fileChunk` inner kind) keyed by a shared
-    /// `attachmentId`. Each chunk consumes one delivery token; a 10 MB
-    /// file is ~160 chunks → ~160 tokens. With `Contact.initialIssuance
-    /// = 1024` users can ship roughly six 10 MB files between refills,
-    /// which the maybeRequestRefill threshold (256) keeps lubricated
-    /// in steady state.
+    /// `attachmentId`. Each chunk consumes one v2 hash-chain token
+    /// (52-byte presentation); a 10 MB file is ~160 chunks. Default
+    /// chain length 16384 covers thousands of attachments before
+    /// `Chain.shouldRotate` flips and the peer re-mints.
     ///
     /// Strip + chunk + encrypt happens off the main thread so the UI
     /// stays responsive even on a multi-MB attachment with AVAsset
@@ -1657,43 +1525,19 @@ final class ChatStore: NSObject {
         // can't reassemble.
         // v2 cutover: under the flag, a file send needs a chain with
         // at least `chunks.count` remaining tokens. Missing or
-        // under-supplied chain → trigger a refresh and bail. The user
-        // re-attaches the file once the chain lands. v1 below is
-        // unreachable in cutover mode.
-        if HashChainToken.cutoverEnabled {
-            let remaining = state.contacts[idx].outboundTokenChain.map {
-                $0.length - ($0.nextIndex - 1)
-            } ?? 0
-            if remaining < chunks.count {
-                if remaining == 0 {
-                    appendSystem(
-                        "Refreshing connection — re-attach this file once it's back online.",
-                        to: idx,
-                    )
-                    requestBundleWithHashcash(fromPeer: state.contacts[idx].identityPub)
-                } else {
-                    appendSystem(
-                        "Chain almost spent — \(remaining) tokens left, need \(chunks.count). Refreshing.",
-                        to: idx,
-                    )
-                    requestBundleWithHashcash(fromPeer: state.contacts[idx].identityPub)
-                }
-                return
-            }
-        } else {
-            let stash = state.contacts[idx].deliveryTokensForPeer.count
-            if stash < chunks.count {
-                if stash == 0 {
-                    appendSystem("Can't send this file — out of delivery tokens. Re-pair this contact to refresh.", to: idx)
-                } else {
-                    appendSystem(
-                        "Not enough delivery tokens for this file (need \(chunks.count), have \(stash)). Asking your peer for more — try again shortly.",
-                        to: idx,
-                    )
-                    requestTokenRefillBroadcast(from: state.contacts[idx], session: session)
-                }
-                return
-            }
+        // under-supplied chain → request a fresh bundle (the peer
+        // answers with a new chain seed) and bail. The user
+        // re-attaches the file once the new chain lands.
+        let remaining = state.contacts[idx].outboundTokenChain.map {
+            $0.length - ($0.nextIndex - 1)
+        } ?? 0
+        if remaining < chunks.count {
+            let msg = remaining == 0
+                ? "Refreshing connection — re-attach this file once it's back online."
+                : "Chain almost spent — \(remaining) tokens left, need \(chunks.count). Refreshing."
+            appendSystem(msg, to: idx)
+            requestBundleWithHashcash(fromPeer: state.contacts[idx].identityPub)
+            return
         }
 
         let chunkCountU32 = UInt32(chunks.count)
@@ -1722,31 +1566,21 @@ final class ChatStore: NSObject {
                     messageId: messageId,
                     plaintext: inner,
                 )
-                // Pop a token AFTER successful encrypt so an encrypt
-                // failure doesn't burn one. Under cutover the token
-                // comes from the v2 hash chain (52 B encoded wire);
-                // pre-cutover it's the v1 Ed25519-signed blob.
-                let token: Data
-                if HashChainToken.cutoverEnabled {
-                    guard let v2 = mintV2DeliveryToken(forContactAt: idx) else {
-                        appendSystem(
-                            "Chain exhausted mid-attachment after \(i)/\(chunks.count) chunks. Re-send to refresh.",
-                            to: idx,
-                        )
-                        requestBundleWithHashcash(fromPeer: contactId)
-                        return
-                    }
-                    token = HashChainToken.encode(v2)
-                } else {
-                    guard let v1 = popDeliveryToken(forContactAt: idx) else {
-                        appendSystem(
-                            "Token stash exhausted mid-attachment after \(i)/\(chunks.count) chunks.",
-                            to: idx,
-                        )
-                        return
-                    }
-                    token = v1
+                // Mint a v2 token after successful encrypt so an
+                // encrypt failure doesn't burn one. The chain
+                // remaining-tokens guard above ensures this can only
+                // fail under contention with another sender path; if
+                // so, we abort the rest of the attachment and ask
+                // the peer for a fresh chain.
+                guard let v2 = mintV2DeliveryToken(forContactAt: idx) else {
+                    appendSystem(
+                        "Chain exhausted mid-attachment after \(i)/\(chunks.count) chunks. Re-send to refresh.",
+                        to: idx,
+                    )
+                    requestBundleWithHashcash(fromPeer: contactId)
+                    return
                 }
+                let token = HashChainToken.encode(v2)
                 var entry = OutboxEntry(
                     messageId: messageId,
                     recipientPeerId: contactId,
@@ -1803,7 +1637,14 @@ final class ChatStore: NSObject {
         state.contacts[idx].log.append(row)
         state.contacts[idx].lastMessageAt = row.timestamp
         persistContactSliceAndAppended(row, at: idx)
-        maybeRequestRefill(forContactAt: idx, session: session)
+        // v2 rotation: if the chain just crossed the 80% mark, log so
+        // future telemetry can surface the cadence. Rotation itself
+        // is recipient-initiated (the peer minted this chain, so only
+        // they can replace it); we rely on `requestBundleWithHashcash`
+        // in the eventually-exhausted path to trigger their re-issue.
+        if let chain = state.contacts[idx].outboundTokenChain, chain.shouldRotate {
+            pzLog("[pizzini] v2 chain crossing rotation threshold for \(self.short(contactId))")
+        }
     }
 
     /// Map a sanitized filename to the best-guess MIME / UTI string.
@@ -1822,87 +1663,6 @@ final class ChatStore: NSObject {
         return type.preferredMIMEType ?? type.identifier
     }
 
-    /// Pop one token from `contact.deliveryTokensForPeer`. Persists.
-    /// Returns nil if the stash is empty — caller must trigger a
-    /// refill before retrying.
-    /// Pop one delivery token from `state.contacts[idx]`'s stash.
-    /// Internal-not-private so the group fan-out path in
-    /// `ChatStoreGroups.swift` can borrow tokens per-recipient
-    /// without re-implementing the rate-limit + refill logic.
-    func popDeliveryTokenPublic(forContactAt idx: Int) -> Data? {
-        popDeliveryToken(forContactAt: idx)
-    }
-
-    private func popDeliveryToken(forContactAt idx: Int) -> Data? {
-        guard !state.contacts[idx].deliveryTokensForPeer.isEmpty else { return nil }
-        let token = state.contacts[idx].deliveryTokensForPeer.removeFirst()
-        // Mirror the in-memory pop into the DB so a cold launch can't
-        // re-issue an already-consumed token. Both pops are FIFO; the
-        // DB row deleted is the one corresponding to MIN(position) —
-        // the head of the queue — same as the in-memory `removeFirst`.
-        _ = Storage.popDeliveryToken(contactId: state.contacts[idx].id)
-        return token
-    }
-
-    /// If the stash dropped below `Contact.refillThreshold` and the
-    /// 6h cooldown has elapsed, send a sealed refill-request.
-    private func maybeRequestRefill(forContactAt idx: Int, session: Session) {
-        let c = state.contacts[idx]
-        guard c.deliveryTokensForPeer.count < Contact.refillThreshold else { return }
-        if let last = c.lastRefillRequestSentAt, Date().timeIntervalSince(last) < Contact.refillCooldown {
-            return
-        }
-        requestTokenRefillBroadcast(from: c, session: session)
-    }
-
-    private func requestTokenRefillBroadcast(from contact: Contact, session: Session) {
-        guard let idx = contactIndex(forIdentity: contact.identityPub) else { return }
-        // Refill requests bypass the token rate-limit (the relay accepts
-        // a SEND with a 0-length token field iff the recipient has not
-        // yet registered a verify key for this connection — but in
-        // steady state that doesn't apply). The clean answer: spend a
-        // token to ask for tokens. If we're at zero, we can't refill —
-        // user must re-pair. Callers are expected to gate on stash
-        // emptiness BEFORE invoking us so they can surface the right
-        // message; we no longer emit our own chat row.
-        guard let token = popDeliveryToken(forContactAt: idx) else {
-            pzLog("[pizzini] refill broadcast skipped: token stash empty")
-            return
-        }
-        do {
-            let inner = Data([RelayClient.InnerEnvelopeKind.tokenRefillRequest.rawValue])
-            let sealed = try session.encryptSealed(
-                peer: contact.identityPub,
-                messageId: Self.makeMessageId(),
-                plaintext: inner,
-            )
-            // F-601: persist the advanced ratchet state BEFORE handing
-            // off to the relay. A force-quit between encryptSealed and
-            // persistAll otherwise rolls the on-disk session back one
-            // step and the next outbound encrypt reuses an already-
-            // consumed counter; the peer rejects with DuplicatedMessage
-            // and the user sees ✓✓ on a message that never arrived.
-            // Mirrors the invariant the other encrypt sites uphold (see
-            // emitAck and emitReadReceiptIfEnabled).
-            state.contacts[idx].lastRefillRequestSentAt = Date()
-            persistContactSlice(at: idx)
-            broadcastToRelays {
-                $0.sendSealed(
-                    toPeer: contact.identityPub,
-                    sealedCiphertext: sealed,
-                    ttlSeconds: Self.defaultTTLSeconds,
-                    token: token,
-                )
-            }
-        } catch {
-            appendSystem("Refill request failed: \(error)", to: idx)
-        }
-    }
-
-    /// Mint a fresh batch of tokens for `peer` and ship via TOKEN_ISSUE.
-    /// Used both at pair time (right after we send their bundle) and
-    /// in response to a refill request. Rate-limited to one issuance
-    /// per `Contact.refillCooldown` per peer.
     /// Pending v2 sends queued behind a chain refresh. Keyed by
     /// contact UUID. Each entry is the raw plaintext we'll re-submit
     /// to `send(_:to:)` once `handleChainSeedDelivery` installs the
@@ -1948,13 +1708,21 @@ final class ChatStore: NSObject {
     }
 
     /// v2 token mint: pop the next token off the contact's outbound
-    /// hash chain, advance the cursor, and persist. Returns nil when
-    /// the cutover flag is off, no chain is installed, or the chain
-    /// is exhausted — caller falls back to the v1 stash. Encoding to
-    /// wire bytes is the caller's job (`HashChainToken.encode`).
+    /// hash chain, advance the cursor, persist. Returns nil when no
+    /// chain is installed or the chain is exhausted — caller calls
+    /// `refreshChainAndQueue` to recover. Encoding to wire bytes is
+    /// the caller's job (`HashChainToken.encode`).
+    ///
+    /// Internal-not-private so the group fan-out path in
+    /// `ChatStoreGroups.swift` can mint one v2 token per recipient
+    /// without duplicating the persist logic.
     @MainActor
-    private func mintV2DeliveryToken(forContactAt idx: Int) -> HashChainToken.Token? {
-        guard HashChainToken.cutoverEnabled else { return nil }
+    func v2TokenWire(forContactAt idx: Int) -> Data? {
+        mintV2DeliveryToken(forContactAt: idx).map { HashChainToken.encode($0) }
+    }
+
+    @MainActor
+    func mintV2DeliveryToken(forContactAt idx: Int) -> HashChainToken.Token? {
         guard var chain = state.contacts[idx].outboundTokenChain else { return nil }
         guard let token = HashChainToken.nextToken(in: &chain) else { return nil }
         state.contacts[idx].outboundTokenChain = chain
@@ -2038,39 +1806,21 @@ final class ChatStore: NSObject {
         _ = client
     }
 
-    private func issueTokens(for peer: Data, via relay: RelayClient, session: Session) {
+    /// Mint a fresh outbound chain for `peer` and ship the seed over
+    /// the sealed Double Ratchet. Called right after we serve their
+    /// bundle. Rate-limited per `Contact.chainServeCooldown` so a
+    /// peer cycling BUNDLE_REQUEST can't drive us into a tight
+    /// mint-ship loop.
+    private func serveChain(forPeer peer: Data, via relay: RelayClient, session: Session) {
         guard let idx = contactIndex(forIdentity: peer) else { return }
-        if let last = state.contacts[idx].lastRefillRequestHandledAt,
-           Date().timeIntervalSince(last) < Contact.refillCooldown {
-            pzLog("[pizzini] refill rate-limited for \(self.short(peer))")
+        if let last = state.contacts[idx].lastChainServedAt,
+           Date().timeIntervalSince(last) < Contact.chainServeCooldown {
+            pzLog("[pizzini] chain serve rate-limited for \(self.short(peer))")
             return
         }
-        state.contacts[idx].lastRefillRequestHandledAt = Date()
+        state.contacts[idx].lastChainServedAt = Date()
         Storage.upsertContact(state.contacts[idx])
-        if HashChainToken.cutoverEnabled {
-            // v2-only: a single sealed chain-seed delivery replaces the
-            // v1 1024-token batch entirely. Sender derives every future
-            // token from this one seed; relay validates against the
-            // registered root.
-            sendChainSeedDelivery(toPeer: peer, via: relay, session: session)
-            return
-        }
-        // v1 path — pre-cutover behaviour. Mint 1024 signed tokens
-        // and ship them via the unsealed `TOKEN_ISSUE` frame. Single
-        // path on the wire (no v2 chain alongside) so a coerced
-        // relay operator can only see the metadata leak it was
-        // already going to see, not both.
-        var tokens: [Data] = []
-        tokens.reserveCapacity(Contact.initialIssuance)
-        for _ in 0..<Contact.initialIssuance {
-            do {
-                tokens.append(try session.mintDeliveryToken())
-            } catch {
-                pzLog("[pizzini] mintDeliveryToken failed: \(error)")
-                return
-            }
-        }
-        broadcastToRelays { $0.sendTokenIssue(toPeer: peer, tokens: tokens) }
+        sendChainSeedDelivery(toPeer: peer, via: relay, session: session)
     }
 
     /// Default per-message TTL until Phase 4's per-message picker lands.
@@ -2249,10 +1999,11 @@ final class ChatStore: NSObject {
             pzLog("[pizzini] deferring read receipt — relay not connected (state=\(relayState))")
             return
         }
-        guard let token = popDeliveryToken(forContactAt: idx) else {
-            pzLog("[pizzini] cannot emit read receipt: out of tokens")
+        guard let v2 = mintV2DeliveryToken(forContactAt: idx) else {
+            pzLog("[pizzini] cannot emit read receipt: chain missing or exhausted")
             return
         }
+        let token = HashChainToken.encode(v2)
         var inner = Data([RelayClient.InnerEnvelopeKind.readReceipt.rawValue])
         inner.append(highestMessageId)
         do {
@@ -2742,17 +2493,14 @@ extension ChatStore: RelayClientDelegate {
             // other side hadn't scanned us when we last asked".
             //
             // Also re-request for paired contacts whose `peerVerifyKey`
-            // is nil. This catches the F-202 upgrade-path strand: a
-            // user upgrading from pre-Phase-3 has every Contact row
-            // with `peerVerifyKey == nil` (the field didn't exist on
-            // disk). Without this, every TOKEN_ISSUE batch from those
-            // peers gets dropped at didReceiveTokenIssueFrom and the
-            // user silently drains their stash. The next BUNDLE_RESPONSE
-            // re-populates the key via Session.extractBundleVerifyKey.
-            // F-404's lastBundleServedAt cooldown (peer-side) keeps
-            // this from amplifying into a flood.
+            // is nil OR whose v2 chain hasn't been delivered. The
+            // BUNDLE_RESPONSE handler installs the verify_key; the
+            // serveChain handler installs the chain — together they
+            // bring a half-paired contact back online.
             for c in self.state.contacts
-                where !c.sessionEstablished || c.peerVerifyKey == nil
+                where !c.sessionEstablished
+                    || c.peerVerifyKey == nil
+                    || c.outboundTokenChain == nil
             {
                 self.requestBundleWithHashcash(fromPeer: c.identityPub)
             }
@@ -2817,96 +2565,6 @@ extension ChatStore: RelayClientDelegate {
         }
     }
 
-    nonisolated func relayClient(
-        _ client: RelayClient,
-        didReceiveTokenIssueFrom fromPeer: Data,
-        tokens: [Data]
-    ) {
-        // F-NEW-204: run the per-token XEd25519 verify loop OFF the
-        // main actor. At ~75 µs per verify a malicious paired peer
-        // shipping a max-size frame (~12 482 tokens) would otherwise
-        // freeze MainActor for ~940 ms, repeatable indefinitely.
-        // Detached priority-userInitiated keeps the verifies snappy
-        // without blocking UI; the verified-stash append jumps back
-        // onto MainActor at the end.
-        Task.detached(priority: .userInitiated) { [weak self] in
-            guard let self else { return }
-            // Block-list gate: a blocked peer's TOKEN_ISSUE batch is
-            // dropped before we even verify it. Mirrors the receive-
-            // side gates at SEND and BUNDLE_RESPONSE.
-            if await self.isIdentityBlocked(fromPeer) {
-                return
-            }
-            // Read the peer's verify_key under MainActor isolation,
-            // do the verifies off-actor, then re-enter MainActor for
-            // the stash update.
-            let verifyKey: Data? = await self.peerVerifyKey(forIdentity: fromPeer)
-            guard let verifyKey else {
-                pzLog(
-                    "[pizzini] dropped TOKEN_ISSUE from \(self.short(fromPeer)): no peerVerifyKey on contact (re-pair to refresh)"
-                )
-                return
-            }
-            var verified: [Data] = []
-            verified.reserveCapacity(tokens.count)
-            for token in tokens {
-                do {
-                    if try Session.verifyDeliveryToken(verifyKey: verifyKey, token: token) {
-                        verified.append(token)
-                    } else {
-                        pzLog(
-                            "[pizzini] dropping batch from \(self.short(fromPeer)): token signature did not verify against bundle-published verify_key"
-                        )
-                        return
-                    }
-                } catch {
-                    pzLog(
-                        "[pizzini] dropping batch from \(self.short(fromPeer)): verify error \(error)"
-                    )
-                    return
-                }
-            }
-            // Hop back to MainActor for the stash mutation.
-            await self.acceptVerifiedTokens(fromPeer: fromPeer, verified: verified)
-        }
-    }
-
-    /// MainActor helper for the off-actor TOKEN_ISSUE verify loop —
-    /// reads the cached peer verify_key without blocking on the
-    /// per-token verify cost.
-    @MainActor
-    private func peerVerifyKey(forIdentity peerIdentity: Data) -> Data? {
-        guard let idx = contactIndex(forIdentity: peerIdentity) else { return nil }
-        return state.contacts[idx].peerVerifyKey
-    }
-
-    /// MainActor helper used by the off-actor verify path to append
-    /// verified tokens. Contains the F-206 cap-and-trim logic that
-    /// previously lived inline in the delegate.
-    @MainActor
-    private func acceptVerifiedTokens(fromPeer: Data, verified: [Data]) {
-        guard let idx = contactIndex(forIdentity: fromPeer) else { return }
-        // F-206: cap stash size, but trim from the BACK (newest first)
-        // rather than the front. Combined with verify above this is
-        // belt-and-suspenders — fabricated tokens never enter — but a
-        // peer that legitimately issues lots of refills shouldn't be
-        // able to push older trusted tokens off the queue either.
-        let cap = 2 * Contact.initialIssuance
-        var stash = state.contacts[idx].deliveryTokensForPeer
-        stash.append(contentsOf: verified)
-        if stash.count > cap {
-            stash.removeLast(stash.count - cap)
-        }
-        state.contacts[idx].deliveryTokensForPeer = stash
-        Storage.replaceDeliveryTokens(
-            contactId: state.contacts[idx].id,
-            tokens: stash,
-        )
-        persistContactSlice(at: idx)
-        pzLog(
-            "[pizzini] received \(verified.count) verified tokens from \(short(fromPeer)); stash now \(stash.count)"
-        )
-    }
 
     @MainActor
     private func handleSealedFrame(_ sealedCiphertext: Data, isAckFrame: Bool, via client: RelayClient) {
@@ -2973,9 +2631,6 @@ extension ChatStore: RelayClientDelegate {
             self.handleChatPayload(payload, sealedSize: sealedCiphertext.count, contactIdx: idx, ackId: received.messageId, via: client)
         case .ack:
             self.handleAckPayload(payload, contactIdx: idx)
-        case .tokenRefillRequest:
-            guard let session = self.session else { return }
-            self.issueTokens(for: received.peer, via: client, session: session)
         case .readReceipt:
             self.handleReadReceiptPayload(payload, contactIdx: idx)
         case .fileChunk:
@@ -3248,16 +2903,17 @@ extension ChatStore: RelayClientDelegate {
                 guard let idx = contactIndex(forIdentity: entry.recipientPeerId) else {
                     continue
                 }
-                guard let token = popDeliveryToken(forContactAt: idx) else {
-                    pzLog("[pizzini] cannot retry \(short(entry.recipientPeerId)): out of tokens")
+                guard let v2 = mintV2DeliveryToken(forContactAt: idx) else {
+                    pzLog("[pizzini] cannot retry \(short(entry.recipientPeerId)): chain missing or exhausted")
                     continue
                 }
+                let wire = HashChainToken.encode(v2)
                 broadcastToRelays {
                     $0.sendSealed(
                         toPeer: entry.recipientPeerId,
                         sealedCiphertext: entry.sealedCiphertext,
                         ttlSeconds: UInt32(entry.ttl),
-                        token: token,
+                        token: wire,
                     )
                 }
                 var e = entry
@@ -3327,10 +2983,11 @@ extension ChatStore: RelayClientDelegate {
         guard let session = self.session,
               let idx = contactIndex(forIdentity: toPeer)
         else { return }
-        guard let token = popDeliveryToken(forContactAt: idx) else {
-            pzLog("[pizzini] cannot emit ACK to \(self.short(toPeer)): out of tokens")
+        guard let v2 = mintV2DeliveryToken(forContactAt: idx) else {
+            pzLog("[pizzini] cannot emit ACK to \(self.short(toPeer)): chain missing or exhausted")
             return
         }
+        let token = HashChainToken.encode(v2)
         var inner = Data([RelayClient.InnerEnvelopeKind.ack.rawValue])
         inner.append(messageId)
         do {
@@ -3397,7 +3054,7 @@ extension ChatStore: RelayClientDelegate {
             // request — a CPU/battery DoS amplified by the existing
             // F-402 ability for a malicious relay to inject requests.
             if let last = self.state.contacts[idx].lastBundleServedAt,
-               Date().timeIntervalSince(last) < Contact.refillCooldown
+               Date().timeIntervalSince(last) < Contact.chainServeCooldown
             {
                 pzLog(
                     "[pizzini] BUNDLE_REQUEST from \(self.short(fromPeer)) rate-limited; last served \(last)"
@@ -3412,11 +3069,12 @@ extension ChatStore: RelayClientDelegate {
                 // shared relay.
                 self.broadcastToRelays { $0.sendBundle(toPeer: fromPeer, bundle: bundle) }
                 self.state.contacts[idx].lastBundleServedAt = Date()
-                // Right after the bundle, mint and ship a fresh stash
-                // of delivery tokens for the requester. They'll need
-                // these for every subsequent SEND/ACK to clear our
-                // relay-side rate-limit gate.
-                self.issueTokens(for: fromPeer, via: client, session: session)
+                // Right after the bundle, mint and ship a fresh v2
+                // hash chain. The peer derives every future delivery
+                // token from this one seed; the chain root is
+                // registered with our connected relays as part of
+                // `serveChain` so v2 SENDs from the peer validate.
+                self.serveChain(forPeer: fromPeer, via: client, session: session)
                 self.persistContactSlice(at: idx)
                 // The peer just proved they have us in their contacts (we
                 // only get here if our own contact-gate let them through).
@@ -3451,28 +3109,23 @@ extension ChatStore: RelayClientDelegate {
                 return
             }
             do {
-                // F-202/F-401: stash the peer's delivery-token verify key
-                // BEFORE consuming the bundle in initiateSession. Used to
-                // authenticate every later TOKEN_ISSUE batch from this
-                // peer end-to-end. Failing to extract is fatal for the
-                // bundle exchange — better to refuse the pair than accept
-                // a malformed bundle whose token batches we can't verify.
+                // F-202/F-401: stash the peer's verify_key. With v2
+                // hash-chain tokens this key isn't used for token
+                // authentication at the relay (the chain root is the
+                // capability), but it's still the libsignal verify
+                // key for sealed-sender certificates — keep it in
+                // step with the bundle.
                 let verifyKey = try Session.extractBundleVerifyKey(bundle)
                 try session.initiateSession(peerIdentity: fromPeer, bundle: bundle)
-                // A bundle carrying a fresh verify_key invalidates every
-                // token in our stash: the relay will reject anything
-                // signed under the previous key once the peer's next
-                // HELLO updates `verify_keys[peer_id]` server-side.
-                // Drop the stash atomically with the overwrite so sends
-                // don't quietly burn dead tokens; the refill-on-low
-                // path will repopulate from the next TOKEN_ISSUE batch.
+                // A bundle from a peer who's rotated their identity
+                // invalidates our outbound chain to them: its root is
+                // registered with the relay under the peer's prior
+                // (peer_id, chain_id) state, and after the peer
+                // re-pairs they'll register a new one. Drop the chain
+                // here so the next send hits `refreshChainAndQueue`.
                 let priorVerifyKey = self.state.contacts[idx].peerVerifyKey
                 if priorVerifyKey != nil, priorVerifyKey != verifyKey {
-                    self.state.contacts[idx].deliveryTokensForPeer = []
-                    Storage.replaceDeliveryTokens(
-                        contactId: self.state.contacts[idx].id,
-                        tokens: [],
-                    )
+                    self.state.contacts[idx].outboundTokenChain = nil
                 }
                 self.state.contacts[idx].peerVerifyKey = verifyKey
                 self.state.contacts[idx].sessionEstablished = true

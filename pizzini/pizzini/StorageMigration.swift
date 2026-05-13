@@ -146,15 +146,6 @@ enum StorageMigration {
             for msg in contact.log {
                 try storage.appendContactMessage(contactId: contact.id, msg)
             }
-            // Same for the FIFO token queue — replayed in original
-            // order so MIN(position) still hands out the oldest
-            // token first.
-            if !contact.deliveryTokensForPeer.isEmpty {
-                try storage.replaceDeliveryTokens(
-                    contactId: contact.id,
-                    tokens: contact.deliveryTokensForPeer,
-                )
-            }
         }
         for group in state.groups {
             try storage.upsertGroup(group)

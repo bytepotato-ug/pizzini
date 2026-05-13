@@ -151,16 +151,6 @@ enum Storage {
                     for m in c.log {
                         try store.updateContactMessage(contactId: c.id, m)
                     }
-                    // Delivery tokens get a full-list rewrite (rare
-                    // path — only fires on the issuance flow). The
-                    // common pop / append path lives in the per-row
-                    // mutators below.
-                    if !c.deliveryTokensForPeer.isEmpty {
-                        try store.replaceDeliveryTokens(
-                            contactId: c.id,
-                            tokens: c.deliveryTokensForPeer,
-                        )
-                    }
                 }
                 for g in state.groups {
                     try store.upsertGroup(g)
@@ -248,46 +238,7 @@ enum Storage {
         catch { pzLog("[pizzini.storage] deleteAllGroupMessages failed: \(error)") }
     }
 
-    // MARK: - Delivery tokens
-
-    static func replaceDeliveryTokens(contactId: UUID, tokens: [Data]) {
-        guard let store = SQLiteStorage.shared else { return }
-        do { try store.replaceDeliveryTokens(contactId: contactId, tokens: tokens) }
-        catch { pzLog("[pizzini.storage] replaceDeliveryTokens failed: \(error)") }
-    }
-
-    static func popDeliveryToken(contactId: UUID) -> Data? {
-        guard let store = SQLiteStorage.shared else { return nil }
-        return (try? store.popDeliveryToken(contactId: contactId)) ?? nil
-    }
-
-    /// Atomic "spend a delivery token AND record the outbox row in
-    /// the same SQLite transaction." Caller passes a builder that
-    /// receives the popped token bytes and returns the full
-    /// `OutboxEntry` to persist. Returns the assembled entry on
-    /// success, `nil` if the contact's queue was empty (the outbox
-    /// row is NOT inserted in that case). See
-    /// `SQLiteStorage.commitDeliveryTokenSpend` for the
-    /// transaction shape.
-    static func commitDeliveryTokenSpend(
-        contactId: UUID,
-        entryBuilder: (Data) -> OutboxEntry
-    ) -> OutboxEntry? {
-        guard let store = SQLiteStorage.shared else { return nil }
-        do { return try store.commitDeliveryTokenSpend(contactId: contactId, entryBuilder: entryBuilder) }
-        catch {
-            pzLog("[pizzini.storage] commitDeliveryTokenSpend failed: \(error)")
-            return nil
-        }
-    }
-
-    static func appendDeliveryTokens(contactId: UUID, tokens: [Data]) {
-        guard let store = SQLiteStorage.shared else { return }
-        do { try store.appendDeliveryTokens(contactId: contactId, tokens: tokens) }
-        catch { pzLog("[pizzini.storage] appendDeliveryTokens failed: \(error)") }
-    }
-
-    // MARK: - Block list (v4)
+    // MARK: - Block list
 
     static func blockIdentity(_ identityPub: Data) {
         guard let store = SQLiteStorage.shared else { return }
