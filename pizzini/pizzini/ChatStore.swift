@@ -216,8 +216,8 @@ final class ChatStore: NSObject {
     /// `TorController.prepareHiddenService(_:)`, not by aggressive
     /// retrying: by the time the first SOCKS5 CONNECT goes out, tor
     /// already has the HS descriptor cached.
-    static let autoReconnectBackoffFloor: TimeInterval = 5
-    static let autoReconnectBackoffCeiling: TimeInterval = 60
+    nonisolated static let autoReconnectBackoffFloor: TimeInterval = 5
+    nonisolated static let autoReconnectBackoffCeiling: TimeInterval = 60
 
     /// Hard cap on consecutive auto-reconnect attempts before we stop
     /// retrying silently and surface the Reconnect button via the
@@ -227,7 +227,7 @@ final class ChatStore: NSObject {
     /// enough that a user who comes back to the app after a real
     /// outage sees an actionable affordance instead of a spinner
     /// that's been spinning since they last looked.
-    static let autoReconnectMaxConsecutiveFailures: Int = 5
+    nonisolated static let autoReconnectMaxConsecutiveFailures: Int = 5
 
     /// Pure decision for the auto-reconnect state machine. Given the
     /// pre-failure streak and current backoff, returns what action
