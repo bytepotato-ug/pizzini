@@ -109,3 +109,13 @@ operator-key*.pem
 # locally for staging.
 scripts/deploy/env
 scripts/deploy/env.rendered
+
+# Local dev artifacts — exported QA-debug logs, Xcode console captures,
+# anything we drop into the workspace root while debugging. Sensitive
+# (peer-id fragments, relay hosts, timestamps of session activity) and
+# fundamentally per-developer; never belongs in the public repo.
+qa.log
+qa.log.*
+*.log
+xcode logs.rtfd/
+*.rtfd/
