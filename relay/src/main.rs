@@ -114,14 +114,12 @@ mod chain_validator_store;
 mod encrypted_file;
 mod pending_store;
 mod push_token_store;
-mod replay_store;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use libsignal_protocol::PublicKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -131,7 +129,6 @@ use tokio::sync::mpsc;
 use crate::apns::{ApnsClient, ApnsConfig};
 use crate::pending_store::{PendingFrame, PendingStore};
 use crate::push_token_store::PushTokenStore;
-use crate::replay_store::ReplayStore;
 
 /// Static self-attestation snapshot computed once at startup. Shared
 /// (`Arc`) with every connection handler so STATUS_REQUEST handling
@@ -321,7 +318,8 @@ const FRAME_TYPE_BUNDLE_REQUEST: u8 = 3;
 const FRAME_TYPE_BUNDLE_RESPONSE: u8 = 4;
 const FRAME_TYPE_REGISTER_PUSH: u8 = 5;
 const FRAME_TYPE_ACK: u8 = 6;
-const FRAME_TYPE_TOKEN_ISSUE: u8 = 7;
+// Slot 7 was FRAME_TYPE_TOKEN_ISSUE in v1. Reserved — do not re-use
+// without coordinating with the iOS RelayClient frame map.
 /// USP #1: binary self-attestation. Client → relay request, empty
 /// payload. Relay replies with a STATUS_RESPONSE (frame 9) carrying
 /// crate version, git commit SHA, "dirty?" bit, and SHA-256 of the
@@ -393,27 +391,16 @@ const PENDING_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// XEd25519 verify key wire size — 1-byte DJB type prefix + 32-byte point.
 const VERIFY_KEY_LEN: usize = 33;
-/// Delivery-token v1 wire layout: nonce(16) + expiry_be_u32(4) + sig(64).
-const TOKEN_NONCE_LEN: usize = 16;
-const TOKEN_SIG_LEN: usize = 64;
-const TOKEN_LEN: usize = TOKEN_NONCE_LEN + 4 + TOKEN_SIG_LEN;
-
-/// Delivery-token v2 wire layout: chainID(16) + index_be_u32(4) + value(32).
-/// The SEND frame's `token` field length distinguishes v1 (84 B) from v2
-/// (52 B) — see `check_delivery_token` for the dispatch.
+/// Delivery-token wire layout: chainID(16) + index_be_u32(4) + value(32).
 ///
-/// v2 swaps the per-message Ed25519 signature for hash-chained tokens:
-/// the recipient mints a chain (root = H^n(seed)), ships the seed to the
+/// Recipient mints a hash chain (root = H^n(seed)), ships the seed to the
 /// sender via the sealed Double Ratchet, registers the root with this
-/// relay, and the sender derives token[i] = H^(n-i)(seed). The relay
-/// validates a presentation against the (recipient, chainID) state in
-/// O(Δi) hashes, with replay protection via a monotonic last-seen index.
-///
-/// This relay parses v2 tokens but does NOT yet validate them — the
-/// validator state (per (recipient, chainID) → root, last_index,
-/// last_value) lands in a follow-up commit alongside the on-disk store
-/// shape. Until then, any v2 SEND fails closed with a clear error so
-/// clients can detect the relay is not yet v2-ready.
+/// relay (FRAME_TYPE_REGISTER_CHAIN), and the sender derives
+/// token[i] = H^(n−i)(seed). The relay validates a presentation against
+/// the (recipient, chain_id) → (root, last_index, last_value) state in
+/// O(Δi) hashes, with replay protection via the monotonic last-seen
+/// index. Sealed-sender preserved: the relay never needs to know the
+/// sender's identity to verify a token.
 const TOKEN_V2_CHAIN_ID_LEN: usize = 16;
 const TOKEN_V2_VALUE_LEN: usize = 32;
 const TOKEN_V2_LEN: usize = TOKEN_V2_CHAIN_ID_LEN + 4 + TOKEN_V2_VALUE_LEN;
@@ -468,16 +455,6 @@ const HASHCASH_BITS: u32 = 22;
 /// theoretically map to the same 32-byte challenge. Bumping this string
 /// invalidates every in-flight precomputed proof — coordinate with iOS.
 const HASHCASH_CHALLENGE_TAG: &[u8] = b"pizzini.hashcash.bundle.v1";
-/// How long a SEND/ACK token's nonce stays in the replay set after we
-/// see it. F-201: must be ≥ token TTL (30d) so we never forget a nonce
-/// while its token is still verifiable; otherwise a captured frame can be
-/// replayed during the (TTL − replay-window) gap. RAM cost is bounded by
-/// the per-peer issuance rate × number of active peers; the 5-minute GC
-/// task drops expired entries, so steady-state size tracks active load
-/// rather than peak.
-const TOKEN_REPLAY_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-/// How often we GC the token replay set.
-const TOKEN_REPLAY_GC_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// Chain validators are aged out when their last successful
 /// presentation predates this window. 90 days = a recipient who
 /// hasn't been sent to in 3 months is presumed unpaired / re-paired
@@ -488,12 +465,6 @@ const CHAIN_VALIDATOR_IDLE_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60
 const CHAIN_VALIDATOR_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Hard ceiling on accepted token expiry (relative to now). Mirrors
 /// crypto-core's DELIVERY_TOKEN_TTL_SECS plus a 5-minute clock-skew
-/// margin. F-205: a malicious recipient who minted tokens with
-/// `expiry = u32::MAX` would otherwise pin the token replayable for the
-/// life of the verify_key — the relay rejects such tokens client-side
-/// rather than relying on the recipient's good behaviour.
-const TOKEN_MAX_FUTURE_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60 + 5 * 60;
-
 type PeerId = Vec<u8>;
 type Outbox = mpsc::UnboundedSender<Vec<u8>>;
 type Routes = Arc<Mutex<HashMap<PeerId, Outbox>>>;
@@ -521,38 +492,24 @@ type PushTokens = Arc<Mutex<PushTokenStore>>;
 /// memory + linkability the same way: an attacker padding peer_ids
 /// gets entries that age out in `VERIFY_KEY_TTL`. N-002.
 type VerifyKeys = Arc<Mutex<HashMap<PeerId, (Vec<u8>, Instant)>>>;
-/// How long a verify_key entry lives without being touched. Must be
-/// ≥ `DELIVERY_TOKEN_TTL_SECS` so a token from the longest possible
-/// holdout sender still finds its issuer's key. The token TTL itself
-/// guarantees that pruned entries never correspond to a still-valid
-/// token.
-const VERIFY_KEY_TTL: Duration = TOKEN_REPLAY_WINDOW;
-/// How often the GC walks the verify_keys table. 1h is well below
-/// `VERIFY_KEY_TTL` (30d) — coarse enough to keep lock contention
-/// negligible, fine enough that "drift past TTL" stays bounded.
+/// How long a verify_key entry lives without being touched. v1
+/// delivery tokens are gone, but verify_keys are still used for the
+/// sealed-sender `SenderCertificate` validation in libsignal and for
+/// matching BUNDLE_REQUEST → BUNDLE_RESPONSE. 30 days matches the
+/// previous baseline.
+const VERIFY_KEY_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// How often the GC walks the verify_keys table.
 const VERIFY_KEY_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
-/// Replay-set entry: (recipient_peer_id, token_nonce). Each token is
-/// one-use against a given recipient; the same nonce against a
-/// different recipient is a logically different token (different
-/// signing key, would fail verification anyway).
-///
-/// F-NEW-203 fix: the replay set is PERSISTENT (encrypted-at-rest)
-/// rather than in-memory. The pending-queue is persistent; without a
-/// matching persistent replay set, every relay restart would re-open
-/// the replay window against any captured SEND whose token hadn't
-/// expired. See `replay_store::ReplayStore` for the storage layer.
-/// Pre-F-NEW-203 the relay used `(PeerId, [u8; TOKEN_NONCE_LEN])`
-/// as a direct HashMap key. The new persistent store uses
-/// `(Vec<u8>, Vec<u8>)` internally to keep its on-disk serde shape
-/// flexible; the type alias is gone with it.
-type Replays = Arc<Mutex<ReplayStore>>;
 type ChainValidators = Arc<Mutex<chain_validator_store::ChainValidatorStore>>;
-/// HELLO replay set: (peer_id, nonce) keys. Separate from the SEND/ACK
-/// `Replays` table because (a) the lifetime is much shorter (matches
-/// the timestamp window, not the token TTL) and (b) the lookup happens
-/// on every HELLO not every SEND. F-203.
+/// HELLO replay set: (peer_id, nonce) keys. Lookup runs on every
+/// HELLO (not every SEND), so the table stays in-memory and cheap.
+/// F-203.
 type HelloReplayKey = (PeerId, [u8; HELLO_NONCE_LEN]);
 type HelloReplays = Arc<Mutex<HashMap<HelloReplayKey, Instant>>>;
+/// HELLO replay-set GC cadence. The HELLO replay window is bounded
+/// by `HELLO_TIMESTAMP_TOLERANCE`, so a 15-minute tick comfortably
+/// covers anything inside the acceptance window.
+const HELLO_REPLAY_GC_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// Persistent offline-message queue, wrapping `pending_store::PendingStore`.
 /// Pre-this refactor the queue was an in-memory `HashMap<PeerId,
@@ -717,25 +674,8 @@ async fn main() -> std::io::Result<()> {
     );
     let pending: Pending = Arc::new(Mutex::new(pending_store_inst));
     let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
-    let replay_store_inst = ReplayStore::load_or_create(&state_dir, TOKEN_REPLAY_WINDOW)
-        .map_err(|e| {
-            eprintln!(
-                "[pizzini-relay] FATAL: could not open replay store at {}: {e}",
-                state_dir.display(),
-            );
-            e
-        })?;
-    println!(
-        "  replay store: {} ({} entries after TTL purge)",
-        state_dir.display(),
-        replay_store_inst.len(),
-    );
-    let replays: Replays = Arc::new(Mutex::new(replay_store_inst));
     let hello_replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
-    // v2 delivery-token chain validators. Lives alongside ReplayStore;
-    // its TTL is independent (CHAIN_VALIDATOR_IDLE_TTL) because a
-    // chain's "useful life" is "until the recipient rotates it,"
-    // typically much longer than the per-token replay window.
+    // v2 hash-chain delivery-token validators.
     let chain_validator_inst =
         chain_validator_store::ChainValidatorStore::load_or_create(
             &state_dir,
@@ -756,7 +696,6 @@ async fn main() -> std::io::Result<()> {
     let chain_validators: ChainValidators = Arc::new(Mutex::new(chain_validator_inst));
 
     spawn_pending_gc(pending.clone());
-    spawn_replay_gc(replays.clone());
     spawn_chain_validator_gc(chain_validators.clone());
     spawn_hello_replay_gc(hello_replays.clone());
     spawn_verify_keys_gc(verify_keys.clone());
@@ -777,7 +716,7 @@ async fn main() -> std::io::Result<()> {
                 let pending_h = pending.clone();
                 let push_tokens_h = push_tokens.clone();
                 let verify_keys_h = verify_keys.clone();
-                let replays_h = replays.clone();
+                let chain_validators_h2 = chain_validators.clone();
                 tokio::spawn(async move {
                     if let Err(e) = run_health_server(
                         health_bind,
@@ -785,7 +724,7 @@ async fn main() -> std::io::Result<()> {
                         pending_h,
                         push_tokens_h,
                         verify_keys_h,
-                        replays_h,
+                        chain_validators_h2,
                     )
                     .await
                     {
@@ -844,7 +783,6 @@ async fn main() -> std::io::Result<()> {
                 let push_tokens = push_tokens.clone();
                 let pending = pending.clone();
                 let verify_keys = verify_keys.clone();
-                let replays = replays.clone();
                 let chain_validators_h = chain_validators.clone();
                 let hello_replays = hello_replays.clone();
                 let apns = apns.clone();
@@ -861,7 +799,6 @@ async fn main() -> std::io::Result<()> {
                         push_tokens,
                         pending,
                         verify_keys,
-                        replays,
                         chain_validators_h,
                         hello_replays,
                         apns,
@@ -892,7 +829,7 @@ async fn run_health_server(
     pending: Pending,
     push_tokens: PushTokens,
     verify_keys: VerifyKeys,
-    replays: Replays,
+    chain_validators: ChainValidators,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = TcpListener::bind(bind).await?;
@@ -902,7 +839,7 @@ async fn run_health_server(
         let pending = pending.clone();
         let push_tokens = push_tokens.clone();
         let verify_keys = verify_keys.clone();
-        let replays = replays.clone();
+        let chain_validators = chain_validators.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             let n = match stream.read(&mut buf).await {
@@ -920,9 +857,9 @@ async fn run_health_server(
                 let pending_total = pending.lock().await.total_frames();
                 let push_total = push_tokens.lock().await.len();
                 let verify_total = verify_keys.lock().await.len();
-                let replay_total = replays.lock().await.len();
+                let chain_total = chain_validators.lock().await.len();
                 format!(
-                    "{{\"status\":\"ok\",\"connections\":{connections},\"pending_frames\":{pending_total},\"push_tokens\":{push_total},\"verify_keys\":{verify_total},\"replay_entries\":{replay_total}}}\n"
+                    "{{\"status\":\"ok\",\"connections\":{connections},\"pending_frames\":{pending_total},\"push_tokens\":{push_total},\"verify_keys\":{verify_total},\"chain_validators\":{chain_total}}}\n"
                 )
             } else {
                 String::from("not found\n")
@@ -973,7 +910,6 @@ async fn handle_connection(
     push_tokens: PushTokens,
     pending: Pending,
     verify_keys: VerifyKeys,
-    replays: Replays,
     chain_validators: ChainValidators,
     hello_replays: HelloReplays,
     apns: Option<Arc<ApnsClient>>,
@@ -1070,8 +1006,6 @@ async fn handle_connection(
         &routes,
         &push_tokens,
         &pending,
-        &verify_keys,
-        &replays,
         &chain_validators,
         apns.clone(),
         &peer_id,
@@ -1116,8 +1050,6 @@ async fn read_loop(
     routes: &Routes,
     push_tokens: &PushTokens,
     pending: &Pending,
-    verify_keys: &VerifyKeys,
-    replays: &Replays,
     chain_validators: &ChainValidators,
     apns: Option<Arc<ApnsClient>>,
     self_id: &[u8],
@@ -1303,7 +1235,7 @@ async fn read_loop(
                     }
                 };
                 if let Err(reason) =
-                    check_delivery_token(&parsed, verify_keys, replays, chain_validators).await
+                    check_delivery_token(&parsed, chain_validators).await
                 {
                     dev_peer_elog!(
                         "rejecting {} → {}: {reason}",
@@ -1379,7 +1311,7 @@ async fn read_loop(
                 }
                 continue;
             }
-            FRAME_TYPE_BUNDLE_RESPONSE | FRAME_TYPE_TOKEN_ISSUE => {
+            FRAME_TYPE_BUNDLE_RESPONSE => {
                 // Bundle response keeps the explicit from_id at the
                 // wire level — first contact pre-dates a session, so
                 // the sealed-sender envelope can't yet be applied.
@@ -1523,110 +1455,35 @@ async fn drain_pending(peer_id: &[u8], pending: &Pending, routes: &Routes) {
 /// logs the reason and refuses to forward / queue.
 async fn check_delivery_token(
     parsed: &ParsedSealed,
-    verify_keys: &VerifyKeys,
-    replays: &Replays,
     chain_validators: &ChainValidators,
 ) -> Result<(), String> {
     // v2 hash-chained token (52 B): validate against the recipient's
-    // chain state. Length is the discriminator between v1 (84 B) and
-    // v2 (52 B) — no version byte on the wire.
-    if parsed.token.len() == TOKEN_V2_LEN {
-        let v2 = parse_v2_token(&parsed.token).map_err(|e| format!("v2 token malformed: {e}"))?;
-        let mut store = chain_validators.lock().await;
-        let outcome = store
-            .validate(&parsed.to_id, &v2.chain_id, v2.index, &v2.value)
-            .map_err(|e| format!("chain-validator persist failed: {e}"))?;
-        return match outcome {
-            chain_validator_store::ValidateOutcome::Accepted => Ok(()),
-            chain_validator_store::ValidateOutcome::UnknownChain => Err(format!(
-                "v2 token references unknown chain for recipient {}",
-                short_hex(&parsed.to_id),
-            )),
-            chain_validator_store::ValidateOutcome::OutOfRange => {
-                Err("v2 token replay or out-of-range index".into())
-            }
-            chain_validator_store::ValidateOutcome::BadChainValue => {
-                Err("v2 token did not chain to recipient's registered root".into())
-            }
-        };
-    }
-    if parsed.token.len() != TOKEN_LEN {
+    // registered chain state. v1 (84 B) is gone — no length-based
+    // dispatch needed.
+    if parsed.token.len() != TOKEN_V2_LEN {
         return Err(format!(
-            "wrong token length: {} (expected {TOKEN_LEN})",
+            "wrong token length: {} (expected {TOKEN_V2_LEN})",
             parsed.token.len()
         ));
     }
-    let nonce: [u8; TOKEN_NONCE_LEN] =
-        parsed.token[..TOKEN_NONCE_LEN].try_into().expect("len checked");
-    let expiry = u32::from_be_bytes(
-        parsed.token[TOKEN_NONCE_LEN..TOKEN_NONCE_LEN + 4]
-            .try_into()
-            .expect("len checked"),
-    );
-    let sig = &parsed.token[TOKEN_NONCE_LEN + 4..];
-
-    let now_secs_u64 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let now_secs = now_secs_u64 as u32;
-    if expiry < now_secs {
-        return Err(format!("token expired (expiry={expiry}, now={now_secs})"));
-    }
-    // F-205: cap accepted future-expiry. A malicious or buggy recipient
-    // could otherwise mint tokens with `expiry = u32::MAX` and pin them
-    // replayable for the life of their verify_key.
-    let future_secs = u64::from(expiry).saturating_sub(now_secs_u64);
-    if future_secs > TOKEN_MAX_FUTURE_EXPIRY_SECS {
-        return Err(format!(
-            "token expiry too far in the future ({future_secs}s; cap {TOKEN_MAX_FUTURE_EXPIRY_SECS}s)"
-        ));
-    }
-
-    // N-002: touch last_used on every successful lookup so an active
-    // recipient's verify_key stays cached even when they're disconnected
-    // (third parties keep sending them mail; each verified frame
-    // refreshes the GC marker).
-    let verify_key_bytes = {
-        let mut table = verify_keys.lock().await;
-        match table.get_mut(&parsed.to_id) {
-            Some(entry) => {
-                entry.1 = Instant::now();
-                Some(entry.0.clone())
-            }
-            None => None,
+    let v2 = parse_v2_token(&parsed.token).map_err(|e| format!("v2 token malformed: {e}"))?;
+    let mut store = chain_validators.lock().await;
+    let outcome = store
+        .validate(&parsed.to_id, &v2.chain_id, v2.index, &v2.value)
+        .map_err(|e| format!("chain-validator persist failed: {e}"))?;
+    match outcome {
+        chain_validator_store::ValidateOutcome::Accepted => Ok(()),
+        chain_validator_store::ValidateOutcome::UnknownChain => Err(format!(
+            "v2 token references unknown chain for recipient {}",
+            short_hex(&parsed.to_id),
+        )),
+        chain_validator_store::ValidateOutcome::OutOfRange => {
+            Err("v2 token replay or out-of-range index".into())
         }
-    };
-    let verify_key_bytes = match verify_key_bytes {
-        Some(b) => b,
-        None => {
-            return Err(format!(
-                "no verify key registered for recipient {}",
-                short_hex(&parsed.to_id)
-            ));
+        chain_validator_store::ValidateOutcome::BadChainValue => {
+            Err("v2 token did not chain to recipient's registered root".into())
         }
-    };
-    let key = PublicKey::deserialize(&verify_key_bytes)
-        .map_err(|e| format!("recipient verify key malformed: {e}"))?;
-    let payload = &parsed.token[..TOKEN_NONCE_LEN + 4];
-    if !key.verify_signature(payload, sig) {
-        return Err("token signature does not match recipient's verify key".into());
     }
-
-    // Replay check after signature verify — failed signatures don't
-    // burn a nonce slot.
-    let mut store = replays.lock().await;
-    if store.contains(&parsed.to_id, &nonce) {
-        return Err("token replay".into());
-    }
-    if let Err(e) = store.insert(parsed.to_id.clone(), nonce.to_vec()) {
-        // A persist failure must NOT be treated as a successful
-        // accept — better to refuse the frame than to accept-without-
-        // persisting and have a future restart re-accept the same
-        // bytes after this nonce was supposedly burned.
-        return Err(format!("replay-store persist failed: {e}").into());
-    }
-    Ok(())
 }
 
 /// F-NEW-208: persistent push-token GC. The previous design only
@@ -1649,23 +1506,8 @@ fn spawn_push_tokens_gc(push_tokens: PushTokens) {
     });
 }
 
-fn spawn_replay_gc(replays: Replays) {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(TOKEN_REPLAY_GC_INTERVAL);
-        loop {
-            tick.tick().await;
-            let mut store = replays.lock().await;
-            match store.gc_expired(TOKEN_REPLAY_WINDOW) {
-                Ok(0) => {}
-                Ok(n) => println!("token-replay GC: pruned {n} → {}", store.len()),
-                Err(e) => eprintln!("[pizzini-relay] replay-store GC persist failed: {e}"),
-            }
-        }
-    });
-}
-
-/// Periodic GC for the chain-validator store. Sparser than the replay
-/// GC because chains are O(contacts), not O(messages).
+/// Periodic GC for the chain-validator store. Chains are
+/// O(contacts), not O(messages), so the GC tick is sparse.
 fn spawn_chain_validator_gc(validators: ChainValidators) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(CHAIN_VALIDATOR_GC_INTERVAL);
@@ -1926,7 +1768,7 @@ async fn verify_hello_possession_proof(
 
 fn spawn_hello_replay_gc(hello_replays: HelloReplays) {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(TOKEN_REPLAY_GC_INTERVAL);
+        let mut tick = tokio::time::interval(HELLO_REPLAY_GC_INTERVAL);
         loop {
             tick.tick().await;
             let cutoff = Instant::now() - HELLO_REPLAY_WINDOW;
@@ -2413,18 +2255,12 @@ mod tests {
         assert!(parse_v2_token(&[]).is_err());
         assert!(parse_v2_token(&vec![0u8; TOKEN_V2_LEN - 1]).is_err());
         assert!(parse_v2_token(&vec![0u8; TOKEN_V2_LEN + 1]).is_err());
-        // v1 length must NOT parse as v2.
-        assert!(parse_v2_token(&vec![0u8; TOKEN_LEN]).is_err());
     }
 
     #[test]
-    fn v2_token_length_distinguishes_from_v1() {
-        // Wire shape contract: the two lengths must differ so the
-        // dispatch in check_delivery_token can pick the right path
-        // without a version byte on the wire.
-        assert_ne!(TOKEN_LEN, TOKEN_V2_LEN);
+    fn v2_token_length_is_52_bytes() {
+        // Wire shape contract used by every iOS and Rust v2 codec.
         assert_eq!(TOKEN_V2_LEN, 52);
-        assert_eq!(TOKEN_LEN, 84);
     }
 
     /// End-to-end: register a chain, hand the relay a valid v2 token,
@@ -2444,10 +2280,6 @@ mod tests {
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let chain_validators: ChainValidators = Arc::new(Mutex::new(
             ChainValidatorStore::load_or_create(&tmp_dir, CHAIN_VALIDATOR_IDLE_TTL).unwrap(),
-        ));
-        let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
-        let replays: Replays = Arc::new(Mutex::new(
-            ReplayStore::load_or_create(&tmp_dir, TOKEN_REPLAY_WINDOW).unwrap(),
         ));
 
         // Build a deterministic chain.
@@ -2492,11 +2324,11 @@ mod tests {
             ttl_seconds: 3600,
             token: token_wire.clone(),
         };
-        check_delivery_token(&parsed, &verify_keys, &replays, &chain_validators)
+        check_delivery_token(&parsed, &chain_validators)
             .await
             .expect("first v2 presentation must validate");
         // Replay of the same index → out-of-range.
-        let err = check_delivery_token(&parsed, &verify_keys, &replays, &chain_validators)
+        let err = check_delivery_token(&parsed, &chain_validators)
             .await
             .expect_err("replay must fail");
         assert!(err.contains("replay") || err.contains("out-of-range"));
@@ -2510,7 +2342,7 @@ mod tests {
             ttl_seconds: 3600,
             token: bad_wire,
         };
-        let err = check_delivery_token(&bad_parsed, &verify_keys, &replays, &chain_validators)
+        let err = check_delivery_token(&bad_parsed, &chain_validators)
             .await
             .expect_err("tampered value must fail");
         assert!(err.contains("chain"));
@@ -2750,76 +2582,6 @@ mod tests {
 
     // ─── N-002 verify_keys lifetime ───────────────────────────────────────
 
-    /// N-002: Bob has been registered (HELLO completed) and is now
-    /// disconnected. A SEND aimed at Bob with a token signed by Bob's
-    /// verify_key MUST still verify — otherwise offline-message
-    /// delivery breaks for any peer whose connection just dropped.
-    /// This was the regression introduced by the original F-204 fix.
-    #[tokio::test]
-    async fn n002_verify_key_survives_disconnect_and_check_succeeds() {
-        // Mint Bob's IdentityKey and derive his recipient verify_key
-        // the same way crypto-core does (HKDF-SHA512 from the
-        // IdentityKeyPair's private bytes is the production path; for
-        // this test we just need ANY valid (verify_key, signature) pair
-        // that goes through the same `PublicKey::verify_signature` path
-        // the relay uses).
-        let (bob_pid, bob_kp) = fresh_identity();
-        let bob_verify_pub = *bob_kp.identity_key().public_key();
-        let bob_verify_key_bytes = bob_verify_pub.serialize().to_vec();
-        // Sign a token (nonce16 || expiry_be_u32) with Bob's private key.
-        let mut rng = rand::rngs::OsRng.unwrap_err();
-        let nonce = [0xCDu8; TOKEN_NONCE_LEN];
-        let expiry = (SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-            + 3600) as u32;
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&nonce);
-        payload.extend_from_slice(&expiry.to_be_bytes());
-        let sig = bob_kp
-            .private_key()
-            .calculate_signature(&payload, &mut rng)
-            .expect("sign");
-        let mut token = Vec::with_capacity(TOKEN_LEN);
-        token.extend_from_slice(&payload);
-        token.extend_from_slice(&sig);
-        assert_eq!(token.len(), TOKEN_LEN);
-
-        // Register Bob via HELLO-equivalent insert into verify_keys.
-        let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
-        verify_keys
-            .lock()
-            .await
-            .insert(bob_pid.clone(), (bob_verify_key_bytes, Instant::now()));
-
-        // Bob "disconnects" — under N-002's fix, no removal happens.
-        // (Pre-fix, the F-204 eager-remove block ran here and dropped
-        // verify_keys[bob].)
-
-        // Alice's SEND to Bob arrives at the relay — check_delivery_token
-        // looks up verify_keys[bob] and verifies the signature.
-        let parsed = ParsedSealed {
-            to_id: bob_pid.clone(),
-            ttl_seconds: 3600,
-            token,
-        };
-        let tmp_dir = std::env::temp_dir().join(format!("pizzini-relay-test-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())); std::fs::create_dir_all(&tmp_dir).expect("tempdir for replay store");
-        let replays: Replays = Arc::new(Mutex::new(
-            ReplayStore::load_or_create(&tmp_dir, TOKEN_REPLAY_WINDOW).expect("replay store"),
-        ));
-        let chain_validators: ChainValidators = Arc::new(Mutex::new(
-            chain_validator_store::ChainValidatorStore::load_or_create(
-                &tmp_dir,
-                CHAIN_VALIDATOR_IDLE_TTL,
-            )
-            .expect("chain validator store"),
-        ));
-        check_delivery_token(&parsed, &verify_keys, &replays, &chain_validators)
-            .await
-            .expect("verify must succeed for recently-disconnected recipient");
-    }
-
     /// N-002: the periodic GC prunes verify_keys entries unused for
     /// `VERIFY_KEY_TTL`. Simulates an old entry by inserting with
     /// last_touched = `now - VERIFY_KEY_TTL - 1s`.
@@ -2855,56 +2617,4 @@ mod tests {
         );
     }
 
-    // ─── F-205 expiry-cap ─────────────────────────────────────────────────
-
-    /// F-205: a token with `expiry = u32::MAX` should be rejected for
-    /// being too far in the future. The cap is
-    /// TOKEN_MAX_FUTURE_EXPIRY_SECS ≈ 30d + 5min from now.
-    #[tokio::test]
-    async fn f205_token_with_max_expiry_rejected_as_too_far_future() {
-        // Build a valid recipient verify_key by deriving from a fresh
-        // libsignal IdentityKey, mirroring crypto-core's pattern.
-        let (recipient_pid, _kp) = fresh_identity();
-        let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
-        // Use a placeholder verify_key (signature won't match anyway,
-        // but we want to reach the expiry-cap branch first). Insert
-        // *something* so the verify_keys lookup succeeds.
-        verify_keys
-            .lock()
-            .await
-            .insert(
-                recipient_pid.clone(),
-                (vec![0u8; VERIFY_KEY_LEN], Instant::now()),
-            );
-        let tmp_dir = std::env::temp_dir().join(format!("pizzini-relay-test-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())); std::fs::create_dir_all(&tmp_dir).expect("tempdir for replay store");
-        let replays: Replays = Arc::new(Mutex::new(
-            ReplayStore::load_or_create(&tmp_dir, TOKEN_REPLAY_WINDOW).expect("replay store"),
-        ));
-        let chain_validators: ChainValidators = Arc::new(Mutex::new(
-            chain_validator_store::ChainValidatorStore::load_or_create(
-                &tmp_dir,
-                CHAIN_VALIDATOR_IDLE_TTL,
-            )
-            .expect("chain validator store"),
-        ));
-        let mut token = vec![0u8; TOKEN_LEN];
-        // Nonce: arbitrary.
-        token[..TOKEN_NONCE_LEN].copy_from_slice(&[0xABu8; TOKEN_NONCE_LEN]);
-        // Expiry = u32::MAX (year 2106).
-        token[TOKEN_NONCE_LEN..TOKEN_NONCE_LEN + 4]
-            .copy_from_slice(&u32::MAX.to_be_bytes());
-        // Sig: bogus.
-        let parsed = ParsedSealed {
-            to_id: recipient_pid.clone(),
-            ttl_seconds: 3600,
-            token,
-        };
-        let err = check_delivery_token(&parsed, &verify_keys, &replays, &chain_validators)
-            .await
-            .unwrap_err();
-        assert!(
-            err.contains("future"),
-            "expected expiry-cap error, got: {err}"
-        );
-    }
 }
