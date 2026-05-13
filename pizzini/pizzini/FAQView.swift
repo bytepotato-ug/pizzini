@@ -165,12 +165,12 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             """
         case .relayVisibility:
             return """
-            The relay is what shuttles ciphertext from your phone to \
-            your contact’s phone. To do its job it sees:
+            The relay shuttles ciphertext from your phone to your \
+            contact’s phone. To do its job it sees:
 
             • the recipient’s peer-id (so it knows where to forward)
             • the sealed-envelope bytes (encrypted; it can’t decrypt)
-            • the IP address of any device that connects to it
+            • the IP of any device that connects (Tor masks yours)
             • frame sizes and timing
 
             It does NOT see:
@@ -178,16 +178,31 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             • the sender’s peer-id (sealed sender hides it)
             • message text or attachment content
             • your contacts list
-            • anything across restarts — the relay is stateless, \
-              has no user accounts, and keeps everything in RAM only
+            • per-user accounts of any kind — the relay has no \
+              user records
 
-            Offline messages sit in an in-memory queue (capped at 100 \
-            frames per peer, with a sender-chosen TTL up to 7 days). A \
-            relay restart wipes the queue.
+            Where state lives. Most of the relay’s state is in memory \
+            only and is wiped on restart: live route table, verify-key \
+            cache, hashcash buckets, token replay set. Two pieces \
+            persist across restarts under ChaCha20-Poly1305 with 0600 \
+            permissions: the offline-message queue (your contact’s \
+            sealed ciphertexts waiting for them to come online — \
+            per-peer cap, TTL up to 7 days) and the APNs push-token \
+            map (30 days). Without that persistence, a relay reboot \
+            would silently drop messages and break push for paired \
+            devices.
 
-            Today’s default relay is a dev build over plain TCP on \
-            your LAN. Production deployment over Tor onion services is \
-            still on the roadmap (see “What Pizzini doesn’t do yet”).
+            What that encryption protects against. Operator mistakes \
+            — a stray `cp -r`, a forgotten tarball, a careless rsync. \
+            The key file lives next to the data, so it’s not a \
+            defense against someone who physically seizes the machine. \
+            Content protection is libsignal end-to-end, which the \
+            relay can’t read regardless.
+
+            Today’s fleet runs three independent Tor onion services \
+            in Germany, Norway, and the USA. Your phone dials all \
+            three in parallel; the first to deliver wins, the others \
+            drop the duplicate.
             """
         case .runYourOwnRelay:
             return """
@@ -697,21 +712,30 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             """
         case .notYetShipped:
             return """
-            Pizzini is in active development. A few things are not \
-            yet ready and the README tracks them as open:
+            Pizzini is in pre-audit private beta. The protocol \
+            surface, storage layer, and relay fleet are \
+            feature-complete; a few items remain explicitly open:
 
-            • Production Tor onion service for the relay (the current \
-              relay binds to plain TCP on your LAN — fine for testing, \
-              not yet what you’d use on the real internet).
-            • App Attest + ATS-strict transport policy.
-            • Reproducible build script.
-            • First independent security audit.
-            • Multi-relay client fanout (sending the same message to \
-              multiple jurisdictions in parallel for resilience).
+            • App Attest + ATS-strict. App Attest binds a device to \
+              its app instance so a forged client can’t talk to the \
+              relay; ATS-strict refuses any non-TLS-1.3 outbound. \
+              Both are roadmap.
+            • First paid third-party security audit. The protocol has \
+              had an internal 32-finding remediation pass; an \
+              independent firm hasn’t reviewed it yet.
+            • Multi-maintainer transparency-log signing. Today one \
+              operator signs every relay release; co-signing by \
+              multiple maintainers is the right shape but not built.
+            • Post-quantum identity signature. Identity keys today \
+              are XEd25519 (libsignal-native). A post-quantum \
+              signature scheme for the long-lived identity layer \
+              (ML-DSA-65 or SLH-DSA-SHA2-128s) is roadmap. The \
+              handshake and ratchet are already post-quantum via \
+              PQXDH and Triple Ratchet.
 
             If any of these matter to your threat model, hold off — \
-            the project README and the GitHub status section are the \
-            authoritative source of progress.
+            the project README on GitHub is the authoritative source \
+            of progress.
             """
         }
     }
