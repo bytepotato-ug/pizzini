@@ -435,17 +435,33 @@ struct ContactsListView: View {
             Button {
                 store.forceReconnectRelays()
             } label: {
-                ZStack {
-                    Circle()
-                        .fill(Color.red)
-                        .frame(width: 22, height: 22)
-                    Image(systemName: "exclamationmark")
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(.white)
+                HStack(spacing: 6) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.red)
+                            .frame(width: 22, height: 22)
+                        Image(systemName: "exclamationmark")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(.white)
+                    }
+                    // After 5 failed auto-reconnects in a row we stop
+                    // silently retrying and let the user drive the
+                    // next attempt. Surface a plain-language label
+                    // next to the badge so the affordance reads as
+                    // "tap me" rather than "background status icon".
+                    if store.manualReconnectRequired {
+                        Text("Reconnect")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.red)
+                    }
                 }
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Pizzini is not connected. Tap to retry.")
+            .accessibilityLabel(
+                store.manualReconnectRequired
+                    ? "Pizzini is not connected. Tap to reconnect."
+                    : "Pizzini is not connected. Retrying."
+            )
         }
     }
 

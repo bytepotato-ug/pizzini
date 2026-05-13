@@ -216,8 +216,62 @@ final class ChatStore: NSObject {
     /// `TorController.prepareHiddenService(_:)`, not by aggressive
     /// retrying: by the time the first SOCKS5 CONNECT goes out, tor
     /// already has the HS descriptor cached.
-    private static let autoReconnectBackoffFloor: TimeInterval = 5
-    private static let autoReconnectBackoffCeiling: TimeInterval = 60
+    static let autoReconnectBackoffFloor: TimeInterval = 5
+    static let autoReconnectBackoffCeiling: TimeInterval = 60
+
+    /// Hard cap on consecutive auto-reconnect attempts before we stop
+    /// retrying silently and surface the Reconnect button via the
+    /// `manualReconnectRequired` flag. Five attempts at 5-10-20-40-60 s
+    /// spread is about 2 minutes of background spinning, which is
+    /// enough rope for any transient outage to recover but short
+    /// enough that a user who comes back to the app after a real
+    /// outage sees an actionable affordance instead of a spinner
+    /// that's been spinning since they last looked.
+    static let autoReconnectMaxConsecutiveFailures: Int = 5
+
+    /// Pure decision for the auto-reconnect state machine. Given the
+    /// pre-failure streak and current backoff, returns what action
+    /// the host should take: schedule another retry (with the
+    /// `delaySeconds` to wait and the `nextBackoff` to remember for
+    /// the FOLLOWING failure), or stop silently retrying and require
+    /// a user tap. Public so `AutoReconnectDecisionTests` in the iOS
+    /// app test target pins the contract — every backoff doubles,
+    /// every doubling is capped at the ceiling, and the streak cap
+    /// switches modes exactly once.
+    public enum AutoReconnectAction: Equatable, Sendable {
+        case scheduleRetry(delaySeconds: TimeInterval, nextBackoff: TimeInterval)
+        case requireManual
+    }
+    public struct AutoReconnectDecision: Equatable, Sendable {
+        public let action: AutoReconnectAction
+        public let newStreak: Int
+    }
+    public nonisolated static func computeAutoReconnectDecision(
+        previousStreak: Int,
+        currentBackoff: TimeInterval,
+    ) -> AutoReconnectDecision {
+        let newStreak = previousStreak + 1
+        if newStreak >= autoReconnectMaxConsecutiveFailures {
+            return AutoReconnectDecision(action: .requireManual, newStreak: newStreak)
+        }
+        let nextBackoff = min(currentBackoff * 2, autoReconnectBackoffCeiling)
+        return AutoReconnectDecision(
+            action: .scheduleRetry(delaySeconds: currentBackoff, nextBackoff: nextBackoff),
+            newStreak: newStreak,
+        )
+    }
+    /// Consecutive auto-reconnect failures since the last successful
+    /// HELLO. Reset to 0 on `.connected` (which only fires after the
+    /// HELLO is ack'd — i.e. a relay actually accepted us), NOT on
+    /// every intermediate state transition. A flaky relay that
+    /// bounces us back to `.failed` shouldn't drain the budget.
+    private var autoReconnectFailureStreak: Int = 0
+    /// True once `autoReconnectFailureStreak` has hit the cap and we
+    /// stopped scheduling new auto-reconnect tasks. The UI surfaces
+    /// a tappable "Reconnect" button (forceReconnectRelays clears
+    /// the flag + restarts the auto-loop). Reset to false on the
+    /// next `.connected` so the next outage starts a fresh budget.
+    var manualReconnectRequired: Bool = false
     /// Phase 2 attachment reassembly state. Lives in-process: a force-
     /// quit while a partial inbound is in flight loses the in-RAM
     /// indices but the per-chunk files stay on disk under
@@ -690,32 +744,50 @@ final class ChatStore: NSObject {
     ) {
         switch next {
         case .connected:
+            // A `.connected` aggregate means at least one relay
+            // ack'd our HELLO. This is the only place where the
+            // backoff + streak should reset — a flaky relay
+            // bouncing us through `.failed → .connecting → .failed`
+            // without ever reaching `.connected` should keep
+            // draining the streak so the user eventually sees the
+            // Reconnect button.
             autoReconnectTask?.cancel()
             autoReconnectTask = nil
             autoReconnectBackoff = Self.autoReconnectBackoffFloor
+            autoReconnectFailureStreak = 0
+            manualReconnectRequired = false
         case .failed:
             // Already failed previously? Don't double-arm — there's
             // already a task in flight. (The existing task will
             // re-fire connectRelay on its own deadline.)
             if case .failed = prev { return }
-            let delay = autoReconnectBackoff
-            pzLog("[pizzini] aggregate state .failed; auto-reconnecting in \(Int(delay)) s")
-            autoReconnectBackoff = min(
-                autoReconnectBackoff * 2,
-                Self.autoReconnectBackoffCeiling,
+            let decision = Self.computeAutoReconnectDecision(
+                previousStreak: autoReconnectFailureStreak,
+                currentBackoff: autoReconnectBackoff,
             )
-            autoReconnectTask?.cancel()
-            autoReconnectTask = Task { @MainActor [weak self] in
-                let nanos = UInt64(delay * 1_000_000_000)
-                try? await Task.sleep(nanoseconds: nanos)
-                guard let self else { return }
-                if Task.isCancelled { return }
-                // Re-check state — the user might have manually
-                // reconnected, or the prior attempt might have
-                // self-recovered between schedule and fire.
-                if case .failed = self.relayState {
-                    pzLog("[pizzini] auto-reconnect firing")
-                    self.connectRelay()
+            autoReconnectFailureStreak = decision.newStreak
+            switch decision.action {
+            case .requireManual:
+                pzLog("[pizzini] aggregate state .failed; auto-reconnect cap reached (\(self.autoReconnectFailureStreak)/\(Self.autoReconnectMaxConsecutiveFailures)) — surfacing Reconnect button")
+                manualReconnectRequired = true
+                autoReconnectTask?.cancel()
+                autoReconnectTask = nil
+            case let .scheduleRetry(delay, nextBackoff):
+                pzLog("[pizzini] aggregate state .failed; auto-reconnecting in \(Int(delay)) s (attempt \(self.autoReconnectFailureStreak)/\(Self.autoReconnectMaxConsecutiveFailures))")
+                autoReconnectBackoff = nextBackoff
+                autoReconnectTask?.cancel()
+                autoReconnectTask = Task { @MainActor [weak self] in
+                    let nanos = UInt64(delay * 1_000_000_000)
+                    try? await Task.sleep(nanoseconds: nanos)
+                    guard let self else { return }
+                    if Task.isCancelled { return }
+                    // Re-check state — the user might have manually
+                    // reconnected, or the prior attempt might have
+                    // self-recovered between schedule and fire.
+                    if case .failed = self.relayState {
+                        pzLog("[pizzini] auto-reconnect firing")
+                        self.connectRelay()
+                    }
                 }
             }
         case .idle, .connecting, .connectingToTor:
@@ -749,10 +821,14 @@ final class ChatStore: NSObject {
         switch relayState {
         case .failed:
             pzLog("[pizzini] manual reconnect requested")
-            // Reset auto-reconnect backoff: the user's explicit
-            // intervention means the NEXT failure should retry
-            // quickly, not wait for the accumulated 60 s cap.
+            // Reset auto-reconnect backoff AND the consecutive-
+            // failure streak: the user's explicit intervention is a
+            // fresh slate. Without resetting the streak, hitting
+            // Reconnect when `manualReconnectRequired == true`
+            // would just spin once and re-surface the button.
             autoReconnectBackoff = Self.autoReconnectBackoffFloor
+            autoReconnectFailureStreak = 0
+            manualReconnectRequired = false
             connectRelay()
         case .connected, .connecting, .connectingToTor, .idle:
             pzLog("[pizzini] reconnect requested but state is \(relayState); ignoring")
