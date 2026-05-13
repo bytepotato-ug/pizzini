@@ -389,6 +389,99 @@ public final class TorController: ObservableObject {
         }
     }
 
+    /// Probe tor for hung-libevent / stale-circuit state and force a
+    /// guard rotation if it looks degraded. Call from the foreground
+    /// path BEFORE the host redials its RelayClients.
+    ///
+    /// **Why this exists.** When iOS suspends the app for more than a
+    /// few minutes, the embedded tor's libevent runloop is still
+    /// alive but its epoll/kevent handles return stale errors against
+    /// connections the OS evicted while we slept. The control socket
+    /// usually survives (it's loopback), so the obvious "is tor up"
+    /// signal — `controller.isConnected` — lies. We probe with
+    /// `GETINFO status/bootstrap-phase`: a healthy tor replies in
+    /// well under 100 ms with a `PROGRESS=100` line, a hung one
+    /// either takes seconds or reports a non-100 state. Either case
+    /// triggers `SIGNAL RELOAD` (refreshes guard set + reloads
+    /// config — does NOT kill tor) before the host's
+    /// `connectRelay()` opens a fresh SOCKS5 socket.
+    ///
+    /// 2 s deadline matches the user-perceptible "did the app
+    /// freeze on resume" threshold — anything longer and we'd
+    /// rather spend the budget on RELOAD + reconnect.
+    public func probeAndRecover() async {
+        guard let controller = torController, controller.isConnected else {
+            torLog.debug("probe: skipped — no controller")
+            return
+        }
+        let probeStart = Date()
+        let deadline: TimeInterval = 2
+        // Race GETINFO completion against the deadline. `single`
+        // guarantees the continuation resumes exactly once; the
+        // controller callback fires on tor's control queue (off
+        // MainActor) and Task.sleep below fires on a background
+        // task.
+        let result: Bool? = await withCheckedContinuation { (cont: CheckedContinuation<Bool?, Never>) in
+            let single = SingleFire()
+            controller.getInfoForKeys(["status/bootstrap-phase"]) { values in
+                guard single.claim() else { return }
+                let raw = values.first ?? ""
+                // A healthy tor reports e.g.
+                //   `NOTICE BOOTSTRAP PROGRESS=100 TAG=done SUMMARY="Done"`
+                // A daemon that's still warming up or in a degraded
+                // state reports `PROGRESS=<n>` where n < 100.
+                let ok = raw.contains("PROGRESS=100")
+                cont.resume(returning: ok)
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000))
+                guard single.claim() else { return }
+                cont.resume(returning: nil)
+            }
+        }
+        let elapsed = Date().timeIntervalSince(probeStart)
+        let elapsedFmt = String(format: "%.2fs", elapsed)
+        switch result {
+        case .some(true):
+            torLog.debug("probe: bootstrap-phase OK after \(elapsedFmt)")
+        case .some(false):
+            torLog.notice("probe: bootstrap-phase reports degraded after \(elapsedFmt) — issuing SIGNAL RELOAD")
+            sendReloadSignal()
+        case .none:
+            torLog.notice("probe: GETINFO timed out after \(elapsedFmt) — issuing SIGNAL RELOAD")
+            sendReloadSignal()
+        }
+    }
+
+    /// Single-fire atomic claim, used by `probeBootstrapPhase` to keep
+    /// the GETINFO completion + timeout task from both resuming the
+    /// same continuation. The first `claim()` returns true; everyone
+    /// else returns false.
+    final class SingleFire: @unchecked Sendable {
+        private let lock = OSAllocatedUnfairLock<Bool>(initialState: false)
+        func claim() -> Bool {
+            lock.withLock { fired in
+                if fired { return false }
+                fired = true
+                return true
+            }
+        }
+    }
+
+    /// SIGNAL RELOAD — tells tor to re-read torrc and refresh guard
+    /// selection logic. Heavier than NEWNYM, lighter than SHUTDOWN.
+    /// Safe to call mid-session; tor will keep serving streams while
+    /// it reloads.
+    private func sendReloadSignal() {
+        guard let controller = torController, controller.isConnected else { return }
+        controller.sendCommand("SIGNAL", arguments: ["RELOAD"], data: nil) { @Sendable codes, _, stop in
+            let ok = codes.first?.intValue == 250
+            torLog.debug("probe: SIGNAL RELOAD \(ok ? "OK" : "rejected")")
+            stop.pointee = true
+            return true
+        }
+    }
+
     /// Tears down the running tor daemon. Used by the app-background
     /// flow after the relay drain window. Idempotent.
     public func stop() {

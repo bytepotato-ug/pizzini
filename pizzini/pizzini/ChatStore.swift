@@ -895,8 +895,20 @@ final class ChatStore: NSObject {
         if !relays.isEmpty {
             teardownRelay()
         }
+        // Probe the embedded tor for hung-libevent / stale-circuit
+        // state BEFORE redialing. If iOS suspended us for more than
+        // a few minutes, tor's runloop is alive but its socket
+        // handles return stale errors; probeAndRecover surfaces
+        // that by `GETINFO status/bootstrap-phase` with a 2 s
+        // deadline and forces SIGNAL RELOAD if the daemon is slow
+        // or degraded. Async-fire-and-redial: the connectRelay
+        // call inside the Task fires AFTER probeAndRecover settles,
+        // so the redial picks up freshly-rotated guards.
         pzLog("[pizzini] relay reconnect on foreground")
-        connectRelay()
+        Task { @MainActor [weak self] in
+            await TorController.shared.probeAndRecover()
+            self?.connectRelay()
+        }
     }
 
     // MARK: - Contacts
