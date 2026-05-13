@@ -509,6 +509,24 @@ type HelloReplays = Arc<Mutex<HashMap<HelloReplayKey, Instant>>>;
 /// covers anything inside the acceptance window.
 const HELLO_REPLAY_GC_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
+/// Per-(recipient, hour) cap on accepted `BUNDLE_REQUEST` frames.
+/// Hashcash + the (recipient, hour) hashcash bucket already gate
+/// the *cost* of forging one valid proof; this cap bounds how many
+/// *valid* proofs a Sybil swarm can use to harass one recipient in
+/// one hour. A legitimate "first contact" against the same peer is
+/// rare — 8/hour is generous enough that no real user hits it and
+/// tight enough that a swarm cannot drown a target's bundle channel.
+const BUNDLE_REQ_PER_RECIPIENT_PER_HOUR: u32 = 8;
+/// Rate-limit table for accepted `BUNDLE_REQUEST` frames. Keyed by
+/// `(recipient_peer_id, hour_bucket)`; value is the running count
+/// for that bucket. Entries age out via `spawn_bundle_req_rate_gc`
+/// — anything older than two buckets is dead weight.
+type BundleReqRate = Arc<Mutex<HashMap<(PeerId, u64), u32>>>;
+/// GC cadence for the bundle-request rate-limit map. Buckets are
+/// hour-wide, so a 30-minute tick guarantees a bucket is evicted
+/// within at most 90 minutes of its end.
+const BUNDLE_REQ_RATE_GC_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
 /// Persistent offline-message queue, wrapping `pending_store::PendingStore`.
 /// Pre-this refactor the queue was an in-memory `HashMap<PeerId,
 /// VecDeque<PendingFrame>>` wiped on every restart — meaning a relay
@@ -673,6 +691,7 @@ async fn main() -> std::io::Result<()> {
     let pending: Pending = Arc::new(Mutex::new(pending_store_inst));
     let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
     let hello_replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
+    let bundle_req_rate: BundleReqRate = Arc::new(Mutex::new(HashMap::new()));
     // v2 hash-chain delivery-token validators.
     let chain_validator_inst =
         chain_validator_store::ChainValidatorStore::load_or_create(
@@ -698,6 +717,7 @@ async fn main() -> std::io::Result<()> {
     spawn_hello_replay_gc(hello_replays.clone());
     spawn_verify_keys_gc(verify_keys.clone());
     spawn_push_tokens_gc(push_tokens.clone());
+    spawn_bundle_req_rate_gc(bundle_req_rate.clone());
 
     // Health endpoint — separate listener on `PIZZINI_RELAY_HEALTH_BIND`
     // (default `127.0.0.1:7778`). Replies with a one-line JSON snapshot
@@ -783,6 +803,7 @@ async fn main() -> std::io::Result<()> {
                 let verify_keys = verify_keys.clone();
                 let chain_validators_h = chain_validators.clone();
                 let hello_replays = hello_replays.clone();
+                let bundle_req_rate_h = bundle_req_rate.clone();
                 let apns = apns.clone();
                 let status_snapshot = status_snapshot.clone();
                 tokio::spawn(async move {
@@ -799,6 +820,7 @@ async fn main() -> std::io::Result<()> {
                         verify_keys,
                         chain_validators_h,
                         hello_replays,
+                        bundle_req_rate_h,
                         apns,
                         status_snapshot,
                         peer_addr,
@@ -910,6 +932,7 @@ async fn handle_connection(
     verify_keys: VerifyKeys,
     chain_validators: ChainValidators,
     hello_replays: HelloReplays,
+    bundle_req_rate: BundleReqRate,
     apns: Option<Arc<ApnsClient>>,
     status_snapshot: Arc<RelayStatus>,
     peer_addr: SocketAddr,
@@ -1005,6 +1028,7 @@ async fn handle_connection(
         &push_tokens,
         &pending,
         &chain_validators,
+        &bundle_req_rate,
         apns.clone(),
         &peer_id,
         &our_tx,
@@ -1049,6 +1073,7 @@ async fn read_loop(
     push_tokens: &PushTokens,
     pending: &Pending,
     chain_validators: &ChainValidators,
+    bundle_req_rate: &BundleReqRate,
     apns: Option<Arc<ApnsClient>>,
     self_id: &[u8],
     our_tx: &mpsc::UnboundedSender<Vec<u8>>,
@@ -1288,6 +1313,30 @@ async fn read_loop(
                         "rejecting bundle request {} → {}: invalid hashcash (need {HASHCASH_BITS} zero bits)",
                         short_hex(&parsed.from_id),
                         short_hex(&parsed.to_id),
+                    );
+                    continue;
+                }
+                // Per-(recipient, hour) cap on accepted bundle requests.
+                // Hashcash bounds CPU cost per proof; this bounds how
+                // many valid proofs a Sybil swarm can land on one
+                // target in one hour. Increment-and-check is atomic
+                // under the Mutex; the cap is checked AFTER the
+                // increment so the counter records the attempt either
+                // way (a flood that fails the cap still shows up in GC
+                // logs / operator monitoring).
+                let bucket = current_hour_bucket();
+                let over_cap = {
+                    let mut map = bundle_req_rate.lock().await;
+                    let entry = map.entry((parsed.to_id.clone(), bucket)).or_insert(0);
+                    *entry = entry.saturating_add(1);
+                    *entry > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR
+                };
+                if over_cap {
+                    dev_peer_elog!(
+                        "rejecting bundle request {} → {}: per-recipient/hour cap ({}) exceeded",
+                        short_hex(&parsed.from_id),
+                        short_hex(&parsed.to_id),
+                        BUNDLE_REQ_PER_RECIPIENT_PER_HOUR,
                     );
                     continue;
                 }
@@ -1559,13 +1608,21 @@ fn build_hashcash_challenge(recipient_peer_id: &[u8], hour: u64) -> [u8; 32] {
     *chal.finalize().as_bytes()
 }
 
+/// Current wall-clock hour bucket — the same coordinate used by the
+/// hashcash challenge and the per-recipient bundle-request rate
+/// limiter. Returns 0 if the clock has gone past pre-epoch, which
+/// only happens in pathological test environments.
+fn current_hour_bucket() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() / 3600)
+        .unwrap_or(0)
+}
+
 /// Verify hashcash on a BUNDLE_REQUEST. Accepts the current and
 /// previous hour to absorb clock skew across the relay/sender pair.
 fn verify_hashcash(recipient_peer_id: &[u8], nonce: u64) -> bool {
-    let now_hour = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() / 3600)
-        .unwrap_or(0);
+    let now_hour = current_hour_bucket();
     let try_bucket = |hour: u64| -> bool {
         let challenge = build_hashcash_challenge(recipient_peer_id, hour);
         let mut hasher = blake3::Hasher::new();
@@ -1762,6 +1819,33 @@ async fn verify_hello_possession_proof(
     }
     set.insert(key, Instant::now());
     Ok(())
+}
+
+fn spawn_bundle_req_rate_gc(rate: BundleReqRate) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(BUNDLE_REQ_RATE_GC_INTERVAL);
+        loop {
+            tick.tick().await;
+            // Drop any bucket older than (now − 1) — entries from
+            // hour H are still consulted during hour H+1 only via
+            // the hashcash skew window, not the rate-limit table
+            // (which is per-bucket — the next hour starts a fresh
+            // counter). Two hours of slack keeps the table tiny
+            // and is comfortably above any clock-skew tolerance.
+            let now = current_hour_bucket();
+            let cutoff = now.saturating_sub(1);
+            let mut map = rate.lock().await;
+            let before = map.len();
+            map.retain(|(_, bucket), _| *bucket >= cutoff);
+            let after = map.len();
+            if before != after {
+                println!(
+                    "bundle-req-rate GC: pruned {} → {after}",
+                    before - after,
+                );
+            }
+        }
+    });
 }
 
 fn spawn_hello_replay_gc(hello_replays: HelloReplays) {
@@ -2613,4 +2697,62 @@ mod tests {
         );
     }
 
+    /// Audit H2b: per-(recipient, hour) BUNDLE_REQUEST cap. The
+    /// rate-limit table is just a `HashMap<(PeerId, u64), u32>`; this
+    /// pins the increment-and-check arithmetic so a future refactor
+    /// that switches to a different storage shape preserves the
+    /// semantics. Verifies that the first
+    /// `BUNDLE_REQ_PER_RECIPIENT_PER_HOUR` increments are inside the
+    /// cap and the next one trips it.
+    #[tokio::test]
+    async fn bundle_req_rate_cap_trips_at_cap_plus_one() {
+        let rate: BundleReqRate = Arc::new(Mutex::new(HashMap::new()));
+        let recipient: PeerId = vec![0x77u8; 33];
+        let bucket: u64 = 1_000_000;
+        // First `BUNDLE_REQ_PER_RECIPIENT_PER_HOUR` increments must
+        // each leave the counter at-or-below the cap (i.e., not over).
+        for i in 1..=BUNDLE_REQ_PER_RECIPIENT_PER_HOUR {
+            let over_cap = {
+                let mut map = rate.lock().await;
+                let entry = map.entry((recipient.clone(), bucket)).or_insert(0);
+                *entry = entry.saturating_add(1);
+                *entry > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR
+            };
+            assert!(
+                !over_cap,
+                "increment #{i} must stay inside the cap of {}",
+                BUNDLE_REQ_PER_RECIPIENT_PER_HOUR,
+            );
+        }
+        // Increment #(cap + 1) must trip the limit.
+        let over_cap = {
+            let mut map = rate.lock().await;
+            let entry = map.entry((recipient.clone(), bucket)).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR
+        };
+        assert!(over_cap, "increment #(cap + 1) must exceed the cap");
+        // A different recipient in the same bucket has its own
+        // counter and starts fresh.
+        let other: PeerId = vec![0x88u8; 33];
+        let other_over_cap = {
+            let mut map = rate.lock().await;
+            let entry = map.entry((other.clone(), bucket)).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR
+        };
+        assert!(!other_over_cap, "fresh recipient must not be capped");
+        // The same recipient in a different bucket also starts fresh.
+        let other_bucket: u64 = bucket + 1;
+        let next_hour_over_cap = {
+            let mut map = rate.lock().await;
+            let entry = map.entry((recipient.clone(), other_bucket)).or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR
+        };
+        assert!(
+            !next_hour_over_cap,
+            "fresh hour bucket must restart the counter for the same recipient",
+        );
+    }
 }
