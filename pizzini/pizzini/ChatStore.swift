@@ -1935,7 +1935,14 @@ final class ChatStore: NSObject {
     /// this order means the registration is queued before the
     /// recipient's first v2 SEND can possibly land back.
     @MainActor
-    private func sendChainSeedDelivery(toPeer peer: Data, via client: RelayClient, session: Session) {
+    /// Returns true iff the seed was successfully encrypted and shipped.
+    /// Caller uses the boolean to drive `lastChainServedAt` so a
+    /// failed serve does not engage the chain-serve cooldown — without
+    /// that, the very first attempt (typically before a libsignal
+    /// session to the peer exists) would burn the cooldown window and
+    /// every later retry would silently rate-limit.
+    @discardableResult
+    private func sendChainSeedDelivery(toPeer peer: Data, via client: RelayClient, session: Session) -> Bool {
         let chain = HashChainToken.mintChain()
         // 1. Register the chain root with every connected relay so v2
         //    SENDs from this peer can validate.
@@ -1966,10 +1973,17 @@ final class ChatStore: NSObject {
                     token: Data(),
                 )
             }
+            _ = client
+            return true
         } catch {
-            pzLog("[pizzini] chainSeedDelivery encrypt failed: \(error)")
+            // Almost always "no session yet" — happens when peer asked
+            // for our bundle before we'd processed theirs. Don't burn
+            // the cooldown; the retry in `maybeServePendingChain` will
+            // fire as soon as session establishes.
+            pzLog("[pizzini] chainSeedDelivery encrypt failed: \(error) — will retry when session lands")
+            _ = client
+            return false
         }
-        _ = client
     }
 
     /// Mint a fresh outbound chain for `peer` and ship the seed over
@@ -1984,9 +1998,44 @@ final class ChatStore: NSObject {
             pzLog("[pizzini] chain serve rate-limited for \(self.short(peer))")
             return
         }
+        // sealed_sender encryptSealed needs a libsignal session with the
+        // peer — i.e. we must have processed their bundle. The typical
+        // asymmetric pairing has peer's BUNDLE_REQUEST arriving BEFORE
+        // we've fetched their bundle, so the first call here finds
+        // sessionEstablished=false and must defer. The bundle-response
+        // handler (and any other path that flips sessionEstablished)
+        // calls `maybeServePendingChain` to drain.
+        guard state.contacts[idx].sessionEstablished else {
+            pzLog("[pizzini] chain serve deferred for \(self.short(peer)) — no session yet")
+            return
+        }
+        let ok = sendChainSeedDelivery(toPeer: peer, via: relay, session: session)
+        guard ok else { return }
+        // Only stamp on success so a failed serve doesn't engage the
+        // cooldown — otherwise the very first deferred attempt would
+        // win the cooldown window even though no chain was shipped.
         state.contacts[idx].lastChainServedAt = Date()
         Storage.upsertContact(state.contacts[idx])
-        sendChainSeedDelivery(toPeer: peer, via: relay, session: session)
+    }
+
+    /// Drain the "owe peer a chain seed but couldn't ship yet" state.
+    /// Called from every path that flips `sessionEstablished` to true.
+    /// The signal that peer is owed a chain is "we served them a
+    /// bundle but never successfully shipped a chain after it" —
+    /// `lastBundleServedAt != nil && lastChainServedAt == nil`.
+    @MainActor
+    private func maybeServePendingChain(forContactAt idx: Int) {
+        guard let session else { return }
+        guard idx >= 0, idx < state.contacts.count else { return }
+        let contact = state.contacts[idx]
+        guard contact.sessionEstablished else { return }
+        guard contact.lastBundleServedAt != nil, contact.lastChainServedAt == nil else { return }
+        // Pick any connected relay for the `via` parameter; serveChain's
+        // sealed envelope fans out via `broadcastToRelays` so the
+        // specific client passed in is informational only.
+        guard let anyRelay = readyRelays.first else { return }
+        pzLog("[pizzini] retrying deferred chain serve for \(self.short(contact.identityPub))")
+        serveChain(forPeer: contact.identityPub, via: anyRelay, session: session)
     }
 
     /// Default per-message TTL until Phase 4's per-message picker lands.
@@ -2848,6 +2897,9 @@ extension ChatStore: RelayClientDelegate {
         self.state.contacts[idx].log.append(entry)
         self.state.contacts[idx].lastMessageAt = entry.timestamp
         self.state.contacts[idx].sessionEstablished = true
+        // Drain a deferred chain serve if peer asked for our bundle
+        // before our libsignal session to them existed.
+        self.maybeServePendingChain(forContactAt: idx)
         // When the receive lands in the chat the user is provably
         // in (`activeSurface` matches), fire the read-receipt emit
         // synchronously instead of waiting for SwiftUI's
@@ -2924,6 +2976,7 @@ extension ChatStore: RelayClientDelegate {
             state.contacts[idx].log.append(row)
             state.contacts[idx].lastMessageAt = row.timestamp
             state.contacts[idx].sessionEstablished = true
+            maybeServePendingChain(forContactAt: idx)
             persistContactSliceAndAppended(row, at: idx)
             maybeFireBackgroundHaptic(
                 forIncoming: .oneOnOne(peerIdentity: state.contacts[idx].identityPub),
@@ -3294,6 +3347,10 @@ extension ChatStore: RelayClientDelegate {
                 self.state.contacts[idx].peerVerifyKey = verifyKey
                 self.state.contacts[idx].sessionEstablished = true
                 self.persistContactSlice(at: idx)
+                // Now that we have an outbound session, drain any
+                // chain serve that was deferred because the peer
+                // asked for our bundle before we had their bundle.
+                self.maybeServePendingChain(forContactAt: idx)
             } catch {
                 pzLog("[pizzini] initiateSession failed: \(error)")
             }
