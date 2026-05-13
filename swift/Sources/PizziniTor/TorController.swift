@@ -1015,7 +1015,18 @@ public final class TorController: ObservableObject {
         // without buying us anything.
         config.cookieAuthentication = true
         config.autoControlPort = true
-        config.avoidDiskWrites = true
+        // `avoidDiskWrites` was on historically as a flash-longevity
+        // gesture. Cost: every cold launch re-downloads the
+        // ~2.5 MB consensus + microdescriptor set AND re-picks fresh
+        // guards from scratch — ~6-8 s on real-device cellular.
+        // Leaving it off lets tor persist `cached-microdesc-consensus`,
+        // `cached-microdescs`, `cached-certs`, and `state` (the guard
+        // set) under `Library/Caches/tor/`, so the next cold launch
+        // loads them off disk, validates against the cached directory
+        // authority certs, and is ready in 1-2 s. iOS may evict the
+        // cache under storage pressure; the fallback is the old
+        // re-download path, so no correctness regression.
+        config.avoidDiskWrites = false
         config.clientOnly = true
         config.dataDirectory = dataDir
         // IMPORTANT: do NOT set `config.socksPort` AND a SocksPort
