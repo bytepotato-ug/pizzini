@@ -330,6 +330,16 @@ final class ChatStore: NSObject {
             name: .pizziniTorNetworkPathChanged,
             object: nil,
         )
+        // Mirror TorController.requiresAppRestart onto our @Observable
+        // state so ContentView's banner can re-render. tor_run_main()
+        // is single-shot per process; once tor exits in-process, the
+        // only safe path is a user-driven app restart.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleTorRequiresAppRestart),
+            name: .pizziniTorRequiresAppRestart,
+            object: nil,
+        )
     }
 
     @objc
@@ -339,6 +349,24 @@ final class ChatStore: NSObject {
         pzLog("[pizzini] network path changed — redialing relays")
         teardownRelay(keepRetryTimer: true)
         connectRelay()
+    }
+
+    /// Sticky flag mirroring `TorController.requiresAppRestart`. Set
+    /// to true once the embedded tor's NSThread reports finished —
+    /// after that, no amount of reconnect is going to recover, the
+    /// user has to restart. ContentView surfaces a non-dismissable
+    /// banner whose "Restart Pizzini" button calls `exit(0)` (iOS
+    /// auto-relaunches because the trigger was a direct user tap).
+    var torRequiresAppRestart: Bool = false
+
+    @objc
+    private func handleTorRequiresAppRestart() {
+        pzLog("[pizzini] tor daemon exited — surfacing restart CTA")
+        torRequiresAppRestart = true
+        // Cancel any pending auto-reconnect — it will just spin
+        // forever against a dead daemon. The user has to act.
+        autoReconnectTask?.cancel()
+        autoReconnectTask = nil
     }
 
     /// USP #1 second half: refresh the transparency log from the

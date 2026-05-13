@@ -80,6 +80,18 @@ public extension Notification.Name {
     /// is currently empty (reserved for a future change-cause
     /// tag).
     static let pizziniTorNetworkPathChanged = Notification.Name("app.pizzini.tor.network-path-changed")
+
+    /// Posted on the MainActor when the embedded tor daemon has
+    /// exited and the only recovery path is an app restart.
+    /// TORThread's `tor_run_main()` is single-shot per process; once
+    /// the NSThread reports `isFinished == true`, there is no
+    /// in-process way to relaunch the daemon (the singleton guard
+    /// in TORThread.m would `abort()` on a second alloc). The host
+    /// listens to surface a non-dismissable "Restart Pizzini" CTA;
+    /// tapping the CTA calls `exit(0)` and iOS auto-relaunches the
+    /// app as if the user had force-quit and reopened it. Fires
+    /// once per process; subsequent triggers are no-ops.
+    static let pizziniTorRequiresAppRestart = Notification.Name("app.pizzini.tor.requires-app-restart")
 }
 
 /// Debug logger for the embedded tor lifecycle. Subsystem +
@@ -157,6 +169,14 @@ public final class TorController: ObservableObject {
     /// dialing on this; before it flips, dialing would just stall on
     /// the SOCKS handshake while tor is still wiring its directory.
     @Published public private(set) var isReady: Bool = false
+
+    /// Set true the first time we detect the embedded tor daemon has
+    /// exited — `TORThread.active.isFinished == true`. Once true,
+    /// there is no in-process recovery (`tor_run_main` is single-shot
+    /// per process), so the host should surface a "Restart Pizzini"
+    /// CTA. Sticky for the rest of the process lifetime; clearing it
+    /// without an actual app restart would be a lie to the UI.
+    @Published public private(set) var requiresAppRestart: Bool = false
 
     /// SOCKS5 port tor is bound to on `127.0.0.1`. Picked at startup by
     /// `TorConfiguration.socksPort` below (we pin to a fixed port so
@@ -410,6 +430,12 @@ public final class TorController: ObservableObject {
     /// freeze on resume" threshold — anything longer and we'd
     /// rather spend the budget on RELOAD + reconnect.
     public func probeAndRecover() async {
+        // Cheap structural check first: if the NSThread reports
+        // finished, there's no point asking the daemon anything. The
+        // notification fired from inside checkTorThreadHealth surfaces
+        // the Restart CTA; caller's redial attempt that follows
+        // becomes a no-op once the host reads requiresAppRestart.
+        if checkTorThreadHealth() { return }
         guard let controller = torController, controller.isConnected else {
             torLog.debug("probe: skipped — no controller")
             return
@@ -583,6 +609,12 @@ public final class TorController: ObservableObject {
         // against the still-listening tor.
         isReady = false
         bootstrapProgress = 0
+        // After every teardown, peek at the NSThread state. If it
+        // reports finished, the daemon is gone and the next
+        // bootstrap will spend its full deadline polling for files
+        // that will never appear — better to set requiresAppRestart
+        // now and surface the CTA.
+        checkTorThreadHealth()
     }
 
     private func runBootstrap() async throws -> UInt16 {
@@ -593,6 +625,13 @@ public final class TorController: ObservableObject {
         // it (tor itself is process-singleton; the path observer
         // mirrors that lifetime).
         Self.ensurePathMonitorStarted()
+        // If the singleton thread already exited, no amount of work
+        // here will revive it. Fail fast with the same error code
+        // the file-poll path would have produced 30 s later, plus
+        // post the restart CTA so the user can recover.
+        if checkTorThreadHealth() {
+            throw TorControllerError.missingCookie
+        }
         // Reuse the existing tor thread if one is already running.
         // TORThread enforces one-per-process; `TORThread.active`
         // returns the live instance (or nil before the first start).
@@ -665,6 +704,11 @@ public final class TorController: ObservableObject {
             torLog.info("bootstrap: controlport file appeared after \(Self.fmtElapsed(from: phase2Start)) (total \(Self.fmtElapsed(from: bootstrapStart)))")
         } catch {
             torLog.error("bootstrap: startup files did not appear within \(Int(Self.startupFilePollDeadline)) s — tor likely crashed. cookie=\(cookieURL.path, privacy: .public) controlport=\(controlPortFile.path, privacy: .public)")
+            // If the NSThread reports isFinished == true, tor really
+            // did die mid-process (asan/OOM/abort). No in-process
+            // recovery — surface the restart CTA so the user isn't
+            // stuck staring at a "Connecting…" pill forever.
+            checkTorThreadHealth()
             throw TorControllerError.missingCookie
         }
         guard let cookie = try? Data(contentsOf: cookieURL), !cookie.isEmpty else {
@@ -777,6 +821,12 @@ public final class TorController: ObservableObject {
         bootstrapProgress = 100
         isReady = true
         torLog.info("bootstrap: ready (total \(Self.fmtElapsed(from: bootstrapStart)))")
+        // Belt-and-braces: between authenticate and now, tor could
+        // theoretically have crashed (rare but observed on
+        // memory-pressure CI). If the thread reports finished here
+        // the daemon is dead despite our STATUS_CLIENT observer
+        // happily firing for what was already a corpse.
+        checkTorThreadHealth()
         return Self.fixedSocksPort
     }
 
@@ -1159,6 +1209,27 @@ public final class TorController: ObservableObject {
         }
     }
 
+
+    /// Check whether the embedded tor daemon's NSThread reports
+    /// `isFinished == true`. Returns true if we just flipped
+    /// `requiresAppRestart` (so the caller can short-circuit
+    /// whatever bootstrap / probe work it was about to do); false
+    /// otherwise (including when no thread has ever been started).
+    /// Idempotent — once `requiresAppRestart` is set, subsequent
+    /// calls return false because the work already happened.
+    @discardableResult
+    private func checkTorThreadHealth() -> Bool {
+        guard !requiresAppRestart else { return false }
+        let thread = torThread ?? TORThread.active
+        guard let thread, thread.isFinished else { return false }
+        torLog.error("tor: TORThread reports isFinished=true — daemon has exited, app restart required")
+        requiresAppRestart = true
+        NotificationCenter.default.post(
+            name: .pizziniTorRequiresAppRestart,
+            object: self,
+        )
+        return true
+    }
 
     /// Start the shared NWPathMonitor if it isn't already running.
     /// The first MainActor hop seeds `lastPathFingerprint` without

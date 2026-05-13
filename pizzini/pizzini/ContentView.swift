@@ -230,6 +230,11 @@ struct ContentView: View {
         // detail surface.
         .safeAreaInset(edge: .top, spacing: 0) {
             VStack(spacing: 0) {
+                // Tor restart CTA outranks every other banner — the
+                // user can't send a single message until they tap it.
+                if store.torRequiresAppRestart {
+                    torRestartBanner
+                }
                 if store.keychainWriteFailing {
                     keychainFailureBanner
                 }
@@ -356,6 +361,50 @@ struct ContentView: View {
         .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.orange)
+    }
+
+    /// Non-dismissable banner shown when the embedded tor daemon
+    /// has exited mid-process. tor_run_main() is single-shot, so
+    /// there's no in-process recovery; the only path to a working
+    /// connection is a fresh process. The Restart button calls
+    /// `exit(0)` — iOS treats user-initiated termination as
+    /// equivalent to a force-quit and immediately relaunches when
+    /// the user taps the app icon next. The action is documented in
+    /// the user's prompt as the intended recovery for this state.
+    private var torRestartBanner: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "arrow.clockwise.circle.fill")
+                .foregroundStyle(.white)
+                .imageScale(.large)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Pizzini needs to restart")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                Text("The privacy network exited unexpectedly. Restart the app to reconnect.")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.95))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            Button {
+                exit(0)
+            } label: {
+                Text("Restart")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(
+                        Capsule().fill(Color.white)
+                    )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Restart Pizzini")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.red)
     }
 
     /// F-602: persistent banner shown above the nav bar when ChatStore
