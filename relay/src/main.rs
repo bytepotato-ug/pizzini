@@ -348,6 +348,14 @@ const FRAME_TYPE_COVER: u8 = 10;
 /// frame from the authenticated HELLO. Idempotent: a no-op when
 /// the peer has no entry in the store.
 const FRAME_TYPE_DEREGISTER_PUSH: u8 = 11;
+/// v2 delivery-token chain registration. Body:
+/// `chain_id(16) ‖ root(32) ‖ length(4 BE)`.
+/// HELLO-authenticated; the relay binds the chain to the sender's
+/// peer_id (the HELLO `peer_id` is the *recipient* of v2 sends to
+/// this chain). Idempotent on `(peer_id, chain_id)` — duplicate
+/// registrations with identical `(root, length)` are accepted as
+/// no-ops; conflicting roots are refused.
+const FRAME_TYPE_REGISTER_CHAIN: u8 = 12;
 /// Fixed payload size for COVER frames (post-frame-type body).
 /// Sized to roughly match the smallest padded sealed_ciphertext
 /// bucket (256 bytes) so the wire byte-count of a heartbeat is
@@ -470,6 +478,14 @@ const HASHCASH_CHALLENGE_TAG: &[u8] = b"pizzini.hashcash.bundle.v1";
 const TOKEN_REPLAY_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// How often we GC the token replay set.
 const TOKEN_REPLAY_GC_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// Chain validators are aged out when their last successful
+/// presentation predates this window. 90 days = a recipient who
+/// hasn't been sent to in 3 months is presumed unpaired / re-paired
+/// (in which case a fresh chain replaces the stale one anyway).
+const CHAIN_VALIDATOR_IDLE_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+/// GC cadence for the chain validator store. Much sparser than the
+/// replay store — there are O(contacts) chains, not O(messages).
+const CHAIN_VALIDATOR_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// Hard ceiling on accepted token expiry (relative to now). Mirrors
 /// crypto-core's DELIVERY_TOKEN_TTL_SECS plus a 5-minute clock-skew
 /// margin. F-205: a malicious recipient who minted tokens with
@@ -530,6 +546,7 @@ const VERIFY_KEY_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// `(Vec<u8>, Vec<u8>)` internally to keep its on-disk serde shape
 /// flexible; the type alias is gone with it.
 type Replays = Arc<Mutex<ReplayStore>>;
+type ChainValidators = Arc<Mutex<chain_validator_store::ChainValidatorStore>>;
 /// HELLO replay set: (peer_id, nonce) keys. Separate from the SEND/ACK
 /// `Replays` table because (a) the lifetime is much shorter (matches
 /// the timestamp window, not the token TTL) and (b) the lookup happens
@@ -715,9 +732,32 @@ async fn main() -> std::io::Result<()> {
     );
     let replays: Replays = Arc::new(Mutex::new(replay_store_inst));
     let hello_replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
+    // v2 delivery-token chain validators. Lives alongside ReplayStore;
+    // its TTL is independent (CHAIN_VALIDATOR_IDLE_TTL) because a
+    // chain's "useful life" is "until the recipient rotates it,"
+    // typically much longer than the per-token replay window.
+    let chain_validator_inst =
+        chain_validator_store::ChainValidatorStore::load_or_create(
+            &state_dir,
+            CHAIN_VALIDATOR_IDLE_TTL,
+        )
+        .map_err(|e| {
+            eprintln!(
+                "[pizzini-relay] FATAL: could not open chain validator store at {}: {e}",
+                state_dir.display(),
+            );
+            e
+        })?;
+    println!(
+        "  chain validator store: {} ({} chains after TTL purge)",
+        state_dir.display(),
+        chain_validator_inst.len(),
+    );
+    let chain_validators: ChainValidators = Arc::new(Mutex::new(chain_validator_inst));
 
     spawn_pending_gc(pending.clone());
     spawn_replay_gc(replays.clone());
+    spawn_chain_validator_gc(chain_validators.clone());
     spawn_hello_replay_gc(hello_replays.clone());
     spawn_verify_keys_gc(verify_keys.clone());
     spawn_push_tokens_gc(push_tokens.clone());
@@ -805,6 +845,7 @@ async fn main() -> std::io::Result<()> {
                 let pending = pending.clone();
                 let verify_keys = verify_keys.clone();
                 let replays = replays.clone();
+                let chain_validators_h = chain_validators.clone();
                 let hello_replays = hello_replays.clone();
                 let apns = apns.clone();
                 let status_snapshot = status_snapshot.clone();
@@ -821,6 +862,7 @@ async fn main() -> std::io::Result<()> {
                         pending,
                         verify_keys,
                         replays,
+                        chain_validators_h,
                         hello_replays,
                         apns,
                         status_snapshot,
@@ -932,6 +974,7 @@ async fn handle_connection(
     pending: Pending,
     verify_keys: VerifyKeys,
     replays: Replays,
+    chain_validators: ChainValidators,
     hello_replays: HelloReplays,
     apns: Option<Arc<ApnsClient>>,
     status_snapshot: Arc<RelayStatus>,
@@ -1029,6 +1072,7 @@ async fn handle_connection(
         &pending,
         &verify_keys,
         &replays,
+        &chain_validators,
         apns.clone(),
         &peer_id,
         &our_tx,
@@ -1074,6 +1118,7 @@ async fn read_loop(
     pending: &Pending,
     verify_keys: &VerifyKeys,
     replays: &Replays,
+    chain_validators: &ChainValidators,
     apns: Option<Arc<ApnsClient>>,
     self_id: &[u8],
     our_tx: &mpsc::UnboundedSender<Vec<u8>>,
@@ -1175,6 +1220,50 @@ async fn read_loop(
                     ),
                 }
             }
+            FRAME_TYPE_REGISTER_CHAIN => {
+                let reg = match parse_register_chain(&frame[1..], self_id) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "malformed REGISTER_CHAIN from {}: {e}",
+                            short_hex(self_id),
+                        );
+                        continue;
+                    }
+                };
+                let outcome = match chain_validators.lock().await.register(reg) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        dev_peer_elog!(
+                            "REGISTER_CHAIN persist failed for {}: {e}",
+                            short_hex(self_id),
+                        );
+                        continue;
+                    }
+                };
+                match outcome {
+                    chain_validator_store::RegisterOutcome::Registered => dev_peer_log!(
+                        "REGISTER_CHAIN from {}: new chain installed (chainID={}…, length={})",
+                        short_hex(self_id),
+                        encrypted_file::hex_encode(&reg.chain_id[..4]),
+                        reg.length,
+                    ),
+                    chain_validator_store::RegisterOutcome::AlreadyRegistered => dev_peer_log!(
+                        "REGISTER_CHAIN from {}: idempotent re-register, no-op",
+                        short_hex(self_id),
+                    ),
+                    chain_validator_store::RegisterOutcome::Conflict => dev_peer_elog!(
+                        "REGISTER_CHAIN from {}: chain_id conflict; ignoring",
+                        short_hex(self_id),
+                    ),
+                    chain_validator_store::RegisterOutcome::BadLength => dev_peer_elog!(
+                        "REGISTER_CHAIN from {}: bad length {} (max {})",
+                        short_hex(self_id),
+                        reg.length,
+                        chain_validator_store::MAX_CHAIN_LENGTH,
+                    ),
+                }
+            }
             FRAME_TYPE_DEREGISTER_PUSH => {
                 // No body — the peer is identified by the authenticated
                 // HELLO. Drop our cached token so a subsequent
@@ -1214,7 +1303,7 @@ async fn read_loop(
                     }
                 };
                 if let Err(reason) =
-                    check_delivery_token(&parsed, verify_keys, replays).await
+                    check_delivery_token(&parsed, verify_keys, replays, chain_validators).await
                 {
                     dev_peer_elog!(
                         "rejecting {} → {}: {reason}",
@@ -1436,19 +1525,30 @@ async fn check_delivery_token(
     parsed: &ParsedSealed,
     verify_keys: &VerifyKeys,
     replays: &Replays,
+    chain_validators: &ChainValidators,
 ) -> Result<(), String> {
-    // v2 hash-chained tokens are 52 bytes and parse cleanly, but the
-    // per-recipient chain-validator store doesn't exist yet on this
-    // relay. Recognise the v2 shape so the failure message is honest
-    // (clients trying v2 know to stay on v1), but reject all v2 frames
-    // until the validator lands.
+    // v2 hash-chained token (52 B): validate against the recipient's
+    // chain state. Length is the discriminator between v1 (84 B) and
+    // v2 (52 B) — no version byte on the wire.
     if parsed.token.len() == TOKEN_V2_LEN {
-        if let Err(e) = parse_v2_token(&parsed.token) {
-            return Err(format!("v2 token malformed: {e}"));
-        }
-        return Err(
-            "delivery-token v2 not yet validated by this relay; clients should stay on v1".into(),
-        );
+        let v2 = parse_v2_token(&parsed.token).map_err(|e| format!("v2 token malformed: {e}"))?;
+        let mut store = chain_validators.lock().await;
+        let outcome = store
+            .validate(&parsed.to_id, &v2.chain_id, v2.index, &v2.value)
+            .map_err(|e| format!("chain-validator persist failed: {e}"))?;
+        return match outcome {
+            chain_validator_store::ValidateOutcome::Accepted => Ok(()),
+            chain_validator_store::ValidateOutcome::UnknownChain => Err(format!(
+                "v2 token references unknown chain for recipient {}",
+                short_hex(&parsed.to_id),
+            )),
+            chain_validator_store::ValidateOutcome::OutOfRange => {
+                Err("v2 token replay or out-of-range index".into())
+            }
+            chain_validator_store::ValidateOutcome::BadChainValue => {
+                Err("v2 token did not chain to recipient's registered root".into())
+            }
+        };
     }
     if parsed.token.len() != TOKEN_LEN {
         return Err(format!(
@@ -1559,6 +1659,23 @@ fn spawn_replay_gc(replays: Replays) {
                 Ok(0) => {}
                 Ok(n) => println!("token-replay GC: pruned {n} → {}", store.len()),
                 Err(e) => eprintln!("[pizzini-relay] replay-store GC persist failed: {e}"),
+            }
+        }
+    });
+}
+
+/// Periodic GC for the chain-validator store. Sparser than the replay
+/// GC because chains are O(contacts), not O(messages).
+fn spawn_chain_validator_gc(validators: ChainValidators) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(CHAIN_VALIDATOR_GC_INTERVAL);
+        loop {
+            tick.tick().await;
+            let mut store = validators.lock().await;
+            match store.gc_expired(CHAIN_VALIDATOR_IDLE_TTL) {
+                Ok(0) => {}
+                Ok(n) => println!("chain-validator GC: pruned {n} → {}", store.len()),
+                Err(e) => eprintln!("[pizzini-relay] chain-validator GC persist failed: {e}"),
             }
         }
     });
@@ -1855,6 +1972,38 @@ fn parse_sealed(body: &[u8]) -> std::io::Result<ParsedSealed> {
     // Remaining bytes are the sealed ciphertext — opaque to the relay.
     let _ = c.rest();
     Ok(ParsedSealed { to_id, ttl_seconds, token })
+}
+
+/// REGISTER_CHAIN body parser. The recipient's peer_id is taken from
+/// the HELLO-authenticated `self_id` rather than the frame body —
+/// otherwise a connected peer could register chains for someone else
+/// and override their valid roots.
+fn parse_register_chain(
+    body: &[u8],
+    self_id: &[u8],
+) -> std::io::Result<chain_validator_store::ChainRegistration> {
+    if self_id.len() != 33 {
+        return Err(invalid("HELLO peer_id must be 33 bytes"));
+    }
+    let mut c = Cursor::new(body);
+    let chain_id_bytes = c.take(chain_validator_store::CHAIN_ID_LEN)?;
+    let root_bytes = c.take(chain_validator_store::CHAIN_VALUE_LEN)?;
+    let length = c.u32()?;
+    if !c.is_empty() {
+        return Err(invalid("trailing bytes after REGISTER_CHAIN"));
+    }
+    let mut peer_id = [0u8; 33];
+    peer_id.copy_from_slice(self_id);
+    let mut chain_id = [0u8; chain_validator_store::CHAIN_ID_LEN];
+    chain_id.copy_from_slice(chain_id_bytes);
+    let mut root = [0u8; chain_validator_store::CHAIN_VALUE_LEN];
+    root.copy_from_slice(root_bytes);
+    Ok(chain_validator_store::ChainRegistration {
+        peer_id,
+        chain_id,
+        root,
+        length,
+    })
 }
 
 fn parse_register_push(body: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -2278,6 +2427,95 @@ mod tests {
         assert_eq!(TOKEN_LEN, 84);
     }
 
+    /// End-to-end: register a chain, hand the relay a valid v2 token,
+    /// expect Accepted; hand it the same token again, expect replay
+    /// rejection; hand it a tampered token, expect chain-value error.
+    #[tokio::test]
+    async fn v2_check_delivery_token_accepts_then_rejects_replay() {
+        use chain_validator_store::*;
+        use sha2::{Digest, Sha256};
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "pizzini-relay-v2-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let chain_validators: ChainValidators = Arc::new(Mutex::new(
+            ChainValidatorStore::load_or_create(&tmp_dir, CHAIN_VALIDATOR_IDLE_TTL).unwrap(),
+        ));
+        let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
+        let replays: Replays = Arc::new(Mutex::new(
+            ReplayStore::load_or_create(&tmp_dir, TOKEN_REPLAY_WINDOW).unwrap(),
+        ));
+
+        // Build a deterministic chain.
+        let seed = [0x77u8; 32];
+        let length: u32 = 8;
+        let mut positions: Vec<[u8; 32]> = Vec::with_capacity(length as usize + 1);
+        positions.push(seed);
+        let mut cur = seed;
+        for _ in 0..length {
+            let mut h = Sha256::new();
+            h.update(cur);
+            let out = h.finalize();
+            let mut next = [0u8; 32];
+            next.copy_from_slice(&out);
+            positions.push(next);
+            cur = next;
+        }
+        let root = positions[length as usize];
+        let to_id = vec![0xAA; 33];
+        let chain_id = [0xCC; 16];
+        chain_validators
+            .lock()
+            .await
+            .register(ChainRegistration {
+                peer_id: to_id.as_slice().try_into().unwrap(),
+                chain_id,
+                root,
+                length,
+            })
+            .unwrap();
+
+        // Token at sender-side index 1 = position (length - 1) = positions[7].
+        let token_value = positions[(length - 1) as usize];
+        let mut token_wire = Vec::with_capacity(TOKEN_V2_LEN);
+        token_wire.extend_from_slice(&chain_id);
+        token_wire.extend_from_slice(&1u32.to_be_bytes());
+        token_wire.extend_from_slice(&token_value);
+        assert_eq!(token_wire.len(), TOKEN_V2_LEN);
+
+        let parsed = ParsedSealed {
+            to_id: to_id.clone(),
+            ttl_seconds: 3600,
+            token: token_wire.clone(),
+        };
+        check_delivery_token(&parsed, &verify_keys, &replays, &chain_validators)
+            .await
+            .expect("first v2 presentation must validate");
+        // Replay of the same index → out-of-range.
+        let err = check_delivery_token(&parsed, &verify_keys, &replays, &chain_validators)
+            .await
+            .expect_err("replay must fail");
+        assert!(err.contains("replay") || err.contains("out-of-range"));
+        // Tampered value at index 2 → bad chain value.
+        let mut bad_wire = Vec::with_capacity(TOKEN_V2_LEN);
+        bad_wire.extend_from_slice(&chain_id);
+        bad_wire.extend_from_slice(&2u32.to_be_bytes());
+        bad_wire.extend_from_slice(&[0xFFu8; 32]);
+        let bad_parsed = ParsedSealed {
+            to_id,
+            ttl_seconds: 3600,
+            token: bad_wire,
+        };
+        let err = check_delivery_token(&bad_parsed, &verify_keys, &replays, &chain_validators)
+            .await
+            .expect_err("tampered value must fail");
+        assert!(err.contains("chain"));
+    }
+
     // ─── F-203 fix-review attack vectors ──────────────────────────────────
     // The audit prompt enumerates six attacks the HELLO possession proof
     // must defeat. These tests exercise verify_hello_possession_proof
@@ -2570,7 +2808,14 @@ mod tests {
         let replays: Replays = Arc::new(Mutex::new(
             ReplayStore::load_or_create(&tmp_dir, TOKEN_REPLAY_WINDOW).expect("replay store"),
         ));
-        check_delivery_token(&parsed, &verify_keys, &replays)
+        let chain_validators: ChainValidators = Arc::new(Mutex::new(
+            chain_validator_store::ChainValidatorStore::load_or_create(
+                &tmp_dir,
+                CHAIN_VALIDATOR_IDLE_TTL,
+            )
+            .expect("chain validator store"),
+        ));
+        check_delivery_token(&parsed, &verify_keys, &replays, &chain_validators)
             .await
             .expect("verify must succeed for recently-disconnected recipient");
     }
@@ -2635,6 +2880,13 @@ mod tests {
         let replays: Replays = Arc::new(Mutex::new(
             ReplayStore::load_or_create(&tmp_dir, TOKEN_REPLAY_WINDOW).expect("replay store"),
         ));
+        let chain_validators: ChainValidators = Arc::new(Mutex::new(
+            chain_validator_store::ChainValidatorStore::load_or_create(
+                &tmp_dir,
+                CHAIN_VALIDATOR_IDLE_TTL,
+            )
+            .expect("chain validator store"),
+        ));
         let mut token = vec![0u8; TOKEN_LEN];
         // Nonce: arbitrary.
         token[..TOKEN_NONCE_LEN].copy_from_slice(&[0xABu8; TOKEN_NONCE_LEN]);
@@ -2647,7 +2899,7 @@ mod tests {
             ttl_seconds: 3600,
             token,
         };
-        let err = check_delivery_token(&parsed, &verify_keys, &replays)
+        let err = check_delivery_token(&parsed, &verify_keys, &replays, &chain_validators)
             .await
             .unwrap_err();
         assert!(
