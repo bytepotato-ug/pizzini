@@ -223,6 +223,11 @@ public final class RelayClient: @unchecked Sendable {
     /// previous primary stops emitting duplicate APNs wake-ups.
     /// Match `FRAME_TYPE_DEREGISTER_PUSH` in `relay/src/main.rs`.
     private static let frameTypeDeregisterPush: UInt8 = 11
+    /// v2 delivery-token chain registration. Body:
+    /// `chain_id(16) ‖ root(32) ‖ length(4 BE)`. The relay binds the
+    /// chain to the HELLO-authenticated peer_id of this connection.
+    /// Match `FRAME_TYPE_REGISTER_CHAIN` in `relay/src/main.rs`.
+    private static let frameTypeRegisterChain: UInt8 = 12
     /// Body length of a COVER frame. Sized to roughly match the
     /// smallest padded sealed_ciphertext bucket so a passive
     /// observer can't trivially distinguish covers from short
@@ -882,6 +887,26 @@ public final class RelayClient: @unchecked Sendable {
         appendU16Blob(&payload, to)
         appendU16Blob(&payload, myIdentity)
         payload.append(bundle)
+        writeFrame(payload, on: connection)
+    }
+
+    /// REGISTER_CHAIN: tell the relay about a hash-chain root we just
+    /// minted. The relay binds this chain to our HELLO-authenticated
+    /// peer_id, then validates future v2 SENDs to us against the
+    /// matching `(chain_id, root)`. Body layout matches the relay's
+    /// `parse_register_chain`:
+    ///   `chain_id(16) ‖ root(32) ‖ length(4 BE)`.
+    /// Frame type 12, paralleling `frameTypeRegisterPush`.
+    public func sendRegisterChain(chainID: Data, root: Data, length: UInt32) {
+        precondition(chainID.count == 16, "chainID must be 16 bytes")
+        precondition(root.count == 32, "root must be 32 bytes")
+        guard let connection, state == .connected else { return }
+        var payload = Data()
+        payload.append(Self.frameTypeRegisterChain)
+        payload.append(chainID)
+        payload.append(root)
+        var lengthBE = length.bigEndian
+        withUnsafeBytes(of: &lengthBE) { payload.append(contentsOf: $0) }
         writeFrame(payload, on: connection)
     }
 

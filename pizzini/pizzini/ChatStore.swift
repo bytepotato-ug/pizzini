@@ -1905,9 +1905,27 @@ final class ChatStore: NSObject {
     /// `issueTokens` — and (b) the peer's outbound chain is approaching
     /// exhaustion (`shouldRotate`) so we mint a successor before the
     /// current one dries up. No-op if we have no session yet.
+    ///
+    /// Order is load-bearing: REGISTER_CHAIN must reach EVERY relay
+    /// before the peer presents a token, otherwise the relay returns
+    /// "unknown chain". Broadcasting both on the same relay set in
+    /// this order means the registration is queued before the
+    /// recipient's first v2 SEND can possibly land back.
     @MainActor
     private func sendChainSeedDelivery(toPeer peer: Data, via client: RelayClient, session: Session) {
         let chain = HashChainToken.mintChain()
+        // 1. Register the chain root with every connected relay so v2
+        //    SENDs from this peer can validate.
+        broadcastToRelays {
+            $0.sendRegisterChain(
+                chainID: chain.chainID,
+                root: chain.root,
+                length: UInt32(chain.length),
+            )
+        }
+        // 2. Ship the seed to the peer via sealed Double Ratchet —
+        //    the relay sees only opaque sealed bytes; metadata
+        //    posture matches today's chat traffic.
         var inner = Data([RelayClient.InnerEnvelopeKind.chainSeedDelivery.rawValue])
         inner.append(HashChainToken.encodeSeedDelivery(chain))
         do {
@@ -1917,10 +1935,6 @@ final class ChatStore: NSObject {
                 plaintext: inner,
             )
             persistSession()
-            // Best-effort: rides through the same path as a regular SEND,
-            // so the relay-side rate-limit gate applies. The recipient
-            // unwraps and installs; if the SEND drops, the next pair-time
-            // or rotation pass will retry.
             broadcastToRelays {
                 $0.sendSealed(
                     toPeer: peer,
@@ -1932,10 +1946,6 @@ final class ChatStore: NSObject {
         } catch {
             pzLog("[pizzini] chainSeedDelivery encrypt failed: \(error)")
         }
-        // The chain we just minted is for THEIR outbound use; the relay
-        // will eventually register the root via the stage-3 register-
-        // chain frame. Nothing to persist on our side — the relay holds
-        // the validator state.
         _ = client
     }
 
