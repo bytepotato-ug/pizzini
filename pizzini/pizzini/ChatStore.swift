@@ -1502,13 +1502,14 @@ final class ChatStore: NSObject {
         state.contacts[idx].log.append(logEntry)
         state.contacts[idx].lastMessageAt = logEntry.timestamp
         persistContactSliceAndAppended(logEntry, at: idx)
-        // v2 rotation: if the chain just crossed the 80% mark, ask the
-        // peer to mint a fresh one over the sealed channel. The peer
-        // owns chain issuance; we trigger by re-requesting their
-        // bundle, which their side answers with a `chainSeedDelivery`
-        // carrying a fresh chain. Debounced per-contact so a burst of
-        // sends at the threshold doesn't fan into a burst of requests.
-        maybeRequestProactiveChainRotation(forContactAt: idx)
+        // v2 rotation: if the chain just crossed the 80% mark, the
+        // *recipient* (us) of any next v2 token presentation would
+        // start watching for the new one. The chain owner (peer) is
+        // the one who mints — we can't do it locally. Best we can do
+        // here is log so a future telemetry pass surfaces the cadence.
+        if let chain = state.contacts[idx].outboundTokenChain, chain.shouldRotate {
+            pzLog("[pizzini] v2 chain crossing rotation threshold for \(self.short(contact.identityPub))")
+        }
     }
 
     /// Send a file attachment to `contact`. Phase 2 wire path: chunked
@@ -1802,10 +1803,14 @@ final class ChatStore: NSObject {
         state.contacts[idx].log.append(row)
         state.contacts[idx].lastMessageAt = row.timestamp
         persistContactSliceAndAppended(row, at: idx)
-        // v2 rotation: attachments often burn dozens of chain tokens
-        // per file (one per chunk). Fire the proactive rotation hint
-        // here on the same debounce as the text-send path.
-        maybeRequestProactiveChainRotation(forContactAt: idx)
+        // v2 rotation: if the chain just crossed the 80% mark, log so
+        // future telemetry can surface the cadence. Rotation itself
+        // is recipient-initiated (the peer minted this chain, so only
+        // they can replace it); we rely on `requestBundleWithHashcash`
+        // in the eventually-exhausted path to trigger their re-issue.
+        if let chain = state.contacts[idx].outboundTokenChain, chain.shouldRotate {
+            pzLog("[pizzini] v2 chain crossing rotation threshold for \(self.short(contactId))")
+        }
     }
 
     /// Map a sanitized filename to the best-guess MIME / UTI string.
@@ -1832,44 +1837,6 @@ final class ChatStore: NSObject {
     @MainActor
     private var pendingV2Sends: [UUID: [String]] = [:]
     private static let maxPendingV2SendsPerContact = 16
-
-    /// Last time we asked a peer to mint a fresh chain (because our
-    /// outbound chain to them crossed the rotation threshold). In-
-    /// memory only, reset on relaunch — a duplicate request after a
-    /// process restart is harmless (the peer's `chainServeCooldown`
-    /// collapses it). Used to debounce the proactive-rotation path
-    /// in `maybeRequestProactiveChainRotation`.
-    @MainActor
-    private var chainRotationLastRequestedAt: [UUID: Date] = [:]
-    /// Minimum time between proactive chain-rotation requests for the
-    /// same contact. Chain length is 16384 tokens so even at 100 msg/
-    /// day this triggers at most every few weeks; 1h is comfortably
-    /// shorter than that, comfortably longer than any reconnect storm.
-    private static let chainRotationRequestCooldown: TimeInterval = 60 * 60
-
-    /// Fire `requestBundleWithHashcash` against `contactIdx`'s peer if
-    /// the contact's outbound chain has crossed the rotation threshold
-    /// AND we haven't requested a rotation for them in the last hour.
-    /// Replaces the previous log-only handling at the two sites where
-    /// `shouldRotate` was being observed — proactively re-mints before
-    /// the chain exhausts rather than waiting for a send failure to
-    /// land in `refreshChainAndQueue`.
-    @MainActor
-    private func maybeRequestProactiveChainRotation(forContactAt idx: Int) {
-        guard let chain = state.contacts[idx].outboundTokenChain, chain.shouldRotate else { return }
-        let contact = state.contacts[idx]
-        let now = Date()
-        if let last = chainRotationLastRequestedAt[contact.id],
-           now.timeIntervalSince(last) < Self.chainRotationRequestCooldown {
-            return
-        }
-        chainRotationLastRequestedAt[contact.id] = now
-        pzLog(
-            "[pizzini] v2 chain at rotation threshold (\(chain.nextIndex - 1)/\(chain.length)) — "
-            + "requesting fresh chain from \(self.short(contact.identityPub))"
-        )
-        requestBundleWithHashcash(fromPeer: contact.identityPub)
-    }
 
     /// v2 cutover recovery: trigger a peer-bundle refresh (which the
     /// recipient answers with a sealed `chainSeedDelivery`), and
