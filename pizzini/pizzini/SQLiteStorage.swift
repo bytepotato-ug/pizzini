@@ -94,14 +94,25 @@ final class SQLiteStorage {
         let path = try databaseURL().path
         try ensureParentDirectory()
 
-        // Orphan check before any key derivation. If a DB file exists
-        // but the SE wrap doesn't, the file is forensically useless
-        // (no key can ever decrypt it) and would just produce a
-        // confusing open-failure if we tried. Unlink it and the
-        // next path proceeds as fresh-install.
         let fm = FileManager.default
+        // Orphan check #1: DB file exists but the SE wrap doesn't.
+        // The file is forensically useless (no key can ever decrypt
+        // it). Unlink it and the next path proceeds as fresh-install.
         if fm.fileExists(atPath: path), !DBKey.isInitialized {
             unlinkDatabaseFiles()
+        }
+        // Orphan check #2: DB file does NOT exist but Keychain has
+        // material from a previous install (iOS keeps Keychain
+        // entries across app uninstall by default — they're scoped
+        // to the Team ID, not the sandbox). The DB key, the
+        // Argon2id params, the AppPasscode slots are all ghosts at
+        // this point: there's no DB for the key to decrypt, and a
+        // fresh install should be a true clean slate from the
+        // user's perspective. Wipe everything paired to the (now
+        // gone) DB so the post-install state is "first launch."
+        if !fm.fileExists(atPath: path), DBKey.isInitialized {
+            DBKey.eraseKeyMaterial()
+            AppPasscode.eraseAll()
         }
 
         // Run Argon2id with the same params the DB was originally
@@ -112,8 +123,32 @@ final class SQLiteStorage {
         let params = DBKey.loadStoredParams()
         let key = try DBKey.deriveKey(params: params)
 
-        let db = try Database(path: path, rawKey: key)
-        try Migrator.run(on: db)
+        var db = try Database(path: path, rawKey: key)
+        do {
+            try Migrator.run(on: db)
+        } catch SchemaError.onDiskAheadOfCode(let onDisk, let code) {
+            // On-disk schema is from a newer code generation than
+            // we're running (typically: a pre-launch schema-collapse
+            // refactor reset the migration list, and the user's
+            // existing DB still carries the older `user_version`).
+            // No users yet, so the right move is to wipe the DB +
+            // every Keychain entry that paired with it, then
+            // reopen fresh as if first launch.
+            storageLog.notice(
+                "schema downgrade detected (onDisk=\(onDisk, privacy: .public), code=\(code, privacy: .public)); wiping for fresh start",
+            )
+            // Close the open handle before touching the files. The
+            // existing Database value falls out of scope here, but
+            // we also explicitly drop the path-side files.
+            unlinkDatabaseFiles()
+            DBKey.eraseKeyMaterial()
+            AppPasscode.eraseAll()
+            // Re-derive a fresh key and open a clean DB.
+            let freshParams = DBKey.loadStoredParams()
+            let freshKey = try DBKey.deriveKey(params: freshParams)
+            db = try Database(path: path, rawKey: freshKey)
+            try Migrator.run(on: db)
+        }
         let inst = SQLiteStorage(db: db, path: path)
         shared = inst
         // Re-assert file-protection + iCloud-backup-exclusion on the

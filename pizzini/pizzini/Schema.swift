@@ -227,6 +227,16 @@ struct Migration {
     let sql: String
 }
 
+enum SchemaError: Error {
+    /// On-disk `user_version` is ahead of the code's `currentVersion`.
+    /// Caller should treat this as a downgrade signal — typically by
+    /// wiping the database files (and any paired Keychain state) and
+    /// re-bootstrapping into a fresh schema. Pre-launch this happens
+    /// after a schema-collapse refactor; post-launch it would only
+    /// fire on a manual app-version downgrade.
+    case onDiskAheadOfCode(onDisk: Int32, code: Int32)
+}
+
 enum Migrator {
     /// Apply every migration whose `from` version is `≥` the db's
     /// current `PRAGMA user_version`, in order, inside one
@@ -234,8 +244,16 @@ enum Migrator {
     /// schema upgrade leaves the user_version pinned at the last
     /// fully-applied step — the next launch re-runs only the
     /// missing tail.
+    ///
+    /// Throws `SchemaError.onDiskAheadOfCode` when `user_version`
+    /// exceeds `target`. The caller (bootstrap) recovers by wiping
+    /// the DB and re-opening; a silent early-return would leave a
+    /// stale schema that the new code's SELECTs can't read.
     static func run(on db: Database, target: Int32 = Schema.currentVersion) throws {
         let current = try userVersion(of: db)
+        if current > target {
+            throw SchemaError.onDiskAheadOfCode(onDisk: current, code: target)
+        }
         guard current < target else { return }
         try db.transaction { tx in
             for migration in Schema.migrations where migration.from >= current && migration.to <= target {
