@@ -142,11 +142,11 @@ public enum OnionHost {
 /// signs the list.
 public enum RelayRegistry {
     /// Production-trusted relays. Ordered for human readability — the
-    /// fanout code treats the set as unordered. Today's fleet is a
-    /// single onion in DE while the CH/IS/PA buildout proceeds (per
-    /// the README Status checklist); the multi-relay fanout code is
-    /// in place from day one so the second + third relays add
-    /// without further client work.
+    /// fanout code treats the set as unordered. Today's fleet is
+    /// three onions in DE / NO / US (per the README); CH/IS/PA is
+    /// the longer-term jurisdictional-diversity target. Adding more
+    /// relays is a one-line edit per entry — the multi-relay fanout
+    /// code path is in place from day one.
     public static let trusted: [RelayDescriptor] = [
         // pizzini-relay-de01 — Hetzner FSN1, operator: bytepotato-ceo.
         // Onion key fingerprinted in the transparency log; the live

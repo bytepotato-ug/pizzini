@@ -13,7 +13,7 @@ We start from Signal's protocol because it is the gold standard. We diverge wher
 - **Stateless relays in multiple jurisdictions.** No single seizable server. "Stateless" here means *no per-user accounts, no plaintext user data, no message bodies the relay can read*. Two routing maps persist across restarts under ChaCha20-Poly1305 with 0600 perms — the offline-message queue (libsignal-sealed ciphertexts, sender-chosen TTL up to 7d, per-peer cap) and the APNs push-token map (30-day TTL) — so a relay bounce doesn't silently drop messages or break push for paired devices. The rest of relay state (live route table, verify-key cache, hashcash + token replay sets) stays in-memory only and is wiped on restart. The encryption-at-rest is defence-in-depth against operator mistakes (a careless `cp -r`, a stray tarball), not defence against an attacker who seizes the machine — the key file lives next to the data. Message bodies are libsignal-sealed end-to-end regardless.
 - **Cryptographic erasure on duress.** Real wipe, not pretend mode.
 - **Post-quantum from day one.** PQXDH + Triple Ratchet (already in libsignal as of late 2025).
-- **Reproducible builds + multi-maintainer signing.**
+- **Reproducible builds + signed transparency log.** Every relay binary is reproducible from source under the pinned Docker toolchain (`scripts/build-relay-release.sh`); its SHA-256 is signed by the operator's Ed25519 key and committed to `transparency-log.ndjson`. iOS apps verify the running relay's self-attest against the log on every reconnect. (Co-signing by multiple maintainers is a known gap — see [`docs/threat-model.md`](docs/threat-model.md) "Single transparency-log signer".)
 
 Everything else: copy Signal's homework. They got it right.
 
@@ -22,20 +22,20 @@ Everything else: copy Signal's homework. They got it right.
 - **Crypto core:** Rust, using `libsignal` directly. No reinventing.
 - **iOS app:** Swift + SwiftUI, native only. No Electron, no React Native, no WebView for content.
 - **FFI:** Rust → Swift via C ABI.
-- **Storage:** SQLCipher, key in Secure Enclave + Argon2id-derived passphrase.
-- **Transport:** Tor via `Tor.framework` (Onion Browser project, established).
-- **Server:** Rust, stateless relay, deployed initially in CH/IS/PA.
+- **Storage:** SQLCipher (vendored amalgamation v4.6.1). Key chain: Secure-Enclave-resident P-256 → ECIES-unwraps a 32-byte seed in Keychain → HKDF-SHA512 → Argon2id (M=64 MiB, T=3, P=1) → 32-byte SQLCipher key.
+- **Transport:** Tor via embedded `Tor.framework` v409.6.1 (iCepa project, pinned by SHA-256).
+- **Server:** Rust, stateless relay, deployed today in DE/NO/US (CH/IS/PA is the longer-term jurisdictional-diversity target).
 - **License:** AGPLv3.
 
 ## Cryptographic primitives (only these, no others)
 
-- KEM: X25519 + ML-KEM-768 (libsignal's PQXDH)
-- Ratchet: Double Ratchet + SPQR (libsignal's Triple Ratchet, deployed by Signal Oct 2025)
-- Signature: Ed25519 + ML-DSA-65 hybrid; SLH-DSA-SHA2-128s for long-term identity
-- AEAD: ChaCha20-Poly1305
-- Hash: SHA-3 / SHAKE-256
-- KDF: HKDF-SHA-512
-- Password: Argon2id
+- KEM: X25519 + ML-KEM-768 (libsignal v0.93.2's PQXDH)
+- Ratchet: Double Ratchet + SPQR (libsignal v0.93.2's Triple Ratchet, the PQ-ratchet stage Signal deployed October 2025)
+- Signature: XEd25519 / Ed25519 throughout (libsignal IdentityKey + delivery-token verify-key + group-op signatures + transparency-log operator key). A post-quantum signature scheme for long-term identity (ML-DSA-65 / SLH-DSA-SHA2-128s) is on the roadmap but not yet shipped.
+- AEAD: ChaCha20-Poly1305 (relay state files via `chacha20poly1305` crate; libsignal also uses AES-256-GCM internally for sealed-sender envelopes)
+- Hash: BLAKE3 (hashcash PoW, group-op + group-bootstrap digests, hash-chain delivery tokens). libsignal internals additionally use SHA-256 / SHA-512 (the application code does not call SHA-3 / SHAKE-256 anywhere).
+- KDF: HKDF-SHA-512 (delivery-token signing-key derivation + Argon2id input mixing)
+- Password hashing: Argon2id (RustCrypto `argon2` 0.5; M=64 MiB, T=3, P=1 — OWASP 2025 mobile recommendation). Two call sites: the SQLCipher DB-key derivation, and the app/duress passcode verification slots.
 
 If you need anything else, stop and ask.
 
@@ -136,7 +136,7 @@ will pick up the new binary on next build.
 - [x] End-to-end delivered receipts
 - [x] Optional per-contact read receipts (default off)
 - [x] Per-message TTL (1h/24h/3d/7d, 7d hard cap)
-- [x] Recipient-issued delivery tokens (Ed25519)
+- [x] Recipient-issued delivery tokens (v2 BLAKE3 hash chains; v1 Ed25519 one-shot tokens cut over and ripped out — commits `a41f963` → `3bb9242` → `d7eda77`)
 - [x] First-contact hashcash PoW
 - [x] Screen-capture defences (**app-wide isSecureTextEntry wrap, unconditional, no toggle** — every screen, every sheet, every full-screen cover blanks in screenshots / screen recording / AirPlay mirroring / remote-screen-sharing; runtime self-test + automatic fallback with degraded-mode notice in Settings; live shield over chat / contacts / settings while iOS reports recording or external display; black `LaunchScreen.storyboard` and black `PrivacyShieldView` so launch + multitasking-snapshot reveal nothing either)
 - [x] Device-integrity warning layer (jailbreak indicators, debugger attach in release builds, hook-framework dylib scan via `_dyld_image_*`; surfaced as a banner + FAQ — detection-only, never refuses to run, no telemetry)
@@ -150,11 +150,11 @@ will pick up the new binary on next build.
 - [x] 32-finding security-review remediation pass (Surfaces 1–10)
 - [x] Multi-relay client fanout ([`docs/relay-architecture.md`](docs/relay-architecture.md) D3) — `ChatStore.relays: [RelayClient]`, broadcast every send across `readyRelays`, libsignal `SealedSenderResult.isDuplicate` handles receive dedup. Aggregate `relayState` is `.connected` iff any client is ready; `.connectingToTor(max progress)` while bootstrap is in flight on any client; `.failed(merged)` only when all clients have given up. APNs push token registers on exactly one primary relay so an offline-recipient burst doesn't produce N "New message" pushes.
 - [x] Production onion allowlist + signed bundle pipeline ([`docs/relay-architecture.md`](docs/relay-architecture.md) D5) — `PizziniCryptoCore.RelayRegistry.trusted` is the compile-time list; the iOS build's code-signature transitively signs it. Settings → Relays surfaces each entry with a live status dot (idle / connecting / Tor N% / connected / failed) and a BYO `Custom relay` text field for dev (`127.0.0.1`) or community deployments. Empty BYO = fanout across the bundled fleet; non-empty BYO collapses to a single client at that host.
-- [ ] Three production onions stood up (`pizzini2/3/4`, vanity-prefix via `mkp224o`) — CH/IS/PA. Today the fleet ships with one entry (`pizzini2…` on Hetzner FSN1/DE); the multi-relay code path is in place from day one so adding CH/IS/PA is a single-line edit per relay.
-- [x] Storage layer (SQLCipher) — vendored amalgamation v4.6.1 keyed by Secure-Enclave-wrapped seed + Argon2id; eleven normalised tables (settings, device_store, contacts, delivery_tokens, groups, group_members, group_pending_ops, group_op_digests, messages, outbox, meta); one-shot Keychain → SQLCipher migration with verify-before-delete on first launch after upgrade
+- [x] Three production onions stood up (`pizzini2/3/4`, vanity-prefix via `mkp224o`) — today in DE/NO/US (Germany/Norway/USA, all bundled in `PizziniCryptoCore.RelayRegistry.trusted`). CH/IS/PA is the longer-term jurisdictional-diversity target; adding more relays is a one-line edit per entry.
+- [x] Storage layer (SQLCipher) — vendored amalgamation v4.6.1 keyed by Secure-Enclave-wrapped seed + Argon2id; eleven normalised tables (meta, settings, device_store, contacts, blocked_identities, groups, group_members, group_pending_ops, group_op_digests, messages, outbox); one-shot Keychain → SQLCipher migration with verify-before-delete on first launch after upgrade
 - [x] Duress passphrase + cryptographic erasure — opt-in App passcode (mandatory if Face ID off) + opt-in Duress passcode (long-press anywhere on the lock screen brings up entry); duress entry triggers `Storage.eraseAndReinitialize` (DB unlink + SE-key delete + Argon2id salt/params wipe + passcode wipe) then re-opens to an empty lived-in state preserving relay host + UX prefs
 - [ ] App Attest + ATS strict
-- [ ] Reproducible build script
+- [x] Reproducible build script (`scripts/build-relay-release.sh`) — Docker-pinned `rust:1.95.0-bookworm`, offline `cargo vendor`, `--remap-path-prefix` sentinels strip operator-specific paths, `SOURCE_DATE_EPOCH` pinned to commit timestamp. Two operators on the same commit produce byte-identical binaries.
 - [ ] First external audit
 
 ## License
@@ -194,13 +194,13 @@ AGPL-3.0-or-later. See [LICENSE](LICENSE).
 - 2026-05-11 — embedded Tor (Tor.framework v409.6.1) wired in. `scripts/build-tor-xcframework.sh` fetches the iCepa pinned-sha256 release, repackages as a static-library xcframework, stages headers under `swift/Sources/PizziniTorObjC/torheaders/` (gitignored — module-map collision with PizziniCryptoCore.xcframework's flat `include/module.modulemap` output path forced the split). New `PizziniTor` SwiftPM target wraps `TORThread` + `TORController` with a Swift `TorController.shared` (`bootstrap() async throws -> UInt16`, observable `bootstrapProgress`, `isReady`, `stop()`) on data dir `Library/Caches/tor/`. `RelayClient.connect(to:port:)` branches on `.hasSuffix(".onion")`: onion targets await Tor bootstrap, dial 127.0.0.1:39150, do a hand-rolled SOCKS5 NO_AUTH + CONNECT (NWParameters.proxyConfiguration is unreliable for SOCKS5 + .onion on iOS 18), then hand off to the existing relay HELLO; non-onion hosts use the unchanged direct-TCP path. New `RelayClient.State.connectingToTor(progress:)` drives "Connecting to Tor… N%" in DiagnosticsView / RelayAttestationView / ContactsListView. Background grace: relay closes immediately on `didEnterBackground`, Tor lingers 30 s to drain the outbox retry walk, then stops; foreground cancels the pending stop and reconnects (cached consensus → sub-5 s second bootstrap). 15 new `Socks5Tests` cover the framing builder/parsers; all 49 PizziniCryptoCore + PizziniDB tests pass. Default still 127.0.0.1 in this commit — the .onion routing path was the prerequisite for D3 + D5 above, which flipped the default to the bundled fleet.
 - 2026-05-11 — duress passphrase + cryptographic erasure lands. Three new Swift files (`AppPasscode.swift`, `PasscodeEntryView.swift`, `PasscodeSetupView.swift`) + lock + settings + storage updates + 9 unit tests. Design (locked in by the maintainer via three plain-language questions): (Q1c) Face ID toggle preserved, app passcode mandatory when Face ID off, passcode entry pulled up via long-press-anywhere on the lock screen (also auto-shown when Face ID is off); (Q2b) post-wipe state is "empty but lived-in" — relay host + Face ID toggle + auto-lock + panic-mode + screenshot-mask state preserved, every chat/contact/key/outbox row wiped; (Q3a) duress passcode is removable in Settings. **AppPasscode** stores two Argon2id-hashed slots in Keychain (`app-passcode-hash/salt` + `duress-passcode-hash/salt`) under the production preset (M=64 MiB T=3 P=1). `check(_:)` runs both verifications constant-time and returns `.real`/`.duress`/`.neither` — Argon2id cost (~250 ms) dominates wall-clock so an attacker can't distinguish the paths by timing. `setDuressPasscode` rejects values that match the real passcode (would silently wipe on every legit unlock). **Storage.eraseAndReinitialize** is the cryptographic-erasure primitive: deletes the SQLCipher file (+ WAL + SHM sidecars), deletes the Secure-Enclave private key (so the wrapped seed in Keychain becomes ECIES-undecryptable), deletes the Argon2id salt + params + wrapped seed slots, optionally wipes `AppPasscode` slots, re-opens a fresh empty SQLCipher store, and optionally re-persists a preserved-UX-settings AppState. **ChatStore.duressWipe** wires it all up: snapshots state, tears down the relay, calls eraseAndReinitialize, reloads from the fresh-but-preserved-settings DB, mints a brand-new libsignal identity, reconnects the relay. **LockManager** gains `submitPasscode(_:) -> PasscodeOutcome` (real/duress/wrong) and `unlockAfterDuress()`. Its `isLockGateActive` accessor folds Face-ID-enabled OR passcode-set into one check so `handleWillEnterForeground` re-locks correctly in both modes. **LockOverlayView** picks the right primary UI (Face ID prompt + long-press for passcode when Face ID on; passcode entry directly when Face ID off) and runs the wipe BEFORE dropping the lock so a coercer watching the unlock never sees a frame of real contacts. **SecuritySettingsView** gains four new rows (Set/Change/Remove passcode + Set/Change/Remove duress passcode) with footer copy that spells out the wipe behaviour explicitly. Remove-passcode is blocked when Face ID is off (would leave the app gateless). Tests: 9 `AppPasscodeTests` covering real round-trip + duress round-trip + check classifier + duress-can't-match-real + min-length + clear + salt-distinctness + eraseAll + LockManager.submitPasscode flow. All 174+ pizziniTests still pass; build clean. Next: real-device verification on iPhone 15 Pro (sim/device for SE wrap can diverge — particularly worth confirming the duress wipe leaves Application Support clean), then App Attest + ATS strict.
 
-## Done in early sessions
+## Component snapshot (current — not historical)
 
-| Layer | What works |
+| Layer | What works today |
 |---|---|
-| Rust crypto-core | libsignal-protocol v0.93.2 pinned; cbindgen FFI surface; `pizzini_identity_keypair_generate`, `pizzini_store_*` (opaque DeviceStore: identity getters, publish_bundle, initiate_session, encrypt/decrypt) |
-| Tests | 11 Rust unit + 2 integration (PQXDH, ratchet flip, store + bundle wire roundtrip) + 5 Swift Testing on iOS Simulator |
-| Build | `scripts/build-xcframework.sh` (debug+release, drops modulemap, two ios slices), 32 MB release `.a` |
-| Swift | `Package.swift` at repo root wraps the xcframework as `PizziniCryptoCore`; `IdentityKeyPair`, `Session`, `RelayClient`, `Keychain` |
-| Relay | `pizzini-relay` (Tokio, 0.0.0.0:7777) length-prefixed framing + five frame types: HELLO/SEND/BUNDLE_REQUEST/BUNDLE_RESPONSE/REGISTER_PUSH; stateless drop-on-offline (with payload-opaque APNs wake-up when a token is registered); LAN-IP discovery printed at startup; **DEV ONLY** — production needs onion bind |
-| iOS app | Contact card (CoreImage QR + clipboard fallback) + AVCapture scanner; per-peer chat with PreKey/Whisper badges + unread badge; identity persisted in Keychain (AfterFirstUnlockThisDeviceOnly); relay-host editor; APNs registration + REGISTER_PUSH wiring; running on iPhone 17 Pro sim and physical iPhone 15 Pro |
+| Rust crypto-core | libsignal-protocol v0.93.2 pinned (PQXDH + Triple Ratchet/SPQR); cbindgen FFI surface; opaque DeviceStore: identity keypair, publish_bundle, initiate_session, encrypt/decrypt, sealed-sender encrypt/decrypt (SealedSenderV1), HKDF-SHA512 delivery-token signing-key derivation, Argon2id KDF, BLAKE3 hashcash. |
+| Tests | Rust workspace: ~129 across `crypto-core` (69) + `relay` (60). Swift package: ~72 across `PizziniCryptoCoreTests` + `PizziniDBTests`. iOS app: ~316 `pizziniTests` via `xcodebuild`. CI on macOS-15 (`.github/workflows/ci.yml`). |
+| Build | `scripts/build-xcframework.sh` (XCFramework, debug + release, two iOS slices); `scripts/build-tor-xcframework.sh` (vendors iCepa Tor.framework v409.6.1 + stages C headers); `scripts/build-relay-release.sh` (Docker-pinned reproducible relay build). |
+| Swift | Root `Package.swift` wraps the XCFrameworks as `PizziniCryptoCore` / `PizziniDB` / `PizziniTor`; primary types: `IdentityKeyPair`, `Session`, `RelayClient`, `TorController`, `Keychain`. |
+| Relay | `pizzini-relay` (Tokio) binds 127.0.0.1:7777 by default (fronted by a Tor onion service in production; `PIZZINI_RELAY_BIND` overridable for dev). Twelve framed types: HELLO / SEND / BUNDLE_REQUEST / BUNDLE_RESPONSE / REGISTER_PUSH / ACK / STATUS_REQUEST / STATUS_RESPONSE / COVER / DEREGISTER_PUSH / REGISTER_CHAIN (slot 7 reserved — was v1 TOKEN_ISSUE). Persistent ChaCha20-Poly1305-encrypted state files (0600 perms): offline-message queue (per-peer cap 100, TTL ≤ 7d) + APNs push-token store (30-day TTL). Self-attest reply carries crate version + git SHA + binary SHA-256 + dirty bit. |
+| iOS app | Contact card (CoreImage QR + clipboard fallback) + AVCapture scanner. Identity + per-peer ratchet state persisted in SQLCipher v4.6.1 (11 normalised tables). Embedded Tor bootstraps in ~1.85 s on warm cache; `RelayClient` per onion in `RelayRegistry.trusted`, dial via 127.0.0.1:39150 SOCKS5. APNs + Notification Service Extension drive the app-icon badge while force-quit. App-wide `isSecureTextEntry` screenshot shield (unconditional). Face ID + app/duress passcode + cryptographic-erasure wipe. Group chat with sender-key fanout + chunked sealed attachments. |
