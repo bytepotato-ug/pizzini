@@ -96,6 +96,7 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
     case executableWarning
     case wipingData
     case duressPasscode
+    case transparencyLog
     case notYetShipped
 
     var id: String { rawValue }
@@ -136,6 +137,8 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             return "What each delete option does"
         case .duressPasscode:
             return "The duress passcode (silent wipe)"
+        case .transparencyLog:
+            return "The transparency log (and what it leaks today)"
         case .notYetShipped:
             return "What Pizzini doesn’t do yet"
         }
@@ -645,6 +648,52 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             The duress feature exists to defeat a real-time coercer who \
             hands you back your phone and demands you unlock it. It is \
             not retroactive cover for prior leaks.
+            """
+        case .transparencyLog:
+            return """
+            Pizzini publishes a signed transparency log of every relay \
+            binary the operator deploys. Each entry is signed with the \
+            operator’s Ed25519 key, so a relay running an unannounced \
+            build is detectable — your app refuses to talk to it.
+
+            Today the log is hosted on GitHub at \
+            raw.githubusercontent.com. Your phone fetches it over \
+            plain HTTPS, NOT through Tor. This is the one connection \
+            in Pizzini that is not Tor-only.
+
+            What that leaks to GitHub / Cloudflare:
+
+            • Your IP address.
+            • The fact that you are running Pizzini.
+            • The rough cadence at which you reconnect to a relay \
+              (each reconnect can trigger a refresh).
+
+            What it does NOT leak:
+
+            • Who you talk to.
+            • What you say.
+            • Which relay you are using.
+
+            Why we accept this trade-off today: GitHub-raw is the most \
+            tamper-resistant public host we have access to without \
+            running our own infrastructure. The signed-entry chain \
+            means an attacker who controls the host can only delay or \
+            truncate the log, never forge an entry. The end-to-end \
+            signature is what gives the log its integrity, not the \
+            transport.
+
+            Why this isn’t routed through Tor yet: the embedded Tor \
+            daemon runs in “onion traffic only” mode — it refuses \
+            clearnet exits, which is what keeps the rest of the app \
+            Tor-onion-only. Routing the GitHub fetch through Tor would \
+            require relaxing that flag, which is a worse trade-off \
+            than the current IP leak.
+
+            What changes this: an operator-hosted .onion mirror of the \
+            transparency log. When that ships, your phone fetches it \
+            through Tor automatically (no app update needed) — the \
+            code already detects .onion hosts and routes them via the \
+            relay’s Tor circuit.
             """
         case .notYetShipped:
             return """
