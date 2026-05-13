@@ -384,10 +384,60 @@ const PENDING_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// XEd25519 verify key wire size — 1-byte DJB type prefix + 32-byte point.
 const VERIFY_KEY_LEN: usize = 33;
-/// Delivery-token wire layout: nonce(16) + expiry_be_u32(4) + sig(64).
+/// Delivery-token v1 wire layout: nonce(16) + expiry_be_u32(4) + sig(64).
 const TOKEN_NONCE_LEN: usize = 16;
 const TOKEN_SIG_LEN: usize = 64;
 const TOKEN_LEN: usize = TOKEN_NONCE_LEN + 4 + TOKEN_SIG_LEN;
+
+/// Delivery-token v2 wire layout: chainID(16) + index_be_u32(4) + value(32).
+/// The SEND frame's `token` field length distinguishes v1 (84 B) from v2
+/// (52 B) — see `check_delivery_token` for the dispatch.
+///
+/// v2 swaps the per-message Ed25519 signature for hash-chained tokens:
+/// the recipient mints a chain (root = H^n(seed)), ships the seed to the
+/// sender via the sealed Double Ratchet, registers the root with this
+/// relay, and the sender derives token[i] = H^(n-i)(seed). The relay
+/// validates a presentation against the (recipient, chainID) state in
+/// O(Δi) hashes, with replay protection via a monotonic last-seen index.
+///
+/// This relay parses v2 tokens but does NOT yet validate them — the
+/// validator state (per (recipient, chainID) → root, last_index,
+/// last_value) lands in a follow-up commit alongside the on-disk store
+/// shape. Until then, any v2 SEND fails closed with a clear error so
+/// clients can detect the relay is not yet v2-ready.
+const TOKEN_V2_CHAIN_ID_LEN: usize = 16;
+const TOKEN_V2_VALUE_LEN: usize = 32;
+const TOKEN_V2_LEN: usize = TOKEN_V2_CHAIN_ID_LEN + 4 + TOKEN_V2_VALUE_LEN;
+
+/// Decomposed v2 token bytes. Stage-3 parsing only — the validator
+/// against per-recipient chain state lands next.
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedV2Token {
+    chain_id: [u8; TOKEN_V2_CHAIN_ID_LEN],
+    index: u32,
+    value: [u8; TOKEN_V2_VALUE_LEN],
+}
+
+fn parse_v2_token(bytes: &[u8]) -> Result<ParsedV2Token, &'static str> {
+    if bytes.len() != TOKEN_V2_LEN {
+        return Err("v2 token wrong length");
+    }
+    let chain_id: [u8; TOKEN_V2_CHAIN_ID_LEN] = bytes[..TOKEN_V2_CHAIN_ID_LEN]
+        .try_into()
+        .expect("len checked");
+    let index = u32::from_be_bytes(
+        bytes[TOKEN_V2_CHAIN_ID_LEN..TOKEN_V2_CHAIN_ID_LEN + 4]
+            .try_into()
+            .expect("len checked"),
+    );
+    let value: [u8; TOKEN_V2_VALUE_LEN] = bytes[TOKEN_V2_CHAIN_ID_LEN + 4..]
+        .try_into()
+        .expect("len checked");
+    if index == 0 {
+        return Err("v2 token index must be ≥ 1");
+    }
+    Ok(ParsedV2Token { chain_id, index, value })
+}
 /// First-contact PoW difficulty. Verifier rejects anything weaker.
 /// Hashcash difficulty in leading-zero bits. F-NEW-209: raised from
 /// 18 → 22 so a desktop-GPU attacker no longer collapses the per-
@@ -1386,6 +1436,19 @@ async fn check_delivery_token(
     verify_keys: &VerifyKeys,
     replays: &Replays,
 ) -> Result<(), String> {
+    // v2 hash-chained tokens are 52 bytes and parse cleanly, but the
+    // per-recipient chain-validator store doesn't exist yet on this
+    // relay. Recognise the v2 shape so the failure message is honest
+    // (clients trying v2 know to stay on v1), but reject all v2 frames
+    // until the validator lands.
+    if parsed.token.len() == TOKEN_V2_LEN {
+        if let Err(e) = parse_v2_token(&parsed.token) {
+            return Err(format!("v2 token malformed: {e}"));
+        }
+        return Err(
+            "delivery-token v2 not yet validated by this relay; clients should stay on v1".into(),
+        );
+    }
     if parsed.token.len() != TOKEN_LEN {
         return Err(format!(
             "wrong token length: {} (expected {TOKEN_LEN})",
@@ -2165,6 +2228,53 @@ mod tests {
         bad.extend_from_slice(&(64u16.to_be_bytes()));
         bad.extend_from_slice(&[0u8; 8]); // declared 64, gives 8
         assert!(parse_sealed(&bad).is_err());
+    }
+
+    // ─── v2 hash-chained delivery-token parsing ───────────────────────────
+    // The validator against per-recipient chain state lands in a follow-up
+    // commit; these tests pin the wire decomposition the validator will
+    // build on.
+
+    #[test]
+    fn parse_v2_token_round_trip() {
+        let mut wire = vec![0u8; TOKEN_V2_LEN];
+        wire[..TOKEN_V2_CHAIN_ID_LEN].copy_from_slice(&[0x11; TOKEN_V2_CHAIN_ID_LEN]);
+        wire[TOKEN_V2_CHAIN_ID_LEN..TOKEN_V2_CHAIN_ID_LEN + 4]
+            .copy_from_slice(&0x01020304u32.to_be_bytes());
+        wire[TOKEN_V2_CHAIN_ID_LEN + 4..].copy_from_slice(&[0x22; TOKEN_V2_VALUE_LEN]);
+        let parsed = parse_v2_token(&wire).expect("valid v2 token must parse");
+        assert_eq!(parsed.chain_id, [0x11; TOKEN_V2_CHAIN_ID_LEN]);
+        assert_eq!(parsed.index, 0x01020304);
+        assert_eq!(parsed.value, [0x22; TOKEN_V2_VALUE_LEN]);
+    }
+
+    #[test]
+    fn parse_v2_token_rejects_zero_index() {
+        let mut wire = vec![0u8; TOKEN_V2_LEN];
+        // index bytes default to 0 — must be rejected (chain values
+        // are presented at 1-indexed positions; the relay would
+        // otherwise accept root-as-token).
+        wire[..TOKEN_V2_CHAIN_ID_LEN].copy_from_slice(&[0x33; TOKEN_V2_CHAIN_ID_LEN]);
+        assert!(parse_v2_token(&wire).is_err());
+    }
+
+    #[test]
+    fn parse_v2_token_rejects_bad_length() {
+        assert!(parse_v2_token(&[]).is_err());
+        assert!(parse_v2_token(&vec![0u8; TOKEN_V2_LEN - 1]).is_err());
+        assert!(parse_v2_token(&vec![0u8; TOKEN_V2_LEN + 1]).is_err());
+        // v1 length must NOT parse as v2.
+        assert!(parse_v2_token(&vec![0u8; TOKEN_LEN]).is_err());
+    }
+
+    #[test]
+    fn v2_token_length_distinguishes_from_v1() {
+        // Wire shape contract: the two lengths must differ so the
+        // dispatch in check_delivery_token can pick the right path
+        // without a version byte on the wire.
+        assert_ne!(TOKEN_LEN, TOKEN_V2_LEN);
+        assert_eq!(TOKEN_V2_LEN, 52);
+        assert_eq!(TOKEN_LEN, 84);
     }
 
     // ─── F-203 fix-review attack vectors ──────────────────────────────────
