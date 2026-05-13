@@ -418,9 +418,19 @@ struct ContactsListView: View {
         case .connected:
             EmptyView()
         case .idle, .connecting, .connectingToTor:
-            ProgressView()
-                .controlSize(.mini)
-                .accessibilityLabel("Pizzini is connecting")
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.mini)
+                if !store.torBootstrapPhase.isEmpty,
+                   store.torBootstrapPhase != "Connected"
+                {
+                    Text(store.torBootstrapPhase)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Pizzini is connecting. \(store.torBootstrapPhase)")
         case .failed:
             Button {
                 store.forceReconnectRelays()

@@ -340,6 +340,14 @@ final class ChatStore: NSObject {
             name: .pizziniTorRequiresAppRestart,
             object: nil,
         )
+        // Mirror TorController.bootstrapPhaseLabel for the
+        // connection-status indicator in ContactsListView.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleTorBootstrapPhaseChanged(_:)),
+            name: .pizziniTorBootstrapPhaseChanged,
+            object: nil,
+        )
     }
 
     @objc
@@ -359,6 +367,14 @@ final class ChatStore: NSObject {
     /// auto-relaunches because the trigger was a direct user tap).
     var torRequiresAppRestart: Bool = false
 
+    /// Mirror of `TorController.bootstrapPhaseLabel` — short
+    /// user-facing string for the current bootstrap phase ("Loading
+    /// directory", "Building circuit", "Connecting to relay", …).
+    /// Empty until the first STATUS_CLIENT event arrives.
+    /// ContactsListView renders it next to the connection spinner
+    /// so the user can see the app is making progress.
+    var torBootstrapPhase: String = ""
+
     @objc
     private func handleTorRequiresAppRestart() {
         pzLog("[pizzini] tor daemon exited — surfacing restart CTA")
@@ -367,6 +383,12 @@ final class ChatStore: NSObject {
         // forever against a dead daemon. The user has to act.
         autoReconnectTask?.cancel()
         autoReconnectTask = nil
+    }
+
+    @objc
+    private func handleTorBootstrapPhaseChanged(_ notification: Notification) {
+        guard let label = notification.userInfo?["label"] as? String else { return }
+        torBootstrapPhase = label
     }
 
     /// USP #1 second half: refresh the transparency log from the

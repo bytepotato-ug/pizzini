@@ -92,6 +92,14 @@ public extension Notification.Name {
     /// app as if the user had force-quit and reopened it. Fires
     /// once per process; subsequent triggers are no-ops.
     static let pizziniTorRequiresAppRestart = Notification.Name("app.pizzini.tor.requires-app-restart")
+
+    /// Posted on the MainActor when `TorController.bootstrapPhaseLabel`
+    /// changes — i.e. tor emitted a new `TAG=` we have user-facing
+    /// copy for. The host mirrors the label onto its own
+    /// `@Observable` surface so SwiftUI status indicators redraw.
+    /// `object` is the singleton; `userInfo["label"]` is the new
+    /// `String`.
+    static let pizziniTorBootstrapPhaseChanged = Notification.Name("app.pizzini.tor.bootstrap-phase-changed")
 }
 
 /// Debug logger for the embedded tor lifecycle. Subsystem +
@@ -169,6 +177,17 @@ public final class TorController: ObservableObject {
     /// dialing on this; before it flips, dialing would just stall on
     /// the SOCKS handshake while tor is still wiring its directory.
     @Published public private(set) var isReady: Bool = false
+
+    /// User-facing label for the current bootstrap phase, derived
+    /// from tor's `TAG=...` field. Empty until the first BOOTSTRAP
+    /// event arrives; populated only for tags we have a friendly
+    /// translation for (see `userFacingPhase(forTag:)`). Tags we
+    /// don't have copy for leave the previous label in place
+    /// rather than flicker — the user is better served by a sticky
+    /// "Building circuit" than by alternating between that and an
+    /// empty string while tor sweeps through unrelated internal
+    /// phases.
+    @Published public private(set) var bootstrapPhaseLabel: String = ""
 
     /// Set true the first time we detect the embedded tor daemon has
     /// exited — `TORThread.active.isFinished == true`. Once true,
@@ -786,8 +805,17 @@ public final class TorController: ObservableObject {
             guard let raw = arguments?["PROGRESS"], let pct = Int(raw) else { return false }
             let tag = arguments?["TAG"] ?? ""
             torLog.debug("bootstrap: progress=\(pct)% tag=\(tag, privacy: .public)")
+            let phaseLabel = TorController.userFacingPhase(forTag: tag)
             Task { @MainActor [weak self] in
                 self?.bootstrapProgress = pct
+                if let phaseLabel, self?.bootstrapPhaseLabel != phaseLabel {
+                    self?.bootstrapPhaseLabel = phaseLabel
+                    NotificationCenter.default.post(
+                        name: .pizziniTorBootstrapPhaseChanged,
+                        object: self,
+                        userInfo: ["label": phaseLabel],
+                    )
+                }
             }
             // Don't claim the event — other observers (e.g. tests) may
             // also want to see it.
@@ -1209,6 +1237,43 @@ public final class TorController: ObservableObject {
         }
     }
 
+
+    /// Map a tor bootstrap `TAG=` value to a short user-facing
+    /// phrase, or `nil` for tags we don't surface. Keeping the
+    /// vocabulary small and stable matters more than translating
+    /// every internal step — the user sees "Building circuit" for
+    /// ~3 s and "Connecting to relay" for the rest; flipping every
+    /// 200 ms through tor's full internal taxonomy reads as
+    /// "stuck on something I don't understand".
+    ///
+    /// Public so the iOS app test target can pin the contract —
+    /// see `BootstrapPhaseLabelTests` in `pizziniTests`. The mapping
+    /// is intentionally lossy; future tor versions may add new
+    /// TAGs and we just return nil (keeping the previous label
+    /// rather than flickering).
+    public nonisolated static func userFacingPhase(forTag tag: String) -> String? {
+        switch tag {
+        case "starting":
+            return "Starting"
+        case "conn_pt", "conn_done_pt", "conn_proxy", "conn_done_proxy",
+             "conn", "conn_done":
+            return "Finding a route"
+        case "handshake", "handshake_done", "onehop_create":
+            return "Building circuit"
+        case "requesting_status", "loading_status",
+             "loading_keys",
+             "requesting_descriptors", "loading_descriptors",
+             "enough_dirinfo":
+            return "Loading directory"
+        case "ap_conn", "ap_conn_done", "ap_handshake",
+             "ap_handshake_done", "circuit_create":
+            return "Connecting to relay"
+        case "done":
+            return "Connected"
+        default:
+            return nil
+        }
+    }
 
     /// Check whether the embedded tor daemon's NSThread reports
     /// `isFinished == true`. Returns true if we just flipped
