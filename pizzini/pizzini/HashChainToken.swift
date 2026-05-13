@@ -34,6 +34,16 @@ import Foundation
 /// of recipient's chains in turn — N=50 contacts × 1 chain each = 50
 /// SHA-256 ops per validation, well under a millisecond.
 enum HashChainToken {
+    /// Master cutover flag. Default OFF: the v1 Ed25519 token model
+    /// stays authoritative. Flip to `true` once the relay's v2
+    /// validator (stage 3b) is deployed across the fleet — `cargo
+    /// test --manifest-path relay/Cargo.toml v2_validator` must pass
+    /// and the rolling deploy must complete on every seed before
+    /// this can flip, or v2 SENDs will fail closed at the relay
+    /// (`delivery-token v2 not yet validated by this relay`) and the
+    /// chat row will show as failed.
+    static let cutoverEnabled = false
+
     static let hashSize = 32
     static let chainIDSize = 16
     /// Default chain length. 2^14 tokens at one-per-message ≈ 5 months

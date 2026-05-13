@@ -1262,6 +1262,21 @@ final class ChatStore: NSObject {
         // (`Storage.commitDeliveryTokenSpend`) so a crash between
         // the two writes can never burn a token without a
         // corresponding outbox record.
+        // v2 cutover: when the flag is on and a chain is installed,
+        // derive a v2 token, persist the advanced chain, ship the
+        // sealed SEND with the 52-byte v2 token blob, and skip the v1
+        // stash entirely. Falls through to the v1 path when the flag
+        // is off, the chain is missing, or the chain is exhausted.
+        if let v2Token = mintV2DeliveryToken(forContactAt: idx) {
+            sendV2(
+                trimmed: trimmed,
+                forContactAt: idx,
+                contact: contact,
+                session: session,
+                v2Token: v2Token,
+            )
+            return
+        }
         guard !state.contacts[idx].deliveryTokensForPeer.isEmpty else {
             // The stash is empty, so a refill broadcast can't even pay
             // its own postage. The only honest action is to re-pair —
@@ -1379,6 +1394,83 @@ final class ChatStore: NSObject {
             maybeRequestRefill(forContactAt: idx, session: session)
         } catch {
             appendSystem("Encrypt failed: \(error)", to: idx)
+        }
+    }
+
+    /// v2 cutover send path. Mirrors the v1 atomic-spend send but uses
+    /// a pre-minted hash-chain token instead of popping the v1 stash.
+    /// Skipped entirely when `HashChainToken.cutoverEnabled == false`
+    /// (current default — caller never reaches us).
+    @MainActor
+    private func sendV2(
+        trimmed: String,
+        forContactAt idx: Int,
+        contact: Contact,
+        session: Session,
+        v2Token: HashChainToken.Token
+    ) {
+        let messageId = Self.makeMessageId()
+        var inner = Data([RelayClient.InnerEnvelopeKind.chat.rawValue])
+        inner.append(Data(trimmed.utf8))
+        let sealed: Data
+        do {
+            sealed = try session.encryptSealed(
+                peer: contact.identityPub,
+                messageId: messageId,
+                plaintext: inner,
+            )
+        } catch {
+            appendSystem("Encrypt failed: \(error)", to: idx)
+            return
+        }
+        let ttl = state.contacts[idx].ttlSeconds
+        let now = Date()
+        let wireToken = HashChainToken.encode(v2Token)
+        var entry = OutboxEntry(
+            messageId: messageId,
+            recipientPeerId: contact.identityPub,
+            sealedCiphertext: sealed,
+            token: wireToken,
+            ttl: TimeInterval(ttl),
+            sentAt: now,
+            retries: 0,
+            deliveredAt: nil,
+            failedAt: nil,
+            relayedAt: nil,
+        )
+        outbox.entries[messageId] = entry
+        Storage.upsertOutboxEntry(entry)
+        persistSession()
+        broadcastToRelays {
+            $0.sendSealed(
+                toPeer: contact.identityPub,
+                sealedCiphertext: sealed,
+                ttlSeconds: ttl,
+                token: wireToken,
+            )
+        }
+        entry.relayedAt = now
+        // F-505 parity with v1: scrub the token blob once relayed.
+        entry.token = Data()
+        outbox.entries[messageId] = entry
+        Storage.upsertOutboxEntry(entry)
+        let logEntry = PersistedMessage(
+            side: .me,
+            text: trimmed,
+            kind: state.contacts[idx].sessionEstablished ? .whisper : .preKey,
+            bytes: sealed.count,
+            messageId: messageId,
+        )
+        state.contacts[idx].log.append(logEntry)
+        state.contacts[idx].lastMessageAt = logEntry.timestamp
+        persistContactSliceAndAppended(logEntry, at: idx)
+        // v2 rotation: if the chain just crossed the 80% mark, the
+        // *recipient* (us) of any next v2 token presentation would
+        // start watching for the new one. The chain owner (peer) is
+        // the one who mints — we can't do it locally. Best we can do
+        // here is log so a future telemetry pass surfaces the cadence.
+        if let chain = state.contacts[idx].outboundTokenChain, chain.shouldRotate {
+            pzLog("[pizzini] v2 chain crossing rotation threshold for \(self.short(contact.identityPub))")
         }
     }
 
@@ -1770,6 +1862,21 @@ final class ChatStore: NSObject {
     /// Used both at pair time (right after we send their bundle) and
     /// in response to a refill request. Rate-limited to one issuance
     /// per `Contact.refillCooldown` per peer.
+    /// v2 token mint: pop the next token off the contact's outbound
+    /// hash chain, advance the cursor, and persist. Returns nil when
+    /// the cutover flag is off, no chain is installed, or the chain
+    /// is exhausted — caller falls back to the v1 stash. Encoding to
+    /// wire bytes is the caller's job (`HashChainToken.encode`).
+    @MainActor
+    private func mintV2DeliveryToken(forContactAt idx: Int) -> HashChainToken.Token? {
+        guard HashChainToken.cutoverEnabled else { return nil }
+        guard var chain = state.contacts[idx].outboundTokenChain else { return nil }
+        guard let token = HashChainToken.nextToken(in: &chain) else { return nil }
+        state.contacts[idx].outboundTokenChain = chain
+        Storage.upsertContact(state.contacts[idx])
+        return token
+    }
+
     /// Handle a sealed `chainSeedDelivery` payload. The peer (who minted
     /// the chain and registered the root with the relay) has shipped us
     /// the seed for our outbound v2 token chain to them. Install or
@@ -1852,6 +1959,18 @@ final class ChatStore: NSObject {
         broadcastToRelays { $0.sendTokenIssue(toPeer: peer, tokens: tokens) }
         state.contacts[idx].lastRefillRequestHandledAt = Date()
         Storage.upsertContact(state.contacts[idx])
+        // v2 cutover: alongside the v1 batch, ship the peer a hash
+        // chain over the sealed channel so future sends can derive
+        // tokens from a single seed instead of draining the 1024-token
+        // stash. Gated on `HashChainToken.cutoverEnabled` until the
+        // relay-side validator is deployed; until then the chain is
+        // shipped but never used (the sender-side gate is the same
+        // flag), so flipping the relay-side switch is the only step
+        // needed to roll forward.
+        if HashChainToken.cutoverEnabled, let relayForChain = readyRelays.first {
+            sendChainSeedDelivery(toPeer: peer, via: relayForChain, session: session)
+        }
+        _ = relay
     }
 
     /// Default per-message TTL until Phase 4's per-message picker lands.
