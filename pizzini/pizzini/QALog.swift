@@ -34,26 +34,34 @@ import Foundation
 /// contain message bodies or chain seeds — only peer-id prefixes
 /// (4-byte short form), inner-kind hex bytes, and event-name text.
 enum QALog {
+    // Every constant here is `nonisolated` because the iOS module's
+    // default `@MainActor` isolation would otherwise force every
+    // reference (including from `pzLog`, which is a free nonisolated
+    // function, and from the serial dispatch closures below) onto
+    // the main actor. These are pure values — no shared mutable
+    // state — so isolation buys us nothing and breaks the call sites
+    // that need to log from off-main-actor code.
+
     /// Subdirectory name under Application Support. Public so the
     /// share-sheet code can name the URL it hands to
     /// `UIActivityViewController`.
-    static let directoryName = "qa-debug"
+    nonisolated static let directoryName = "qa-debug"
     /// Active log filename.
-    static let filename = "qa.log"
+    nonisolated static let filename = "qa.log"
     /// Rotated (previous-session) log filename. One historical file
     /// kept so a "I just hit the bug, but the log already rotated"
     /// scenario still has the prior chunk available.
-    static let rotatedFilename = "qa.log.1"
+    nonisolated static let rotatedFilename = "qa.log.1"
     /// Rotation threshold. 10 MB ≈ tens of thousands of lines at
     /// our typical line length — enough for a multi-hour test
     /// session before rolling.
-    static let rotateBytes: UInt64 = 10 * 1024 * 1024
+    nonisolated static let rotateBytes: UInt64 = 10 * 1024 * 1024
 
     /// Serial dispatch queue so file writes are ordered AND happen
     /// off the caller's thread (typically `@MainActor`). `qos:
     /// .utility` because diag logging is observability work that
     /// should never compete with UI / network priority.
-    private static let queue = DispatchQueue(
+    nonisolated private static let queue = DispatchQueue(
         label: "pizzini.qalog",
         qos: .utility,
     )
