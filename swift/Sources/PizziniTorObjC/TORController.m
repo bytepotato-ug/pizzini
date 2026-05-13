@@ -323,9 +323,30 @@ static NSString * const TORControllerEndReplyLineSeparator = @" ";
     [self sendCommand:TORCommandSignalShutdown arguments:nil data:nil observer:^BOOL(NSArray<NSNumber *> * __unused codes, NSArray<NSData *> * __unused lines, BOOL * __unused stop) {
         shutdown(self->sock, SHUT_RDWR);
         self->_channel = nil;
-     
+
         return YES;
      }];
+}
+
+// Pizzini addition: close the control channel WITHOUT sending
+// SIGNAL SHUTDOWN to Tor. Used by `TorController.stopInternal()` so
+// the embedded Tor daemon stays alive across an app background /
+// foreground cycle and the next `bootstrap()` can re-auth against
+// the still-running tor (matching the "TORThread is single-shot
+// per process; we never tear down tor" invariant TORThread.m
+// enforces with abort()).
+//
+// `disconnect()` above sends `SIGNAL SHUTDOWN` first, which makes
+// tor exit ("Interrupt: exiting cleanly") and orphans the
+// `TORThread.active` reference — the next bootstrap reuses a dead
+// thread, polls 30s for a cookie file tor will never write, and
+// fails with `missingCookie` forever. This method skips the
+// signal: socket close only.
+- (void)closeControlChannel {
+    if (self->sock > 0) {
+        shutdown(self->sock, SHUT_RDWR);
+    }
+    self->_channel = nil;
 }
 
 #pragma mark - Receiving Responses

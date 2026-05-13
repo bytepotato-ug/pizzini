@@ -408,20 +408,24 @@ public final class TorController: ObservableObject {
     // ─── Internals ────────────────────────────────────────────────────
 
     private func stopInternal() {
-        torController?.disconnect()
+        // CRITICAL: use `closeControlChannel` (Pizzini-only), NOT
+        // `disconnect`. The latter issues `SIGNAL SHUTDOWN` to tor,
+        // which makes the embedded daemon exit cleanly
+        // ("Interrupt: exiting cleanly" in tor's log) and orphans
+        // `TORThread.active` — the next `bootstrap()` reuses a
+        // dead-tor thread, polls 30 s for cookie/controlport files
+        // that will never appear, throws `missingCookie`, and
+        // retries forever. `closeControlChannel` shuts down the
+        // socket only, leaving tor running so reconnection is a
+        // re-auth round-trip rather than a full bootstrap.
+        torController?.closeControlChannel()
         torController = nil
-        // CRITICAL: we do NOT release `torThread`. TORThread
-        // upstream enforces a one-thread-per-process invariant via
-        // NSAssert, and `tor_run_main()` is single-shot anyway —
-        // even if we cleared our reference, the static `_thread`
-        // ivar in TORThread.m stays set, and any subsequent
-        // `TORThread.init` would trip the assert and crash the
-        // process. Leave the daemon alive in the background. The
-        // next `bootstrap()` re-reads the still-valid cookie and
-        // re-opens the control socket against the still-listening
-        // tor, then re-subscribes to STATUS_CLIENT events —
-        // typically completing in a few hundred ms because tor's
-        // first circuit is already up.
+        // We do NOT release `torThread`. TORThread upstream enforces
+        // a one-thread-per-process invariant via abort(), and
+        // `tor_run_main()` is single-shot anyway. Leave the daemon
+        // alive in the background; the next `bootstrap()` re-reads
+        // the still-valid cookie + re-opens the control socket
+        // against the still-listening tor.
         isReady = false
         bootstrapProgress = 0
     }

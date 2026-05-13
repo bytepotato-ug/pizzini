@@ -38,6 +38,18 @@ TOR_EXTERN NSString * const TORControllerErrorDomain;
 - (BOOL)connect:(out NSError **)error;
 - (void)disconnect;
 
+/**
+ Close the control channel WITHOUT sending `SIGNAL SHUTDOWN` to tor.
+ Use this when the caller wants to relinquish the control socket but
+ keep the embedded tor daemon running across an app background /
+ foreground cycle. `disconnect` above issues `SIGNAL SHUTDOWN`,
+ which makes tor exit and breaks the next bootstrap's
+ thread-reuse path (the cookie + controlport files disappear with
+ the dying daemon, and `bootstrap()` polls 30 s for files that will
+ never appear). This method just closes the socket.
+ */
+- (void)closeControlChannel;
+
 // Commands
 - (void)authenticateWithData:(NSData *)data completion:(void (^__nullable)(BOOL success, NSError * __nullable error))completion;
 - (void)resetConfForKey:(NSString *)key completion:(void (^__nullable)(BOOL success, NSError * __nullable error))completion;
