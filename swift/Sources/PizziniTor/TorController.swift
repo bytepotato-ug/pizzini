@@ -275,6 +275,14 @@ public final class TorController: ObservableObject {
     /// but not breaking it).
     private var preparedOnions: Set<String> = []
 
+    /// Onions the host has asked us to proactively HSFETCH in parallel
+    /// with tor's bootstrap, populated via `primeOnions(_:)`. Set
+    /// before the first `bootstrap()` call so `runBootstrap` can read
+    /// it once the control channel authenticates. Subsequent
+    /// `primeOnions` calls overwrite the list (relay-host flip,
+    /// fleet membership change).
+    private var onionsToPrime: [String] = []
+
     /// Hard deadline for a single HSFETCH. **The first HSFETCH after
     /// a fresh bootstrap is the load-bearing one** — tor's HSDir
     /// circuit pool is empty, so the descriptor lookup pays for the
@@ -324,6 +332,33 @@ public final class TorController: ObservableObject {
             // hit "address in use" on the SOCKS bind.
             stopInternal()
             throw error
+        }
+    }
+
+    /// Register onion hosts to proactively HSFETCH in parallel with
+    /// the rest of the bootstrap. Call from the host as early as the
+    /// relay target list is known — typically `ChatStore.connectRelay`
+    /// right before building RelayClients. Fire-and-forget; the
+    /// speculative fetches run on tor's own schedule the moment the
+    /// control channel authenticates, well before `bootstrap()`
+    /// returns. By the time RelayClient calls `prepareHiddenService`,
+    /// the descriptor is usually already cached and the call
+    /// short-circuits through `preparedOnions`.
+    ///
+    /// Idempotent. Repeated calls overwrite the prime list — the
+    /// host may shrink it when a BYO override is flipped on, or grow
+    /// it when the fleet expands. Onions already in `preparedOnions`
+    /// are skipped; in-flight fetches via `hsFetchTasks` are reused.
+    public func primeOnions(_ hosts: [String]) {
+        let normalized = hosts.map { Self.stripOnionSuffix($0).lowercased() }
+        onionsToPrime = normalized
+        // If we already have an authenticated controller (e.g. the
+        // host is changing the prime list mid-session), dispatch
+        // immediately. On the cold-launch path the controller is nil
+        // here and the dispatch happens inside `runBootstrap` right
+        // after authenticate succeeds.
+        if torController != nil {
+            dispatchSpeculativeHsFetches()
         }
     }
 
@@ -548,6 +583,18 @@ public final class TorController: ObservableObject {
             }
         }
         torLog.info("bootstrap: authenticate OK after \(Self.fmtElapsed(from: authStart)) (total \(Self.fmtElapsed(from: bootstrapStart)))")
+
+        // Speculative HSFETCH: kick off descriptor lookups for the
+        // host-primed onions BEFORE waiting for CIRCUIT_ESTABLISHED.
+        // Tor accepts the HSFETCH command at the control port even
+        // mid-bootstrap; the descriptor circuit races the
+        // general-purpose circuit instead of being serialised behind
+        // it. By the time RelayClient calls `prepareHiddenService`
+        // the descriptor is usually already cached and we short-
+        // circuit on `preparedOnions`, shaving ~2-3 s off cold-launch
+        // dial latency. Failures are swallowed — the regular
+        // prepareHiddenService path retries on demand.
+        dispatchSpeculativeHsFetches()
 
         // Subscribe to STATUS_CLIENT events to drive bootstrapProgress.
         // The observer must capture self weakly — TORController retains
@@ -987,6 +1034,36 @@ public final class TorController: ObservableObject {
         }
     }
 
+
+    /// Fire HSFETCH for each onion in `onionsToPrime` that we haven't
+    /// already cached and don't already have an in-flight fetch for.
+    /// The tasks live in `hsFetchTasks` so a concurrent
+    /// `prepareHiddenService(_:)` from RelayClient coalesces onto
+    /// the same in-flight fetch instead of stacking a second one.
+    private func dispatchSpeculativeHsFetches() {
+        guard let controller = torController, !onionsToPrime.isEmpty else { return }
+        var dispatched = 0
+        for address in onionsToPrime {
+            if preparedOnions.contains(address) { continue }
+            if hsFetchTasks[address] != nil { continue }
+            let task = Task<Void, Error> { [weak self] in
+                guard let self else { throw TorControllerError.cancelled }
+                try await self.runHsFetch(address: address, on: controller)
+                self.preparedOnions.insert(address)
+            }
+            hsFetchTasks[address] = task
+            // Drain on completion so a subsequent prime-list update
+            // can re-dispatch this onion if needed.
+            Task { [weak self, address] in
+                _ = try? await task.value
+                self?.hsFetchTasks[address] = nil
+            }
+            dispatched += 1
+        }
+        if dispatched > 0 {
+            torLog.info("hsfetch: speculative dispatch (\(dispatched) onions)")
+        }
+    }
 
     private func resolveDataDirectory() throws -> URL {
         let fm = FileManager.default

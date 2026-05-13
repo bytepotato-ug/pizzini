@@ -417,6 +417,13 @@ final class ChatStore: NSObject {
             return
         }
         let targets = relayTargets()
+        // Speculative HSFETCH: tell TorController about every onion
+        // we're about to dial so it can fetch HS descriptors in
+        // parallel with bootstrap. Each RelayClient still calls
+        // `prepareHiddenService` on its own; those calls short-
+        // circuit through TorController.preparedOnions once these
+        // speculative fetches complete.
+        TorController.shared.primeOnions(targets.map { $0.host })
         // Strong capture for HELLO signing — RelayClient lifetime is
         // bounded by the fleet we're building; `teardownRelay` clears
         // the array on identity reset, and the captured closure is
