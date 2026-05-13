@@ -179,7 +179,10 @@ impl ApnsClient {
         {
             let cache = self.cached_jwt.lock().await;
             if let Some(c) = cache.as_ref() {
-                if c.expires_at > now + 60 {
+                // `>=` not `>` — strict comparison races on the boundary
+                // second. A stale JWT means a 401 from APNs and an
+                // extra round-trip; the keepalive margin is cheap.
+                if c.expires_at >= now + 60 {
                     return Ok(c.token.clone());
                 }
             }
