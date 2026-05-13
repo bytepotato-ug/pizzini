@@ -45,6 +45,10 @@ sha2 = { version = "0.10", default-features = false }
 # Used only by F-203 fix-review unit tests to construct signed HELLO
 # possession proofs — needs an Rng to mint IdentityKeyPairs.
 rand = "0.9"
+# Per-test temp directories for the persistent-store tests
+# (chain_validator_store, etc.). Lifetime-scoped cleanup so a
+# test run never leaks state between tests.
+tempfile = "3"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

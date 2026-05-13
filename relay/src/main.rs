@@ -110,6 +110,7 @@
 //! brings the app forward. On reconnect, the queue drains.
 
 mod apns;
+mod chain_validator_store;
 mod encrypted_file;
 mod pending_store;
 mod push_token_store;
