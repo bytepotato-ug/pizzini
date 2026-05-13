@@ -74,7 +74,12 @@ enum QALog {
     /// serial queue. Errors are swallowed because diag logging must
     /// never crash an app flow; the parallel `os_log` path in
     /// `ChatStore.diagLog` retains observability if disk writes fail.
-    static func record(category: String, message: String) {
+    ///
+    /// `nonisolated` so `pzLog` (a free `nonisolated` function) and
+    /// any background-queue caller can write without hopping to the
+    /// main actor. The serial dispatch queue inside `record` is the
+    /// actual synchronisation primitive.
+    nonisolated static func record(category: String, message: String) {
         #if DEBUG
         let ts = isoFormatter.string(from: Date())
         let line = "\(ts) [\(category)] \(message)\n"
@@ -90,7 +95,7 @@ enum QALog {
     /// URL of the active log file if recording is enabled on this
     /// build. Returns `nil` on Release builds (no file exists).
     /// Used by the DiagnosticsView "Export" button.
-    static func currentLogFileURL() -> URL? {
+    nonisolated static func currentLogFileURL() -> URL? {
         #if DEBUG
         return try? logFileURL()
         #else
@@ -101,7 +106,7 @@ enum QALog {
     /// URL of the rotated (previous-session) log if one exists.
     /// Useful for "export both" flows where the operator wants the
     /// historical chunk too.
-    static func rotatedLogFileURL() -> URL? {
+    nonisolated static func rotatedLogFileURL() -> URL? {
         #if DEBUG
         guard let active = try? logFileURL() else { return nil }
         let rotated = active.deletingLastPathComponent().appendingPathComponent(rotatedFilename)
@@ -114,7 +119,7 @@ enum QALog {
     /// Wipe the QA log file(s). Surfaced as a button in the export
     /// UI so the operator can start a fresh capture cleanly without
     /// reinstalling the app.
-    static func clear() {
+    nonisolated static func clear() {
         #if DEBUG
         queue.sync {
             guard let url = try? logFileURL() else { return }
@@ -131,7 +136,7 @@ enum QALog {
     /// first creation. Throws on any FileManager failure — caller
     /// swallows; we never propagate disk errors to the app's hot
     /// path.
-    static func logFileURL() throws -> URL {
+    nonisolated static func logFileURL() throws -> URL {
         let support = try FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
@@ -158,7 +163,7 @@ enum QALog {
     /// would cross `rotateBytes`. File-creation uses
     /// `completeFileProtectionUntilFirstUserAuthentication` to match
     /// the SQLCipher DB's protection posture.
-    private static func appendLine(_ line: String) throws {
+    nonisolated private static func appendLine(_ line: String) throws {
         let url = try logFileURL()
         let data = Data(line.utf8)
         if FileManager.default.fileExists(atPath: url.path) {
@@ -187,7 +192,7 @@ enum QALog {
     /// Single-step rotation: rename `qa.log` to `qa.log.1`,
     /// overwriting any prior rotated file. Caller then writes a
     /// fresh `qa.log` with the new line.
-    private static func rotate(_ url: URL) throws {
+    nonisolated private static func rotate(_ url: URL) throws {
         let rotated = url.deletingLastPathComponent().appendingPathComponent(rotatedFilename)
         if FileManager.default.fileExists(atPath: rotated.path) {
             try FileManager.default.removeItem(at: rotated)

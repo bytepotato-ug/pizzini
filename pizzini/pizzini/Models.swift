@@ -334,7 +334,13 @@ struct Contact: Codable, Identifiable, Sendable {
     /// to a peer-initiated BUNDLE_REQUEST. 6 h matches the cost
     /// profile of the bundle-coupled path (kyber1024 keygen + one-
     /// time prekey burn).
-    static let chainServeCooldown: TimeInterval = 6 * 60 * 60
+    ///
+    /// `nonisolated` because Swift 6's module-default `@MainActor`
+    /// isolation would otherwise force every reference (including
+    /// default-value expressions on parameters) onto the main
+    /// actor. The constant is a pure value — no shared mutable
+    /// state, no resource access — so isolation buys us nothing.
+    nonisolated static let chainServeCooldown: TimeInterval = 6 * 60 * 60
 
     /// Audit M1: minimum time between chain mint+ship operations
     /// triggered by a *sealed* `chainRefreshRequest` envelope. 30 min
@@ -347,7 +353,7 @@ struct Contact: Codable, Identifiable, Sendable {
     /// hits the cap in normal use, and tight enough that a buggy
     /// or compromised paired peer can't flood the recipient with
     /// rotation-replacement frames.
-    static let chainRefreshCooldown: TimeInterval = 30 * 60
+    nonisolated static let chainRefreshCooldown: TimeInterval = 30 * 60
 
     private enum CodingKeys: String, CodingKey {
         case id, identityPub, displayName, sessionEstablished, log, lastMessageAt
