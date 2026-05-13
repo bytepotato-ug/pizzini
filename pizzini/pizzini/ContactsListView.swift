@@ -190,6 +190,35 @@ struct ContactsListView: View {
                 dismissButton: .default(Text("OK")),
             )
         }
+        // Re-pair UX: one-shot alert after an explicit identity
+        // reset. Wired to ChatStore.identityResetBannerPending,
+        // which is set true only by `resetIdentity()` (NOT by
+        // duressWipe — see that method's coercer-watching design).
+        // The "Show my QR" action deep-links the user to the Profil
+        // tab where their fresh QR is rendered.
+        .alert(
+            "Your identity has been reset",
+            isPresented: Binding(
+                get: { store.identityResetBannerPending },
+                set: { newValue in
+                    if !newValue { store.dismissIdentityResetBanner() }
+                },
+            ),
+        ) {
+            Button("Show my QR") {
+                store.dismissIdentityResetBanner()
+                onRevealMyQR()
+            }
+            Button("Got it", role: .cancel) {
+                store.dismissIdentityResetBanner()
+            }
+        } message: {
+            Text(
+                "Pizzini gave you a fresh identity. Anyone who had you in "
+                + "their contacts before the reset must delete you from "
+                + "their list and re-scan your new QR card."
+            )
+        }
     }
 
     // ─── Custom search bar ─────────────────────────────────────────────

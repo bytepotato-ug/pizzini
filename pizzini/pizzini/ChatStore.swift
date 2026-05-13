@@ -45,6 +45,35 @@ final class ChatStore: NSObject {
     /// binary against the operator-published transparency-log
     /// entry. `nil` until the first STATUS_RESPONSE lands.
     var relayStatus: RelayStatus?
+
+    /// Re-pair UX: set true after the user explicitly resets their
+    /// identity via Settings → Reset everything. Drives a one-shot
+    /// alert in `ContactsListView` that tells them anyone who had
+    /// them in their contacts must delete + re-scan their new QR.
+    ///
+    /// **NOT** set after `duressWipe()` — the duress path's design
+    /// (Q2b in the README session log) explicitly requires the
+    /// post-wipe state to be indistinguishable from a normal
+    /// freshly-installed app, so a coercer watching the screen sees
+    /// no telltale "identity was reset" affordance. Persisted via
+    /// `UserDefaults` (a single boolean, set on reset, cleared on
+    /// the user's "Got it" tap) so a crash between reset and
+    /// dismiss doesn't lose the prompt.
+    var identityResetBannerPending: Bool = false {
+        didSet {
+            UserDefaults.standard.set(
+                identityResetBannerPending,
+                forKey: Self.identityResetBannerPendingDefaultsKey,
+            )
+        }
+    }
+    private static let identityResetBannerPendingDefaultsKey = "pizzini.identityResetBannerPending"
+
+    /// User dismissed the identity-reset banner. Idempotent; safe to
+    /// call from any caller (a duplicate tap on "Got it" is a no-op).
+    func dismissIdentityResetBanner() {
+        identityResetBannerPending = false
+    }
     /// USP #1 second half: cached transparency-log entries loaded
     /// from disk on launch and refreshed in the background on
     /// every successful relay (re)connect. Reads pass through
@@ -327,6 +356,14 @@ final class ChatStore: NSObject {
         // render an immediate answer without waiting for the
         // first reconnect to repopulate.
         self.transparencyLog = TransparencyLog.loadCachedLog()
+        // Re-pair UX: restore the post-reset banner flag from
+        // UserDefaults so a crash between reset and the user's
+        // "Got it" tap doesn't lose the prompt. Default false
+        // (no banner pending) is the right value for a fresh
+        // install and also for any unset key.
+        self.identityResetBannerPending = UserDefaults.standard.bool(
+            forKey: Self.identityResetBannerPendingDefaultsKey,
+        )
         super.init()
         // Migration: pre-fleet installs persisted dev hosts like
         // `127.0.0.1`. Per `docs/relay-architecture.md` D1 every
@@ -2528,6 +2565,12 @@ final class ChatStore: NSObject {
         Storage.resetEverything(preserveAppState: true)
         state = resetState
         outbox = .empty
+        // Re-pair UX: explicit reset → surface the one-shot
+        // banner that tells the user their identity changed and
+        // anyone who had them as a contact must delete + re-scan
+        // their new QR. NOT fired on `duressWipe()` (see that
+        // method's design — coercer-watching invariant).
+        identityResetBannerPending = true
         do {
             let s = try Storage.loadOrCreateSession()
             session = s
