@@ -60,10 +60,21 @@
 //     views observing this object don't need additional bridging.
 //
 // Data directory:
-//   `Library/Caches/tor/`. iOS may evict caches under storage
-//   pressure — that's acceptable here. A wiped consensus cache
-//   forces a fresh bootstrap on next start (a few extra seconds
-//   on the cold path), but no app data is lost.
+//   `Library/Application Support/tor/`, excluded from iCloud
+//   backup. Holds the consensus cache, microdescriptor cache,
+//   directory-authority certs, and the persistent guard `state`
+//   file. Application Support is the iOS-correct home for these
+//   because: (a) iOS never evicts Application Support under
+//   storage pressure (it evicts `Library/Caches/` aggressively),
+//   so a once-warmed bootstrap stays warm across launches; and
+//   (b) `state` contains the user's selected guard nodes — a
+//   small fingerprinting signal we don't want syncing to iCloud
+//   (hence the `isExcludedFromBackup` flag set on resolve).
+//
+//   Builds before 2026-05-14 stored this under `Library/Caches/tor/`.
+//   First launch on the new version moves the directory if the
+//   legacy location is populated, so upgraded users keep their
+//   warm consensus and guard set.
 
 import Foundation
 import Network
@@ -1408,20 +1419,64 @@ public final class TorController: ObservableObject {
 
     private func resolveDataDirectory() throws -> URL {
         let fm = FileManager.default
-        // Library/Caches/tor — eviction-safe. Tor's consensus cache
-        // can be rebuilt from the network if iOS purges it; nothing
-        // here is user data.
-        let caches = try fm.url(
-            for: .cachesDirectory,
+        let appSupport = try fm.url(
+            for: .applicationSupportDirectory,
             in: .userDomainMask,
             appropriateFor: nil,
             create: true
         )
-        let dir = caches.appendingPathComponent("tor", isDirectory: true)
+        var dir = appSupport.appendingPathComponent("tor", isDirectory: true)
         if !fm.fileExists(atPath: dir.path) {
-            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            // First launch on a build that uses Application Support:
+            // attempt to move the legacy `Library/Caches/tor/` over so
+            // the upgraded user doesn't pay a one-time cold-bootstrap
+            // tax. Failure is non-fatal — we just create a fresh empty
+            // directory and tor will re-download the consensus on
+            // first bootstrap.
+            Self.tryMigrateLegacyCachesDirectory(to: dir)
+            if !fm.fileExists(atPath: dir.path) {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            }
         }
+        // Exclude from iCloud backup. The Tor `state` file inside
+        // contains the user's persistent guard set — a small
+        // fingerprinting signal we don't want syncing to iCloud (or
+        // riding along in an unencrypted iTunes/Finder backup). This
+        // call is idempotent; re-setting on every resolve is cheap
+        // and self-healing if a future iOS migration ever clears it.
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        try? dir.setResourceValues(resourceValues)
         return dir
+    }
+
+    /// One-shot migration of the legacy `Library/Caches/tor/` data
+    /// directory to `Library/Application Support/tor/`. Called from
+    /// `resolveDataDirectory()` when the Application Support path
+    /// doesn't yet exist. No-op if the legacy directory is empty or
+    /// absent.
+    ///
+    /// Why a move (not a copy): tor doesn't tolerate two daemons
+    /// racing on the same data directory, so leaving the old one
+    /// in place could let a future regression accidentally point
+    /// back at it. The move is atomic on a single APFS volume,
+    /// which is always the case on iOS.
+    nonisolated private static func tryMigrateLegacyCachesDirectory(to newDir: URL) {
+        let fm = FileManager.default
+        guard let caches = try? fm.url(
+            for: .cachesDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        ) else { return }
+        let legacy = caches.appendingPathComponent("tor", isDirectory: true)
+        guard fm.fileExists(atPath: legacy.path) else { return }
+        do {
+            try fm.moveItem(at: legacy, to: newDir)
+            torLog.info("migrated Tor data dir from Library/Caches/tor/ to Library/Application Support/tor/")
+        } catch {
+            torLog.error("legacy Tor data dir migration failed: \(error.localizedDescription, privacy: .public) — falling back to fresh bootstrap")
+        }
     }
 
     private func makeConfiguration(dataDir: URL) -> TORConfiguration {
@@ -1436,14 +1491,16 @@ public final class TorController: ObservableObject {
         // `avoidDiskWrites` was on historically as a flash-longevity
         // gesture. Cost: every cold launch re-downloads the
         // ~2.5 MB consensus + microdescriptor set AND re-picks fresh
-        // guards from scratch — ~6-8 s on real-device cellular.
-        // Leaving it off lets tor persist `cached-microdesc-consensus`,
-        // `cached-microdescs`, `cached-certs`, and `state` (the guard
-        // set) under `Library/Caches/tor/`, so the next cold launch
+        // guards from scratch — ~6-8 s on real-device cellular,
+        // far worse on flaky cellular. Leaving it off lets tor
+        // persist `cached-microdesc-consensus`, `cached-microdescs`,
+        // `cached-certs`, and `state` (the guard set) under
+        // `Library/Application Support/tor/`, so the next cold launch
         // loads them off disk, validates against the cached directory
-        // authority certs, and is ready in 1-2 s. iOS may evict the
-        // cache under storage pressure; the fallback is the old
-        // re-download path, so no correctness regression.
+        // authority certs, and is ready in 1-2 s. Application Support
+        // (vs the legacy `Library/Caches/`) is the iOS-correct home
+        // for these files — iOS doesn't evict it under storage
+        // pressure, so a once-warm bootstrap stays warm.
         config.avoidDiskWrites = false
         config.clientOnly = true
         config.dataDirectory = dataDir
@@ -1529,8 +1586,9 @@ public final class TorController: ObservableObject {
     /// starting a fresh `TORThread`.
     ///
     /// **Why this exists.** On real devices the data directory
-    /// (`Library/Caches/tor/`) persists across app launches, but
-    /// `ControlPort auto` makes tor pick a random control-port
+    /// (`Library/Application Support/tor/`) persists across app
+    /// launches, but `ControlPort auto` makes tor pick a random
+    /// control-port
     /// number every startup. A leftover `controlport` file from
     /// the previous session points at a port no one is listening
     /// on; `waitForControlPortFile` finds it instantly; the
