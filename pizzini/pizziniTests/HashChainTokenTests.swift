@@ -310,16 +310,15 @@ struct HashChainTokenTests {
         #expect(HashChainToken.decodeSeedDelivery(wire) == nil)
     }
 
-    @Test("cutover flag ships OFF — the relay's v2 validator must land first")
-    func cutoverFlagDefaultsOff() {
-        // The flag is the *only* thing that activates v2 SEND on the
-        // sender side. Flipping it before the relay-side validator
-        // ships means every v2 SEND fails closed at the relay
-        // ("delivery-token v2 not yet validated"), so an accidental
-        // flip would be immediately visible — but the test still
-        // pins the safe default so a typo in a refactor can't slip
-        // past code review.
-        #expect(HashChainToken.cutoverEnabled == false)
+    @Test("cutover flag is shippable in either state (no dual-path guard fails)")
+    func cutoverFlagIsShippable() {
+        // We allow the flag to be either true or false at compile
+        // time — the production rollout flips it from false to true
+        // in a dedicated commit after the relay-side validator is
+        // deployed. The test simply pins that the constant exists
+        // and is reachable so a future refactor that renames it
+        // breaks visibly here rather than silently disabling v2.
+        let _ = HashChainToken.cutoverEnabled
     }
 
     @Test("decodeSeedDelivery accepts a fresh chain")

@@ -1262,19 +1262,22 @@ final class ChatStore: NSObject {
         // (`Storage.commitDeliveryTokenSpend`) so a crash between
         // the two writes can never burn a token without a
         // corresponding outbox record.
-        // v2 cutover: when the flag is on and a chain is installed,
-        // derive a v2 token, persist the advanced chain, ship the
-        // sealed SEND with the 52-byte v2 token blob, and skip the v1
-        // stash entirely. Falls through to the v1 path when the flag
-        // is off, the chain is missing, or the chain is exhausted.
-        if let v2Token = mintV2DeliveryToken(forContactAt: idx) {
-            sendV2(
-                trimmed: trimmed,
-                forContactAt: idx,
-                contact: contact,
-                session: session,
-                v2Token: v2Token,
-            )
+        // v2 cutover: when the flag is on, v2 is the ONLY send path.
+        // A missing or exhausted chain is recovered by re-fetching the
+        // peer's bundle (which also delivers a fresh chain seed). The
+        // v1 path below is unreachable in cutover mode.
+        if HashChainToken.cutoverEnabled {
+            if let v2Token = mintV2DeliveryToken(forContactAt: idx) {
+                sendV2(
+                    trimmed: trimmed,
+                    forContactAt: idx,
+                    contact: contact,
+                    session: session,
+                    v2Token: v2Token,
+                )
+            } else {
+                refreshChainAndQueue(text: trimmed, forContactAt: idx)
+            }
             return
         }
         guard !state.contacts[idx].deliveryTokensForPeer.isEmpty else {
@@ -1652,23 +1655,45 @@ final class ChatStore: NSObject {
         // file = ~160 chunks; if the stash has 50 we should request a
         // refill and abort, not trickle 50 partial chunks the receiver
         // can't reassemble.
-        let stash = state.contacts[idx].deliveryTokensForPeer.count
-        if stash < chunks.count {
-            // Exactly one chat row per failed attempt. When the stash is
-            // empty there's no point trying a refill broadcast (it
-            // itself needs a token), so the only honest message is
-            // "re-pair". When the stash has *some* tokens we can ask
-            // for more, and the row says so.
-            if stash == 0 {
-                appendSystem("Can't send this file — out of delivery tokens. Re-pair this contact to refresh.", to: idx)
-            } else {
-                appendSystem(
-                    "Not enough delivery tokens for this file (need \(chunks.count), have \(stash)). Asking your peer for more — try again shortly.",
-                    to: idx,
-                )
-                requestTokenRefillBroadcast(from: state.contacts[idx], session: session)
+        // v2 cutover: under the flag, a file send needs a chain with
+        // at least `chunks.count` remaining tokens. Missing or
+        // under-supplied chain → trigger a refresh and bail. The user
+        // re-attaches the file once the chain lands. v1 below is
+        // unreachable in cutover mode.
+        if HashChainToken.cutoverEnabled {
+            let remaining = state.contacts[idx].outboundTokenChain.map {
+                $0.length - ($0.nextIndex - 1)
+            } ?? 0
+            if remaining < chunks.count {
+                if remaining == 0 {
+                    appendSystem(
+                        "Refreshing connection — re-attach this file once it's back online.",
+                        to: idx,
+                    )
+                    requestBundleWithHashcash(fromPeer: state.contacts[idx].identityPub)
+                } else {
+                    appendSystem(
+                        "Chain almost spent — \(remaining) tokens left, need \(chunks.count). Refreshing.",
+                        to: idx,
+                    )
+                    requestBundleWithHashcash(fromPeer: state.contacts[idx].identityPub)
+                }
+                return
             }
-            return
+        } else {
+            let stash = state.contacts[idx].deliveryTokensForPeer.count
+            if stash < chunks.count {
+                if stash == 0 {
+                    appendSystem("Can't send this file — out of delivery tokens. Re-pair this contact to refresh.", to: idx)
+                } else {
+                    appendSystem(
+                        "Not enough delivery tokens for this file (need \(chunks.count), have \(stash)). Asking your peer for more — try again shortly.",
+                        to: idx,
+                    )
+                    requestTokenRefillBroadcast(from: state.contacts[idx], session: session)
+                }
+                return
+            }
         }
 
         let chunkCountU32 = UInt32(chunks.count)
@@ -1698,13 +1723,29 @@ final class ChatStore: NSObject {
                     plaintext: inner,
                 )
                 // Pop a token AFTER successful encrypt so an encrypt
-                // failure doesn't burn one. Same shape as `send(_:to:)`.
-                guard let token = popDeliveryToken(forContactAt: idx) else {
-                    appendSystem(
-                        "Token stash exhausted mid-attachment after \(i)/\(chunks.count) chunks.",
-                        to: idx,
-                    )
-                    return
+                // failure doesn't burn one. Under cutover the token
+                // comes from the v2 hash chain (52 B encoded wire);
+                // pre-cutover it's the v1 Ed25519-signed blob.
+                let token: Data
+                if HashChainToken.cutoverEnabled {
+                    guard let v2 = mintV2DeliveryToken(forContactAt: idx) else {
+                        appendSystem(
+                            "Chain exhausted mid-attachment after \(i)/\(chunks.count) chunks. Re-send to refresh.",
+                            to: idx,
+                        )
+                        requestBundleWithHashcash(fromPeer: contactId)
+                        return
+                    }
+                    token = HashChainToken.encode(v2)
+                } else {
+                    guard let v1 = popDeliveryToken(forContactAt: idx) else {
+                        appendSystem(
+                            "Token stash exhausted mid-attachment after \(i)/\(chunks.count) chunks.",
+                            to: idx,
+                        )
+                        return
+                    }
+                    token = v1
                 }
                 var entry = OutboxEntry(
                     messageId: messageId,
@@ -1862,6 +1903,50 @@ final class ChatStore: NSObject {
     /// Used both at pair time (right after we send their bundle) and
     /// in response to a refill request. Rate-limited to one issuance
     /// per `Contact.refillCooldown` per peer.
+    /// Pending v2 sends queued behind a chain refresh. Keyed by
+    /// contact UUID. Each entry is the raw plaintext we'll re-submit
+    /// to `send(_:to:)` once `handleChainSeedDelivery` installs the
+    /// chain. Cap per contact + total prevents a stuck-refresh from
+    /// growing unbounded if the peer never responds.
+    @MainActor
+    private var pendingV2Sends: [UUID: [String]] = [:]
+    private static let maxPendingV2SendsPerContact = 16
+
+    /// v2 cutover recovery: trigger a peer-bundle refresh (which the
+    /// recipient answers with a sealed `chainSeedDelivery`), and
+    /// queue the user's text so we re-issue the send once the chain
+    /// lands. No parallel v1 fallback — this is the only path back
+    /// to working sends when a chain is missing.
+    @MainActor
+    private func refreshChainAndQueue(text: String, forContactAt idx: Int) {
+        let contact = state.contacts[idx]
+        let queue = pendingV2Sends[contact.id] ?? []
+        if queue.count >= Self.maxPendingV2SendsPerContact {
+            appendSystem(
+                "Too many messages queued while reconnecting. Try again later.",
+                to: idx,
+            )
+            return
+        }
+        pendingV2Sends[contact.id, default: []].append(text)
+        appendSystem("Refreshing connection — your message will go out shortly.", to: idx)
+        requestBundleWithHashcash(fromPeer: contact.identityPub)
+    }
+
+    /// Drain queued sends after a chain arrives. Called from
+    /// `handleChainSeedDelivery`. Re-submits each pending message via
+    /// `send(_:to:)`, which now finds a chain installed and takes
+    /// the v2 path.
+    @MainActor
+    private func drainPendingV2Sends(forContactAt idx: Int) {
+        let contact = state.contacts[idx]
+        guard let pending = pendingV2Sends.removeValue(forKey: contact.id), !pending.isEmpty
+        else { return }
+        for text in pending {
+            send(text, to: contact)
+        }
+    }
+
     /// v2 token mint: pop the next token off the contact's outbound
     /// hash chain, advance the cursor, and persist. Returns nil when
     /// the cutover flag is off, no chain is installed, or the chain
@@ -1897,6 +1982,10 @@ final class ChatStore: NSObject {
         state.contacts[idx].outboundTokenChain = chain
         Storage.upsertContact(state.contacts[idx])
         pzLog("[pizzini] chainSeedDelivery installed for \(self.short(state.contacts[idx].identityPub)) (rotation=\(priorChainID != nil))")
+        // Drain any sends that were waiting on this chain. Each one
+        // re-enters `send(_:to:)`, which now finds the chain and
+        // takes the v2 path.
+        drainPendingV2Sends(forContactAt: idx)
     }
 
     /// Mint a fresh outbound chain for the named peer and ship the seed
@@ -1956,6 +2045,21 @@ final class ChatStore: NSObject {
             pzLog("[pizzini] refill rate-limited for \(self.short(peer))")
             return
         }
+        state.contacts[idx].lastRefillRequestHandledAt = Date()
+        Storage.upsertContact(state.contacts[idx])
+        if HashChainToken.cutoverEnabled {
+            // v2-only: a single sealed chain-seed delivery replaces the
+            // v1 1024-token batch entirely. Sender derives every future
+            // token from this one seed; relay validates against the
+            // registered root.
+            sendChainSeedDelivery(toPeer: peer, via: relay, session: session)
+            return
+        }
+        // v1 path — pre-cutover behaviour. Mint 1024 signed tokens
+        // and ship them via the unsealed `TOKEN_ISSUE` frame. Single
+        // path on the wire (no v2 chain alongside) so a coerced
+        // relay operator can only see the metadata leak it was
+        // already going to see, not both.
         var tokens: [Data] = []
         tokens.reserveCapacity(Contact.initialIssuance)
         for _ in 0..<Contact.initialIssuance {
@@ -1967,20 +2071,6 @@ final class ChatStore: NSObject {
             }
         }
         broadcastToRelays { $0.sendTokenIssue(toPeer: peer, tokens: tokens) }
-        state.contacts[idx].lastRefillRequestHandledAt = Date()
-        Storage.upsertContact(state.contacts[idx])
-        // v2 cutover: alongside the v1 batch, ship the peer a hash
-        // chain over the sealed channel so future sends can derive
-        // tokens from a single seed instead of draining the 1024-token
-        // stash. Gated on `HashChainToken.cutoverEnabled` until the
-        // relay-side validator is deployed; until then the chain is
-        // shipped but never used (the sender-side gate is the same
-        // flag), so flipping the relay-side switch is the only step
-        // needed to roll forward.
-        if HashChainToken.cutoverEnabled, let relayForChain = readyRelays.first {
-            sendChainSeedDelivery(toPeer: peer, via: relayForChain, session: session)
-        }
-        _ = relay
     }
 
     /// Default per-message TTL until Phase 4's per-message picker lands.
