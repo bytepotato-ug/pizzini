@@ -296,6 +296,13 @@ public final class TorController: ObservableObject {
         set { Self.processSingletonThread = newValue }
     }
     private var torController: TORController?
+    /// Wall-clock of the first non-zero BOOTSTRAP progress event in
+    /// the current bootstrap pass, plus its percentage. Drives the
+    /// per-bootstrap timing summary line ("5%→100% in 6.85s") that
+    /// makes "why was this cold start slow" greppable in a
+    /// sysdiagnose. Cleared at the start of each runBootstrap.
+    private var firstProgressEventAt: Date?
+    private var firstProgressEventPct: Int = 0
     /// Cached data directory for the bootstrapped tor. Used to
     /// re-read the cookie on a reconnect without re-running the
     /// full `runBootstrap()` from scratch. Set on first bootstrap;
@@ -638,6 +645,8 @@ public final class TorController: ObservableObject {
 
     private func runBootstrap() async throws -> UInt16 {
         let bootstrapStart = Date()
+        firstProgressEventAt = nil
+        firstProgressEventPct = 0
         torLog.info("bootstrap: begin")
         // First bootstrap also installs the NWPathMonitor. We pin it
         // for the process lifetime — there's no use case for stopping
@@ -808,6 +817,10 @@ public final class TorController: ObservableObject {
             let phaseLabel = TorController.userFacingPhase(forTag: tag)
             Task { @MainActor [weak self] in
                 self?.bootstrapProgress = pct
+                if pct > 0, self?.firstProgressEventAt == nil {
+                    self?.firstProgressEventAt = Date()
+                    self?.firstProgressEventPct = pct
+                }
                 if let phaseLabel, self?.bootstrapPhaseLabel != phaseLabel {
                     self?.bootstrapPhaseLabel = phaseLabel
                     NotificationCenter.default.post(
@@ -848,7 +861,23 @@ public final class TorController: ObservableObject {
         // shouldn't ever see "ready" while still showing 87%.
         bootstrapProgress = 100
         isReady = true
-        torLog.info("bootstrap: ready (total \(Self.fmtElapsed(from: bootstrapStart)))")
+        // One-line per-bootstrap timing summary: total elapsed plus
+        // the inner "first-progress→100%" span. Makes "why was this
+        // cold start slow" a single grep in sysdiagnose: a high
+        // total with a tiny inner span means startup files were
+        // slow (consensus eviction, dataDir contention); a small
+        // total with a near-equal inner span means tor itself was
+        // the bottleneck.
+        let totalFmt = Self.fmtElapsed(from: bootstrapStart)
+        if let firstAt = firstProgressEventAt {
+            let innerFmt = Self.fmtElapsed(from: firstAt)
+            torLog.info("bootstrap: ready (total \(totalFmt); \(self.firstProgressEventPct)%→100% in \(innerFmt))")
+        } else {
+            // Warm reconnect path — tor was already past 100% by the
+            // time we attached the observer, so we never saw a
+            // sub-100 event. Just log total.
+            torLog.info("bootstrap: ready (total \(totalFmt); warm reconnect, no progress events)")
+        }
         // Belt-and-braces: between authenticate and now, tor could
         // theoretically have crashed (rare but observed on
         // memory-pressure CI). If the thread reports finished here

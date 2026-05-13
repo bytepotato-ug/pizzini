@@ -264,8 +264,12 @@ public final class RelayClient: @unchecked Sendable {
             // public address (already on the wire in the SOCKS
             // CONNECT) and the transition itself is the entire
             // diagnostic value.
+            // info level (not notice) — onion hostnames stay out of
+            // release sysdiagnose archives by default. Local Console
+            // debugging keeps the same diagnostic value because info
+            // is still streamed live.
             let hostPrefix = lastTargetHost.prefix(12)
-            relayLog.notice(
+            relayLog.info(
                 "state: \(hostPrefix, privacy: .public)… \(String(describing: oldValue), privacy: .public) → \(String(describing: snapshot), privacy: .public)"
             )
             let delegate = self.delegate
@@ -579,7 +583,7 @@ public final class RelayClient: @unchecked Sendable {
                     targetPort: targetPort
                 )
             case .cancelled:
-                relayLog.notice("nwconn → .cancelled — setting state=.idle on \(self.lastTargetHost.prefix(12), privacy: .public)…")
+                relayLog.info("nwconn → .cancelled — setting state=.idle on \(self.lastTargetHost.prefix(12), privacy: .public)…")
                 self.state = .idle
             default:
                 break
@@ -775,7 +779,7 @@ public final class RelayClient: @unchecked Sendable {
             // is effectively a single ongoing connection attempt.
             state = .connecting
             let attempt = socksRetries
-            relayLog.notice("socks: retry \(attempt)/\(Self.maxSocksRetries) in \(Int(Self.socksRetryDelay))s — \(reason, privacy: .public)")
+            relayLog.info("socks: retry \(attempt)/\(Self.maxSocksRetries) in \(Int(Self.socksRetryDelay))s — \(reason, privacy: .public)")
             queue.asyncAfter(deadline: .now() + Self.socksRetryDelay) { [weak self] in
                 guard let self else { return }
                 self.openSocksConnection(
@@ -925,7 +929,7 @@ public final class RelayClient: @unchecked Sendable {
     public func registerPush(token: Data) {
         pushToken = token
         let st = state
-        relayLog.notice("registerPush called on \(self.lastTargetHost.prefix(12), privacy: .public)… (state=\(String(describing: st), privacy: .public), token=\(token.count) bytes)")
+        relayLog.info("registerPush called on \(self.lastTargetHost.prefix(12), privacy: .public)… (state=\(String(describing: st), privacy: .public), token=\(token.count) bytes)")
         if state == .connected {
             sendRegisterPush(token: token)
         }
@@ -943,7 +947,7 @@ public final class RelayClient: @unchecked Sendable {
     public func deregisterPush() {
         pushToken = nil
         let st = state
-        relayLog.notice("deregisterPush called on \(self.lastTargetHost.prefix(12), privacy: .public)… (state=\(String(describing: st), privacy: .public), connection=\(self.connection != nil, privacy: .public))")
+        relayLog.info("deregisterPush called on \(self.lastTargetHost.prefix(12), privacy: .public)… (state=\(String(describing: st), privacy: .public), connection=\(self.connection != nil, privacy: .public))")
         guard state == .connected, let connection else { return }
         var payload = Data()
         payload.append(Self.frameTypeDeregisterPush)
@@ -1081,7 +1085,7 @@ public final class RelayClient: @unchecked Sendable {
                 self.drainFrames()
             }
             if isComplete {
-                relayLog.notice("receive isComplete=true — peer sent FIN — setting state=.idle on \(self.lastTargetHost.prefix(12), privacy: .public)… (buffer=\(self.readBuffer.count) bytes pending)")
+                relayLog.info("receive isComplete=true — peer sent FIN — setting state=.idle on \(self.lastTargetHost.prefix(12), privacy: .public)… (buffer=\(self.readBuffer.count) bytes pending)")
                 self.state = .idle
                 return
             }
