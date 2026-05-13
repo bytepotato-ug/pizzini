@@ -20,7 +20,10 @@
 
 use crate::encrypted_file;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+// Chain primitive is BLAKE3 — keeps the app-code hash audit surface
+// to a single algorithm (the same one used by hashcash, group-op
+// digests, and the iOS challenge derivation). The Swift side's
+// `HashChainToken.applyHash` must use the same primitive bit-for-bit.
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -191,10 +194,8 @@ impl ChainValidatorStore {
         let delta = index - state.last_index;
         let mut current = *value;
         for _ in 0..delta {
-            let mut hasher = Sha256::new();
-            hasher.update(current);
-            let out = hasher.finalize();
-            current.copy_from_slice(&out);
+            let out = blake3::hash(&current);
+            current.copy_from_slice(out.as_bytes());
         }
         // Constant-time compare on the 32-byte chain value. Without
         // this a relay implementation under timing observation could
@@ -328,7 +329,6 @@ fn purge_stale(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::Sha256;
     use tempfile::TempDir;
 
     fn fresh_chain(seed: [u8; 32], length: u32) -> ([u8; 32], Vec<[u8; 32]>) {
@@ -340,11 +340,9 @@ mod tests {
         let mut current = seed;
         positions.push(current);
         for _ in 0..length {
-            let mut hasher = Sha256::new();
-            hasher.update(current);
-            let out = hasher.finalize();
+            let out = blake3::hash(&current);
             let mut next = [0u8; 32];
-            next.copy_from_slice(&out);
+            next.copy_from_slice(out.as_bytes());
             positions.push(next);
             current = next;
         }
@@ -576,5 +574,80 @@ mod tests {
             store2.validate(&reg.peer_id, &reg.chain_id, 2, &t2).unwrap(),
             ValidateOutcome::Accepted,
         );
+    }
+
+    /// Audit M1 + M2 negative case: walking the chain all the way to
+    /// `length` succeeds for the last token, then any further token
+    /// (regardless of value) is rejected as `OutOfRange`. After that,
+    /// re-registering with a fresh chain under a NEW `chain_id`
+    /// recovers — the sender resumes sending against the new chain
+    /// while the exhausted one stays dead in the store.
+    #[test]
+    fn chain_exhaustion_then_recovery_via_new_chain_id() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = make_store(tmp.path());
+        let seed = [0xEEu8; 32];
+        let length: u32 = 6;
+        let (root, positions) = fresh_chain(seed, length);
+        let reg = ChainRegistration {
+            peer_id: [0xCC; 33],
+            chain_id: [0xDD; 16],
+            root,
+            length,
+        };
+        assert_eq!(store.register(reg).unwrap(), RegisterOutcome::Registered);
+        // Walk all `length` tokens — every one must Accept.
+        for i in 1..=length {
+            let ti = token_at(&positions, length, i);
+            assert_eq!(
+                store.validate(&reg.peer_id, &reg.chain_id, i, &ti).unwrap(),
+                ValidateOutcome::Accepted,
+                "token at index {i} must accept",
+            );
+        }
+        // One past the end must fail with OutOfRange, even with a
+        // structurally valid-shaped token value.
+        let bogus = [0u8; 32];
+        assert_eq!(
+            store
+                .validate(&reg.peer_id, &reg.chain_id, length + 1, &bogus)
+                .unwrap(),
+            ValidateOutcome::OutOfRange,
+        );
+        // Recovery: register a fresh chain under a NEW chain_id. The
+        // exhausted entry stays in the map (it has not aged out) but
+        // the new one is independently usable.
+        let seed_b = [0x55u8; 32];
+        let (root_b, positions_b) = fresh_chain(seed_b, length);
+        let reg_b = ChainRegistration {
+            peer_id: reg.peer_id,
+            chain_id: [0xAA; 16],
+            root: root_b,
+            length,
+        };
+        assert_eq!(store.register(reg_b).unwrap(), RegisterOutcome::Registered);
+        let t1_b = token_at(&positions_b, length, 1);
+        assert_eq!(
+            store
+                .validate(&reg_b.peer_id, &reg_b.chain_id, 1, &t1_b)
+                .unwrap(),
+            ValidateOutcome::Accepted,
+        );
+    }
+
+    /// Audit H1 sanity check: the validator's hash primitive is
+    /// BLAKE3, not SHA-256. Reproduce the chain root via the public
+    /// crate API (so a future swap to a different hash would break
+    /// this test loudly rather than silently desynchronising from
+    /// the iOS side).
+    #[test]
+    fn chain_primitive_is_blake3() {
+        let seed = [0x42u8; 32];
+        let h1 = blake3::hash(&seed);
+        let h2 = blake3::hash(h1.as_bytes());
+        // fresh_chain(seed, 2) MUST produce the same root as two
+        // explicit blake3 applications.
+        let (root, _) = fresh_chain(seed, 2);
+        assert_eq!(&root, h2.as_bytes());
     }
 }

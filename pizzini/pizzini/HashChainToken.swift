@@ -1,5 +1,5 @@
-import CryptoKit
 import Foundation
+import PizziniCryptoCore
 
 /// Hash-chained delivery tokens (v2). Replaces the per-message
 /// Ed25519-signed token model.
@@ -281,12 +281,16 @@ enum HashChainToken {
 
     // MARK: - Internal helpers
 
-    /// Apply SHA-256 `n` times. `n == 0` returns the input unchanged.
+    /// Apply BLAKE3 `n` times. `n == 0` returns the input unchanged.
+    /// Hash primitive must match the relay's `chain_validator_store`
+    /// bit-for-bit — both sides use BLAKE3 so the app's hash audit
+    /// surface stays single-primitive (the same one used by hashcash
+    /// and the group-op digests).
     static func applyHash(_ input: Data, times n: Int) -> Data {
         precondition(n >= 0, "hash iteration count must be non-negative")
         var current = input
         for _ in 0..<n {
-            current = Data(SHA256.hash(data: current))
+            current = Blake3.hash(current)
         }
         return current
     }

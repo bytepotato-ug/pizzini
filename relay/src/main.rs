@@ -2267,7 +2267,6 @@ mod tests {
     #[tokio::test]
     async fn v2_check_delivery_token_accepts_then_rejects_replay() {
         use chain_validator_store::*;
-        use sha2::{Digest, Sha256};
         let tmp_dir = std::env::temp_dir().join(format!(
             "pizzini-relay-v2-test-{}",
             std::time::SystemTime::now()
@@ -2280,18 +2279,17 @@ mod tests {
             ChainValidatorStore::load_or_create(&tmp_dir, CHAIN_VALIDATOR_IDLE_TTL).unwrap(),
         ));
 
-        // Build a deterministic chain.
+        // Build a deterministic chain. Hash primitive is BLAKE3 to
+        // match `chain_validator_store::validate` bit-for-bit.
         let seed = [0x77u8; 32];
         let length: u32 = 8;
         let mut positions: Vec<[u8; 32]> = Vec::with_capacity(length as usize + 1);
         positions.push(seed);
         let mut cur = seed;
         for _ in 0..length {
-            let mut h = Sha256::new();
-            h.update(cur);
-            let out = h.finalize();
+            let out = blake3::hash(&cur);
             let mut next = [0u8; 32];
-            next.copy_from_slice(&out);
+            next.copy_from_slice(out.as_bytes());
             positions.push(next);
             cur = next;
         }

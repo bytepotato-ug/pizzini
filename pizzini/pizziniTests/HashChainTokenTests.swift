@@ -1,5 +1,5 @@
-import CryptoKit
 import Foundation
+import PizziniCryptoCore
 import Testing
 @testable import pizzini
 
@@ -23,7 +23,7 @@ struct HashChainTokenTests {
         #expect(!chain.shouldRotate)
     }
 
-    @Test("root equals SHA-256 iterated `length` times over the seed")
+    @Test("root equals BLAKE3 iterated `length` times over the seed")
     func rootMatchesIteratedHash() {
         let chain = HashChainToken.mintChain(length: 128)
         let recomputed = HashChainToken.applyHash(chain.seed, times: chain.length)
@@ -72,7 +72,7 @@ struct HashChainTokenTests {
                 return
             }
             if let prior {
-                let next = Data(SHA256.hash(data: token.value))
+                let next = Blake3.hash(token.value)
                 #expect(next == prior, "H(token[i+1]) must equal token[i]")
             }
             prior = token.value
