@@ -1130,11 +1130,12 @@ final class ChatStore: NSObject {
     /// Timestamps of recent decoy emissions for the aggregate-budget
     /// check. Pruned to entries newer than 60s on access.
     private var decoyAggregateRecent: [Date] = []
-    /// Pacing budget for the real BUNDLE_RESPONSE + TOKEN_ISSUE path on
-    /// a modern phone — kyber1024 keygen + 1024 XEd25519 signatures
-    /// runs ~1s. Decoy waits within this window before emitting so the
-    /// relay can't time-distinguish "Y is in Alice's contacts" from
-    /// "Y is not". 50ms jitter prevents a learned-fixed-1s signature.
+    /// Pacing budget for the real BUNDLE_RESPONSE + chainSeedDelivery
+    /// path on a modern phone — kyber1024 keygen + one sealed-sender
+    /// envelope encrypt runs ~1s in steady state. Decoy waits within
+    /// this window before emitting so the relay can't time-distinguish
+    /// "Y is in Alice's contacts" from "Y is not". 50ms jitter prevents
+    /// a learned-fixed-1s signature.
     private static let decoyEmitDelay: ClosedRange<Duration> = .milliseconds(900) ... .milliseconds(1100)
 
     @MainActor
@@ -1955,8 +1956,8 @@ final class ChatStore: NSObject {
     }
 
     /// True iff this peer's identityPub is on the block list. Hot
-    /// path — every inbound BUNDLE_RESPONSE / TOKEN_ISSUE / SEND
-    /// passes through this gate.
+    /// path — every inbound BUNDLE_RESPONSE / chainSeedDelivery /
+    /// SEND passes through this gate.
     func isIdentityBlocked(_ identityPub: Data) -> Bool {
         state.blockedIdentities.contains(identityPub)
     }
@@ -3026,9 +3027,7 @@ extension ChatStore: RelayClientDelegate {
             // anti-probe defense for *unknown* requesters; for a
             // blocked one, the user has explicitly opted out of
             // ever pairing with them again, and silence is the
-            // intended posture. Emitting a decoy here would also
-            // mint a TOKEN_ISSUE batch into the blocked peer's
-            // contact-graph view.
+            // intended posture.
             if self.isIdentityBlocked(fromPeer) {
                 return
             }
@@ -3037,8 +3036,8 @@ extension ChatStore: RelayClientDelegate {
             else {
                 // F-402: a malicious relay can fabricate BUNDLE_REQUEST
                 // frames with arbitrary `from_id` to probe our contact
-                // set — silence-vs-(BUNDLE_RESPONSE+TOKEN_ISSUE) on the
-                // wire is the oracle. Mask by emitting a same-shape,
+                // set — silence-vs-(BUNDLE_RESPONSE+chainSeedDelivery)
+                // on the wire is the oracle. Mask by emitting a same-shape,
                 // same-timing decoy when the requester isn't in our
                 // contacts, so the relay sees identical outbound
                 // bandwidth + latency for known-vs-unknown.
@@ -3140,8 +3139,7 @@ extension ChatStore: RelayClientDelegate {
     /// Internal-not-private so the group surface in
     /// `ChatStoreGroups.swift` can render the same shorthand without
     /// duplicating the formatter. `nonisolated` so detached tasks
-    /// (e.g. the off-actor TOKEN_ISSUE verify loop) can format peer
-    /// ids without hopping back through MainActor.
+    /// can format peer ids without hopping back through MainActor.
     nonisolated func short(_ data: Data) -> String {
         let head = data.prefix(4).map { String(format: "%02x", $0) }.joined()
         return head + "…"

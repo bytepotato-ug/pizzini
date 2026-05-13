@@ -56,16 +56,14 @@
 //!   u16 from_len + from_id_bytes
 //!   bundle bytes (consume to end-of-payload)
 //!
-//! TOKEN_ISSUE (type = 7) — recipient mints 1024 delivery tokens for the
-//!                          requester so subsequent SEND/ACK frames pass
-//!                          the relay's per-recipient rate-limit gate.
-//!                          Sent right after BUNDLE_RESPONSE on first
-//!                          contact, also in response to a sealed
-//!                          token-refill-request when a stash gets low:
-//!   u16 to_len   + to_id_bytes
-//!   u16 from_len + from_id_bytes
-//!   u32 token_count
-//!   token_bytes  (84 bytes each: nonce16 + expiry_be_u32 + sig64)
+//! REGISTER_CHAIN (type = 12) — recipient announces a hash-chain root
+//!                              to bind their HELLO-authenticated peer_id
+//!                              to a chain identifier so v2 SENDs from any
+//!                              sender can validate against (peer_id, chain_id):
+//!   [16] chain_id
+//!   [32] root  = H^length(seed)
+//!   u32  length
+//! Idempotent on identical (root, length); conflicts refused.
 //!
 //! Hashcash on BUNDLE_REQUEST: the sender computes a u64 nonce such
 //! that `BLAKE3(challenge || nonce_be) starts with ≥ 18 zero bits`,

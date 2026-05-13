@@ -571,8 +571,8 @@ extension ChatStore {
 
     /// Encrypt `text` with our group sender-key chain and fan out
     /// sealed-sender envelopes to every active member except self.
-    /// Skips recipients we have no delivery token for (logged as a
-    /// system row on the local group log; outbox+retry pending v2).
+    /// Skips recipients we have no v2 chain for (logged as a system
+    /// row on the local group log; outbox+retry pending).
     /// Refuses to send if the local user is no longer an active
     /// member of the group (audit fix HIGH-3).
     @discardableResult
@@ -738,7 +738,7 @@ extension ChatStore {
             appendGroupSystem(
                 groupAt: gIdx,
                 "Sent to \(recipients.count - skipped.count)/\(recipients.count) members. "
-                    + "No delivery tokens for: \(skipped.joined(separator: ", ")).",
+                    + "No chain installed for: \(skipped.joined(separator: ", ")).",
             )
         }
         Storage.upsertGroup(state.groups[gIdx])
@@ -1045,7 +1045,7 @@ extension ChatStore {
             for (peer, dropped) in perRecipientSkippedChunks {
                 diagLog("group", "sendGroupAttachment \(short(groupId)):"
                     + " \(short(peer)) dropped \(dropped)/\(chunkCountU32) chunk(s)"
-                    + " (out of delivery tokens or unpaired)")
+                    + " (chain missing/exhausted or unpaired)")
             }
         }
         // Single `.attachment` chat row for the sender — captions
@@ -2142,7 +2142,7 @@ extension ChatStore {
             return
         }
         guard let token = v2TokenWire(forContactAt: cIdx) else {
-            pzLog("[pizzini.group] bootstrap → \(short(recipient)): no delivery token")
+            pzLog("[pizzini.group] bootstrap → \(short(recipient)): no v2 chain installed")
             return
         }
         var inner = Data([RelayClient.InnerEnvelopeKind.groupBootstrap.rawValue])

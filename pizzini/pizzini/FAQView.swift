@@ -211,9 +211,12 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
               other.
             • Hashcash. First-contact bundle requests cost ~1 second \
               of CPU work. Trivial on a phone, expensive in bulk.
-            • Recipient-issued delivery tokens. Once you’ve paired, \
-              your contact gets a batch of 1024 tokens minted by you, \
-              one per send/ack. They burn out a hostile peer fast.
+            • Recipient-issued hash-chain tokens. Once you’ve paired, \
+              your contact gets a 32-byte chain seed minted by you \
+              and registered with the relay; every send derives one \
+              token from that seed. A hostile peer can’t forge tokens \
+              without your seed, and the relay rejects any unsigned \
+              attempt.
 
             Together these mean a leaked relay address is annoying \
             (your friends might switch) but not catastrophic — \

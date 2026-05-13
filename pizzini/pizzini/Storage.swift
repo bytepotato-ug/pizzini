@@ -116,8 +116,8 @@ enum Storage {
     // MARK: - Settings + Contacts + Groups (non-message graph)
 
     /// Persist the full in-memory graph: settings + every contact
-    /// (with their messages + delivery tokens) + every group (with
-    /// their members + messages). One transaction; UPSERT semantics
+    /// (with their messages + outbound-chain state) + every group
+    /// (with members + messages). One transaction; UPSERT semantics
     /// mean unchanged rows are written but no foreign-key cascade
     /// fires.
     ///

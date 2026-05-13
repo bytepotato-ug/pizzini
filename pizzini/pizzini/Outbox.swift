@@ -14,15 +14,14 @@ struct OutboxEntry: Codable, Sendable {
     let messageId: Data         // 16 bytes
     let recipientPeerId: Data
     let sealedCiphertext: Data
-    /// The XEd25519-signed delivery token attached to the original SEND.
-    /// **F-505**: scrubbed to empty once `relayedAt != nil` — the relay
-    /// has accepted the bytes; storing the signed token onward only
-    /// widens the post-extraction replay surface (a Keychain-extracted
-    /// blob within the token's 30-day TTL would otherwise let an
-    /// attacker re-inject the SEND, force the recipient onto the
-    /// duplicate-ACK path, and burn a recipient token per replay).
-    /// Retries that fire BEFORE `relayedAt` is set still need this
-    /// token; retries AFTER are blocked by F-501's relayedAt-aware cap.
+    /// The 52-byte v2 hash-chain delivery token attached to the
+    /// original SEND. **F-505**: scrubbed to empty once
+    /// `relayedAt != nil` — the relay has accepted the bytes, and
+    /// storing the token onward only widens the post-extraction
+    /// replay surface against the per-(recipient, chain_id) state.
+    /// Retries that fire BEFORE `relayedAt` is set re-derive a fresh
+    /// token from the chain at retry time; retries AFTER are blocked
+    /// by F-501's relayedAt-aware cap.
     var token: Data
     let ttl: TimeInterval
     let sentAt: Date
