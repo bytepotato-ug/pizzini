@@ -1889,6 +1889,20 @@ final class ChatStore: NSObject {
     /// (30 min) collapses it.
     @MainActor
     private var chainRotationLastRequestedAt: [UUID: Date] = [:]
+
+    /// Per-(peer, messageId) sliding-window dedup for ACK
+    /// re-emissions on duplicate sealed frames. The relay's outbound
+    /// queue is at-least-once; on every reconnect it redelivers
+    /// every still-unexpired queued frame. Without this gate, each
+    /// re-delivery would mint a fresh v2 delivery-token from our
+    /// outbound chain to that peer, and a busy conversation would
+    /// exhaust the 16,384-entry chain in seconds — the exact bug
+    /// captured in QA-debug log 2026-05-13 (22,088 duplicate
+    /// detections, 5,704 chain-exhaustion lines, all in one
+    /// foreground/background cycle). See `DuplicateAckSuppressor`
+    /// for the full rationale and TTL/capacity tradeoffs.
+    @MainActor
+    private var ackEmissionSuppressor = DuplicateAckSuppressor()
     /// Sender-side cooldown between proactive chain-rotation requests
     /// for the same contact. 1 h is much shorter than the natural
     /// rotation cadence (~13 000 tokens / direction = months at
@@ -3040,6 +3054,22 @@ extension ChatStore: RelayClientDelegate {
         // libsignal's ratchet step happens during decrypt; persist
         // before any further work so a crash here doesn't desync.
         persistSession()
+        // A relay-queue redelivery of a chainSeedDelivery we've
+        // already consumed surfaces here as `isDuplicate=true` with
+        // an empty plaintext (the ratchet swallowed the duplicate
+        // ciphertext and returned the metadata-only frame). The
+        // prior code fell through to the inner-kind check and
+        // logged a misleading "REJECTED non-chainSeedDelivery
+        // inner kind (empty)" — the operator reading the QA log
+        // would chase a non-existent protocol bug. Short-circuit
+        // here with the correct diagnostic.
+        if received.isDuplicate {
+            diagLog(
+                "chain",
+                "chain-seed-frame ratchet-duplicate from \(short(received.peer)) — drop (chain already installed)",
+            )
+            return
+        }
         if self.isIdentityBlocked(received.peer) {
             diagLog("chain", "chain-seed-frame from BLOCKED peer \(short(received.peer)) — drop")
             return
@@ -3123,6 +3153,26 @@ extension ChatStore: RelayClientDelegate {
             // app-level state. The ratchet already returned us to
             // a quiescent state in this case (libsignal's
             // DuplicatedMessage path doesn't mutate the session).
+            //
+            // CRITICAL gate: every emitAck call mints a v2 delivery
+            // token off our outbound chain (length 16,384). The
+            // relay's outbound queue is at-least-once and replays
+            // its entire queue on every reconnect — that's how the
+            // QA-debug log of 2026-05-13 saw 22,088 duplicate
+            // detections for one peer in one foreground/background
+            // cycle, exhausting the whole chain in seconds and
+            // then logging "cannot emit ACK" forever after. The
+            // suppressor caps re-emission at one per (peer,
+            // messageId) per 10-min window; the original ACK is
+            // already broadcast across every ready relay's queue,
+            // so the peer will get ✓✓ from one of those without us
+            // re-emitting.
+            if self.ackEmissionSuppressor.shouldSuppress(
+                peer: received.peer,
+                messageId: received.messageId,
+            ) {
+                return
+            }
             pzLog(
                 "[pizzini] duplicate sealed frame from \(self.short(received.peer)) — re-emitting ACK"
             )
@@ -3520,6 +3570,18 @@ extension ChatStore: RelayClientDelegate {
         else { return }
         guard let v2 = mintV2DeliveryToken(forContactAt: idx) else {
             pzLog("[pizzini] cannot emit ACK to \(self.short(toPeer)): chain missing or exhausted")
+            // Chain is dead and we can't ACK. The peer will retry
+            // forever. Trigger a debounced bundle refresh so the
+            // peer mints + ships a fresh chainSeedDelivery; once
+            // that lands, future ACKs work again. Without this
+            // recovery the captured 2026-05-13 log shows the loop
+            // ran for thousands of frames with `refreshChainAndQueue
+            // will fire` logged on every attempt but no BUNDLE_REQUEST
+            // actually going out, because that text was just the
+            // mint-failure log line and the only path that actually
+            // refreshes was on the user-text send route — not the
+            // ACK path.
+            recoverChainAfterExhaustion(forContactAt: idx)
             return
         }
         let token = HashChainToken.encode(v2)
@@ -3549,9 +3611,41 @@ extension ChatStore: RelayClientDelegate {
                     token: token,
                 )
             }
+            // Record AFTER the broadcast — if encryptSealed threw
+            // we want a future retry of this same (peer, messageId)
+            // to be allowed through, not gated by the suppressor.
+            // The record makes the next sealed-frame duplicate for
+            // this exact messageId a silent drop (see
+            // `handleSealedFrame.isDuplicate`).
+            ackEmissionSuppressor.record(peer: toPeer, messageId: messageId)
         } catch {
             pzLog("[pizzini] failed to emit ACK to \(self.short(toPeer)): \(error)")
         }
+    }
+
+    /// Recover after `emitAck` finds the outbound chain to this
+    /// contact missing or exhausted. Fires a `BUNDLE_REQUEST` —
+    /// the peer responds with a fresh `chainSeedDelivery` which
+    /// `handleChainSeedDelivery` installs as our new outbound
+    /// chain. Debounced via the existing `chainRotationLastRequestedAt`
+    /// per-contact cooldown (1 h) so a duplicate flood can't
+    /// hammer the network. Idempotent: if a refresh request is
+    /// already in flight from the proactive 80%-threshold path,
+    /// the cooldown short-circuits us.
+    @MainActor
+    private func recoverChainAfterExhaustion(forContactAt idx: Int) {
+        let contact = state.contacts[idx]
+        let now = Date()
+        if let last = chainRotationLastRequestedAt[contact.id],
+           now.timeIntervalSince(last) < Self.chainRotationRequestCooldown {
+            return
+        }
+        chainRotationLastRequestedAt[contact.id] = now
+        diagLog(
+            "chain",
+            "ACK chain missing/exhausted for \(short(contact.identityPub)) — firing BUNDLE_REQUEST recovery",
+        )
+        requestBundleWithHashcash(fromPeer: contact.identityPub)
     }
 
     nonisolated func relayClient(_ client: RelayClient, didReceiveBundleRequestFrom fromPeer: Data) {
@@ -3649,6 +3743,43 @@ extension ChatStore: RelayClientDelegate {
                 // key for sealed-sender certificates — keep it in
                 // step with the bundle.
                 let verifyKey = try Session.extractBundleVerifyKey(bundle)
+                let priorVerifyKey = self.state.contacts[idx].peerVerifyKey
+
+                // Idempotency gate against relay-queue redelivery.
+                // `BUNDLE_RESPONSE` is at-least-once: a single peer-
+                // side reply surfaces N times (once per ready relay
+                // whose queue still holds our session). libsignal's
+                // `initiateSession` consumes the bundle's one-time-
+                // prekey on the FIRST call; re-running on the same
+                // bytes throws `internalError` because the prekey is
+                // gone, and serves no purpose either way because we
+                // already have a working session. Skip when we have
+                // a session AND the bundle's verify_key matches what
+                // we stashed last time (peer has NOT rotated). If
+                // priorVerifyKey is nil (legacy pair predating the
+                // F-401 stash) we still call initiateSession; the
+                // verify_key compare below this site then catches
+                // any actual rotation. Same root-cause class as the
+                // duplicate-ACK runaway: relay's at-least-once
+                // redelivery hitting an idempotency boundary the
+                // earlier code didn't gate.
+                if self.state.contacts[idx].sessionEstablished,
+                   priorVerifyKey != nil,
+                   priorVerifyKey == verifyKey {
+                    pzLog(
+                        "[pizzini] BUNDLE_RESPONSE from \(self.short(fromPeer))"
+                        + " — session already established with matching"
+                        + " verify_key, skipping initiateSession"
+                        + " (queue-redelivery idempotency)"
+                    )
+                    // Still drain any deferred chain serve — the peer
+                    // may have just asked for our bundle in parallel
+                    // and `maybeServePendingChain` is the gate on that
+                    // queue. Skipping it here would strand a chain.
+                    self.maybeServePendingChain(forContactAt: idx)
+                    return
+                }
+
                 try session.initiateSession(peerIdentity: fromPeer, bundle: bundle)
                 // A bundle from a peer who's rotated their identity
                 // invalidates our outbound chain to them: its root is
@@ -3656,7 +3787,6 @@ extension ChatStore: RelayClientDelegate {
                 // (peer_id, chain_id) state, and after the peer
                 // re-pairs they'll register a new one. Drop the chain
                 // here so the next send hits `refreshChainAndQueue`.
-                let priorVerifyKey = self.state.contacts[idx].peerVerifyKey
                 if priorVerifyKey != nil, priorVerifyKey != verifyKey {
                     self.state.contacts[idx].outboundTokenChain = nil
                 }
@@ -3668,7 +3798,12 @@ extension ChatStore: RelayClientDelegate {
                 // asked for our bundle before we had their bundle.
                 self.maybeServePendingChain(forContactAt: idx)
             } catch {
-                pzLog("[pizzini] initiateSession failed: \(error)")
+                // Include the peer's short id so a future QA capture
+                // pinpoints which contact's session init failed.
+                // Previous error line was "initiateSession failed:
+                // internalError" with no peer context — useless for
+                // multi-contact diagnosis.
+                pzLog("[pizzini] initiateSession failed for \(self.short(fromPeer)): \(error)")
             }
         }
     }
