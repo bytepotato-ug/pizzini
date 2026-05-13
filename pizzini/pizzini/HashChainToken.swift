@@ -34,15 +34,22 @@ import Foundation
 /// of recipient's chains in turn — N=50 contacts × 1 chain each = 50
 /// SHA-256 ops per validation, well under a millisecond.
 enum HashChainToken {
-    /// Master cutover flag. Default OFF: the v1 Ed25519 token model
-    /// stays authoritative. Flip to `true` once the relay's v2
-    /// validator (stage 3b) is deployed across the fleet — `cargo
-    /// test --manifest-path relay/Cargo.toml v2_validator` must pass
-    /// and the rolling deploy must complete on every seed before
-    /// this can flip, or v2 SENDs will fail closed at the relay
-    /// (`delivery-token v2 not yet validated by this relay`) and the
-    /// chat row will show as failed.
-    static let cutoverEnabled = false
+    /// Master cutover flag. Currently ON: the v2 hash-chained token
+    /// model is the single path on the sender side, in lockstep with
+    /// the relay's `chain_validator_store` which accepts v2 SENDs as
+    /// of the stage-3b/2 commit. The v1 Ed25519-signed-token code is
+    /// retained behind the `else` branches one release for paranoia /
+    /// rollback (set this to `false` to revert without deploying a
+    /// new build); a follow-up commit will excise it once v2 has
+    /// soaked in production.
+    ///
+    /// Operational requirement before this flip reaches users: the
+    /// updated relay binary (including `FRAME_TYPE_REGISTER_CHAIN`,
+    /// `chain_validator_store`, and the 52-byte v2 dispatch in
+    /// `check_delivery_token`) must be deployed on EVERY seed in
+    /// `chainparams` before this build is published. See
+    /// `docs/delivery-token-v2-rollout.md`.
+    static let cutoverEnabled = true
 
     static let hashSize = 32
     static let chainIDSize = 16
