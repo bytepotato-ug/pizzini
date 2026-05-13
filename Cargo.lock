@@ -1481,7 +1481,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pizzini-crypto-core"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "argon2",
  "blake3",
@@ -1496,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "pizzini-relay"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "chacha20poly1305",
