@@ -216,6 +216,60 @@ struct HashChainTokenTests {
         #expect(v.lastIndex == 5)
     }
 
+    // MARK: - Wire format
+
+    @Test("wire encode/decode round-trips a token")
+    func wireRoundTrip() {
+        var chain = HashChainToken.mintChain(length: 16)
+        let original = HashChainToken.nextToken(in: &chain)!
+        let wire = HashChainToken.encode(original)
+        #expect(wire.count == HashChainToken.wireSize)
+        guard let decoded = HashChainToken.decode(wire) else {
+            Issue.record("decode returned nil for a freshly-encoded token")
+            return
+        }
+        #expect(decoded == original)
+    }
+
+    @Test("wire size matches the v2 spec: 52 bytes")
+    func wireSizeIs52() {
+        #expect(HashChainToken.wireSize == 52)
+    }
+
+    @Test("decode rejects v1-shaped (84 B) tokens")
+    func decodeRejectsV1Length() {
+        // 84 = 16 nonce + 4 expiry + 64 sig — the relay's v1 token
+        // shape. A v1 blob arriving at a v2 decoder must return nil
+        // so the caller falls back to v1 parsing.
+        let v1Shape = Data(repeating: 0xAA, count: 84)
+        #expect(HashChainToken.decode(v1Shape) == nil)
+    }
+
+    @Test("decode rejects empty + arbitrary lengths")
+    func decodeRejectsBadLengths() {
+        #expect(HashChainToken.decode(Data()) == nil)
+        #expect(HashChainToken.decode(Data(repeating: 0, count: 51)) == nil)
+        #expect(HashChainToken.decode(Data(repeating: 0, count: 53)) == nil)
+    }
+
+    @Test("wire encoding preserves big-endian index")
+    func wireIndexIsBigEndian() {
+        // Index 0x01020304 should encode as bytes 01 02 03 04 at
+        // offset chainIDSize. Tests the BE invariant the relay-side
+        // Rust parser will rely on.
+        let token = HashChainToken.Token(
+            chainID: Data(repeating: 0x11, count: HashChainToken.chainIDSize),
+            index: 0x01020304,
+            value: Data(repeating: 0x22, count: HashChainToken.hashSize),
+        )
+        let wire = HashChainToken.encode(token)
+        let idx = HashChainToken.chainIDSize
+        #expect(wire[idx] == 0x01)
+        #expect(wire[idx + 1] == 0x02)
+        #expect(wire[idx + 2] == 0x03)
+        #expect(wire[idx + 3] == 0x04)
+    }
+
     @Test("validator rejects a token from a different chain ID")
     func validatorRejectsWrongChain() {
         var chainA = HashChainToken.mintChain(length: 8)

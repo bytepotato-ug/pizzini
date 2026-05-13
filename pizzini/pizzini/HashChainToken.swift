@@ -80,6 +80,42 @@ enum HashChainToken {
         let value: Data
     }
 
+    /// Exact wire size of an encoded v2 token: 16 (chainID) + 4
+    /// (index, big-endian u32) + 32 (value) = 52 bytes. The relay
+    /// distinguishes v1 (84 B) from v2 (52 B) purely by `token` field
+    /// length on the SEND frame — no version byte, no protocol break.
+    static let wireSize = chainIDSize + 4 + hashSize
+
+    /// Encode a token for the SEND frame's `token` blob.
+    /// Layout: `chainID(16) ‖ index(4 BE) ‖ value(32)`.
+    static func encode(_ token: Token) -> Data {
+        precondition(token.chainID.count == chainIDSize, "chain id must be \(chainIDSize) bytes")
+        precondition(token.value.count == hashSize, "token value must be \(hashSize) bytes")
+        precondition(token.index >= 0, "token index must be non-negative")
+        var out = Data(capacity: wireSize)
+        out.append(token.chainID)
+        var indexBE = UInt32(token.index).bigEndian
+        withUnsafeBytes(of: &indexBE) { out.append(contentsOf: $0) }
+        out.append(token.value)
+        return out
+    }
+
+    /// Decode a 52-byte SEND-frame token blob back into the struct.
+    /// Returns nil on any size or shape mismatch — the caller falls
+    /// back to v1-token parsing.
+    static func decode(_ wire: Data) -> Token? {
+        guard wire.count == wireSize else { return nil }
+        let chainID = wire.subdata(in: wire.startIndex ..< wire.startIndex + chainIDSize)
+        let indexStart = wire.startIndex + chainIDSize
+        let indexBytes = wire.subdata(in: indexStart ..< indexStart + 4)
+        let valueStart = indexStart + 4
+        let value = wire.subdata(in: valueStart ..< valueStart + hashSize)
+        let index = indexBytes.withUnsafeBytes { ptr -> UInt32 in
+            ptr.loadUnaligned(as: UInt32.self).bigEndian
+        }
+        return Token(chainID: chainID, index: Int(index), value: value)
+    }
+
     /// Recipient-side primitive: mint a fresh chain. The seed is 32
     /// random bytes from `SecRandomCopyBytes`; the chain root is the
     /// `length`-fold SHA-256 of the seed. The recipient registers
