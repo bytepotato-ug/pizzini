@@ -1890,19 +1890,6 @@ final class ChatStore: NSObject {
     @MainActor
     private var chainRotationLastRequestedAt: [UUID: Date] = [:]
 
-    /// Per-(peer, messageId) sliding-window dedup for ACK
-    /// re-emissions on duplicate sealed frames. The relay's outbound
-    /// queue is at-least-once; on every reconnect it redelivers
-    /// every still-unexpired queued frame. Without this gate, each
-    /// re-delivery would mint a fresh v2 delivery-token from our
-    /// outbound chain to that peer, and a busy conversation would
-    /// exhaust the 16,384-entry chain in seconds — the exact bug
-    /// captured in QA-debug log 2026-05-13 (22,088 duplicate
-    /// detections, 5,704 chain-exhaustion lines, all in one
-    /// foreground/background cycle). See `DuplicateAckSuppressor`
-    /// for the full rationale and TTL/capacity tradeoffs.
-    @MainActor
-    private var ackEmissionSuppressor = DuplicateAckSuppressor()
     /// Sender-side cooldown between proactive chain-rotation requests
     /// for the same contact. 1 h is much shorter than the natural
     /// rotation cadence (~13 000 tokens / direction = months at
@@ -3164,37 +3151,30 @@ extension ChatStore: RelayClientDelegate {
             return
         }
         if received.isDuplicate {
-            // Sender retried a SEND we already processed (their first
-            // ACK from us probably got lost). Re-emit a fresh ACK
-            // pointing at the same message_id so their outbox can flip
-            // ✓→✓✓; do NOT re-append to the chat log or advance any
-            // app-level state. The ratchet already returned us to
-            // a quiescent state in this case (libsignal's
-            // DuplicatedMessage path doesn't mutate the session).
+            // Relay-queue redelivery of a sealed frame we already
+            // processed. NEVER re-emit an ACK here — every emitAck
+            // call mints a v2 delivery token off our outbound chain,
+            // and a long relay-queue backlog of distinct messageIds
+            // can drain the entire 16,384-entry chain in minutes.
+            // (QA log 2026-05-13: 12,492 first-time duplicates from
+            // one peer over an hour, each minting a fresh token,
+            // the prior per-(peer, messageId) suppressor caught only
+            // *subsequent* redeliveries of the same messageId, not
+            // the first.)
             //
-            // CRITICAL gate: every emitAck call mints a v2 delivery
-            // token off our outbound chain (length 16,384). The
-            // relay's outbound queue is at-least-once and replays
-            // its entire queue on every reconnect — that's how the
-            // QA-debug log of 2026-05-13 saw 22,088 duplicate
-            // detections for one peer in one foreground/background
-            // cycle, exhausting the whole chain in seconds and
-            // then logging "cannot emit ACK" forever after. The
-            // suppressor caps re-emission at one per (peer,
-            // messageId) per 10-min window; the original ACK is
-            // already broadcast across every ready relay's queue,
-            // so the peer will get ✓✓ from one of those without us
-            // re-emitting.
-            if self.ackEmissionSuppressor.shouldSuppress(
-                peer: received.peer,
-                messageId: received.messageId,
-            ) {
-                return
-            }
+            // Why always-suppress is safe: when the peer's outbox
+            // retries because our original ACK didn't reach them,
+            // they re-encrypt the plaintext with a FRESH ratchet
+            // number. That arrives here as `isDuplicate=false` and
+            // gets a normal ACK via the regular fresh-receive path.
+            // `isDuplicate=true` only ever means "the relay's
+            // at-least-once queue redelivered the same sealed bytes",
+            // and our original ACK for those bytes is already queued
+            // at every connected relay — the peer sees ✓✓ from
+            // whichever relay's queue drains first.
             pzLog(
-                "[pizzini] duplicate sealed frame from \(self.short(received.peer)) — re-emitting ACK"
+                "[pizzini] duplicate sealed frame from \(self.short(received.peer)) — drop (relay-queue redelivery)"
             )
-            self.emitAck(for: received.messageId, toPeer: received.peer, via: client)
             return
         }
         guard let kindByte = received.plaintext.first,
@@ -3629,13 +3609,6 @@ extension ChatStore: RelayClientDelegate {
                     token: token,
                 )
             }
-            // Record AFTER the broadcast — if encryptSealed threw
-            // we want a future retry of this same (peer, messageId)
-            // to be allowed through, not gated by the suppressor.
-            // The record makes the next sealed-frame duplicate for
-            // this exact messageId a silent drop (see
-            // `handleSealedFrame.isDuplicate`).
-            ackEmissionSuppressor.record(peer: toPeer, messageId: messageId)
         } catch {
             pzLog("[pizzini] failed to emit ACK to \(self.short(toPeer)): \(error)")
         }
