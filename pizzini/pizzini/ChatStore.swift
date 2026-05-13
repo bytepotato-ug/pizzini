@@ -1770,6 +1770,68 @@ final class ChatStore: NSObject {
     /// Used both at pair time (right after we send their bundle) and
     /// in response to a refill request. Rate-limited to one issuance
     /// per `Contact.refillCooldown` per peer.
+    /// Handle a sealed `chainSeedDelivery` payload. The peer (who minted
+    /// the chain and registered the root with the relay) has shipped us
+    /// the seed for our outbound v2 token chain to them. Install or
+    /// replace `Contact.outboundTokenChain`; the next SEND will derive
+    /// tokens from this chain instead of popping from the v1 stash.
+    @MainActor
+    private func handleChainSeedDelivery(payload: Data, contactIdx idx: Int) {
+        guard let chain = HashChainToken.decodeSeedDelivery(payload) else {
+            pzLog("[pizzini] chainSeedDelivery: malformed payload from \(self.short(state.contacts[idx].identityPub))")
+            return
+        }
+        // Replacing an existing chain is legitimate (rotation); the old
+        // chain's unused indices are simply discarded — the relay's
+        // `(recipient, chainID)` state for the old chain ages out via
+        // the relay's GC. Logging makes the rotation auditable in
+        // sysdiagnose without revealing chain bytes.
+        let priorChainID = state.contacts[idx].outboundTokenChain?.chainID
+        state.contacts[idx].outboundTokenChain = chain
+        Storage.upsertContact(state.contacts[idx])
+        pzLog("[pizzini] chainSeedDelivery installed for \(self.short(state.contacts[idx].identityPub)) (rotation=\(priorChainID != nil))")
+    }
+
+    /// Mint a fresh outbound chain for the named peer and ship the seed
+    /// via the sealed Double Ratchet. Called when (a) we're answering a
+    /// peer's bootstrap (post-bundle) — the v2 replacement for
+    /// `issueTokens` — and (b) the peer's outbound chain is approaching
+    /// exhaustion (`shouldRotate`) so we mint a successor before the
+    /// current one dries up. No-op if we have no session yet.
+    @MainActor
+    private func sendChainSeedDelivery(toPeer peer: Data, via client: RelayClient, session: Session) {
+        let chain = HashChainToken.mintChain()
+        var inner = Data([RelayClient.InnerEnvelopeKind.chainSeedDelivery.rawValue])
+        inner.append(HashChainToken.encodeSeedDelivery(chain))
+        do {
+            let sealed = try session.encryptSealed(
+                peer: peer,
+                messageId: Self.makeMessageId(),
+                plaintext: inner,
+            )
+            persistSession()
+            // Best-effort: rides through the same path as a regular SEND,
+            // so the relay-side rate-limit gate applies. The recipient
+            // unwraps and installs; if the SEND drops, the next pair-time
+            // or rotation pass will retry.
+            broadcastToRelays {
+                $0.sendSealed(
+                    toPeer: peer,
+                    sealedCiphertext: sealed,
+                    ttlSeconds: 24 * 60 * 60,
+                    token: Data(),
+                )
+            }
+        } catch {
+            pzLog("[pizzini] chainSeedDelivery encrypt failed: \(error)")
+        }
+        // The chain we just minted is for THEIR outbound use; the relay
+        // will eventually register the root via the stage-3 register-
+        // chain frame. Nothing to persist on our side — the relay holds
+        // the validator state.
+        _ = client
+    }
+
     private func issueTokens(for peer: Data, via relay: RelayClient, session: Session) {
         guard let idx = contactIndex(forIdentity: peer) else { return }
         if let last = state.contacts[idx].lastRefillRequestHandledAt,
@@ -2719,6 +2781,8 @@ extension ChatStore: RelayClientDelegate {
             self.handleGroupBootstrap(payload: Data(payload), fromPeer: received.peer)
         case .groupFileChunk:
             self.handleGroupFileChunk(payload: Data(payload), fromPeer: received.peer)
+        case .chainSeedDelivery:
+            self.handleChainSeedDelivery(payload: Data(payload), contactIdx: idx)
         }
         // Defensive: an ACK arriving on the SEND channel would have
         // landed in the chat path above unless its inner-kind byte is

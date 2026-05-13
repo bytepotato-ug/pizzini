@@ -71,6 +71,79 @@ enum HashChainToken {
         var isExhausted: Bool { nextIndex > length }
     }
 
+    /// Fixed-size binary encoding of a `Chain` for SQLCipher
+    /// persistence and for the `chainSeedDelivery` sealed-envelope
+    /// payload. Layout: `chainID(16) ‖ seed(32) ‖ root(32) ‖ length(4 BE)
+    /// ‖ nextIndex(4 BE)` = 88 bytes. Stable across Swift / Rust ports.
+    static let chainWireSize = chainIDSize + hashSize + hashSize + 4 + 4
+
+    static func encodeChain(_ chain: Chain) -> Data {
+        precondition(chain.chainID.count == chainIDSize, "chain id must be \(chainIDSize) bytes")
+        precondition(chain.seed.count == hashSize, "chain seed must be \(hashSize) bytes")
+        precondition(chain.root.count == hashSize, "chain root must be \(hashSize) bytes")
+        var out = Data(capacity: chainWireSize)
+        out.append(chain.chainID)
+        out.append(chain.seed)
+        out.append(chain.root)
+        var lengthBE = UInt32(chain.length).bigEndian
+        withUnsafeBytes(of: &lengthBE) { out.append(contentsOf: $0) }
+        var nextBE = UInt32(chain.nextIndex).bigEndian
+        withUnsafeBytes(of: &nextBE) { out.append(contentsOf: $0) }
+        return out
+    }
+
+    static func decodeChain(_ wire: Data) -> Chain? {
+        guard wire.count == chainWireSize else { return nil }
+        var cursor = wire.startIndex
+        let chainID = wire.subdata(in: cursor ..< cursor + chainIDSize)
+        cursor += chainIDSize
+        let seed = wire.subdata(in: cursor ..< cursor + hashSize)
+        cursor += hashSize
+        let root = wire.subdata(in: cursor ..< cursor + hashSize)
+        cursor += hashSize
+        let lengthBytes = wire.subdata(in: cursor ..< cursor + 4)
+        cursor += 4
+        let nextBytes = wire.subdata(in: cursor ..< cursor + 4)
+        let length = Int(lengthBytes.withUnsafeBytes { ptr -> UInt32 in
+            ptr.loadUnaligned(as: UInt32.self).bigEndian
+        })
+        let nextIndex = Int(nextBytes.withUnsafeBytes { ptr -> UInt32 in
+            ptr.loadUnaligned(as: UInt32.self).bigEndian
+        })
+        // Sanity guards: length must be positive; nextIndex must be in
+        // [1, length+1]; binary garbage from disk shouldn't blow up
+        // the chat list. Root is intentionally NOT re-verified here
+        // (would cost `length` hashes per load); the relay-side
+        // validator is the trust boundary for chain integrity.
+        guard length > 0, nextIndex >= 1, nextIndex <= length + 1 else { return nil }
+        return Chain(
+            chainID: chainID,
+            seed: seed,
+            length: length,
+            root: root,
+            nextIndex: nextIndex,
+        )
+    }
+
+    /// Sealed-envelope body for `InnerEnvelopeKind.chainSeedDelivery`.
+    /// Carries one freshly-minted chain from the recipient (who owns
+    /// the chain root, registered with the relay) to the sender (who
+    /// uses it to derive tokens for messages to the recipient).
+    /// Identical wire shape as `encodeChain`, so it ships and parses
+    /// through the same 88-byte codec.
+    static func encodeSeedDelivery(_ chain: Chain) -> Data {
+        encodeChain(chain)
+    }
+
+    static func decodeSeedDelivery(_ wire: Data) -> Chain? {
+        guard let chain = decodeChain(wire) else { return nil }
+        // A fresh seed-delivery payload MUST present an unused chain.
+        // A peer that ships `nextIndex > 1` is either confused or
+        // hostile — refuse rather than silently start mid-chain.
+        guard chain.nextIndex == 1 else { return nil }
+        return chain
+    }
+
     /// One on-wire token presentation: chain identifier + cursor +
     /// the 32-byte chain value. The recipient (and ultimately the
     /// relay) validate this against the chain's stored state.

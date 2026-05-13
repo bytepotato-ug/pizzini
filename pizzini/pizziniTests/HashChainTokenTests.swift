@@ -270,6 +270,53 @@ struct HashChainTokenTests {
         #expect(wire[idx + 3] == 0x04)
     }
 
+    // MARK: - Chain wire codec (persistence + seed delivery)
+
+    @Test("chain binary codec round-trips a fresh chain")
+    func chainCodecRoundTripFresh() {
+        let original = HashChainToken.mintChain(length: 1024)
+        let wire = HashChainToken.encodeChain(original)
+        #expect(wire.count == HashChainToken.chainWireSize)
+        let back = HashChainToken.decodeChain(wire)
+        #expect(back == original)
+    }
+
+    @Test("chain binary codec preserves advanced nextIndex")
+    func chainCodecRoundTripAdvanced() {
+        var chain = HashChainToken.mintChain(length: 64)
+        for _ in 0..<7 { _ = HashChainToken.nextToken(in: &chain) }
+        let wire = HashChainToken.encodeChain(chain)
+        let back = HashChainToken.decodeChain(wire)
+        #expect(back == chain)
+        #expect(back?.nextIndex == 8)
+    }
+
+    @Test("decodeChain rejects truncated or oversize blobs")
+    func chainCodecRejectsBadSize() {
+        let chain = HashChainToken.mintChain(length: 8)
+        let valid = HashChainToken.encodeChain(chain)
+        #expect(HashChainToken.decodeChain(valid.dropLast()) == nil)
+        #expect(HashChainToken.decodeChain(valid + Data([0xFF])) == nil)
+        #expect(HashChainToken.decodeChain(Data()) == nil)
+    }
+
+    @Test("decodeSeedDelivery rejects a mid-chain (nextIndex > 1) payload")
+    func seedDeliveryRejectsAdvancedChain() {
+        var chain = HashChainToken.mintChain(length: 32)
+        _ = HashChainToken.nextToken(in: &chain)
+        let wire = HashChainToken.encodeSeedDelivery(chain)
+        // The codec emits same wire, but the seed-delivery decoder
+        // refuses anything other than a fresh `nextIndex == 1` chain.
+        #expect(HashChainToken.decodeSeedDelivery(wire) == nil)
+    }
+
+    @Test("decodeSeedDelivery accepts a fresh chain")
+    func seedDeliveryAcceptsFreshChain() {
+        let chain = HashChainToken.mintChain(length: 32)
+        let wire = HashChainToken.encodeSeedDelivery(chain)
+        #expect(HashChainToken.decodeSeedDelivery(wire) == chain)
+    }
+
     @Test("validator rejects a token from a different chain ID")
     func validatorRejectsWrongChain() {
         var chainA = HashChainToken.mintChain(length: 8)

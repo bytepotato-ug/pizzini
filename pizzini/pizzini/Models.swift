@@ -273,6 +273,15 @@ struct Contact: Codable, Identifiable, Sendable {
     /// surface, not message delivery.
     var mutedAt: Date?
 
+    /// Delivery-token v2 outbound chain — the hash chain we use to
+    /// derive tokens for SENDs to this peer. The peer minted this
+    /// chain, ships the seed via the sealed `chainSeedDelivery`
+    /// envelope, and registered the matching root with the relay.
+    /// Nil = no v2 chain on file for this contact; sender falls back
+    /// to v1 `deliveryTokensForPeer`. Rotated when `shouldRotate`
+    /// crosses 80% used.
+    var outboundTokenChain: HashChainToken.Chain?
+
     init(
         id: UUID = UUID(),
         identityPub: Data,
@@ -291,7 +300,8 @@ struct Contact: Codable, Identifiable, Sendable {
         lastBundleServedAt: Date? = nil,
         addedVia: ContactSource = .qrScan,
         verifiedAt: Date? = nil,
-        mutedAt: Date? = nil
+        mutedAt: Date? = nil,
+        outboundTokenChain: HashChainToken.Chain? = nil
     ) {
         self.id = id
         self.identityPub = identityPub
@@ -311,6 +321,7 @@ struct Contact: Codable, Identifiable, Sendable {
         self.addedVia = addedVia
         self.verifiedAt = verifiedAt
         self.mutedAt = mutedAt
+        self.outboundTokenChain = outboundTokenChain
     }
 
     /// Three-state shorthand for verification status used by the UI.
@@ -353,6 +364,7 @@ struct Contact: Codable, Identifiable, Sendable {
         case peerVerifyKey, lastBundleServedAt
         case addedVia, verifiedAt
         case mutedAt
+        case outboundTokenChain
     }
 
     init(from decoder: Decoder) throws {
@@ -393,6 +405,7 @@ struct Contact: Codable, Identifiable, Sendable {
         self.addedVia = try c.decodeIfPresent(ContactSource.self, forKey: .addedVia) ?? .unknown
         self.verifiedAt = try c.decodeIfPresent(Date.self, forKey: .verifiedAt)
         self.mutedAt = try c.decodeIfPresent(Date.self, forKey: .mutedAt)
+        self.outboundTokenChain = try c.decodeIfPresent(HashChainToken.Chain.self, forKey: .outboundTokenChain)
     }
 
     /// Explicit encode because the legacy `readReceiptsEnabled`
@@ -420,6 +433,7 @@ struct Contact: Codable, Identifiable, Sendable {
         try c.encode(addedVia, forKey: .addedVia)
         try c.encodeIfPresent(verifiedAt, forKey: .verifiedAt)
         try c.encodeIfPresent(mutedAt, forKey: .mutedAt)
+        try c.encodeIfPresent(outboundTokenChain, forKey: .outboundTokenChain)
     }
 
     var unreadCount: Int {

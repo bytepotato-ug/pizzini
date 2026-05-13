@@ -21,7 +21,7 @@ enum Schema {
     /// Current schema version — read by SQLiteStorage at open time
     /// to decide whether the migration runner needs to fire. Bump
     /// when adding a new migration; never decrease.
-    static let currentVersion: Int32 = 4
+    static let currentVersion: Int32 = 5
 
     /// All migrations, ordered. Index `i` is `from version i`.
     /// Migration 0 → 1 is the initial schema; subsequent entries
@@ -32,6 +32,7 @@ enum Schema {
         Migration(from: 1, to: 2, sql: v2ContactProvenanceAndVerification),
         Migration(from: 2, to: 3, sql: v3ReadReceiptsModeAndDefault),
         Migration(from: 3, to: 4, sql: v4MuteAndBlockList),
+        Migration(from: 4, to: 5, sql: v5HashChainOutboundToken),
     ]
 
     private static let v1InitialSchema = """
@@ -304,6 +305,14 @@ enum Schema {
         identity_pub BLOB    PRIMARY KEY NOT NULL,
         blocked_at   INTEGER NOT NULL
     ) STRICT;
+    """
+
+    /// v5 — delivery-token v2 outbound chain. Nullable 88-byte BLOB
+    /// column on `contacts` holding `HashChainToken.encodeChain`
+    /// output. Nil for pre-v2 contacts; populated once the peer ships
+    /// a `chainSeedDelivery` sealed envelope.
+    private static let v5HashChainOutboundToken = """
+    ALTER TABLE contacts ADD COLUMN outbound_token_chain BLOB;
     """
 }
 

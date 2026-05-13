@@ -52,6 +52,37 @@ struct SQLiteStorageTests {
 
     // MARK: - Contacts + messages + tokens
 
+    @Test("contact round-trips outbound token chain (v2)")
+    func contactOutboundChainRoundTrip() throws {
+        let store = try freshStore()
+        let chain = HashChainToken.mintChain(length: 64)
+        let identityPub = Data(repeating: 0x09, count: 33)
+        let original = Contact(
+            identityPub: identityPub,
+            displayName: "Bob",
+            sessionEstablished: true,
+            addedAt: Date(),
+            outboundTokenChain: chain,
+        )
+        try store.upsertContact(original)
+        let loaded = try store.loadContacts().first
+        #expect(loaded?.outboundTokenChain == chain)
+    }
+
+    @Test("contact with no v2 chain loads as nil (legacy compatibility)")
+    func contactWithoutOutboundChainLoadsNil() throws {
+        let store = try freshStore()
+        let identityPub = Data(repeating: 0x0A, count: 33)
+        try store.upsertContact(Contact(
+            identityPub: identityPub,
+            displayName: "Alice",
+            sessionEstablished: false,
+            addedAt: Date(),
+        ))
+        let loaded = try store.loadContacts().first
+        #expect(loaded?.outboundTokenChain == nil)
+    }
+
     @Test("contact + log + tokens round-trip")
     func contactGraphRoundTrip() throws {
         let store = try freshStore()

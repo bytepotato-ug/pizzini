@@ -181,6 +181,17 @@ public final class RelayClient: @unchecked Sendable {
         /// group are decrypted; pending-invitation groups advance the
         /// chain but render nothing.
         case groupFileChunk = 0x0A
+        /// Delivery-token v2 chain-seed delivery. Body: an 88-byte
+        /// `HashChainToken.Chain` binary form (chainID(16) ‖ seed(32)
+        /// ‖ root(32) ‖ length(4 BE) ‖ nextIndex(4 BE)) where
+        /// `nextIndex == 1`. Sent from the recipient (who minted the
+        /// chain and registered the root with the relay) to the
+        /// sender (who installs it as the outbound chain for messages
+        /// to this peer). Replaces the v1 `TOKEN_ISSUE` 1024-token
+        /// fan-out shipped over the unsealed wire frame — chain-seed
+        /// delivery rides the Double Ratchet, so the relay never sees
+        /// the registration step.
+        case chainSeedDelivery = 0x0B
     }
     private static let frameTypeHello: UInt8 = 1
     private static let frameTypeSend: UInt8 = 2

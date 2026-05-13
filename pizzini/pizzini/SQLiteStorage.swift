@@ -379,7 +379,7 @@ final class SQLiteStorage {
                    last_message_at, last_seen_at, added_at,
                    last_refill_request_sent_at, last_refill_request_handled_at,
                    ttl_seconds, read_receipts_mode, peer_verify_key, last_bundle_served_at,
-                   added_via, verified_at, muted_at
+                   added_via, verified_at, muted_at, outbound_token_chain
             FROM contacts ORDER BY added_at ASC;
         """)
         var contacts: [Contact] = []
@@ -418,6 +418,9 @@ final class SQLiteStorage {
                 addedVia: source,
                 verifiedAt: stmt.columnOptionalInt64(14).map { $0.dateFromEpochMs },
                 mutedAt: stmt.columnOptionalInt64(15).map { $0.dateFromEpochMs },
+                outboundTokenChain: stmt.columnBlob(16).flatMap {
+                    HashChainToken.decodeChain($0)
+                },
             )
             c.log = try loadMessages(contactId: idData)
             c.deliveryTokensForPeer = try loadDeliveryTokens(contactId: idData)
@@ -450,8 +453,8 @@ final class SQLiteStorage {
                 last_refill_request_sent_at, last_refill_request_handled_at,
                 ttl_seconds, read_receipts_enabled, read_receipts_mode,
                 peer_verify_key, last_bundle_served_at,
-                added_via, verified_at, muted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                added_via, verified_at, muted_at, outbound_token_chain
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 identity_pub = excluded.identity_pub,
                 display_name = excluded.display_name,
@@ -466,7 +469,8 @@ final class SQLiteStorage {
                 peer_verify_key = excluded.peer_verify_key,
                 last_bundle_served_at = excluded.last_bundle_served_at,
                 verified_at = excluded.verified_at,
-                muted_at = excluded.muted_at;
+                muted_at = excluded.muted_at,
+                outbound_token_chain = excluded.outbound_token_chain;
         """)
         try stmt
             .bind(c.id.data, at: 1)
@@ -486,6 +490,7 @@ final class SQLiteStorage {
             .bind(c.addedVia.rawValue, at: 15)
             .bind(c.verifiedAt, at: 16)
             .bind(c.mutedAt, at: 17)
+            .bind(c.outboundTokenChain.map { HashChainToken.encodeChain($0) }, at: 18)
             .run()
     }
 
