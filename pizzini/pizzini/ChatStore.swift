@@ -2547,6 +2547,16 @@ final class ChatStore: NSObject {
         Storage.upsertSettings(state)
     }
 
+    /// Override the app's light/dark appearance. `.system` follows the
+    /// OS toggle; `.light` / `.dark` pin the appearance regardless.
+    /// Persisted under `AppState.appearanceMode` and applied by
+    /// `ContentView` via `.preferredColorScheme(_:)`.
+    func setAppearanceMode(_ mode: AppearanceMode) {
+        guard state.appearanceMode != mode else { return }
+        state.appearanceMode = mode
+        Storage.upsertSettings(state)
+    }
+
     /// Toggle the in-app haptic for messages landing in a chat OTHER
     /// than the active one. Default OFF — silent reliance on the
     /// badge + chat list updates is the privacy-first default; the
@@ -2613,6 +2623,13 @@ final class ChatStore: NSObject {
         // blocked then "removed" can't simply re-pair around the
         // block. Preserve across identity reset.
         let preservedBlocked = state.blockedIdentities
+        // Appearance is a pure UX choice with no identity correlation,
+        // so the explicit-reset path preserves it. The duress path
+        // (Storage.eraseAndReinitialize, clearPasscodes branch) does
+        // NOT preserve it — a freshly-installed app is light/system
+        // by default, and a dark-mode-pinned post-wipe surface would
+        // signal "this device has been used before" to a coercer.
+        let preservedAppearance = state.appearanceMode
         let resetState = AppState(
             relayHost: preservedHost,
             onboardingCompleted: preservedOnboarding,
@@ -2625,6 +2642,7 @@ final class ChatStore: NSObject {
             defaultReadReceiptsEnabled: preservedDefaultReadReceipts,
             notificationsMuted: preservedNotificationsMuted,
             blockedIdentities: preservedBlocked,
+            appearanceMode: preservedAppearance,
         )
         // F-703: write the post-reset AppState to Keychain BEFORE wiping
         // the device-store / outbox / legacy slots. The previous order

@@ -9,6 +9,20 @@ import SwiftUI
 import UIKit
 import PizziniCryptoCore
 
+/// SwiftUI bridge for the model-layer `AppearanceMode`. Kept on this
+/// side of the import boundary so `Models.swift` stays Foundation-only
+/// (it has no SwiftUI dependency today and we'd rather not introduce
+/// one for a single mapping).
+extension AppearanceMode {
+    var preferredColorScheme: ColorScheme? {
+        switch self {
+        case .system: return nil
+        case .light: return .light
+        case .dark: return .dark
+        }
+    }
+}
+
 struct ContentView: View {
     /// Tabs in the floating bottom bar. `TabKind` rather than `Tab` to
     /// avoid colliding with SwiftUI's `Tab` view in iOS 26's typed
@@ -80,6 +94,11 @@ struct ContentView: View {
                 PrivacyShieldView()
             }
         }
+        // Override the system light/dark setting when the user pinned
+        // an explicit appearance in Settings → Appearance. `.system`
+        // resolves to `nil`, which lets SwiftUI follow `UITraitCollection`
+        // exactly as before.
+        .preferredColorScheme(store.state.appearanceMode.preferredColorScheme)
         // App-wide screenshot mask is applied at the window-CALayer
         // level by `WindowSecureMask` — installed once from
         // `AppDelegate.application(_:didFinishLaunchingWithOptions:)`

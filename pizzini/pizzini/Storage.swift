@@ -419,6 +419,7 @@ enum Storage {
                         // its whole purpose is to outlive contact rows.
                         // Preserve.
                         blockedIdentities: snapshot.blockedIdentities,
+                        appearanceMode: snapshot.appearanceMode,
                     )
                 }
                 _ = persist(appState: preserved)

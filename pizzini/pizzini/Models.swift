@@ -464,6 +464,25 @@ extension AppState {
     }
 }
 
+/// Stored under `AppState.appearanceMode`. Drives the root view's
+/// `.preferredColorScheme(_:)` so the user can override the system
+/// light/dark setting from Settings → Appearance. `.system` is the
+/// default and means "follow the OS toggle"; explicit `.light` /
+/// `.dark` pin the app regardless of what iOS reports.
+enum AppearanceMode: String, Codable, CaseIterable, Sendable {
+    case system
+    case light
+    case dark
+
+    var label: String {
+        switch self {
+        case .system: return "System"
+        case .light: return "Light"
+        case .dark: return "Dark"
+        }
+    }
+}
+
 enum AutoLockTimeout: String, Codable, CaseIterable, Sendable {
     case immediately
     case oneMinute
@@ -632,6 +651,12 @@ struct AppState: Codable, Sendable {
     /// (which only removes the row).
     var blockedIdentities: [Data]
 
+    /// User-chosen override for the app's light/dark appearance.
+    /// Default `.system` — follow the OS toggle. Explicit `.light` /
+    /// `.dark` pin the app regardless of the system setting. Applied
+    /// at the root view via `.preferredColorScheme(_:)`.
+    var appearanceMode: AppearanceMode
+
     static let currentVersion = 1
     // Empty = use the bundled trusted-onion fleet from
     // `RelayRegistry.trusted` (D5 default). A non-empty value is a
@@ -657,7 +682,8 @@ struct AppState: Codable, Sendable {
         inAppHapticsEnabled: Bool = false,
         defaultReadReceiptsEnabled: Bool = false,
         notificationsMuted: Bool = false,
-        blockedIdentities: [Data] = []
+        blockedIdentities: [Data] = [],
+        appearanceMode: AppearanceMode = .system
     ) {
         self.version = version
         self.relayHost = relayHost
@@ -675,6 +701,7 @@ struct AppState: Codable, Sendable {
         self.defaultReadReceiptsEnabled = defaultReadReceiptsEnabled
         self.notificationsMuted = notificationsMuted
         self.blockedIdentities = blockedIdentities
+        self.appearanceMode = appearanceMode
     }
 
     /// Legacy JSON keys that earlier builds wrote but the current
@@ -701,6 +728,7 @@ struct AppState: Codable, Sendable {
         case defaultReadReceiptsEnabled
         case notificationsMuted
         case blockedIdentities
+        case appearanceMode
     }
 
     init(from decoder: Decoder) throws {
@@ -739,6 +767,7 @@ struct AppState: Codable, Sendable {
         defaultReadReceiptsEnabled = try c.decodeIfPresent(Bool.self, forKey: .defaultReadReceiptsEnabled) ?? false
         notificationsMuted = try c.decodeIfPresent(Bool.self, forKey: .notificationsMuted) ?? false
         blockedIdentities = try c.decodeIfPresent([Data].self, forKey: .blockedIdentities) ?? []
+        appearanceMode = try c.decodeIfPresent(AppearanceMode.self, forKey: .appearanceMode) ?? .system
         // Pre-existing JSON blobs from earlier builds may carry the
         // `notifyPeerOnScreenshot`, `blockQRScreenshots`,
         // `blockChatScreenshots`, and `blockAppScreenshots` keys.

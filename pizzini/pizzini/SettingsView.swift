@@ -101,6 +101,26 @@ struct SettingsView: View {
             }
 
             Section {
+                Picker(
+                    selection: Binding(
+                        get: { store.state.appearanceMode },
+                        set: { store.setAppearanceMode($0) }
+                    ),
+                ) {
+                    ForEach(AppearanceMode.allCases, id: \.self) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                } label: {
+                    Label("Theme", systemImage: "circle.lefthalf.filled")
+                }
+                .pickerStyle(.navigationLink)
+            } header: {
+                Text("Appearance")
+            } footer: {
+                Text("System follows your iOS Display & Brightness setting. Light or Dark pin the app regardless of the OS.")
+            }
+
+            Section {
                 Toggle(isOn: Binding(
                     get: { store.state.panicModeEnabled },
                     set: { store.setPanicModeEnabled($0) }
