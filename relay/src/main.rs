@@ -113,7 +113,7 @@ mod encrypted_file;
 mod pending_store;
 mod push_token_store;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -352,6 +352,45 @@ const FRAME_TYPE_DEREGISTER_PUSH: u8 = 11;
 /// registrations with identical `(root, length)` are accepted as
 /// no-ops; conflicting roots are refused.
 const FRAME_TYPE_REGISTER_CHAIN: u8 = 12;
+/// v2 chain-seed delivery. Body: `to_id(u16) ‖ from_id(u16) ‖
+/// sealed_envelope_bytes`. Carries a sealed inner-kind
+/// `chainSeedDelivery` (0x0B) payload from the chain-minting
+/// recipient to the future-sender — i.e. Bob mints a fresh chain
+/// Alice will use to send to Bob, and ships the seed to Alice via
+/// this frame.
+///
+/// Why a separate frame type instead of FRAME_TYPE_SEND: the SEND
+/// path requires a 52-byte v2 delivery token authenticating the
+/// sender against the recipient's registered hash chain — but the
+/// *first* chain-seed delivery happens BEFORE any chain has been
+/// registered between this pair, so the sender has no token to
+/// derive. A SEND with empty token is correctly rejected by
+/// `check_delivery_token`. A new wire type with a different
+/// gatekeeper is the clean fix.
+///
+/// Authorisation model:
+///   * Wire-level: spoof check (from_id == HELLO-authenticated
+///     self_id) — identical to BUNDLE_RESPONSE.
+///   * Wire-level: per-(from_id, to_id) rate limit
+///     (`CHAIN_SEED_DELIVERY_RATE_CAP` per
+///     `CHAIN_SEED_DELIVERY_RATE_WINDOW`) so a malicious paired
+///     peer cannot flood a target with rotation-replacement frames.
+///   * Recipient-level: contact-gate inside the sealed envelope —
+///     a chain seed from a peer not in the recipient's contacts is
+///     dropped. Same gate that already applies to chat messages.
+///   * Recipient-level: inner-kind restriction — only sealed
+///     envelopes carrying `chainSeedDelivery` are accepted via this
+///     frame. Any other inner kind is a protocol violation and is
+///     dropped without installing chain state. This prevents abuse
+///     where a paired peer slips a non-chain envelope through the
+///     no-token pipe.
+///
+/// Forwarding semantics: routed to `to_id` if the recipient is
+/// online, queued in `pending_store` otherwise — matches
+/// FRAME_TYPE_SEND for offline-delivery parity. TTL is fixed at
+/// `MAX_PENDING_TTL` (7 d) since chain seeds carry no sender-chosen
+/// TTL field.
+const FRAME_TYPE_CHAIN_SEED_DELIVERY: u8 = 13;
 /// Fixed payload size for COVER frames (post-frame-type body).
 /// Sized to roughly match the smallest padded sealed_ciphertext
 /// bucket (256 bytes) so the wire byte-count of a heartbeat is
@@ -508,6 +547,22 @@ type HelloReplays = Arc<Mutex<HashMap<HelloReplayKey, Instant>>>;
 /// by `HELLO_TIMESTAMP_TOLERANCE`, so a 15-minute tick comfortably
 /// covers anything inside the acceptance window.
 const HELLO_REPLAY_GC_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// Per-(sender, recipient) rate-limit on `FRAME_TYPE_CHAIN_SEED_DELIVERY`.
+/// Legitimate use: 1 frame per fresh pair + 1 per chain rotation
+/// (rotation is roughly per ~13 000 messages = months at typical
+/// volume). 4 frames per 60 s is generous headroom for a buggy
+/// client retrying a couple of times; an attacker spamming chain
+/// rotations to grief a target is bounded at 4× per peer per minute.
+const CHAIN_SEED_DELIVERY_RATE_CAP: usize = 4;
+const CHAIN_SEED_DELIVERY_RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Rate-limit table for `FRAME_TYPE_CHAIN_SEED_DELIVERY`. Keyed by
+/// `(from_id, to_id)`; value is a deque of timestamps of recently
+/// accepted frames within the rate window. Entries with empty
+/// deques are pruned by `spawn_chain_seed_rate_gc`.
+type ChainSeedRate = Arc<Mutex<HashMap<(PeerId, PeerId), VecDeque<Instant>>>>;
+/// GC cadence for the chain-seed-delivery rate-limit map.
+const CHAIN_SEED_RATE_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Per-(recipient, hour) cap on accepted `BUNDLE_REQUEST` frames.
 /// Hashcash + the (recipient, hour) hashcash bucket already gate
@@ -692,6 +747,7 @@ async fn main() -> std::io::Result<()> {
     let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
     let hello_replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
     let bundle_req_rate: BundleReqRate = Arc::new(Mutex::new(HashMap::new()));
+    let chain_seed_rate: ChainSeedRate = Arc::new(Mutex::new(HashMap::new()));
     // v2 hash-chain delivery-token validators.
     let chain_validator_inst =
         chain_validator_store::ChainValidatorStore::load_or_create(
@@ -718,6 +774,7 @@ async fn main() -> std::io::Result<()> {
     spawn_verify_keys_gc(verify_keys.clone());
     spawn_push_tokens_gc(push_tokens.clone());
     spawn_bundle_req_rate_gc(bundle_req_rate.clone());
+    spawn_chain_seed_rate_gc(chain_seed_rate.clone());
 
     // Health endpoint — separate listener on `PIZZINI_RELAY_HEALTH_BIND`
     // (default `127.0.0.1:7778`). Replies with a one-line JSON snapshot
@@ -804,6 +861,7 @@ async fn main() -> std::io::Result<()> {
                 let chain_validators_h = chain_validators.clone();
                 let hello_replays = hello_replays.clone();
                 let bundle_req_rate_h = bundle_req_rate.clone();
+                let chain_seed_rate_h = chain_seed_rate.clone();
                 let apns = apns.clone();
                 let status_snapshot = status_snapshot.clone();
                 tokio::spawn(async move {
@@ -821,6 +879,7 @@ async fn main() -> std::io::Result<()> {
                         chain_validators_h,
                         hello_replays,
                         bundle_req_rate_h,
+                        chain_seed_rate_h,
                         apns,
                         status_snapshot,
                         peer_addr,
@@ -933,6 +992,7 @@ async fn handle_connection(
     chain_validators: ChainValidators,
     hello_replays: HelloReplays,
     bundle_req_rate: BundleReqRate,
+    chain_seed_rate: ChainSeedRate,
     apns: Option<Arc<ApnsClient>>,
     status_snapshot: Arc<RelayStatus>,
     peer_addr: SocketAddr,
@@ -1029,6 +1089,7 @@ async fn handle_connection(
         &pending,
         &chain_validators,
         &bundle_req_rate,
+        &chain_seed_rate,
         apns.clone(),
         &peer_id,
         &our_tx,
@@ -1074,6 +1135,7 @@ async fn read_loop(
     pending: &Pending,
     chain_validators: &ChainValidators,
     bundle_req_rate: &BundleReqRate,
+    chain_seed_rate: &ChainSeedRate,
     apns: Option<Arc<ApnsClient>>,
     self_id: &[u8],
     our_tx: &mpsc::UnboundedSender<Vec<u8>>,
@@ -1392,6 +1454,92 @@ async fn read_loop(
                     dev_peer_log!(
                         "drop bundle type={} {} → {}: recipient offline (bundle exchange requires both online)",
                         frame[0],
+                        short_hex(&parsed.from_id),
+                        short_hex(&parsed.to_id),
+                    );
+                }
+            }
+            FRAME_TYPE_CHAIN_SEED_DELIVERY => {
+                // Routed like BUNDLE_RESPONSE (to + from + opaque
+                // bytes), but with two differences: (a) per-(from, to)
+                // rate limit AFTER spoof check, (b) queue on offline
+                // (chain seeds are useful whenever the recipient comes
+                // back, unlike bundle exchange which requires both
+                // online).
+                let parsed = match parse_routed(&frame[1..]) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("malformed CHAIN_SEED_DELIVERY frame: {e}");
+                        continue;
+                    }
+                };
+                if parsed.from_id != self_id {
+                    dev_peer_elog!(
+                        "rejecting CHAIN_SEED_DELIVERY with spoofed from_id {} (connection is {})",
+                        short_hex(&parsed.from_id),
+                        short_hex(self_id),
+                    );
+                    continue;
+                }
+                // Per-(from, to) sliding-window rate limit. Pruning
+                // happens inline on every check so the deque stays
+                // bounded by `CHAIN_SEED_DELIVERY_RATE_CAP` even if
+                // the GC tick hasn't fired recently.
+                let over_cap = {
+                    let now = Instant::now();
+                    let cutoff = now - CHAIN_SEED_DELIVERY_RATE_WINDOW;
+                    let mut map = chain_seed_rate.lock().await;
+                    let entry = map
+                        .entry((parsed.from_id.clone(), parsed.to_id.clone()))
+                        .or_default();
+                    while let Some(front) = entry.front() {
+                        if *front < cutoff {
+                            entry.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+                    if entry.len() >= CHAIN_SEED_DELIVERY_RATE_CAP {
+                        true
+                    } else {
+                        entry.push_back(now);
+                        false
+                    }
+                };
+                if over_cap {
+                    dev_peer_elog!(
+                        "rejecting CHAIN_SEED_DELIVERY {} → {}: per-pair rate cap ({}) exceeded in {}s window",
+                        short_hex(&parsed.from_id),
+                        short_hex(&parsed.to_id),
+                        CHAIN_SEED_DELIVERY_RATE_CAP,
+                        CHAIN_SEED_DELIVERY_RATE_WINDOW.as_secs(),
+                    );
+                    continue;
+                }
+                let frame_len = frame.len();
+                let map = routes.lock().await;
+                if let Some(target) = map.get(&parsed.to_id) {
+                    let _ = target.send(frame);
+                    dev_peer_log!(
+                        "forward CHAIN_SEED_DELIVERY {} → {} ({frame_len} bytes)",
+                        short_hex(&parsed.from_id),
+                        short_hex(&parsed.to_id),
+                    );
+                } else {
+                    drop(map);
+                    // Queue with the full MAX_PENDING_TTL — chain
+                    // seeds carry no sender-chosen TTL field and are
+                    // useful whenever the recipient drains, up to
+                    // the same 7-day bound as offline SENDs.
+                    enqueue_pending(
+                        &parsed.to_id,
+                        frame,
+                        MAX_PENDING_TTL.as_secs() as u32,
+                        pending,
+                    )
+                    .await;
+                    dev_peer_log!(
+                        "queued CHAIN_SEED_DELIVERY {} → {}: recipient offline",
                         short_hex(&parsed.from_id),
                         short_hex(&parsed.to_id),
                     );
@@ -1819,6 +1967,40 @@ async fn verify_hello_possession_proof(
     }
     set.insert(key, Instant::now());
     Ok(())
+}
+
+fn spawn_chain_seed_rate_gc(rate: ChainSeedRate) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(CHAIN_SEED_RATE_GC_INTERVAL);
+        loop {
+            tick.tick().await;
+            let cutoff = Instant::now() - CHAIN_SEED_DELIVERY_RATE_WINDOW;
+            let mut map = rate.lock().await;
+            let before = map.len();
+            // Per-entry: drop timestamps older than the window. After
+            // pruning, drop the (from, to) key entirely if its deque
+            // is now empty — keeps the map size proportional to the
+            // number of (from, to) pairs ACTIVELY firing chain-seed
+            // deliveries within the last minute, not all-time.
+            map.retain(|_, deque| {
+                while let Some(front) = deque.front() {
+                    if *front < cutoff {
+                        deque.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                !deque.is_empty()
+            });
+            let after = map.len();
+            if before != after {
+                println!(
+                    "chain-seed-rate GC: pruned {} → {after}",
+                    before - after,
+                );
+            }
+        }
+    });
 }
 
 fn spawn_bundle_req_rate_gc(rate: BundleReqRate) {
@@ -2753,6 +2935,103 @@ mod tests {
         assert!(
             !next_hour_over_cap,
             "fresh hour bucket must restart the counter for the same recipient",
+        );
+    }
+
+    /// `FRAME_TYPE_CHAIN_SEED_DELIVERY` body parses via the same
+    /// `parse_routed` helper used by BUNDLE_RESPONSE. Pin the
+    /// round-trip so a future wire-format change (e.g., adding a
+    /// TTL field) breaks this test loudly rather than silently
+    /// desynchronising the relay from the iOS sender.
+    #[test]
+    fn chain_seed_delivery_body_parses_via_parse_routed() {
+        // `parse_routed` consumes `to(u16) ‖ from(u16) ‖ rest`.
+        let to_id: Vec<u8> = (0..33).collect();
+        let from_id: Vec<u8> = (33..66).collect();
+        let sealed: Vec<u8> = vec![0xCC; 128];
+        let mut body = Vec::new();
+        body.extend_from_slice(&(to_id.len() as u16).to_be_bytes());
+        body.extend_from_slice(&to_id);
+        body.extend_from_slice(&(from_id.len() as u16).to_be_bytes());
+        body.extend_from_slice(&from_id);
+        body.extend_from_slice(&sealed);
+        let parsed = parse_routed(&body).expect("chain-seed body should parse");
+        assert_eq!(parsed.to_id, to_id);
+        assert_eq!(parsed.from_id, from_id);
+    }
+
+    /// Per-(from, to) sliding-window rate limit. Inside the window,
+    /// the first `CHAIN_SEED_DELIVERY_RATE_CAP` frames pass; the
+    /// next one trips the gate. A different (from, to) pair has
+    /// its own independent budget. Stale timestamps outside the
+    /// window are pruned before each acceptance check so a long
+    /// quiet period reopens the budget.
+    #[tokio::test]
+    async fn chain_seed_rate_limits_per_pair_then_prunes_old_entries() {
+        let rate: ChainSeedRate = Arc::new(Mutex::new(HashMap::new()));
+        let from: PeerId = vec![0xAA; 33];
+        let to_a: PeerId = vec![0xBB; 33];
+        let to_b: PeerId = vec![0xCC; 33];
+
+        // Helper mirroring the inline increment-and-check in the
+        // CHAIN_SEED_DELIVERY handler.
+        async fn check_and_record(
+            rate: &ChainSeedRate,
+            from: &PeerId,
+            to: &PeerId,
+        ) -> bool {
+            let now = Instant::now();
+            let cutoff = now - CHAIN_SEED_DELIVERY_RATE_WINDOW;
+            let mut map = rate.lock().await;
+            let entry = map.entry((from.clone(), to.clone())).or_default();
+            while let Some(front) = entry.front() {
+                if *front < cutoff {
+                    entry.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if entry.len() >= CHAIN_SEED_DELIVERY_RATE_CAP {
+                true
+            } else {
+                entry.push_back(now);
+                false
+            }
+        }
+
+        // First `CAP` frames against to_a must all pass.
+        for i in 0..CHAIN_SEED_DELIVERY_RATE_CAP {
+            let over = check_and_record(&rate, &from, &to_a).await;
+            assert!(!over, "frame #{i} must stay inside cap");
+        }
+        // The next one trips the gate.
+        assert!(
+            check_and_record(&rate, &from, &to_a).await,
+            "frame #(cap + 1) must exceed cap",
+        );
+        // A different recipient has an independent budget.
+        assert!(
+            !check_and_record(&rate, &from, &to_b).await,
+            "fresh recipient must not be capped",
+        );
+
+        // Force-age every existing timestamp out of the window so
+        // the budget reopens. Inject a far-past `Instant` directly
+        // into the deque rather than sleeping for the window.
+        {
+            let mut map = rate.lock().await;
+            let stale = Instant::now()
+                .checked_sub(CHAIN_SEED_DELIVERY_RATE_WINDOW + Duration::from_secs(1))
+                .expect("Instant can subtract a 61s offset on every test platform we ship to");
+            map.get_mut(&(from.clone(), to_a.clone()))
+                .expect("entry was created above")
+                .iter_mut()
+                .for_each(|t| *t = stale);
+        }
+        // Budget should now be empty after the in-handler prune.
+        assert!(
+            !check_and_record(&rate, &from, &to_a).await,
+            "stale entries must be pruned before the cap check; budget should reopen",
         );
     }
 }

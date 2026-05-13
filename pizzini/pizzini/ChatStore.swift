@@ -1953,9 +1953,16 @@ final class ChatStore: NSObject {
                 length: UInt32(chain.length),
             )
         }
-        // 2. Ship the seed to the peer via sealed Double Ratchet —
-        //    the relay sees only opaque sealed bytes; metadata
-        //    posture matches today's chat traffic.
+        // 2. Ship the seed via the dedicated `FRAME_TYPE_CHAIN_SEED_DELIVERY`
+        //    wire frame — NOT a sealed SEND. The first chain seed in a
+        //    pair predates any chain on the wire, so there's no v2
+        //    delivery token to derive; a SEND with empty token is
+        //    correctly rejected by the relay's `check_delivery_token`.
+        //    The chain-seed frame skips the token gate and is rate-
+        //    limited per-(sender, recipient) at the relay instead.
+        //    The inner sealed envelope still carries the
+        //    `chainSeedDelivery` inner kind; the recipient verifies
+        //    this and the contact-gate before installing the chain.
         var inner = Data([RelayClient.InnerEnvelopeKind.chainSeedDelivery.rawValue])
         inner.append(HashChainToken.encodeSeedDelivery(chain))
         do {
@@ -1966,12 +1973,7 @@ final class ChatStore: NSObject {
             )
             persistSession()
             broadcastToRelays {
-                $0.sendSealed(
-                    toPeer: peer,
-                    sealedCiphertext: sealed,
-                    ttlSeconds: 24 * 60 * 60,
-                    token: Data(),
-                )
+                $0.sendChainSeedFrame(toPeer: peer, sealedCiphertext: sealed)
             }
             _ = client
             return true
@@ -2762,6 +2764,67 @@ extension ChatStore: RelayClientDelegate {
         Task { @MainActor in
             self.handleSealedFrame(sealedCiphertext, isAckFrame: true, via: client)
         }
+    }
+
+    /// `FRAME_TYPE_CHAIN_SEED_DELIVERY` receive hook. The wire frame
+    /// carries a sealed envelope, just like a SEND, but is a separate
+    /// pipe with its own relay-side rate limit and no delivery-token
+    /// gate. Decryption happens here; the inner-kind restriction
+    /// enforces that this pipe carries ONLY chain seeds (a paired
+    /// peer must not be able to slip chat/ack/etc through the
+    /// no-token wire path).
+    nonisolated func relayClient(
+        _ client: RelayClient,
+        didReceiveChainSeedFrom fromPeer: Data,
+        sealedCiphertext: Data
+    ) {
+        // `fromPeer` is the relay-spoof-checked wire-level sender; the
+        // sealed cert is the authoritative identity for the receive
+        // handler (matches the SEND path's contact-gate).
+        _ = fromPeer
+        Task { @MainActor in
+            self.handleChainSeedFrame(sealedCiphertext, via: client)
+        }
+    }
+
+    /// Decrypt + dispatch a sealed envelope that arrived via the
+    /// dedicated chain-seed wire frame. Strict: any inner kind other
+    /// than `chainSeedDelivery` is dropped as a protocol violation
+    /// (the no-token pipe must not become an abuse vector for chat
+    /// or other envelope kinds).
+    @MainActor
+    private func handleChainSeedFrame(_ sealedCiphertext: Data, via client: RelayClient) {
+        guard let session = self.session else { return }
+        let received: Session.SealedReceived
+        do {
+            received = try session.decryptSealed(sealedCiphertext)
+        } catch {
+            pzLog("[pizzini] chain-seed-frame decrypt failed: \(error)")
+            return
+        }
+        // libsignal's ratchet step happens during decrypt; persist
+        // before any further work so a crash here doesn't desync.
+        persistSession()
+        if self.isIdentityBlocked(received.peer) { return }
+        guard let idx = self.contactIndex(forIdentity: received.peer) else {
+            pzLog(
+                "[pizzini] chain-seed-frame: dropping from unknown peer \(self.short(received.peer))"
+            )
+            return
+        }
+        guard let kindByte = received.plaintext.first,
+              let kind = RelayClient.InnerEnvelopeKind(rawValue: kindByte),
+              kind == .chainSeedDelivery else {
+            let kindHex = received.plaintext.first.map { String(format: "0x%02x", $0) } ?? "(empty)"
+            pzLog(
+                "[pizzini] chain-seed-frame: rejecting non-chainSeedDelivery inner kind "
+                + "\(kindHex) from \(self.short(received.peer))"
+            )
+            return
+        }
+        let payload = received.plaintext.dropFirst()
+        self.handleChainSeedDelivery(payload: Data(payload), contactIdx: idx)
+        _ = client
     }
 
     nonisolated func relayClient(_ client: RelayClient, didReceiveStatus status: RelayStatus) {

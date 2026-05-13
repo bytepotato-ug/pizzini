@@ -65,6 +65,18 @@ public protocol RelayClientDelegate: AnyObject, Sendable {
     /// USP #1: relay answered our `requestStatus()` with the
     /// running binary's self-attestation snapshot.
     func relayClient(_ client: RelayClient, didReceiveStatus status: RelayStatus)
+    /// A `FRAME_TYPE_CHAIN_SEED_DELIVERY` arrived. The payload is a
+    /// sealed-sender envelope — feed straight to
+    /// `Session.decryptSealed`. The host MUST verify the inner kind
+    /// is `chainSeedDelivery` and reject any other kind (this frame
+    /// type is a no-token pipe and must not be abused for general
+    /// envelopes). The host also enforces the contact-gate on the
+    /// sealed cert before installing chain state.
+    func relayClient(
+        _ client: RelayClient,
+        didReceiveChainSeedFrom fromPeer: Data,
+        sealedCiphertext: Data
+    )
 }
 
 /// Default no-op so existing delegate implementations don't have
@@ -72,6 +84,11 @@ public protocol RelayClientDelegate: AnyObject, Sendable {
 /// host can override to surface the snapshot in Settings.
 public extension RelayClientDelegate {
     func relayClient(_ client: RelayClient, didReceiveStatus status: RelayStatus) {}
+    func relayClient(
+        _ client: RelayClient,
+        didReceiveChainSeedFrom fromPeer: Data,
+        sealedCiphertext: Data
+    ) {}
 }
 
 public final class RelayClient: @unchecked Sendable {
@@ -224,6 +241,15 @@ public final class RelayClient: @unchecked Sendable {
     /// chain to the HELLO-authenticated peer_id of this connection.
     /// Match `FRAME_TYPE_REGISTER_CHAIN` in `relay/src/main.rs`.
     private static let frameTypeRegisterChain: UInt8 = 12
+    /// v2 chain-seed delivery (`FRAME_TYPE_CHAIN_SEED_DELIVERY` on the
+    /// relay). Carries a sealed-sender envelope whose inner kind MUST
+    /// be `chainSeedDelivery` (the recipient enforces this on the
+    /// dispatch). A separate wire type from `frameTypeSend` because
+    /// the first chain seed between a pair predates any delivery
+    /// token (the chain it's delivering IS the first chain), so
+    /// `check_delivery_token` on the relay side would reject a SEND
+    /// here. Wire layout: `to_id(u16) ‖ from_id(u16) ‖ sealed`.
+    private static let frameTypeChainSeedDelivery: UInt8 = 13
     /// Body length of a COVER frame. Sized to roughly match the
     /// smallest padded sealed_ciphertext bucket so a passive
     /// observer can't trivially distinguish covers from short
@@ -888,6 +914,23 @@ public final class RelayClient: @unchecked Sendable {
         writeFrame(payload, on: connection)
     }
 
+    /// Ship a chain-seed-delivery sealed envelope over its dedicated
+    /// wire frame (type 13). The relay forwards to `to` without the
+    /// SEND-frame's delivery-token gate (because the first seed
+    /// between a pair predates any chain on the wire), but enforces
+    /// a per-(from, to) rate limit instead. The recipient verifies
+    /// the sealed inner kind is `chainSeedDelivery` and that the
+    /// sender is in their contacts before installing the chain.
+    public func sendChainSeedFrame(toPeer to: Data, sealedCiphertext: Data) {
+        guard let connection, state == .connected else { return }
+        var payload = Data()
+        payload.append(Self.frameTypeChainSeedDelivery)
+        appendU16Blob(&payload, to)
+        appendU16Blob(&payload, myIdentity)
+        payload.append(sealedCiphertext)
+        writeFrame(payload, on: connection)
+    }
+
     /// REGISTER_CHAIN: tell the relay about a hash-chain root we just
     /// minted. The relay binds this chain to our HELLO-authenticated
     /// peer_id, then validates future v2 SENDs to us against the
@@ -1150,6 +1193,21 @@ public final class RelayClient: @unchecked Sendable {
             let bundle = Data(cursor.rest())
             DispatchQueue.main.async {
                 delegate?.relayClient(client, didReceiveBundleFrom: from, bundle: bundle)
+            }
+        case Self.frameTypeChainSeedDelivery:
+            // Wire body: u16 to + u16 from + sealed envelope bytes.
+            // The relay's per-(from, to) rate-limit gate fired before
+            // we ever saw this frame; the host enforces the inner-
+            // kind and contact-gate after decryption.
+            guard cursor.u16Blob() != nil else { return }
+            guard let from = cursor.u16Blob() else { return }
+            let sealed = Data(cursor.rest())
+            DispatchQueue.main.async {
+                delegate?.relayClient(
+                    client,
+                    didReceiveChainSeedFrom: from,
+                    sealedCiphertext: sealed,
+                )
             }
         case Self.frameTypeStatusResponse:
             // USP #1. Payload after frame-type byte:
