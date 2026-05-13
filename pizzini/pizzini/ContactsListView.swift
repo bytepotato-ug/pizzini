@@ -498,28 +498,70 @@ struct ContactsListView: View {
     //
     // Single chokepoint used by both paste call sites (the toolbar
     // "+" confirmation dialog and the empty-state inline button).
-    // Reading `UIPasteboard.general.string` triggers iOS's paste
-    // banner; we do it exactly once per user action so the banner
-    // fires the expected number of times. The actual decision (parse
-    // / self / block / duplicate / OK) is delegated to
+    // Reading `UIPasteboard.general` triggers iOS's paste banner; we
+    // do it exactly once per user action so the banner fires the
+    // expected number of times. The actual decision (parse / self /
+    // block / duplicate / OK) is delegated to
     // `ChatStore.evaluatePastedContact`, which keeps the validation
-    // rules in one place. The view's only job here is to map the
-    // outcome to a user-visible alert OR to the existing name-prompt
-    // flow via `onPasteContact`.
+    // rules in one place. The view's only job here is to read the
+    // clipboard, normalise across iOS's pasteboard type quirks, and
+    // map the outcome to a user-visible alert OR to the existing
+    // name-prompt flow via `onPasteContact`.
     //
     // Title strings are plain language ("Nothing to paste", "Not a
     // contact card") rather than technical ("EmptyClipboardError",
     // "MalformedContactCardError") — the user is recovering from a
     // mistake, not reading a stack trace.
+    //
+    // ## Type-fallback (regression 2026-05-13)
+    //
+    // A user reported "Nothing to paste" with a `pizzini1://…` link
+    // clearly in their clipboard. Root cause: iOS stores clipboard
+    // contents under one or more UTType identifiers. `general.string`
+    // queries `public.utf8-plain-text`. Several common copy paths
+    // (Universal Clipboard sync from macOS, Safari's "Copy Link",
+    // long-press → Share → Copy on a recognised URL) store the value
+    // under `public.url` ONLY — `general.string` returns nil even
+    // though the URL is sitting right there. The fix is to fall
+    // through to `general.url` and (for some sources) `general.urls`,
+    // then finally to coerce to a string. Each accessor here triggers
+    // the same single paste-banner under iOS's privacy model — they
+    // share one underlying read, not one banner each.
     private func handlePasteFromClipboard() {
-        let raw = UIPasteboard.general.string ?? ""
-        switch store.evaluatePastedContact(raw) {
+        // Entry log — fires on every tap, so the QA capture
+        // unambiguously shows the button DID register. A tap that
+        // never produces this line means the gesture didn't reach
+        // SwiftUI (broken hit-target, overlay swallowing taps,
+        // disabled state we didn't anticipate). The snapshot uses
+        // metadata-only accessors (`items.count`, `types`,
+        // `hasStrings`, `hasURLs`) — none of those trigger iOS's
+        // paste banner. Reading `pb.string` here would count as a
+        // separate paste attempt under iOS 16+ privacy and could
+        // pop a second banner (or, on iOS 26, get the subsequent
+        // read in `readPasteboardContactCard()` implicitly denied).
+        // `hasStrings` covers the "is there text on the board"
+        // signal we'd want from `string?.count` without the
+        // content read.
+        let pb = UIPasteboard.general
+        let entryTypes = pb.types.joined(separator: ",")
+        pzLog(
+            "[pizzini.paste] paste tap: BEFORE "
+            + "items=\(pb.items.count) types=[\(entryTypes)] "
+            + "hasStrings=\(pb.hasStrings) hasURLs=\(pb.hasURLs)"
+        )
+        let raw = Self.readPasteboardContactCard()
+        let outcome = store.evaluatePastedContact(raw)
+        pzLog(
+            "[pizzini.paste] paste tap: outcome=\(Self.describe(outcome)) "
+            + "rawLen=\(raw.count)"
+        )
+        switch outcome {
         case .ready(let card):
             onPasteContact(card)
         case .empty:
             pasteAlert = PasteAlertContent(
                 title: "Nothing to paste",
-                message: "Your clipboard is empty. Copy your contact's pizzini1:// card first, then try again.",
+                message: Self.emptyClipboardMessage,
             )
         case .malformed(let reason):
             pasteAlert = PasteAlertContent(
@@ -542,6 +584,123 @@ struct ContactsListView: View {
                 message: "You're already connected with \(name). Pizzini retried the bundle exchange in case the handshake was stuck.",
             )
         }
+    }
+
+    /// Copy for the "Nothing to paste" alert. On a real device this
+    /// is the usual "copy first, then try again" prompt. On the
+    /// iOS Simulator we append a hint about
+    /// `Simulator → Edit → Automatically Sync Pasteboard`, because
+    /// the most common cause of a truly-empty pasteboard during
+    /// development is that toggle silently flipping off across a
+    /// simulator state-reset (verified failure 2026-05-13: BEFORE
+    /// snapshot showed `items=0 types=[]` — nothing on the
+    /// pasteboard for our code to read). Real-device users never
+    /// see the simulator hint.
+    private static var emptyClipboardMessage: String {
+        let base = "Your clipboard is empty. Copy your contact's pizzini1:// card first, then try again."
+        #if targetEnvironment(simulator)
+        return base + "\n\nRunning in the iOS Simulator? Check Simulator → Edit → Automatically Sync Pasteboard — that toggle resets on state changes and silently breaks Mac→sim clipboard sync."
+        #else
+        return base
+        #endif
+    }
+
+    /// One-word label for a `ContactCardPasteOutcome`. Used only by
+    /// the debug log to keep the line scannable — the full alert
+    /// copy already covers the user-facing surface.
+    private static func describe(_ o: ChatStore.ContactCardPasteOutcome) -> String {
+        switch o {
+        case .ready: return "ready"
+        case .empty: return "empty"
+        case .malformed: return "malformed"
+        case .selfPaste: return "selfPaste"
+        case .blocked: return "blocked"
+        case .alreadyPaired: return "alreadyPaired"
+        }
+    }
+
+    /// Best-effort read of a `pizzini1://…` card from the system
+    /// pasteboard. Walks the type fallbacks in priority order:
+    ///
+    ///   1. `string` — `public.utf8-plain-text`. Normal in-app
+    ///      copy and any path that bridges through `NSString`.
+    ///   2. `url` — `public.url`. Universal Clipboard from macOS,
+    ///      Safari "Copy Link", anywhere iOS data-detected the
+    ///      value as a URL on the copy side. `general.string`
+    ///      returns nil in these cases even though the URL is
+    ///      present — this is the bug a user hit on 2026-05-13.
+    ///   3. `urls.first` — same as `url` for older copy sources
+    ///      that wrote the plural form. iOS sometimes populates
+    ///      one or the other.
+    ///   4. `items` — last-ditch scan of every entry in the raw
+    ///      items dictionary, looking for any value we can coerce
+    ///      to a string. Catches exotic UTIs we haven't enumerated
+    ///      explicitly (e.g. third-party clipboard managers
+    ///      writing under their own type identifier with a
+    ///      string-shaped value).
+    ///   5. Whitespace-trimmed empty → return the empty string and
+    ///      let `evaluatePastedContact` map it to `.empty`.
+    ///
+    /// On a fully-empty result the helper logs the available
+    /// pasteboard `types` and item count so the QA-log capture
+    /// shows what was (or wasn't) on the clipboard. Without that
+    /// detail an "empty clipboard" report is unfalsifiable — we
+    /// can't tell apart "iOS Simulator has clipboard-sync off and
+    /// the pasteboard is genuinely empty" from "the pasteboard
+    /// has data under a type we don't know how to read."
+    ///
+    /// Static so the logic is unit-testable in principle (the
+    /// `UIPasteboard.general` global makes the integration side
+    /// hard to fake without a wrapper protocol, but the policy
+    /// can still be exercised against a closure-based stub if a
+    /// future refactor wants to add coverage).
+    private static func readPasteboardContactCard() -> String {
+        let pb = UIPasteboard.general
+        if let s = pb.string, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return s
+        }
+        if let u = pb.url?.absoluteString,
+           !u.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return u
+        }
+        if let u = pb.urls?.first?.absoluteString,
+           !u.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return u
+        }
+        // Last-ditch: scan the raw items dictionary. Each item is
+        // `[uti: value]`; the value can be `String`, `NSString`,
+        // `URL`, `NSURL`, or `Data`. We accept any of those and
+        // coerce. This is broader than `string`/`url`/`urls`
+        // because those accessors filter by canonical UTIs; the
+        // raw items map contains anything any source wrote.
+        for item in pb.items {
+            for value in item.values {
+                if let s = value as? String,
+                   !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return s
+                }
+                if let u = value as? URL,
+                   !u.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return u.absoluteString
+                }
+                if let data = value as? Data,
+                   let s = String(data: data, encoding: .utf8),
+                   !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return s
+                }
+            }
+        }
+        // Nothing readable — log what *was* present so the next
+        // QA-log capture pinpoints the cause. We do this once per
+        // tap (the caller calls us once per user action), so the
+        // line count stays sane.
+        let types = pb.types.joined(separator: ",")
+        pzLog(
+            "[pizzini.paste] empty: items=\(pb.items.count) "
+            + "types=[\(types)] hasStrings=\(pb.hasStrings) "
+            + "hasURLs=\(pb.hasURLs)"
+        )
+        return ""
     }
 }
 

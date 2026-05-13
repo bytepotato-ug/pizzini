@@ -457,6 +457,13 @@ struct ProfileView: View {
     @State private var showDetails = false
     @State private var copyConfirmation = false
 
+    /// Seconds until the `Copy as text` button's pasteboard entry
+    /// auto-expires. 5 min is the smallest window that comfortably
+    /// covers the realistic share flow (open messenger → find chat
+    /// → type a one-liner → paste) while still bounding clipboard
+    /// exposure for the user who copies and walks away.
+    static let pasteboardExpirySeconds: TimeInterval = 300
+
     var body: some View {
         ScrollView {
             VStack(spacing: 24) {
@@ -595,17 +602,64 @@ struct ProfileView: View {
         if let card {
             VStack(spacing: 8) {
                 Button {
-                    // localOnly + 60-second expiration: keeps the identity
+                    // localOnly + 5-minute expiration: keeps the identity
                     // off Universal Clipboard (would otherwise sync to
                     // every macOS device on the same iCloud account)
                     // and auto-clears the system pasteboard if the user
                     // forgets to paste-and-go.
-                    UIPasteboard.general.setItems(
-                        [[UIPasteboard.typeAutomatic: card.encoded]],
-                        options: [
-                            .localOnly: true,
-                            .expirationDate: Date().addingTimeInterval(60),
-                        ],
+                    //
+                    // 60 s (the prior value) was too short for the
+                    // realistic share flow — open the recipient app,
+                    // navigate to the right chat, type a quick
+                    // explanation, then paste. A user reported
+                    // copying their card, switching to messenger,
+                    // and finding "Nothing to paste" on the receiving
+                    // device because the system pasteboard had
+                    // auto-cleared between the two app switches.
+                    // 5 min covers the realistic flow and still
+                    // bounds exposure if the user puts the phone
+                    // down and forgets.
+                    //
+                    // Routed through `setObjects(_:localOnly:expirationDate:)`
+                    // — the modern UIPasteboard write API. The prior code
+                    // used `setItems(_:options:)` with
+                    // `UIPasteboard.typeAutomatic` as the key; that
+                    // combination silently writes nothing on iOS Simulator
+                    // under recent Xcodes (a real-device-vs-simulator
+                    // divergence in how the type-autodetect path resolves
+                    // a Swift `String` value). `setObjects` takes a
+                    // `[String]` directly, conforms-as-NSItemProviderWriting
+                    // under the hood, and gives us a deterministic
+                    // `public.utf8-plain-text` write on both surfaces.
+                    //
+                    // CRITICAL: do NOT read the pasteboard on the copy
+                    // path. `pb.string`, `pb.types`, `pb.items`, `pb.url`,
+                    // and friends all trigger iOS's paste banner — and
+                    // on a device with Universal Clipboard active and
+                    // content on a paired Mac, that banner becomes a
+                    // Handoff prompt "Paste from Mac Studio?" which is
+                    // both confusing and the opposite of what the user
+                    // asked for. The cheap predicate accessors
+                    // (`hasStrings`, `hasURLs`, `numberOfItems`) don't
+                    // trigger the banner, but for a copy action we
+                    // don't need any of them — `setObjects` is the
+                    // authoritative write API and its contract is
+                    // "the data is on the pasteboard when this call
+                    // returns." The `pzLog` line below confirms the
+                    // button fired with the right payload size; the
+                    // round-trip test (copy → paste in chats → see the
+                    // "self-paste" alert) already verified end-to-end
+                    // correctness, so we no longer need post-write
+                    // verification on every tap.
+                    let cardLen = card.encoded.count
+                    UIPasteboard.general.setObjects(
+                        [card.encoded],
+                        localOnly: true,
+                        expirationDate: Date().addingTimeInterval(Self.pasteboardExpirySeconds),
+                    )
+                    pzLog(
+                        "[pizzini.paste] copy card: wrote cardLen=\(cardLen)"
+                        + " (no pasteboard read — would trigger Handoff banner)"
                     )
                     copyConfirmation = true
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
