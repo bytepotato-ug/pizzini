@@ -142,6 +142,38 @@ struct Socks5Tests {
         }
     }
 
+    /// Audit M2/L1 (negative case): a DOMAINNAME reply that announces
+    /// a 0xFF-byte domain (255 octets — the RFC 1928 max) but only
+    /// delivers a partial buffer must return `.incomplete` rather
+    /// than over-read the buffer. The parser's correctness hinges
+    /// on the `data.count < total` guard at the tail.
+    @Test("CONNECT reply with max-length domain but truncated tail returns .incomplete")
+    func connectReplyTruncatedMaxLengthDomain() throws {
+        // VER REP RSV ATYP=3 LEN=0xFF + only 100 of the promised
+        // 255 domain bytes (no BND.PORT). Full reply would be
+        // 4 + 1 + 255 + 2 = 262 bytes; we deliver 4 + 1 + 100 = 105.
+        var frame = Data([0x05, 0x00, 0x00, 0x03, 0xFF])
+        frame.append(contentsOf: Array(repeating: UInt8(0x61), count: 100))
+        let result = try Socks5.tryParseConnectReply(frame)
+        #expect(result == .incomplete, "truncated max-length domain must wait for more bytes")
+    }
+
+    /// Audit M2/L1 (positive boundary): a DOMAINNAME reply with the
+    /// full max-length 255-byte domain + BND.PORT exactly fills
+    /// 262 bytes and must parse as `.complete(consumed: 262)`.
+    @Test("CONNECT reply with full max-length domain consumes exactly 262 bytes")
+    func connectReplyFullMaxLengthDomain() throws {
+        var frame = Data([0x05, 0x00, 0x00, 0x03, 0xFF])
+        frame.append(contentsOf: Array(repeating: UInt8(0x61), count: 255))
+        frame.append(contentsOf: [0x00, 0x50]) // port = 80, BE
+        switch try Socks5.tryParseConnectReply(frame) {
+        case .complete(let consumed):
+            #expect(consumed == 262, "full max-length domain reply is 262 bytes")
+        case .incomplete:
+            Issue.record("expected complete on a fully-formed max-domain reply")
+        }
+    }
+
     @Test("Decision: only a strict v3 onion routes through SOCKS5")
     func onionRoutingDecision() {
         // The routing decision lives in RelayClient.connect itself,
