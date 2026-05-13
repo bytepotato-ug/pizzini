@@ -1502,14 +1502,13 @@ final class ChatStore: NSObject {
         state.contacts[idx].log.append(logEntry)
         state.contacts[idx].lastMessageAt = logEntry.timestamp
         persistContactSliceAndAppended(logEntry, at: idx)
-        // v2 rotation: if the chain just crossed the 80% mark, the
-        // *recipient* (us) of any next v2 token presentation would
-        // start watching for the new one. The chain owner (peer) is
-        // the one who mints — we can't do it locally. Best we can do
-        // here is log so a future telemetry pass surfaces the cadence.
-        if let chain = state.contacts[idx].outboundTokenChain, chain.shouldRotate {
-            pzLog("[pizzini] v2 chain crossing rotation threshold for \(self.short(contact.identityPub))")
-        }
+        // Audit M1: if the chain just crossed the rotation threshold,
+        // ask the peer (chain owner) to mint a fresh one over the
+        // sealed `chainRefreshRequest` channel. Debounced per-contact
+        // so a burst of sends at the threshold doesn't fan into a
+        // burst of requests; recipient's 30 min cooldown is the
+        // hard rate limit on the receive side.
+        maybeRequestProactiveChainRotation(forContactAt: idx)
     }
 
     /// Send a file attachment to `contact`. Phase 2 wire path: chunked
@@ -1803,14 +1802,10 @@ final class ChatStore: NSObject {
         state.contacts[idx].log.append(row)
         state.contacts[idx].lastMessageAt = row.timestamp
         persistContactSliceAndAppended(row, at: idx)
-        // v2 rotation: if the chain just crossed the 80% mark, log so
-        // future telemetry can surface the cadence. Rotation itself
-        // is recipient-initiated (the peer minted this chain, so only
-        // they can replace it); we rely on `requestBundleWithHashcash`
-        // in the eventually-exhausted path to trigger their re-issue.
-        if let chain = state.contacts[idx].outboundTokenChain, chain.shouldRotate {
-            pzLog("[pizzini] v2 chain crossing rotation threshold for \(self.short(contactId))")
-        }
+        // Audit M1: attachments burn chain tokens fast (one per
+        // chunk; a 10 MB file is ~160 chunks). Same proactive trigger
+        // as the text-send path, same per-contact debounce.
+        maybeRequestProactiveChainRotation(forContactAt: idx)
     }
 
     /// Map a sanitized filename to the best-guess MIME / UTI string.
@@ -1837,6 +1832,50 @@ final class ChatStore: NSObject {
     @MainActor
     private var pendingV2Sends: [UUID: [String]] = [:]
     private static let maxPendingV2SendsPerContact = 16
+
+    /// Audit M1: sender-side debounce for proactive chain rotation.
+    /// Last time we asked a given peer to mint a fresh chain. Reset
+    /// across process restarts — a duplicate request after a relaunch
+    /// is harmless because the recipient's `chainRefreshCooldown`
+    /// (30 min) collapses it.
+    @MainActor
+    private var chainRotationLastRequestedAt: [UUID: Date] = [:]
+    /// Sender-side cooldown between proactive chain-rotation requests
+    /// for the same contact. 1 h is much shorter than the natural
+    /// rotation cadence (~13 000 tokens / direction = months at
+    /// typical volume) so a legit rotation never hits this cap, and
+    /// comfortably longer than any reconnect storm.
+    private static let chainRotationRequestCooldown: TimeInterval = 60 * 60
+
+    /// Audit M1: fire a sealed `chainRefreshRequest` envelope iff the
+    /// contact's outbound chain has crossed the rotation threshold
+    /// AND we haven't requested a rotation for them in the last hour.
+    /// Replaces the prior log-only handling at the two `shouldRotate`
+    /// observation sites; closes the audit M1 follow-up properly
+    /// without the cooldown-deadlock the reverted commit 62dcc54
+    /// introduced — that one fired BUNDLE_REQUEST and tripped the
+    /// recipient's 6 h `chainServeCooldown`. The chain-refresh path
+    /// uses a separate 30 min cooldown on the recipient side.
+    @MainActor
+    private func maybeRequestProactiveChainRotation(forContactAt idx: Int) {
+        guard let chain = state.contacts[idx].outboundTokenChain,
+              chain.shouldRotate else { return }
+        let contact = state.contacts[idx]
+        let now = Date()
+        if let last = chainRotationLastRequestedAt[contact.id],
+           now.timeIntervalSince(last) < Self.chainRotationRequestCooldown {
+            return
+        }
+        guard let session,
+              let client = readyRelays.first else { return }
+        let sent = sendChainRefreshRequest(toPeer: contact.identityPub, via: client, session: session)
+        guard sent else { return }
+        chainRotationLastRequestedAt[contact.id] = now
+        pzLog(
+            "[pizzini] v2 chain at rotation threshold (\(chain.nextIndex - 1)/\(chain.length)) — "
+            + "sent chainRefreshRequest to \(self.short(contact.identityPub))"
+        )
+    }
 
     /// v2 cutover recovery: trigger a peer-bundle refresh (which the
     /// recipient answers with a sealed `chainSeedDelivery`), and
@@ -1896,6 +1935,32 @@ final class ChatStore: NSObject {
         return token
     }
 
+    /// Audit M1: recipient side. Sender's outbound chain to us hit
+    /// the 80 % `shouldRotate` threshold and they've asked us to
+    /// mint + ship a fresh one. Identical to the
+    /// `BUNDLE_REQUEST → publishBundle + serveChain` path but
+    /// shorter cooldown (30 min) because we skip the kyber1024
+    /// prekey burn entirely — this path mints a chain only.
+    @MainActor
+    private func handleChainRefreshRequest(
+        fromPeer peer: Data,
+        contactIdx idx: Int,
+        via client: RelayClient,
+        session: Session
+    ) {
+        pzLog(
+            "[pizzini] chainRefreshRequest from \(self.short(peer)) — "
+            + "serveChain(cooldown=chainRefreshCooldown)"
+        )
+        serveChain(
+            forPeer: peer,
+            via: client,
+            session: session,
+            cooldown: Contact.chainRefreshCooldown,
+        )
+        _ = idx
+    }
+
     /// Handle a sealed `chainSeedDelivery` payload. The peer (who minted
     /// the chain and registered the root with the relay) has shipped us
     /// the seed for our outbound v2 token chain to them. Install or
@@ -1941,6 +2006,55 @@ final class ChatStore: NSObject {
     /// that, the very first attempt (typically before a libsignal
     /// session to the peer exists) would burn the cooldown window and
     /// every later retry would silently rate-limit.
+    /// Audit M1: sender side. Encrypt + ship a sealed
+    /// `chainRefreshRequest` envelope to the peer who owns (minted)
+    /// our outbound chain. Burns ONE token from the chain we're
+    /// asking to rotate — we have ~20 % of the chain left at the
+    /// `shouldRotate` threshold, so plenty of headroom for the
+    /// request itself plus normal sends while waiting for the
+    /// reply.
+    ///
+    /// Returns true if the request was encrypted and queued for
+    /// broadcast. False if there's no chain to derive a token from
+    /// (already exhausted — fall back to the heavier reactive path
+    /// in `refreshChainAndQueue`) or if encryption failed (no
+    /// session yet, etc.).
+    @discardableResult
+    private func sendChainRefreshRequest(toPeer peer: Data, via client: RelayClient, session: Session) -> Bool {
+        guard let idx = contactIndex(forIdentity: peer) else { return false }
+        guard let v2Token = mintV2DeliveryToken(forContactAt: idx) else {
+            // No chain → no token. The reactive
+            // `refreshChainAndQueue` path covers exhaustion; we
+            // don't double-fire here.
+            return false
+        }
+        let messageId = Self.makeMessageId()
+        let inner = Data([RelayClient.InnerEnvelopeKind.chainRefreshRequest.rawValue])
+        let sealed: Data
+        do {
+            sealed = try session.encryptSealed(
+                peer: peer,
+                messageId: messageId,
+                plaintext: inner,
+            )
+        } catch {
+            pzLog("[pizzini] chainRefreshRequest encrypt failed: \(error)")
+            return false
+        }
+        persistSession()
+        let wireToken = HashChainToken.encode(v2Token)
+        broadcastToRelays {
+            $0.sendSealed(
+                toPeer: peer,
+                sealedCiphertext: sealed,
+                ttlSeconds: UInt32(Contact.chainRefreshCooldown),
+                token: wireToken,
+            )
+        }
+        _ = client
+        return true
+    }
+
     @discardableResult
     private func sendChainSeedDelivery(toPeer peer: Data, via client: RelayClient, session: Session) -> Bool {
         let chain = HashChainToken.mintChain()
@@ -1990,14 +2104,27 @@ final class ChatStore: NSObject {
 
     /// Mint a fresh outbound chain for `peer` and ship the seed over
     /// the sealed Double Ratchet. Called right after we serve their
-    /// bundle. Rate-limited per `Contact.chainServeCooldown` so a
-    /// peer cycling BUNDLE_REQUEST can't drive us into a tight
-    /// mint-ship loop.
-    private func serveChain(forPeer peer: Data, via relay: RelayClient, session: Session) {
+    /// bundle (the bundle-coupled path passes `cooldown:
+    /// Contact.chainServeCooldown` = 6 h) and from the audit-M1
+    /// proactive-refresh path (which passes `cooldown:
+    /// Contact.chainRefreshCooldown` = 30 min). The two paths share
+    /// the same `lastChainServedAt` stamp but enforce different
+    /// cooldown windows, so a paired peer can request proactive
+    /// rotation roughly every 30 min while bundle-coupled
+    /// re-publishes remain capped at every 6 h.
+    private func serveChain(
+        forPeer peer: Data,
+        via relay: RelayClient,
+        session: Session,
+        cooldown: TimeInterval = Contact.chainServeCooldown,
+    ) {
         guard let idx = contactIndex(forIdentity: peer) else { return }
         if let last = state.contacts[idx].lastChainServedAt,
-           Date().timeIntervalSince(last) < Contact.chainServeCooldown {
-            pzLog("[pizzini] chain serve rate-limited for \(self.short(peer))")
+           Date().timeIntervalSince(last) < cooldown {
+            pzLog(
+                "[pizzini] chain serve rate-limited for \(self.short(peer)) "
+                + "(cooldown=\(Int(cooldown))s)"
+            )
             return
         }
         // sealed_sender encryptSealed needs a libsignal session with the
@@ -2935,6 +3062,19 @@ extension ChatStore: RelayClientDelegate {
             self.handleGroupFileChunk(payload: Data(payload), fromPeer: received.peer)
         case .chainSeedDelivery:
             self.handleChainSeedDelivery(payload: Data(payload), contactIdx: idx)
+        case .chainRefreshRequest:
+            // Audit M1. Sender's outbound chain to us hit the
+            // rotation threshold; mint + ship a fresh chain via the
+            // dedicated FRAME_TYPE_CHAIN_SEED_DELIVERY pipe. The
+            // 30-min cooldown bounds buggy-client retry storms; the
+            // bundle-coupled 6 h cap is NOT consulted on this path,
+            // by design (different cost profile).
+            self.handleChainRefreshRequest(
+                fromPeer: received.peer,
+                contactIdx: idx,
+                via: client,
+                session: session,
+            )
         }
         // Defensive: an ACK arriving on the SEND channel would have
         // landed in the chat path above unless its inner-kind byte is

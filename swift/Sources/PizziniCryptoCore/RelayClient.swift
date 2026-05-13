@@ -203,6 +203,28 @@ public final class RelayClient: @unchecked Sendable {
         /// delivery rides the Double Ratchet, so the relay never sees
         /// the registration step.
         case chainSeedDelivery = 0x0B
+        /// Audit M1: proactive chain rotation request. Empty body —
+        /// the very fact of the envelope (with valid sealed cert) is
+        /// the signal. Sent from the chain *consumer* (the sender
+        /// whose outbound chain crossed `Chain.shouldRotate`, ~80%
+        /// used) to the chain *owner* (the peer who minted it), via
+        /// a regular sealed SEND that burns ONE remaining token. The
+        /// recipient mints a fresh chain and ships the seed via the
+        /// dedicated `FRAME_TYPE_CHAIN_SEED_DELIVERY` wire frame
+        /// (no-token pipe), subject to its own short cooldown
+        /// (`Contact.chainRefreshCooldown`, 30 min) — NOT the 6 h
+        /// `chainServeCooldown` that gates the bundle-coupled path.
+        ///
+        /// Pre-M1 peers (don't know 0x0C) surface a "Received an
+        /// unknown envelope (0x0c) — possible client mismatch."
+        /// system row but otherwise keep working; the chain
+        /// eventually exhausts and the existing reactive
+        /// `refreshChainAndQueue` path takes over via the heavier
+        /// BUNDLE_REQUEST flow. The pre-M1 fallback is acceptable
+        /// because BLAKE3 chains are ~16 384 tokens / per direction,
+        /// so the reactive path fires roughly once a year per
+        /// contact at normal volume.
+        case chainRefreshRequest = 0x0C
     }
     private static let frameTypeHello: UInt8 = 1
     private static let frameTypeSend: UInt8 = 2

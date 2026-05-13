@@ -331,8 +331,23 @@ struct Contact: Codable, Identifiable, Sendable {
 
     /// Minimum time between chain mint+ship operations to one peer.
     /// Used to rate-limit how often we re-issue a chain in response
-    /// to a peer-initiated BUNDLE_REQUEST.
+    /// to a peer-initiated BUNDLE_REQUEST. 6 h matches the cost
+    /// profile of the bundle-coupled path (kyber1024 keygen + one-
+    /// time prekey burn).
     static let chainServeCooldown: TimeInterval = 6 * 60 * 60
+
+    /// Audit M1: minimum time between chain mint+ship operations
+    /// triggered by a *sealed* `chainRefreshRequest` envelope. 30 min
+    /// matches the cost profile of the chain-only path (BLAKE3 root
+    /// derivation, no prekey burn). Independent from
+    /// `chainServeCooldown` because the bundle path's 6 h cap was
+    /// sized for kyber1024 work that the refresh path skips.
+    /// Threshold is short enough that proactive rotation (which
+    /// triggers at ~13 000 messages on a 16 384-token chain) never
+    /// hits the cap in normal use, and tight enough that a buggy
+    /// or compromised paired peer can't flood the recipient with
+    /// rotation-replacement frames.
+    static let chainRefreshCooldown: TimeInterval = 30 * 60
 
     private enum CodingKeys: String, CodingKey {
         case id, identityPub, displayName, sessionEstablished, log, lastMessageAt
