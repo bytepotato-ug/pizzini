@@ -213,7 +213,19 @@ enum TransparencyLogConfig {
     /// E2E signature provides cryptographic integrity.
     /// Empty default = no automatic fetch (UI renders
     /// "log URL not configured").
-    nonisolated static let logURLString: String = "https://raw.githubusercontent.com/bytepotato-ug/pizzini/main/transparency-log.ndjson"
+    ///
+    /// Disabled until the operator stands up a public mirror.
+    /// The previous URL pointed at the canonical iOS repo
+    /// (`github.com/bytepotato-ug/pizzini`), which is private —
+    /// the unauthenticated raw.githubusercontent.com path 404'd
+    /// every fetch and polluted the connection-debug log with
+    /// `[pizzini.translog] fetch failed: http("HTTP 404")` on
+    /// every successful relay reconnect. Re-enable after either
+    /// (a) the repo flips public or (b) a separate static mirror
+    /// (IPFS / GitHub Pages from a public repo / operator-owned
+    /// CDN) is ready. The signed-entry verification logic on the
+    /// receiving end is unchanged; only the source URL is gated.
+    nonisolated static let logURLString: String = ""
 
     /// Decoded form. Returns nil for unset / malformed keys —
     /// the verifier propagates this to
