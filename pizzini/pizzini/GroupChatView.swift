@@ -817,7 +817,7 @@ private struct GroupChatBubble: View {
                 if message.side == .me {
                     Spacer(minLength: 40)
                     VStack(alignment: .trailing, spacing: 4) {
-                        bubbleContent(bubbleColor: Color.accentColor.opacity(0.20))
+                        bubbleContent(bubbleColor: Color(.systemFill))
                         metadata
                     }
                 } else {
@@ -828,7 +828,7 @@ private struct GroupChatBubble: View {
                                 .foregroundStyle(.secondary)
                                 .padding(.leading, 10)
                         }
-                        bubbleContent(bubbleColor: Color(.secondarySystemBackground))
+                        bubbleContent(bubbleColor: Color(.secondarySystemFill))
                         metadata
                     }
                     Spacer(minLength: 40)

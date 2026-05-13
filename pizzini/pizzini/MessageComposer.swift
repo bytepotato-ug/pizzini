@@ -1,17 +1,5 @@
 import SwiftUI
 
-/// Pizzini brand colours used by the message composer. Centralised on
-/// `Color` so a future dark-mode tweak (e.g. a slightly lighter blue
-/// against `.bar`) lands in one place instead of being scattered
-/// across the 1:1 and group composer call-sites.
-extension Color {
-    /// `#005bfd` — the brand-blue accent. Drives the composer's
-    /// attachment trigger and the send-button background, pairing the
-    /// pre-action and post-action affordances under one consistent
-    /// brand colour.
-    static let composerAccent = Color(red: 0.0, green: 91.0 / 255.0, blue: 253.0 / 255.0)
-}
-
 /// Single docked composer used by both `ChatView` and `GroupChatView`.
 ///
 /// Layout:
@@ -89,7 +77,7 @@ struct MessageComposer<AttachContent: View>: View {
         } label: {
             Image(systemName: "paperclip")
                 .font(.system(size: 20, weight: .regular))
-                .foregroundStyle(Color.composerAccent)
+                .foregroundStyle(Color.accentColor)
                 .frame(width: 36, height: 36)
         }
         .buttonStyle(.plain)
@@ -137,10 +125,10 @@ struct MessageComposer<AttachContent: View>: View {
         Button(action: onSend) {
             Image(systemName: "arrow.up")
                 .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.white)
+                .foregroundStyle(Color(.systemBackground))
                 .frame(width: 36, height: 36)
                 .background(
-                    Circle().fill(Color.composerAccent)
+                    Circle().fill(Color.accentColor)
                 )
         }
         .buttonStyle(.plain)

@@ -772,12 +772,17 @@ private struct ContactRow: View {
     private var unread: Int { contact.unreadCount }
 
     private var unreadBadge: some View {
+        // Inverted system colours so the badge stays readable in both
+        // light and dark modes once the accent flipped to the label
+        // colour (black on light / white on dark). Without the
+        // inversion the badge text would collide with its own fill
+        // in dark mode.
         Text("\(unread)")
             .font(.caption2.bold().monospacedDigit())
-            .foregroundStyle(.white)
+            .foregroundStyle(Color(.systemBackground))
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
-            .background(Capsule().fill(Color.accentColor))
+            .background(Capsule().fill(Color(.label)))
             .accessibilityLabel("\(unread) unread")
     }
 

@@ -1036,11 +1036,16 @@ struct ChatRow: View {
 
     private var bubbleColor: Color {
         switch entry.kind {
-        case .system: return Color.gray.opacity(0.15)
+        case .system: return Color(.tertiarySystemFill)
         case .preKey, .whisper, .attachment:
+            // Monochrome: me-bubbles use the more prominent system
+            // fill so the eye still parses sender/receiver at a
+            // glance, peer-bubbles use the softer one. Both auto-
+            // adapt to light/dark. Semantic colours (verified
+            // badge, warnings, errors) stay on their own glyphs.
             return entry.side == .me
-                ? Color.blue.opacity(0.18)
-                : Color.green.opacity(0.18)
+                ? Color(.systemFill)
+                : Color(.secondarySystemFill)
         }
     }
 
