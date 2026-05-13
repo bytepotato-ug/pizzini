@@ -66,8 +66,21 @@
 //   on the cold path), but no app data is lost.
 
 import Foundation
+import Network
 import os
 import PizziniTorObjC
+
+public extension Notification.Name {
+    /// Posted on the MainActor when the system's network path
+    /// changes in a way that may have invalidated tor's circuits
+    /// (interface flip, captive portal rotation, airplane-mode
+    /// toggle, constrained-mode change). The host listens to drop
+    /// + redial its RelayClients without tearing tor itself down.
+    /// `object` is the `TorController.shared` singleton; userInfo
+    /// is currently empty (reserved for a future change-cause
+    /// tag).
+    static let pizziniTorNetworkPathChanged = Notification.Name("app.pizzini.tor.network-path-changed")
+}
 
 /// Debug logger for the embedded tor lifecycle. Subsystem +
 /// category match `app.pizzini.tor` so Console.app can filter to
@@ -283,6 +296,20 @@ public final class TorController: ObservableObject {
     /// fleet membership change).
     private var onionsToPrime: [String] = []
 
+    /// NWPathMonitor watching the system network path. Started once
+    /// on first `bootstrap()` and never stopped — the daemon is
+    /// pinned for the process lifetime and so is this observer.
+    /// Updates dispatch onto `pathMonitorQueue`, then re-hop to
+    /// MainActor for `handlePathChange`.
+    nonisolated(unsafe) private static var pathMonitor: NWPathMonitor?
+    nonisolated private static let pathMonitorQueue = DispatchQueue(label: "app.pizzini.tor.path")
+    /// Fingerprint of the most recently observed path, set on the
+    /// MainActor inside `handlePathChange`. The first sample
+    /// (initial value) is recorded but produces no signal — there's
+    /// nothing to invalidate yet. Subsequent changes that differ
+    /// from this trigger a NEWNYM + relay-redial flow.
+    private var lastPathFingerprint: String?
+
     /// Hard deadline for a single HSFETCH. **The first HSFETCH after
     /// a fresh bootstrap is the load-bearing one** — tor's HSDir
     /// circuit pool is empty, so the descriptor lookup pays for the
@@ -468,6 +495,11 @@ public final class TorController: ObservableObject {
     private func runBootstrap() async throws -> UInt16 {
         let bootstrapStart = Date()
         torLog.info("bootstrap: begin")
+        // First bootstrap also installs the NWPathMonitor. We pin it
+        // for the process lifetime — there's no use case for stopping
+        // it (tor itself is process-singleton; the path observer
+        // mirrors that lifetime).
+        Self.ensurePathMonitorStarted()
         // Reuse the existing tor thread if one is already running.
         // TORThread enforces one-per-process; `TORThread.active`
         // returns the live instance (or nil before the first start).
@@ -1034,6 +1066,95 @@ public final class TorController: ObservableObject {
         }
     }
 
+
+    /// Start the shared NWPathMonitor if it isn't already running.
+    /// The first MainActor hop seeds `lastPathFingerprint` without
+    /// signalling — there's no "previous" state to compare against
+    /// on the first sample.
+    nonisolated static func ensurePathMonitorStarted() {
+        if pathMonitor != nil { return }
+        let monitor = NWPathMonitor()
+        pathMonitor = monitor
+        monitor.pathUpdateHandler = { path in
+            let fp = computePathFingerprint(path)
+            Task { @MainActor in
+                TorController.shared.handlePathChange(fingerprint: fp)
+            }
+        }
+        monitor.start(queue: pathMonitorQueue)
+    }
+
+    /// Stable string fingerprint of an NWPath. Covers everything
+    /// the user instructions called out: `status`, `isConstrained`,
+    /// and the set of interface types the path uses. A change in
+    /// any of those rotates the fingerprint so the MainActor
+    /// handler fires NEWNYM + redial.
+    nonisolated static func computePathFingerprint(_ path: NWPath) -> String {
+        let types = path.availableInterfaces
+            .map { "\($0.type)" }
+            .sorted()
+            .joined(separator: ",")
+        return "\(path.status):\(path.isConstrained):\(types)"
+    }
+
+    /// MainActor-side path-change handler. First sample seeds the
+    /// fingerprint and exits; subsequent samples that differ from
+    /// the recorded one rotate tor's stream-isolation pool via
+    /// SIGNAL NEWNYM and post a notification so the host drops +
+    /// redials its RelayClient sockets. Never issues SIGNAL
+    /// SHUTDOWN — that would kill the daemon (see commit 44eaec7).
+    func handlePathChange(fingerprint fp: String) {
+        let previous = lastPathFingerprint
+        lastPathFingerprint = fp
+        guard Self.shouldRotateCircuits(previous: previous, current: fp) else {
+            if previous == nil {
+                torLog.debug("path: initial fingerprint=\(fp, privacy: .public)")
+            }
+            return
+        }
+        torLog.notice("path: changed \(previous ?? "<nil>", privacy: .public) → \(fp, privacy: .public) — rotating circuits")
+        sendNewnymSignal()
+        NotificationCenter.default.post(
+            name: .pizziniTorNetworkPathChanged,
+            object: self,
+        )
+    }
+
+    /// Pure decision: should a fingerprint transition fire a
+    /// circuit-rotation? First sample (previous == nil) always
+    /// returns false — there's no prior state to invalidate.
+    /// Same-fingerprint repeats return false. Anything else
+    /// returns true. Public so the iOS app test target can pin
+    /// the contract — see `NetworkPathRotationTests` in
+    /// `pizziniTests`.
+    public nonisolated static func shouldRotateCircuits(
+        previous: String?,
+        current: String
+    ) -> Bool {
+        guard let previous else { return false }
+        return previous != current
+    }
+
+    /// SIGNAL NEWNYM — tells tor to start using fresh circuits for
+    /// future streams. Existing circuits are not torn down (a
+    /// streamcount=0 circuit will idle out on its own); the host's
+    /// relay-redial drops the SOCKS5 TCP socket which forces a new
+    /// circuit on reconnect. NEWNYM is the right primitive here:
+    /// SIGNAL RELOAD would also rotate guard-set selection logic
+    /// which is overkill for a wifi→cellular handoff. No-op if the
+    /// control channel isn't currently authenticated.
+    private func sendNewnymSignal() {
+        guard let controller = torController, controller.isConnected else {
+            torLog.debug("path: NEWNYM skipped — controller not connected")
+            return
+        }
+        controller.sendCommand("SIGNAL", arguments: ["NEWNYM"], data: nil) { @Sendable codes, _, stop in
+            let ok = codes.first?.intValue == 250
+            torLog.debug("path: NEWNYM \(ok ? "OK" : "rejected")")
+            stop.pointee = true
+            return true
+        }
+    }
 
     /// Fire HSFETCH for each onion in `onionsToPrime` that we haven't
     /// already cached and don't already have an in-flight fetch for.

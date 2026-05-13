@@ -319,6 +319,26 @@ final class ChatStore: NSObject {
             self.initError = String(describing: error)
         }
         refreshAppBadge()
+        // Wifi↔cellular handoffs, captive-portal flips, and
+        // constrained-mode changes invalidate tor's circuits. The
+        // observer in TorController issues SIGNAL NEWNYM on its own;
+        // we just need to drop + redial our RelayClient sockets so
+        // the next outgoing frame uses a fresh circuit.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleTorNetworkPathChanged),
+            name: .pizziniTorNetworkPathChanged,
+            object: nil,
+        )
+    }
+
+    @objc
+    private func handleTorNetworkPathChanged() {
+        // Notification arrives from TorController on MainActor.
+        guard !relays.isEmpty else { return }
+        pzLog("[pizzini] network path changed — redialing relays")
+        teardownRelay(keepRetryTimer: true)
+        connectRelay()
     }
 
     /// USP #1 second half: refresh the transparency log from the
