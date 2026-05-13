@@ -139,6 +139,11 @@ final class ChatStore: NSObject {
     /// the kernel level on release devices.
     func diagLog(_ category: String, _ message: String) {
         os_log(.debug, "[pizzini.%{public}@] %{public}@", category, message)
+        // QA-debug persistent log (DEBUG only — release builds compile
+        // the recording path out so a deployed app never carries the
+        // forensic-attack surface). See `QALog.swift` for the file
+        // layout and the rotation policy.
+        QALog.record(category: category, message: message)
         diagEvents.append(DiagEvent(
             timestamp: Date(),
             category: category,
@@ -1516,6 +1521,7 @@ final class ChatStore: NSObject {
         outbox.entries[messageId] = entry
         Storage.upsertOutboxEntry(entry)
         persistSession()
+        let readyCount = readyRelays.count
         broadcastToRelays {
             $0.sendSealed(
                 toPeer: contact.identityPub,
@@ -1524,6 +1530,12 @@ final class ChatStore: NSObject {
                 token: wireToken,
             )
         }
+        diagLog(
+            "send",
+            "v2 SEND → \(short(contact.identityPub)) "
+            + "msgid=\(hex(messageId)) sealed=\(sealed.count)B ttl=\(ttl)s "
+            + "fanout=\(readyCount)"
+        )
         entry.relayedAt = now
         // F-505 parity with v1: scrub the token blob once relayed.
         entry.token = Data()
@@ -1924,6 +1936,11 @@ final class ChatStore: NSObject {
         let contact = state.contacts[idx]
         let queue = pendingV2Sends[contact.id] ?? []
         if queue.count >= Self.maxPendingV2SendsPerContact {
+            diagLog(
+                "send",
+                "refresh-queue FULL for \(short(contact.identityPub)) — dropping send "
+                + "(queue=\(queue.count)/\(Self.maxPendingV2SendsPerContact))"
+            )
             appendSystem(
                 "Too many messages queued while reconnecting. Try again later.",
                 to: idx,
@@ -1931,6 +1948,11 @@ final class ChatStore: NSObject {
             return
         }
         pendingV2Sends[contact.id, default: []].append(text)
+        diagLog(
+            "send",
+            "send for \(short(contact.identityPub)) queued behind chain refresh "
+            + "(queue depth now \(queue.count + 1)); firing BUNDLE_REQUEST"
+        )
         appendSystem("Refreshing connection — your message will go out shortly.", to: idx)
         requestBundleWithHashcash(fromPeer: contact.identityPub)
     }
@@ -1965,10 +1987,23 @@ final class ChatStore: NSObject {
 
     @MainActor
     func mintV2DeliveryToken(forContactAt idx: Int) -> HashChainToken.Token? {
-        guard var chain = state.contacts[idx].outboundTokenChain else { return nil }
-        guard let token = HashChainToken.nextToken(in: &chain) else { return nil }
+        let peer = state.contacts[idx].identityPub
+        guard var chain = state.contacts[idx].outboundTokenChain else {
+            diagLog("send", "NO CHAIN for \(short(peer)) — mintV2DeliveryToken returns nil; refreshChainAndQueue will fire")
+            return nil
+        }
+        guard let token = HashChainToken.nextToken(in: &chain) else {
+            diagLog("send", "CHAIN EXHAUSTED for \(short(peer)) (length=\(chain.length), nextIndex=\(chain.nextIndex)) — refreshChainAndQueue will fire")
+            return nil
+        }
+        let remaining = chain.length - (chain.nextIndex - 1)
         state.contacts[idx].outboundTokenChain = chain
         Storage.upsertContact(state.contacts[idx])
+        diagLog(
+            "send",
+            "minted v2 token idx=\(token.index) for \(short(peer)) "
+            + "(chain remaining \(remaining)/\(chain.length))"
+        )
         return token
     }
 
@@ -1985,9 +2020,10 @@ final class ChatStore: NSObject {
         via client: RelayClient,
         session: Session
     ) {
-        pzLog(
-            "[pizzini] chainRefreshRequest from \(self.short(peer)) — "
-            + "serveChain(cooldown=chainRefreshCooldown)"
+        diagLog(
+            "chain",
+            "chainRefreshRequest from \(short(peer)) — "
+            + "serveChain(cooldown=\(Int(Contact.chainRefreshCooldown))s)"
         )
         serveChain(
             forPeer: peer,
@@ -2005,8 +2041,9 @@ final class ChatStore: NSObject {
     /// tokens from this chain instead of popping from the v1 stash.
     @MainActor
     private func handleChainSeedDelivery(payload: Data, contactIdx idx: Int) {
+        let peer = state.contacts[idx].identityPub
         guard let chain = HashChainToken.decodeSeedDelivery(payload) else {
-            pzLog("[pizzini] chainSeedDelivery: malformed payload from \(self.short(state.contacts[idx].identityPub))")
+            diagLog("chain", "chainSeedDelivery MALFORMED payload from \(short(peer)) (payload=\(payload.count)B)")
             return
         }
         // Replacing an existing chain is legitimate (rotation); the old
@@ -2017,7 +2054,13 @@ final class ChatStore: NSObject {
         let priorChainID = state.contacts[idx].outboundTokenChain?.chainID
         state.contacts[idx].outboundTokenChain = chain
         Storage.upsertContact(state.contacts[idx])
-        pzLog("[pizzini] chainSeedDelivery installed for \(self.short(state.contacts[idx].identityPub)) (rotation=\(priorChainID != nil))")
+        let pendingCount = pendingV2Sends[state.contacts[idx].id]?.count ?? 0
+        diagLog(
+            "chain",
+            "chainSeedDelivery INSTALLED for \(short(peer)) "
+            + "chainID=\(hex(chain.chainID)) length=\(chain.length) "
+            + "rotation=\(priorChainID != nil) drain=\(pendingCount)"
+        )
         // Drain any sends that were waiting on this chain. Each one
         // re-enters `send(_:to:)`, which now finds the chain and
         // takes the v2 path.
@@ -2123,9 +2166,16 @@ final class ChatStore: NSObject {
                 plaintext: inner,
             )
             persistSession()
+            let fanout = readyRelays.count
             broadcastToRelays {
                 $0.sendChainSeedFrame(toPeer: peer, sealedCiphertext: sealed)
             }
+            diagLog(
+                "chain",
+                "shipped chainSeedDelivery → \(short(peer)) "
+                + "chainID=\(hex(chain.chainID)) length=\(chain.length) "
+                + "sealed=\(sealed.count)B fanout=\(fanout)"
+            )
             _ = client
             return true
         } catch {
@@ -2176,7 +2226,15 @@ final class ChatStore: NSObject {
             return
         }
         let ok = sendChainSeedDelivery(toPeer: peer, via: relay, session: session)
-        guard ok else { return }
+        guard ok else {
+            diagLog("chain", "serveChain failed (sendChainSeedDelivery returned false) for \(short(peer))")
+            return
+        }
+        diagLog(
+            "chain",
+            "serveChain shipped for \(short(peer)) "
+            + "(cooldown=\(Int(cooldown))s)"
+        )
         // Only stamp on success so a failed serve doesn't engage the
         // cooldown — otherwise the very first deferred attempt would
         // win the cooldown window even though no chain was shipped.
@@ -2964,21 +3022,32 @@ extension ChatStore: RelayClientDelegate {
     /// or other envelope kinds).
     @MainActor
     private func handleChainSeedFrame(_ sealedCiphertext: Data, via client: RelayClient) {
-        guard let session = self.session else { return }
+        diagLog(
+            "chain",
+            "FRAME_TYPE_CHAIN_SEED_DELIVERY received sealed=\(sealedCiphertext.count)B"
+        )
+        guard let session = self.session else {
+            diagLog("chain", "chain-seed-frame: dropping — no session")
+            return
+        }
         let received: Session.SealedReceived
         do {
             received = try session.decryptSealed(sealedCiphertext)
         } catch {
-            pzLog("[pizzini] chain-seed-frame decrypt failed: \(error)")
+            diagLog("chain", "chain-seed-frame decrypt FAILED: \(error)")
             return
         }
         // libsignal's ratchet step happens during decrypt; persist
         // before any further work so a crash here doesn't desync.
         persistSession()
-        if self.isIdentityBlocked(received.peer) { return }
+        if self.isIdentityBlocked(received.peer) {
+            diagLog("chain", "chain-seed-frame from BLOCKED peer \(short(received.peer)) — drop")
+            return
+        }
         guard let idx = self.contactIndex(forIdentity: received.peer) else {
-            pzLog(
-                "[pizzini] chain-seed-frame: dropping from unknown peer \(self.short(received.peer))"
+            diagLog(
+                "chain",
+                "chain-seed-frame from UNKNOWN peer \(short(received.peer)) — drop (not in contacts)"
             )
             return
         }
@@ -2986,9 +3055,10 @@ extension ChatStore: RelayClientDelegate {
               let kind = RelayClient.InnerEnvelopeKind(rawValue: kindByte),
               kind == .chainSeedDelivery else {
             let kindHex = received.plaintext.first.map { String(format: "0x%02x", $0) } ?? "(empty)"
-            pzLog(
-                "[pizzini] chain-seed-frame: rejecting non-chainSeedDelivery inner kind "
-                + "\(kindHex) from \(self.short(received.peer))"
+            diagLog(
+                "chain",
+                "chain-seed-frame REJECTED non-chainSeedDelivery inner kind \(kindHex) "
+                + "from \(short(received.peer))"
             )
             return
         }

@@ -26,7 +26,18 @@ import os.log
 @inline(__always)
 nonisolated func pzLog(_ message: @autoclosure () -> String) {
     #if DEBUG
-    os_log(.debug, "%{public}@", message())
+    let body = message()
+    os_log(.debug, "%{public}@", body)
+    // QA-debug persistent log. Single evaluation of `message()` —
+    // even though pzLog is a hot path, the file write is dispatched
+    // off-thread on QALog's serial utility queue so the caller pays
+    // only the string-interpolation cost (which DEBUG was already
+    // paying for the os_log line above).
+    //
+    // Categorise as "log" so QA-log readers can distinguish
+    // pzLog-origin lines from `diagLog` events (which carry their
+    // own per-flow category like "relay", "group", "pair", …).
+    QALog.record(category: "log", message: body)
     #else
     // Release: drop the message entirely. The `@autoclosure` means
     // the string-interpolation body never runs, so a hot-path log
