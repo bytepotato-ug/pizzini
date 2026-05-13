@@ -849,20 +849,22 @@ final class ChatStore: NSObject {
     /// already (the second `connect()` reuses the cached SOCKS
     /// port), so the second cycle is sub-5 s on healthy networks.
     ///
-    /// Tap-spam defence: a manual reconnect is meaningful only when
-    /// the aggregate state is `.failed`. If it's `.connected`,
-    /// there's nothing to retry; if it's `.connecting` or
-    /// `.connectingToTor`, a previous reconnect (or the initial
-    /// connect) is already mid-flight and a second teardown would
-    /// drop the in-flight Tor handshake / SOCKS retry it would
-    /// otherwise complete. Either way, no-op silently. The button
-    /// is hidden by ContactsListView in those states; this is
-    /// belt-and-braces in case a future call site forgets the
-    /// guard.
+    /// Acts on every state EXCEPT `.connected` (where there's
+    /// nothing to retry). A user tapping "Reconnect now" while
+    /// the state is `.connecting` / `.connectingToTor` / `.idle`
+    /// means an in-flight bootstrap is taking too long — the
+    /// user explicitly asked for a fresh attempt; dropping it
+    /// and redialing is exactly what they want. Prior version
+    /// silently no-op'd on those states, surfacing as "I tap the
+    /// button and nothing happens" (real-device report
+    /// 2026-05-14: connecting hung ~2 min, tapping Reconnect did
+    /// nothing).
     func forceReconnectRelays() {
         switch relayState {
-        case .failed:
-            pzLog("[pizzini] manual reconnect requested")
+        case .connected:
+            pzLog("[pizzini] reconnect requested but already connected; ignoring")
+        case .failed, .connecting, .connectingToTor, .idle:
+            pzLog("[pizzini] manual reconnect requested (was \(relayState))")
             // Reset auto-reconnect backoff AND the consecutive-
             // failure streak: the user's explicit intervention is a
             // fresh slate. Without resetting the streak, hitting
@@ -872,8 +874,6 @@ final class ChatStore: NSObject {
             autoReconnectFailureStreak = 0
             manualReconnectRequired = false
             connectRelay()
-        case .connected, .connecting, .connectingToTor, .idle:
-            pzLog("[pizzini] reconnect requested but state is \(relayState); ignoring")
         }
     }
 
