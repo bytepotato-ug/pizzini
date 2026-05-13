@@ -214,14 +214,14 @@ enum TransparencyLogConfig {
     /// Empty default = no automatic fetch (UI renders
     /// "log URL not configured").
     ///
-    /// Currently empty pending a publicly-readable mirror. The
-    /// canonical raw URL would be
-    /// `https://raw.githubusercontent.com/bytepotato-ug/pizzini/main/transparency-log.ndjson`
-    /// — re-set this string to that value (or to an independent
-    /// mirror) once the host is publicly reachable. The signed-entry
-    /// verification + rollback-defence logic is unchanged; only the
-    /// source URL is gated.
-    nonisolated static let logURLString: String = ""
+    /// Points at the canonical iOS repo's raw view. The repo IS the
+    /// source of truth for the signed log — entries are appended via
+    /// `scripts/sign-transparency-entry.sh` and committed alongside
+    /// the binary SHA they attest to. The fetch is Tor-routed for
+    /// `.onion` hosts via `torSession`; for this clearnet GitHub
+    /// host the fetch goes through `URLSession.shared` (documented
+    /// IP-leak trade-off, see `fetchAndCache` comment).
+    nonisolated static let logURLString: String = "https://raw.githubusercontent.com/bytepotato-ug/pizzini/main/transparency-log.ndjson"
 
     /// Decoded form. Returns nil for unset / malformed keys —
     /// the verifier propagates this to
