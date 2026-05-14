@@ -342,11 +342,7 @@ private struct RelayHostScreen: View {
             }
 
             Section {
-                Button {
-                    store.forceReconnectRelays()
-                } label: {
-                    Label("Reconnect now", systemImage: "arrow.clockwise")
-                }
+                ReconnectButton(store: store)
             } footer: {
                 Text("Closes every relay socket and dials again. Tor stays up if it was already bootstrapped — the second connect cycle is sub-5 seconds.")
             }
@@ -572,6 +568,155 @@ private struct AdvancedScreen: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("All contacts, sessions, and chats will be erased. Peers will need to scan you again.")
+        }
+    }
+}
+
+/// Settings → Relays → "Reconnect now" row with live state feedback.
+///
+/// The plain `Button { store.forceReconnectRelays() }` it replaced
+/// gave the user no signal that anything happened on tap. Re-tapping
+/// while a reconnect was already in flight silently no-op'd (the
+/// store guards against teardown-mid-dial), making the affordance
+/// read as broken. This row mirrors `store.relayState` directly so
+/// the four phases — idle / reconnecting / succeeded / failed — each
+/// have a distinct visual.
+///
+/// Phases:
+///   • `.connected` (steady state) → "Reconnect now" + arrow,
+///     accent-tinted icon, enabled.
+///   • `.idle` / `.connecting` / `.connectingToTor(progress:)` →
+///     ProgressView spinner + "Reconnecting…" (or "Connecting via
+///     Tor… 75%" when the bootstrap reports a percentage). Disabled
+///     so a panic tap-tap-tap can't tear down a healthy in-flight
+///     handshake.
+///   • `.failed` → red icon + "Try reconnect" + the relay-side
+///     reason as a caption. Enabled so the user can retry.
+///   • `.connected` AFTER a tap-initiated reconnect → green
+///     checkmark + "Connected" + "All relays online." for 1.5 s
+///     before reverting to the steady state. Confirms the action
+///     worked instead of leaving the user wondering if anything
+///     changed.
+///
+/// Medium haptic on every tap so the user feels the tap landed
+/// even before the on-screen state has time to update.
+private struct ReconnectButton: View {
+    @Bindable var store: ChatStore
+    /// Set on tap, cleared once we see `.connected` after the tap.
+    /// Drives the one-shot success animation: without it, opening
+    /// Settings while the relay is already `.connected` would show
+    /// the green check on first render, which would be confusing.
+    @State private var tappedAt: Date? = nil
+    /// True for ~1.5 s after a tap-initiated reconnect successfully
+    /// lands on `.connected`. Toggled off by a sibling Task.
+    @State private var showingSuccess: Bool = false
+
+    var body: some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            tappedAt = Date()
+            store.forceReconnectRelays()
+        } label: {
+            HStack(spacing: 12) {
+                statusIcon
+                    .frame(width: 22, alignment: .center)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .foregroundStyle(titleTint)
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .contentShape(Rectangle())
+        }
+        .disabled(isInFlight || showingSuccess)
+        .animation(.easeInOut(duration: 0.2), value: showingSuccess)
+        .animation(.easeInOut(duration: 0.2), value: store.relayState)
+        .onChange(of: store.relayState) { _, new in
+            handleStateChange(new)
+        }
+    }
+
+    @ViewBuilder
+    private var statusIcon: some View {
+        if showingSuccess {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        } else {
+            switch store.relayState {
+            case .connected:
+                Image(systemName: "arrow.clockwise")
+            case .idle, .connecting, .connectingToTor:
+                ProgressView().controlSize(.small)
+            case .failed:
+                Image(systemName: "arrow.clockwise.circle.fill")
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
+    private var title: String {
+        if showingSuccess { return "Connected" }
+        switch store.relayState {
+        case .connected: return "Reconnect now"
+        case .idle, .connecting: return "Reconnecting…"
+        case .connectingToTor: return "Connecting via Tor…"
+        case .failed: return "Try reconnect"
+        }
+    }
+
+    private var titleTint: Color {
+        if showingSuccess { return .green }
+        switch store.relayState {
+        case .failed: return .red
+        default: return .primary
+        }
+    }
+
+    private var subtitle: String? {
+        if showingSuccess { return "All relays online." }
+        switch store.relayState {
+        case .connectingToTor(let progress):
+            return progress > 0
+                ? "Tor bootstrap \(progress)%"
+                : "Starting Tor…"
+        case .connecting, .idle:
+            return "Dialing relays via Tor…"
+        case .failed(let reason):
+            return reason.isEmpty ? "All relays unreachable." : reason
+        case .connected:
+            return nil
+        }
+    }
+
+    private var isInFlight: Bool {
+        switch store.relayState {
+        case .idle, .connecting, .connectingToTor:
+            return true
+        case .connected, .failed:
+            return false
+        }
+    }
+
+    /// Detect the success transition: state went to `.connected`
+    /// and the user had previously tapped Reconnect (so this is
+    /// the result of their action, not an unrelated state reach).
+    /// Surface the green-check "Connected" copy for 1.5 s, then
+    /// revert to the steady "Reconnect now" affordance.
+    private func handleStateChange(_ newState: RelayClient.State) {
+        guard case .connected = newState else { return }
+        guard tappedAt != nil else { return }
+        tappedAt = nil
+        showingSuccess = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(1500))
+            showingSuccess = false
         }
     }
 }
