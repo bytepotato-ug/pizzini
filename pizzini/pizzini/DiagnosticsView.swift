@@ -44,8 +44,40 @@ struct DiagnosticsView: View {
                 } else {
                     LabeledContent("Peer ID", value: "(no card)")
                 }
-                LabeledContent("Relay", value: store.state.relayHost)
                 LabeledContent("Connection", value: connectionLabel)
+            }
+
+            Section {
+                LabeledContent("Mode", value: relayModeLabel)
+                if store.state.relayHost.isEmpty {
+                    // Fleet mode: one row per trusted onion with its
+                    // live state. Replaces the prior "Relay" row that
+                    // showed a blank string for every user on the
+                    // default fleet — no actionable info, just
+                    // empty space.
+                    ForEach(RelayRegistry.trusted, id: \.host) { descriptor in
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(descriptor.label)
+                                .font(.body)
+                            Spacer()
+                            Text(perRelayStateLabel(for: descriptor.host))
+                                .font(.caption.monospaced())
+                                .foregroundStyle(
+                                    perRelayStateColor(for: descriptor.host)
+                                )
+                        }
+                    }
+                } else {
+                    // Custom override mode: show the operator-typed
+                    // host directly. Per-relay state collapses to the
+                    // same aggregate `Connection` row above; no fleet
+                    // breakdown to render.
+                    LabeledContent("Host", value: store.state.relayHost)
+                }
+            } header: {
+                Text("Relays")
+            } footer: {
+                Text("Sends fan out across every connected relay; receive dedup falls out of libsignal’s SealedSenderResult.isDuplicate. Tap Settings → Relays for the full onion addresses and a Reconnect button.")
             }
 
             Section("Counts") {
@@ -196,6 +228,47 @@ struct DiagnosticsView: View {
         let head = data.prefix(4).map { String(format: "%02x", $0) }.joined()
         let tail = data.suffix(2).map { String(format: "%02x", $0) }.joined()
         return "\(head)…\(tail)"
+    }
+
+    /// One-line summary of how the app is reaching the relay layer.
+    /// Drives the `Mode` row in the Relays section. Empty `relayHost`
+    /// means "use the bundled trusted onion fleet from
+    /// `RelayRegistry.trusted`" (D5 default); a non-empty value is
+    /// the operator's BYO override.
+    private var relayModeLabel: String {
+        if store.state.relayHost.isEmpty {
+            let n = RelayRegistry.trusted.count
+            return "Trusted fleet (\(n) onion\(n == 1 ? "" : "s"))"
+        }
+        return "Custom"
+    }
+
+    /// Short label for a single relay's current `RelayClient.State`.
+    /// Reads from `store.perRelayState`, which the relay-delegate
+    /// mirrors on every transition. "—" means the relay isn't being
+    /// dialled at all (e.g. when the user has set a custom override
+    /// and the trusted fleet is dormant).
+    private func perRelayStateLabel(for host: String) -> String {
+        guard let s = store.perRelayState[host] else { return "—" }
+        switch s {
+        case .idle: return "idle"
+        case let .connectingToTor(progress): return "Tor \(progress)%"
+        case .connecting: return "connecting"
+        case .connected: return "connected"
+        case .failed: return "failed"
+        }
+    }
+
+    /// Foreground colour for the per-relay state cell. Semantic
+    /// (green = OK, orange = in-flight, red = bad) — these are status
+    /// signals, not brand, so the monochrome theme leaves them as-is.
+    private func perRelayStateColor(for host: String) -> Color {
+        guard let s = store.perRelayState[host] else { return .secondary }
+        switch s {
+        case .connected: return .green
+        case .idle, .connecting, .connectingToTor: return .orange
+        case .failed: return .red
+        }
     }
 
     private var connectionLabel: String {
