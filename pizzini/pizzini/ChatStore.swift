@@ -1040,6 +1040,14 @@ final class ChatStore: NSObject {
     ///    empty), or we never backgrounded with a socket alive.**
     ///    Standard reconnect path.
     func reconnectAfterBackground() {
+        // Reconcile the app-icon badge with the authoritative
+        // `state.totalUnread` on every foreground. While we were
+        // backgrounded the NSE may have inflated the badge (every
+        // push it processes is a +1), but the main app's stored
+        // state is the truth — re-asserting it here means a fresh
+        // glance at the home screen + the in-app contact rows show
+        // the same number.
+        refreshAppBadge()
         // Always cancel the tor-stop — Tor is a fleet-wide singleton
         // we want to keep alive across any foreground transition.
         cancelTorBackgroundStop()
@@ -2856,6 +2864,18 @@ final class ChatStore: NSObject {
             defaults.set(
                 state.notificationsMuted,
                 forKey: SharedAppGroup.suppressBadgeKey,
+            )
+            // Activity heartbeat: tells the NSE "the main app is alive
+            // and has just written the authoritative badge value." For
+            // the next `mainAppActiveWindow` seconds the NSE will
+            // suppress its own bump on incoming pushes, because the
+            // relay is delivering the same payload to us and the
+            // existing handlers will call `refreshAppBadge` again with
+            // the correct count. Closes the foreground-race that
+            // produced the "badge=5 when only 1 unread" bug.
+            defaults.set(
+                Date().timeIntervalSince1970,
+                forKey: SharedAppGroup.mainAppActiveEpochKey,
             )
         }
     }

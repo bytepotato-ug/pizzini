@@ -45,6 +45,21 @@ final class NotificationService: UNNotificationServiceExtension {
             contentHandler(bestAttemptContent)
             return
         }
+        // Skip the bump entirely when the main app was active within
+        // `mainAppActiveWindow` seconds. In that case the relay also
+        // delivered the same payload to the running main app, which
+        // already called `refreshAppBadge` with the authoritative
+        // count. A second bump here would double-count: the foreground
+        // race produced the "badge=N when only 1 is unread" bug
+        // reported 2026-05-14. Delivering without touching the badge
+        // is correct — the main app's `setBadgeCount` is the
+        // authoritative value while it's running.
+        let epoch = suite?.double(forKey: SharedAppGroup.mainAppActiveEpochKey) ?? 0
+        let now = Date().timeIntervalSince1970
+        if epoch > 0, now - epoch < SharedAppGroup.mainAppActiveWindow {
+            contentHandler(bestAttemptContent)
+            return
+        }
         let current = suite?.integer(forKey: SharedAppGroup.unreadCountKey) ?? 0
         let nseFloor = suite?.integer(forKey: SharedAppGroup.nseBadgeFloorKey) ?? 0
         let cap = nseFloor + SharedAppGroup.nseBadgeCap
@@ -84,4 +99,12 @@ enum SharedAppGroup {
     /// stop touching the badge entirely (used by the per-chat mute
     /// + global-mute paths). Reset on next main-app resume.
     static let suppressBadgeKey = "suppressBadgeBump"
+    /// Wall-clock seconds-since-1970 written by the main app on every
+    /// `refreshAppBadge`. The NSE reads it; if the main app touched
+    /// the badge within `mainAppActiveWindow` seconds, the NSE skips
+    /// its own bump (the main app already has the authoritative count
+    /// and a second bump here would double-count). See main-app
+    /// mirror in `pizzini/SharedAppGroup.swift` for the full reasoning.
+    static let mainAppActiveEpochKey = "mainAppActiveEpoch"
+    static let mainAppActiveWindow: TimeInterval = 30
 }
