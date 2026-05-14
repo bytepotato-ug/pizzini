@@ -79,6 +79,7 @@ struct PasscodeEntryView: View {
                         Text("Unlock")
                             .font(.headline)
                             .frame(maxWidth: .infinity)
+                            .prominentLabelText()
                     }
                 }
                 .buttonStyle(.borderedProminent)

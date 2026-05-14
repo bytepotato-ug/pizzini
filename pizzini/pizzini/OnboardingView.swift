@@ -63,6 +63,7 @@ struct OnboardingView: View {
                     .font(.headline)
                     .frame(maxWidth: .infinity)
                     .padding()
+                    .prominentLabelText()
             }
             .buttonStyle(.borderedProminent)
             .padding(.bottom, 24)
@@ -96,6 +97,7 @@ struct OnboardingView: View {
                         .font(.headline)
                         .frame(maxWidth: .infinity)
                         .padding()
+                        .prominentLabelText()
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(notificationsInFlight)
@@ -179,6 +181,7 @@ struct OnboardingView: View {
                     .font(.headline)
                     .frame(maxWidth: .infinity)
                     .padding()
+                    .prominentLabelText()
             }
             .buttonStyle(.borderedProminent)
             .padding(.bottom, 24)
@@ -213,6 +216,7 @@ struct OnboardingView: View {
                         .font(.headline)
                         .frame(maxWidth: .infinity)
                         .padding()
+                        .prominentLabelText()
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(authInFlight)

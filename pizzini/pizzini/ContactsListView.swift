@@ -288,6 +288,7 @@ struct ContactsListView: View {
                 } label: {
                     Label("Scan a QR", systemImage: "qrcode.viewfinder")
                         .frame(maxWidth: .infinity)
+                        .prominentLabelText()
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
@@ -1025,6 +1026,7 @@ private struct InvitationRow: View {
                 } label: {
                     Text("Accept")
                         .frame(minWidth: 70)
+                        .prominentLabelText()
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)

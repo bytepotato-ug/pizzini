@@ -59,6 +59,7 @@ struct LockOverlayView: View {
                         .font(.headline)
                         .frame(maxWidth: .infinity)
                         .padding()
+                        .prominentLabelText()
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(lockManager.authInFlight)
