@@ -156,16 +156,31 @@ enum Storage {
 
     // MARK: - Device store (libsignal blob)
 
+    /// QA-DIAG (2026-05-14): content fingerprint of a device_store blob —
+    /// `len=<bytes> fp=<8 hex>`. Lets a sysdiagnose capture confirm whether
+    /// the blob loaded at launch is the SAME one the previous session's
+    /// last `persistSession()` wrote. A drift here means the ratchet state
+    /// is being rolled back across launches (the "messages stop arriving
+    /// once the peer was closed" report). No secret material is logged —
+    /// the fingerprint is a one-way BLAKE3 prefix of an already-encrypted
+    /// blob. Remove once the persistence bug is closed.
+    private static func deviceStoreFingerprint(_ blob: Data) -> String {
+        let fp = Blake3.hash(blob).prefix(4).map { String(format: "%02x", $0) }.joined()
+        return "len=\(blob.count) fp=\(fp)"
+    }
+
     static func loadOrCreateSession() throws -> Session {
         guard let store = SQLiteStorage.shared else {
             throw StorageError.databaseWriteFailed(detail: "storage not bootstrapped")
         }
         if let blob = try store.loadDeviceStore() {
+            pzLog("[pizzini.storage] QA-DIAG loadOrCreateSession: loaded device_store \(deviceStoreFingerprint(blob))")
             return try Session(serialized: blob)
         }
         // First-ever launch (no legacy Keychain content either —
         // that path was handled by StorageMigration). Mint a fresh
         // identity and persist its serialize() blob.
+        pzLog("[pizzini.storage] QA-DIAG loadOrCreateSession: no device_store row — minting a FRESH identity")
         let s = try Session()
         try persist(session: s)
         return s
@@ -179,6 +194,7 @@ enum Storage {
         do {
             let blob = try session.serialize()
             try store.saveDeviceStore(blob)
+            pzLog("[pizzini.storage] QA-DIAG persist(session:): wrote device_store \(deviceStoreFingerprint(blob))")
             return true
         } catch {
             pzLog("[pizzini.storage] device_store UPSERT failed: \(error)")

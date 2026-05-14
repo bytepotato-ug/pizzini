@@ -1766,6 +1766,85 @@ mod tests {
     }
 
     #[test]
+    fn sending_chain_counter_survives_serialize_between_sends() {
+        // Regression: when the recipient is offline the sender emits
+        // several messages on ONE sending chain (no reply → no DH
+        // ratchet step). If `serialize`/`from_serialized` does not
+        // preserve the sending-chain message counter, every send after
+        // a rehydrate reuses counter 0 and the recipient rejects it as
+        // a DuplicatedMessage. Mirrors the field report: "foreground
+        // works, but with the peer closed nothing arrives."
+        let mut alice = DeviceStore::fresh().unwrap();
+        let mut bob = DeviceStore::fresh().unwrap();
+        let alice_id = alice.identity_public_bytes();
+        let bob_id = bob.identity_public_bytes();
+        alice
+            .initiate_session(&bob_id, &bob.publish_bundle().unwrap())
+            .unwrap();
+        bob.register_peer(&alice_id);
+
+        // Message 0 on the chain — live store.
+        let s0 = alice.seal_send(&bob_id, &[0u8; 16], b"m0").unwrap();
+        let r0 = bob.seal_receive(&s0).unwrap();
+        assert!(!r0.is_duplicate, "m0 must decrypt fresh");
+        assert_eq!(r0.plaintext, b"m0");
+
+        // Rehydrate Alice (simulates an app relaunch) and send again on
+        // the SAME chain — Bob has not replied, so no DH ratchet step.
+        let snap = alice.serialize().unwrap();
+        let mut alice = DeviceStore::from_serialized(&snap).unwrap();
+        let s1 = alice.seal_send(&bob_id, &[1u8; 16], b"m1").unwrap();
+        let r1 = bob.seal_receive(&s1).unwrap();
+        assert!(
+            !r1.is_duplicate,
+            "m1 after a serialize round-trip must NOT be a duplicate — \
+             the sending-chain counter was lost across from_serialized",
+        );
+        assert_eq!(r1.plaintext, b"m1");
+
+        // And once more, to prove it advances rather than merely
+        // skipping one.
+        let snap = alice.serialize().unwrap();
+        let mut alice = DeviceStore::from_serialized(&snap).unwrap();
+        let s2 = alice.seal_send(&bob_id, &[2u8; 16], b"m2").unwrap();
+        let r2 = bob.seal_receive(&s2).unwrap();
+        assert!(!r2.is_duplicate, "m2 after a second round-trip must decrypt fresh");
+        assert_eq!(r2.plaintext, b"m2");
+    }
+
+    #[test]
+    fn serialize_does_not_reset_the_live_sending_chain() {
+        // The host calls `serialize()` after EVERY `seal_send` (the
+        // `persistSession()` flush). If `serialize` mutated the live
+        // sending chain back to counter 0, every subsequent send on
+        // the same handle would reuse counter 0 and the recipient
+        // would reject all of them as duplicates — exactly the field
+        // report. `serialize` takes `&mut self`; this pins that the
+        // `&mut` does not disturb ratchet state.
+        let mut alice = DeviceStore::fresh().unwrap();
+        let mut bob = DeviceStore::fresh().unwrap();
+        let alice_id = alice.identity_public_bytes();
+        let bob_id = bob.identity_public_bytes();
+        alice
+            .initiate_session(&bob_id, &bob.publish_bundle().unwrap())
+            .unwrap();
+        bob.register_peer(&alice_id);
+
+        for i in 0..5u8 {
+            let s = alice.seal_send(&bob_id, &[i; 16], b"m").unwrap();
+            let r = bob.seal_receive(&s).unwrap();
+            assert!(
+                !r.is_duplicate,
+                "send #{i} on the same handle became a duplicate — \
+                 serialize() between sends reset the live sending chain",
+            );
+            // Flush exactly like the iOS `persistSession()` hot path:
+            // serialize the SAME live handle after every send.
+            let _ = alice.serialize().unwrap();
+        }
+    }
+
+    #[test]
     fn seal_receive_returns_duplicate_flag_on_replay() {
         // Replay defence: feeding the same sealed bytes through
         // seal_receive twice must surface `is_duplicate = true` on the

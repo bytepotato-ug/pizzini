@@ -38,6 +38,14 @@ enum StorageMigration {
         // running it on every bootstrap is cheap and closes the
         // post-marker-pre-delete crash window forever.
         if try metaFlagPresent(storage: storage) {
+            // QA-DIAG (2026-05-14): the steady-state branch — must be
+            // what every launch after the first hits. If a sysdiagnose
+            // shows the `migrating` line below on a launch where the
+            // user already has chat history, the migration is re-running
+            // and `migrateDeviceStore` is clobbering device_store with
+            // the frozen legacy Keychain blob — that rolls the libsignal
+            // ratchet back on every launch.
+            pzLog("[pizzini.migration] QA-DIAG run: meta flag present — steady state, device_store untouched")
             deleteAllLegacySlots()
             return
         }
@@ -45,9 +53,11 @@ enum StorageMigration {
         // fresh install needs no migration but should not re-probe
         // every launch.
         guard hasLegacyContent() else {
+            pzLog("[pizzini.migration] QA-DIAG run: no meta flag, no legacy content — fresh install, setting marker")
             try setMetaFlag(storage: storage)
             return
         }
+        pzLog("[pizzini.migration] QA-DIAG run: no meta flag + legacy content present — RUNNING migration (migrateDeviceStore will overwrite device_store)")
         pzLog("[pizzini.migration] Keychain → SQLCipher migration starting")
 
         try storage.db.transaction { _ in
@@ -179,6 +189,11 @@ enum StorageMigration {
         // device-store blob wins because it carries the active
         // ratchet state.
         if let blob = Keychain.read(account: legacyDeviceStoreAccount) {
+            // QA-DIAG (2026-05-14): if this fires on a launch where the
+            // user already has chat history, the frozen legacy blob is
+            // overwriting a live, ratchet-advanced device_store.
+            let fp = Blake3.hash(blob).prefix(4).map { String(format: "%02x", $0) }.joined()
+            pzLog("[pizzini.migration] QA-DIAG migrateDeviceStore: overwriting device_store with legacy Keychain blob len=\(blob.count) fp=\(fp)")
             try storage.saveDeviceStore(blob)
             return
         }
