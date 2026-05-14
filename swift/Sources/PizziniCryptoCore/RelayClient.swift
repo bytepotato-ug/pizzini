@@ -1070,10 +1070,25 @@ public final class RelayClient: @unchecked Sendable {
     /// to send even if we never registered. No-op if not connected
     /// — the relay has no record either way once the socket dropped.
     public func deregisterPush() {
+        let hadToken = pushToken != nil
         pushToken = nil
-        let st = state
-        relayLog.info("deregisterPush called on \(self.lastTargetHost.prefix(12), privacy: .public)… (state=\(String(describing: st), privacy: .public), connection=\(self.connection != nil, privacy: .public))")
-        guard state == .connected, let connection else { return }
+        guard state == .connected, let connection else {
+            // `electPushPrimary` calls this on every non-primary relay
+            // on every state transition, so the not-connected /
+            // nothing-cached case is overwhelmingly the common one —
+            // stay silent to keep the log readable. Only the rare case
+            // where a cached token was actually dropped while offline
+            // is worth a line.
+            if hadToken {
+                relayLog.info(
+                    "deregisterPush: cleared cached token on \(self.lastTargetHost.prefix(12), privacy: .public)… (offline — no frame sent)"
+                )
+            }
+            return
+        }
+        relayLog.info(
+            "deregisterPush → \(self.lastTargetHost.prefix(12), privacy: .public)… (connected — sending DEREGISTER_PUSH)"
+        )
         var payload = Data()
         payload.append(Self.frameTypeDeregisterPush)
         writeFrame(payload, on: connection)
