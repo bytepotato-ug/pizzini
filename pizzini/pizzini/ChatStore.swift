@@ -739,32 +739,39 @@ final class ChatStore: NSObject {
     /// transitions in or out of `.connected`. Picks the first ready
     /// relay (deterministic per session, since `relays` retains the
     /// `relayTargets()` order) and registers our cached APNs token
-    /// against it. Idempotent — re-electing the same primary is a
-    /// no-op.
+    /// against it.
     ///
-    /// On reshuffle (the previous primary dropped, a new one took
-    /// its place) the OLD primary is sent a DEREGISTER_PUSH frame
-    /// while it's still connected. Without that, the relay's
-    /// persistent push-token store on the old primary keeps our
-    /// token until the 30-day TTL purge — and since every connected
-    /// relay independently evaluates `maybe_send_push` on every
-    /// inbound SEND for us, the user would get N duplicate APNs
-    /// wake-ups per message until the TTL expired. If the old
-    /// primary is unreachable (already torn down, lost connection)
-    /// the DEREGISTER is silently skipped — that's tolerable
-    /// because the next legitimate REGISTER_PUSH to that relay
-    /// overwrites the stale token, and the relay's TTL purge
-    /// reaps anything else within 30 days.
+    /// Every connected relay independently evaluates `maybe_send_push`
+    /// on every inbound SEND for us, so the invariant is hard: at most
+    /// ONE relay may ever hold our push token, or the recipient gets a
+    /// duplicate APNs wake-up — and a duplicate NSE badge bump — per
+    /// stale-token relay per message. The hazard case: a relay that
+    /// was primary loses its connection (the DEREGISTER_PUSH cannot be
+    /// sent), then later reconnects while a *different* relay is now
+    /// primary. The old "DEREGISTER only the immediately-previous
+    /// primary, only when the primary changes" rule never cleaned that
+    /// relay up — its reconnect does not change `pushPrimary` — so its
+    /// stale token lingered until the relay-side 30-day TTL purge: N
+    /// duplicate pushes per message for up to a month.
+    ///
+    /// So this runs unconditionally on every call, *before* the
+    /// early-return, and DEREGISTERs every relay that is not the
+    /// elected primary — connected or not. `deregisterPush` clears the
+    /// per-client cached intent (`pushToken`) even while offline, so a
+    /// reconnecting ex-primary does not re-register itself, and sends
+    /// the wire DEREGISTER to any relay that is connected. It is
+    /// idempotent and a no-op on a relay that holds nothing.
     private func electPushPrimary() {
         let firstReady = readyRelays.first
+        // Enforce "at most one relay holds our token" on every call.
+        // A non-primary relay reconnecting does not change
+        // `pushPrimary`, so this must run before the early-return
+        // below or a reconnected ex-primary is never cleaned up.
+        for relay in relays where relay !== firstReady {
+            relay.deregisterPush()
+        }
         guard firstReady !== pushPrimary else { return }
-        let oldPrimary = pushPrimary
         pushPrimary = firstReady
-        // Best-effort DEREGISTER to the previous primary. We do it
-        // before the new register so the relay-side ordering
-        // mirrors the client-side intent: "drop the OLD, then
-        // start the NEW".
-        oldPrimary?.deregisterPush()
         if let token = pushTokenCached, let primary = firstReady {
             primary.registerPush(token: token)
         }
@@ -1704,9 +1711,19 @@ final class ChatStore: NSObject {
             + "msgid=\(hex(messageId)) sealed=\(sealed.count)B ttl=\(ttl)s "
             + "fanout=\(readyCount)"
         )
-        entry.relayedAt = now
-        // F-505 parity with v1: scrub the token blob once relayed.
-        entry.token = Data()
+        // `relayedAt` must mean "handed to at least one connected
+        // relay," not merely "a send was attempted" — `broadcastToRelays`
+        // is fire-and-forget and returns the count it actually reached.
+        // With zero ready relays the SEND went nowhere: leaving
+        // `relayedAt` nil keeps the UI honest (no false ✓ for bytes that
+        // never left the device) and the entry on the "never relayed"
+        // retry path. The token blob is scrubbed (F-505) only in the
+        // same branch — an un-relayed entry keeps its un-relayed shape.
+        if readyCount > 0 {
+            entry.relayedAt = now
+            // F-505 parity with v1: scrub the token blob once relayed.
+            entry.token = Data()
+        }
         outbox.entries[messageId] = entry
         Storage.upsertOutboxEntry(entry)
         let logEntry = PersistedMessage(

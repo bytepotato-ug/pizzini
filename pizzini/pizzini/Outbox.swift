@@ -146,34 +146,30 @@ extension OutboxEntry {
     }
 
     /// True iff the retry timer should attempt to re-send this entry.
-    /// F-501 schedule:
     /// - Terminal states (`deliveredAt`/`failedAt`) → no retry.
-    /// - `relayedAt != nil` (relay accepted bytes; only the peer's ACK
-    ///   is missing): cap at `maxRetriesAfterRelayed = 3` and use
-    ///   exponential backoff `60 * 2^retries` capped at 1h. Relay
-    ///   acceptance means further retries unlikely to help — the bytes
-    ///   either reached the peer (and the ACK is in flight / lost) or
-    ///   the peer is offline; either way exponential backoff is the
-    ///   right shape, and capping at 3 turns the F-501 "11-token-burn-
-    ///   per-message" attack into "4-token-burn-per-message".
-    /// - `relayedAt == nil` (transient relay outage / disconnect):
-    ///   keep the historic `min(60 + retries*60)` baseline up to
-    ///   `maxRetries = 10` since the original send hasn't even
-    ///   reached the relay; tokens were already popped, so retrying
-    ///   doesn't burn extra stash on the sender side.
+    /// - `relayedAt != nil` (a relay has accepted the bytes) → no
+    ///   retry, ever. The message is in that relay's offline queue
+    ///   under its own TTL and WILL reach the recipient on their next
+    ///   connect; re-sending cannot make an offline recipient online.
+    ///   A retry would only mint fresh single-use delivery tokens
+    ///   (chain drain), queue duplicate frames, and fire duplicate
+    ///   "New message" pushes at the recipient. The entry resolves to
+    ///   ✓✓ on the peer ACK or ✗ at `ttl`. This also fully closes
+    ///   F-501's "drop every ACK to burn the sender's tokens" attack:
+    ///   zero post-relay token burn.
+    /// - `relayedAt == nil` (the send never reached a relay —
+    ///   transient outage / disconnect): retry up to `maxRetries` on
+    ///   the `max(30, retries*60)` baseline. Each retry re-derives a
+    ///   fresh token; this is the only path that legitimately
+    ///   re-sends.
     func shouldRetry(now: Date) -> Bool {
         guard deliveredAt == nil, failedAt == nil else { return false }
+        // A relayed entry is never retried — see the doc comment.
+        guard relayedAt == nil else { return false }
+        guard retries < OutboxEntry.maxRetries else { return false }
         let elapsed = now.timeIntervalSince(sentAt)
-        if relayedAt != nil {
-            guard retries < OutboxEntry.maxRetriesAfterRelayed else { return false }
-            // Exponential: 60s, 120s, 240s after the original send.
-            let backoff = min(60.0 * pow(2.0, Double(retries)), 3600.0)
-            return elapsed > backoff
-        } else {
-            guard retries < OutboxEntry.maxRetries else { return false }
-            let baseline = max(30.0, TimeInterval(retries) * 60.0)
-            return elapsed > baseline
-        }
+        let baseline = max(30.0, TimeInterval(retries) * 60.0)
+        return elapsed > baseline
     }
 
     /// True iff `now` is past `sentAt + ttl` and we still have no ACK.
@@ -183,14 +179,12 @@ extension OutboxEntry {
         return now.timeIntervalSince(sentAt) > ttl
     }
 
-    /// Cap on retries while the relay has not yet acknowledged the
-    /// original send (transient relay disconnect / queueing). Retains
-    /// the historic max so we don't regress this path.
+    /// Cap on retries while the relay has not yet accepted the
+    /// original send (transient relay disconnect / queueing). Once a
+    /// relay HAS accepted the bytes `shouldRetry` stops outright, so
+    /// there is no separate post-relay cap — there are no post-relay
+    /// retries.
     static let maxRetries: Int = 10
-    /// Cap on retries AFTER the relay has acked the original send
-    /// (`relayedAt != nil`). F-501: turns a malicious-paired-peer
-    /// "drop every ACK" attack into a 4-token burn instead of 11.
-    static let maxRetriesAfterRelayed: Int = 3
 }
 
 /// Codable container so we can persist the whole outbox in one
