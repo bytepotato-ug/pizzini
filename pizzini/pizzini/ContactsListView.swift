@@ -441,25 +441,104 @@ struct ContactsListView: View {
     //                              `forceReconnectRelays`. The colour
     //                              is the only signal that this is a
     //                              non-self-resolving state.
+    /// Short label for the toolbar connecting-pill. Always non-empty
+    /// — the prior implementation hid this when `torBootstrapPhase`
+    /// was empty or "Connected" (latter is misleading anyway:
+    /// "Connected" describes Tor's state, not the relay socket's),
+    /// leaving the user with a bare spinner and no context. Each
+    /// connecting sub-state now has a one-or-two-word label that
+    /// fits in the toolbar without truncation.
+    private var connectingShortLabel: String {
+        switch store.relayState {
+        case .connectingToTor(let progress):
+            return progress > 0 ? "Tor \(progress)%" : "Tor…"
+        case .connecting:
+            return "Connecting"
+        case .idle:
+            return "Starting"
+        case .connected, .failed:
+            return ""
+        }
+    }
+
+    /// Sentence-long explainer shown as the top item of the menu the
+    /// connecting-pill opens. Tells the user *why* the spinner is
+    /// spinning, in plain language, without making them navigate to
+    /// Settings → Relays for the full breakdown.
+    private var connectingMenuExplainer: String {
+        switch store.relayState {
+        case .connectingToTor(let progress):
+            let pct = progress > 0 ? " (\(progress)%)" : ""
+            return "Bootstrapping the embedded Tor client\(pct). The relay sockets dial as soon as Tor is ready."
+        case .connecting:
+            return "Tor is up. Dialing the trusted relay fleet via .onion. Usually completes in a couple of seconds."
+        case .idle:
+            return "Starting up the connection. This usually takes a second after launch."
+        case .connected, .failed:
+            return ""
+        }
+    }
+
+    /// VoiceOver label. Combines short status + the Tor phase string
+    /// for the screen-reader path, where the visible short label is
+    /// not enough context on its own.
+    private var connectingAccessibilityLabel: String {
+        let phase = store.torBootstrapPhase
+        let phaseSuffix = phase.isEmpty || phase == "Connected" ? "" : " \(phase)."
+        switch store.relayState {
+        case .connectingToTor(let progress):
+            let pct = progress > 0 ? " \(progress) percent." : ""
+            return "Connecting through Tor.\(pct)\(phaseSuffix)"
+        case .connecting:
+            return "Connecting to relays.\(phaseSuffix)"
+        case .idle:
+            return "Starting up.\(phaseSuffix)"
+        case .connected:
+            return "Connected."
+        case .failed:
+            return "Not connected."
+        }
+    }
+
     @ViewBuilder
     private var relayStateIndicator: some View {
         switch store.relayState {
         case .connected:
             EmptyView()
         case .idle, .connecting, .connectingToTor:
-            HStack(spacing: 6) {
-                ProgressView()
-                    .controlSize(.mini)
-                if !store.torBootstrapPhase.isEmpty,
-                   store.torBootstrapPhase != "Connected"
-                {
-                    Text(store.torBootstrapPhase)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            // Replaces a bare `ProgressView` that left users staring at
+            // a spinning circle with no explanation. The pill carries
+            // (a) an always-non-empty short label so the user reads
+            // the actual phase ("Tor 73%" / "Connecting" / "Starting"),
+            // (b) a capsule background so it reads as an intentional
+            // status indicator instead of a runaway loading wheel, and
+            // (c) a tap-to-open menu with the full phase explainer +
+            // an inline Reconnect action so the user doesn't have to
+            // navigate to Settings to act on a stuck handshake.
+            Menu {
+                Section {
+                    Text(connectingMenuExplainer)
                 }
+                Button {
+                    store.forceReconnectRelays()
+                } label: {
+                    Label("Reconnect now", systemImage: "arrow.clockwise")
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text(connectingShortLabel)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(Capsule().fill(Color(.secondarySystemFill)))
             }
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("Pizzini is connecting. \(store.torBootstrapPhase)")
+            .accessibilityLabel(connectingAccessibilityLabel)
+            .accessibilityHint("Tap for connection details or to reconnect now.")
         case .failed:
             Button {
                 store.forceReconnectRelays()
