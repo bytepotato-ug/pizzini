@@ -156,31 +156,52 @@ enum Storage {
 
     // MARK: - Device store (libsignal blob)
 
-    /// QA-DIAG (2026-05-14): content fingerprint of a device_store blob —
-    /// `len=<bytes> fp=<8 hex>`. Lets a sysdiagnose capture confirm whether
-    /// the blob loaded at launch is the SAME one the previous session's
-    /// last `persistSession()` wrote. A drift here means the ratchet state
-    /// is being rolled back across launches (the "messages stop arriving
-    /// once the peer was closed" report). No secret material is logged —
-    /// the fingerprint is a one-way BLAKE3 prefix of an already-encrypted
-    /// blob. Remove once the persistence bug is closed.
-    private static func deviceStoreFingerprint(_ blob: Data) -> String {
-        let fp = Blake3.hash(blob).prefix(4).map { String(format: "%02x", $0) }.joined()
-        return "len=\(blob.count) fp=\(fp)"
+    /// QA-DIAG (2026-05-14): launch-time diagnostic lines, drained by
+    /// `ChatStore.init` into the in-app Diagnostics view so the cross-
+    /// launch persistence question can be answered from a screenshot
+    /// — no Console.app capture needed. Cleared by `ChatStore` once
+    /// drained. Remove once the persistence bug is closed.
+    static var qaDiag: [String] = []
+
+    /// 8-hex-char BLAKE3 prefix of a device_store blob. One-way, no
+    /// secret material — the blob is already an encrypted snapshot.
+    private static func fpHex(_ blob: Data) -> String {
+        Blake3.hash(blob).prefix(4).map { String(format: "%02x", $0) }.joined()
     }
+
+    /// `UserDefaults.standard` key holding the fingerprint of the last
+    /// `persist(session:)` write. Survives a normal relaunch; read back
+    /// by `loadOrCreateSession` to prove the blob loaded at launch N+1
+    /// is the one written at the end of launch N.
+    private static let qaLastPersistFPKey = "qa.lastPersistFP"
 
     static func loadOrCreateSession() throws -> Session {
         guard let store = SQLiteStorage.shared else {
             throw StorageError.databaseWriteFailed(detail: "storage not bootstrapped")
         }
+        let priorFP = UserDefaults.standard.string(forKey: qaLastPersistFPKey)
         if let blob = try store.loadDeviceStore() {
-            pzLog("[pizzini.storage] QA-DIAG loadOrCreateSession: loaded device_store \(deviceStoreFingerprint(blob))")
+            let fp = fpHex(blob)
+            let verdict: String
+            if let priorFP {
+                verdict = fp == priorFP
+                    ? "MATCH — survived relaunch"
+                    : "MISMATCH — rolled back (prev session ended fp=\(priorFP))"
+            } else {
+                verdict = "no prior fp recorded (fresh install, or UserDefaults.standard was wiped)"
+            }
+            let line = "loadOrCreateSession: loaded device_store len=\(blob.count) fp=\(fp) — \(verdict)"
+            qaDiag.append(line)
+            pzLog("[pizzini.storage] QA-DIAG \(line)")
             return try Session(serialized: blob)
         }
         // First-ever launch (no legacy Keychain content either —
         // that path was handled by StorageMigration). Mint a fresh
         // identity and persist its serialize() blob.
-        pzLog("[pizzini.storage] QA-DIAG loadOrCreateSession: no device_store row — minting a FRESH identity")
+        let line = "loadOrCreateSession: NO device_store row — minting a FRESH identity"
+            + (priorFP.map { " (but UserDefaults still has prior fp=\($0) — DB was wiped, not the defaults)" } ?? "")
+        qaDiag.append(line)
+        pzLog("[pizzini.storage] QA-DIAG \(line)")
         let s = try Session()
         try persist(session: s)
         return s
@@ -194,7 +215,12 @@ enum Storage {
         do {
             let blob = try session.serialize()
             try store.saveDeviceStore(blob)
-            pzLog("[pizzini.storage] QA-DIAG persist(session:): wrote device_store \(deviceStoreFingerprint(blob))")
+            let fp = fpHex(blob)
+            // Record the fingerprint of the most recent durable write so
+            // the NEXT launch's loadOrCreateSession can prove it loaded
+            // the same bytes (or detect the rollback).
+            UserDefaults.standard.set(fp, forKey: qaLastPersistFPKey)
+            pzLog("[pizzini.storage] QA-DIAG persist(session:): wrote device_store len=\(blob.count) fp=\(fp)")
             return true
         } catch {
             pzLog("[pizzini.storage] device_store UPSERT failed: \(error)")

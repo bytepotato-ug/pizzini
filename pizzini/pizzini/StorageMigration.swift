@@ -39,13 +39,15 @@ enum StorageMigration {
         // post-marker-pre-delete crash window forever.
         if try metaFlagPresent(storage: storage) {
             // QA-DIAG (2026-05-14): the steady-state branch — must be
-            // what every launch after the first hits. If a sysdiagnose
-            // shows the `migrating` line below on a launch where the
-            // user already has chat history, the migration is re-running
-            // and `migrateDeviceStore` is clobbering device_store with
-            // the frozen legacy Keychain blob — that rolls the libsignal
-            // ratchet back on every launch.
-            pzLog("[pizzini.migration] QA-DIAG run: meta flag present — steady state, device_store untouched")
+            // what every launch after the first hits. If the in-app
+            // Diagnostics view shows the `RUNNING migration` line below
+            // on a launch where the user already has chat history, the
+            // migration is re-running and `migrateDeviceStore` is
+            // clobbering device_store with the frozen legacy Keychain
+            // blob — that rolls the libsignal ratchet back every launch.
+            let line = "migration: meta flag present — steady state, device_store untouched"
+            Storage.qaDiag.append(line)
+            pzLog("[pizzini.migration] QA-DIAG \(line)")
             deleteAllLegacySlots()
             return
         }
@@ -53,11 +55,15 @@ enum StorageMigration {
         // fresh install needs no migration but should not re-probe
         // every launch.
         guard hasLegacyContent() else {
-            pzLog("[pizzini.migration] QA-DIAG run: no meta flag, no legacy content — fresh install, setting marker")
+            let line = "migration: no meta flag, no legacy content — fresh install, setting marker"
+            Storage.qaDiag.append(line)
+            pzLog("[pizzini.migration] QA-DIAG \(line)")
             try setMetaFlag(storage: storage)
             return
         }
-        pzLog("[pizzini.migration] QA-DIAG run: no meta flag + legacy content present — RUNNING migration (migrateDeviceStore will overwrite device_store)")
+        let line = "migration: no meta flag + legacy content — RUNNING migration (migrateDeviceStore overwrites device_store)"
+        Storage.qaDiag.append(line)
+        pzLog("[pizzini.migration] QA-DIAG \(line)")
         pzLog("[pizzini.migration] Keychain → SQLCipher migration starting")
 
         try storage.db.transaction { _ in

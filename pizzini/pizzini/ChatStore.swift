@@ -507,6 +507,15 @@ final class ChatStore: NSObject {
         } catch {
             self.initError = String(describing: error)
         }
+        // QA-DIAG (2026-05-14): drain the launch-time storage diagnostics
+        // (StorageMigration branch + device_store load verdict) into the
+        // in-app Diagnostics view, so the cross-launch persistence
+        // question is answerable from a screenshot — no Console.app
+        // capture needed. Remove once the persistence bug is closed.
+        for line in Storage.qaDiag {
+            diagLog("qa-diag", line)
+        }
+        Storage.qaDiag.removeAll()
         refreshAppBadge()
         // Wifi↔cellular handoffs, captive-portal flips, and
         // constrained-mode changes invalidate tor's circuits. The
