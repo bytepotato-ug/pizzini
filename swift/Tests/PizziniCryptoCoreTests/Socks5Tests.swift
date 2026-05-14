@@ -15,9 +15,9 @@ struct Socks5Tests {
     }
 
     @Test("CONNECT request encodes domain target as ATYP=3 + length + bytes + port BE")
-    func connectRequestForOnionTarget() {
+    func connectRequestForOnionTarget() throws {
         let host = "pizzini2rblrswjmq7axintrq55lhnqwudf7vawckrt3toqps26vxxyd.onion"
-        let req = Socks5.connectRequest(host: host, port: 7777)
+        let req = try Socks5.connectRequest(host: host, port: 7777)
         var cursor = 0
         #expect(req[cursor] == 0x05); cursor += 1
         #expect(req[cursor] == 0x01); cursor += 1
@@ -36,8 +36,8 @@ struct Socks5Tests {
     }
 
     @Test("CONNECT request fits short hostnames identically")
-    func connectRequestShortHost() {
-        let req = Socks5.connectRequest(host: "a.onion", port: 1)
+    func connectRequestShortHost() throws {
+        let req = try Socks5.connectRequest(host: "a.onion", port: 1)
         // VER CMD RSV ATYP LEN host... PORT_HI PORT_LO
         #expect(req.count == 4 + 1 + "a.onion".utf8.count + 2)
         #expect(req.last == 0x01)

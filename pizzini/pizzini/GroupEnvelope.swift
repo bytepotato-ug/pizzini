@@ -110,4 +110,50 @@ enum GroupEnvelope {
         let mid = lo + groupIdSize
         return (Data(payload[lo..<mid]), Data(payload[mid..<payload.endIndex]))
     }
+
+    /// Extract the 16-byte `distribution_id` (a libsignal per-CHAIN
+    /// identifier, surfaced as a `UUID`) from the header of a
+    /// `SenderKeyMessage` — WITHOUT decrypting it.
+    ///
+    /// **Why this is needed.** `groupId` in the inner envelope is only
+    /// a routing hint: `Session.groupDecrypt` looks the sender-key
+    /// chain up by `(senderIdentity, distribution_id)`, where the
+    /// `distribution_id` comes from the ciphertext header, not from
+    /// `groupId`. A member who shares two groups with the victim can
+    /// wrap a G2 ciphertext in a `groupChat` envelope labelled `G1`
+    /// and — because the victim has installed that member's G2 chain
+    /// — `groupDecrypt` happily decrypts it, splicing G2 plaintext
+    /// into G1's transcript. The receive handlers defend against that
+    /// by checking the extracted `distribution_id` against the one
+    /// recorded for `(sender, group)` in
+    /// `ChatGroup.memberDistributionIds` BEFORE rendering — but they
+    /// need the ciphertext's `distribution_id` to do so, and the FFI
+    /// `groupDecrypt` does not return it.
+    ///
+    /// **Wire format** (libsignal `SenderKeyMessage`, pinned at
+    /// v0.93.2): `version(1 byte) || protobuf body || mac(8 bytes)`.
+    /// The protobuf `SenderKeyMessage`'s field 1 is
+    /// `distribution_uuid` (`bytes`), so the body begins with the
+    /// protobuf tag `0x0a` (field 1, wire type 2 = length-delimited),
+    /// a length byte `0x10` (16), then the 16 raw UUID bytes. Any
+    /// deviation from that shape — too short, wrong tag, wrong length
+    /// — yields nil, and the callers treat nil as a hard reject
+    /// (fail-closed): a `SenderKeyMessage` whose header cannot be
+    /// parsed is one we will not render.
+    static func distributionId(fromSenderKeyMessage skm: Data) -> UUID? {
+        // version(1) + tag(1) + len(1) + uuid(16) = 19 bytes minimum.
+        guard skm.count >= 19 else { return nil }
+        let base = skm.startIndex
+        // skm[base] is the version byte — not validated here (libsignal
+        // owns version handling on decrypt); we only need the header
+        // shape to locate the UUID.
+        guard skm[base + 1] == 0x0a, skm[base + 2] == 0x10 else { return nil }
+        let uuidStart = base + 3
+        let uuidBytes = skm[uuidStart..<(uuidStart + 16)]
+        let b = Array(uuidBytes)
+        return UUID(uuid: (
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+        ))
+    }
 }

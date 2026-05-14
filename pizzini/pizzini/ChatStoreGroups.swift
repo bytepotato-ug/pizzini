@@ -1127,6 +1127,22 @@ extension ChatStore {
             )
             return
         }
+        // Cross-group binding gate — same rationale as `handleGroupChat`.
+        // `groupId` is a routing hint; `groupDecrypt` resolves the
+        // chain by the ciphertext header's `distribution_id`. Reject
+        // any chunk whose header distribution-id is not the one
+        // recorded for this sender in this group, so an attachment
+        // chunk produced for group G can only ever be decrypted-and-
+        // reassembled in group G. nil on either side is fail-closed.
+        guard let ctDistId = GroupEnvelope.distributionId(fromSenderKeyMessage: ciphertext),
+              let expectedDistId = state.groups[gIdx].memberDistributionIds[sender],
+              ctDistId == expectedDistId else {
+            pzLog(
+                "[pizzini.group] groupFileChunk ← \(short(sender)) for \(short(groupId)):"
+                    + " DROPPED — sender-key distribution-id does not match this group",
+            )
+            return
+        }
         // pendingInvitation: advance chain but drop without rendering.
         if state.groups[gIdx].pendingInvitation {
             pzLog(
@@ -1483,6 +1499,24 @@ extension ChatStore {
                 "Group integrity warning: a group action arrived with a member-list signature"
                     + " that doesn't match this device's view. Op rejected.",
             )
+        case let .rejectedPreJoinHistory(epoch):
+            // The op is for an epoch before the local user joined this
+            // group. A bootstrapped member has no equivocation cache
+            // for pre-join epochs, so this op cannot be verified
+            // either way — surface that honestly instead of letting it
+            // pass as a silent duplicate. This is distinct from the
+            // equivocation warning: it is not "we caught a fork," it
+            // is "we genuinely cannot vouch for history before you
+            // joined."
+            pzLog(
+                "[pizzini.group] groupOp ← \(short(sender)):"
+                    + " pre-join history at epoch \(epoch) — cannot verify, dropped",
+            )
+            appendGroupSystem(
+                groupAt: gIdx,
+                "Cannot verify group history from before you joined "
+                    + "(an action dated to epoch \(epoch) arrived). It has not been applied.",
+            )
         }
         Storage.upsertGroup(state.groups[gIdx])
     }
@@ -1701,6 +1735,28 @@ extension ChatStore {
             pzLog(
                 "[pizzini.group] groupChat ← \(short(sender)) for \(short(groupId)):"
                     + " DROPPED — sender is not an active member",
+            )
+            return
+        }
+        // Cross-group binding gate. `groupId` above is only a routing
+        // hint — `groupDecrypt` resolves the chain by the
+        // `distribution_id` in the ciphertext header, so a member who
+        // shares two groups with us could wrap a ciphertext from
+        // group G2 in a `groupChat` envelope labelled G1 and we would
+        // decrypt-and-render it into G1's transcript. Reject any
+        // ciphertext whose header `distribution_id` is not the one we
+        // recorded for THIS sender in THIS group. nil on either side
+        // (unparseable header, or no SKDM recorded for the sender in
+        // this group) is also a reject — fail-closed. A
+        // `SenderKeyMessage` produced for group G can only ever be
+        // decrypted-and-rendered in group G.
+        guard let ctDistId = GroupEnvelope.distributionId(fromSenderKeyMessage: ciphertext),
+              let expectedDistId = state.groups[gIdx].memberDistributionIds[sender],
+              ctDistId == expectedDistId else {
+            pzLog(
+                "[pizzini.group] groupChat ← \(short(sender)) for \(short(groupId)):"
+                    + " DROPPED — sender-key distribution-id does not match this group"
+                    + " (cross-group splice attempt or no SKDM for this group)",
             )
             return
         }

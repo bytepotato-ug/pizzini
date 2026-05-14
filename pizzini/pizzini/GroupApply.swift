@@ -65,6 +65,19 @@ extension ChatGroup {
         /// they witnessed disagrees with ours. Carries both digests
         /// for the diagnostic UI / dev logs.
         case rejectedMemberSetMismatch(local: Data, claimed: Data)
+        /// Past-epoch op for an epoch BEFORE the local user joined the
+        /// group. A member bootstrapped via `GroupBootstrap` seeds
+        /// `recentOpDigests` with a single entry, so for any epoch
+        /// below the bootstrap epoch the equivocation check has no
+        /// cached digest to compare against and would silently
+        /// classify a divergent op as `.rejectedDuplicate`. That
+        /// would let an inviting admin equivocate undetectably on
+        /// every pre-join epoch. We instead surface this distinct
+        /// outcome: the receiver genuinely cannot verify history from
+        /// before they joined, and the host shows a "cannot verify
+        /// history before you joined" state rather than a misleading
+        /// silent duplicate-drop.
+        case rejectedPreJoinHistory(epoch: UInt64)
     }
 
     /// Side effects accumulated during `apply(_:sideEffects:)`. The host
@@ -166,8 +179,23 @@ extension ChatGroup {
         // Phase 3: epoch ordering.
         let expectedEpoch = currentEpoch + 1
         if op.epoch < expectedEpoch {
-            // Past-epoch op. Distinguish equivocation from idempotent
-            // re-receive via the cached digest at that epoch.
+            // Past-epoch op for an epoch BEFORE the local user joined:
+            // we have no cached digest for that epoch (a bootstrapped
+            // member's `recentOpDigests` starts with a single entry at
+            // the bootstrap epoch), so the equivocation check below
+            // cannot fire and would mislabel a divergent op as a
+            // benign `.rejectedDuplicate`. Surface it as explicitly
+            // out-of-scope instead — the receiver cannot verify
+            // history from before their join, and the host shows that
+            // state rather than silently swallowing the op.
+            if let localId = sx.localIdentityPub,
+               let localJoinedAt = members.first(where: { $0.peerId == localId })?.joinedAtEpoch,
+               op.epoch < localJoinedAt {
+                return .rejectedPreJoinHistory(epoch: op.epoch)
+            }
+            // Past-epoch op at or after our join epoch. Distinguish
+            // equivocation from idempotent re-receive via the cached
+            // digest at that epoch.
             if let known = digest(forEpoch: op.epoch), known != opDigest {
                 sx.equivocationEpoch = op.epoch
                 return .rejectedEquivocation(epoch: op.epoch)

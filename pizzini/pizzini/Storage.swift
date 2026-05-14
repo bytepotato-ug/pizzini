@@ -43,21 +43,68 @@ enum Storage {
 
     // MARK: - Bootstrap
 
+    /// Set by `bootstrap()` when it failed because no derivable key
+    /// can decrypt the on-disk database (`SQLiteStorage.BootstrapError
+    /// .keyMaterialUnavailable`). `ChatStore.init` reads this to enter
+    /// an explicit unrecoverable-state mode rather than degrading
+    /// silently into an `AppState()`-defaults session whose in-memory
+    /// security posture is weaker than what is encrypted on disk.
+    /// `nil` once a bootstrap (or re-bootstrap, e.g. after a duress
+    /// wipe) succeeds.
+    private(set) static var unrecoverableKeyMaterialFailure: Bool = false
+
     /// Open (or create) the SQLCipher database; run the one-shot
     /// Keychain → SQLCipher migration if there's legacy content. Must
     /// be called before any UI surface reaches any other Storage
     /// method. `pizziniApp.init`-equivalent code calls this.
+    ///
+    /// A `SQLiteStorage.BootstrapError.keyMaterialUnavailable` is
+    /// recorded in `unrecoverableKeyMaterialFailure` before being
+    /// rethrown — the caller (`AppDelegate`) still logs + swallows the
+    /// throw, but `ChatStore.init` consults the flag to refuse to come
+    /// up against defaults. A benign schema-downgrade self-heals
+    /// inside `SQLiteStorage.bootstrap` and never reaches this path,
+    /// so that flow is unaffected.
     static func bootstrap() throws {
-        try SQLiteStorage.bootstrap()
+        do {
+            try SQLiteStorage.bootstrap()
+        } catch let e as SQLiteStorage.BootstrapError {
+            unrecoverableKeyMaterialFailure = true
+            throw e
+        }
+        unrecoverableKeyMaterialFailure = false
         try StorageMigration.run(storage: SQLiteStorage.shared)
     }
 
     // MARK: - Whole-graph cold load
 
+    /// Set when a cold-load query against an *opened* SQLCipher store
+    /// threw (torn WAL, `SQLITE_CORRUPT`, an unexpected column type).
+    /// An empty in-memory graph must only ever be the result of an
+    /// empty on-disk store — never a swallowed read error — so a
+    /// thrown read is recorded here and `ChatStore.init` surfaces it
+    /// through the same recoverable-error state `initError` feeds,
+    /// rather than rendering a fresh-install-shaped empty chat list
+    /// over a store whose data is actually intact on disk.
+    ///
+    /// `nil` when the most recent cold load either succeeded or
+    /// returned defaults because the store genuinely had no rows /
+    /// was not bootstrapped (the latter is the F-K02 path, surfaced
+    /// separately via `unrecoverableKeyMaterialFailure`).
+    private(set) static var lastColdLoadError: String?
+
     /// Assemble the in-memory `AppState` from the normalised tables.
     /// Settings + every contact (with their messages + token queue) +
     /// every group (with their members + messages + ops + digests).
     /// Used once at app launch from `ChatStore.init`.
+    ///
+    /// A `nil` `SQLiteStorage.shared` means the store was never
+    /// bootstrapped — return defaults (the F-K02 path owns surfacing
+    /// that). A throw from a query against an *opened* store is a
+    /// genuine read failure: it is recorded in `lastColdLoadError` and
+    /// defaults are returned only so the app does not crash — the
+    /// caller is expected to consult `lastColdLoadError` and refuse to
+    /// present the empty graph as real.
     static func loadAppState() -> AppState {
         guard let store = SQLiteStorage.shared else { return AppState() }
         do {
@@ -67,19 +114,45 @@ enum Storage {
             return state
         } catch {
             pzLog("[pizzini.storage] loadAppState failed: \(error). Returning defaults.")
+            lastColdLoadError = "loadAppState: \(error)"
             return AppState()
         }
     }
 
-    /// Assemble the outbox from the `outbox` table.
+    /// Assemble the outbox from the `outbox` table. Same
+    /// opened-but-threw vs not-bootstrapped distinction as
+    /// `loadAppState` — a throw here records `lastColdLoadError`.
     static func loadOutbox() -> OutboxStore {
         guard let store = SQLiteStorage.shared else { return .empty }
         do { return try store.loadOutbox() }
         catch {
             pzLog("[pizzini.storage] loadOutbox failed: \(error). Returning empty.")
+            lastColdLoadError = "loadOutbox: \(error)"
             return .empty
         }
     }
+
+    /// Clear the recorded cold-load error. Called after a successful
+    /// re-load (duress wipe / identity reset re-bootstraps a fresh,
+    /// genuinely-empty store — that empty graph is real, not a
+    /// swallowed error).
+    static func clearColdLoadError() {
+        lastColdLoadError = nil
+    }
+
+#if DEBUG
+    /// Test-only: clear the process-global bootstrap/cold-load error
+    /// statics. These persist for the life of the process, so a test
+    /// that triggered a `BootstrapError` (or a swallowed cold-load
+    /// throw) would otherwise leak `unrecoverableKeyMaterialFailure`
+    /// / `lastColdLoadError` into every subsequent test's
+    /// `ChatStore.init`, making it early-return into unrecoverable
+    /// mode. Called from `SQLiteStorage._resetForTesting`.
+    static func _resetStaticsForTesting() {
+        unrecoverableKeyMaterialFailure = false
+        lastColdLoadError = nil
+    }
+#endif
 
     // MARK: - Device store (libsignal blob)
 
@@ -301,28 +374,35 @@ enum Storage {
     /// passphrase flow. Wipes the SQLCipher database file AND the key
     /// material that decrypts it.
     ///
-    /// Ordering matters for crash-safety. If the process is killed
-    /// mid-wipe, the on-disk state must NOT be forensically
-    /// distinguishable from a fresh install — otherwise a coercer who
-    /// power-cuts the device mid-wipe knows duress was triggered.
+    /// Ordering is the crash-safety contract. After ANY prefix of the
+    /// step sequence below is interrupted (force-quit, power-cut), the
+    /// next launch's observable surface — lock gate included — must be
+    /// byte-identical to a clean install. That requires the
+    /// IRREVERSIBLE step to come FIRST and to be a single durable
+    /// operation, so any kill after it leaves an orphan DB no key can
+    /// open. Therefore:
     ///
-    /// Therefore:
-    ///
-    ///   1. Wipe the attachment sandbox tree (plaintext bytes go
-    ///      first — they're useless without the DB rows that name
-    ///      them anyway, but they're also useless to a coercer once
-    ///      gone).
-    ///   2. Close the open `Database` and unlink `.sqlite` + WAL +
-    ///      SHM. After this point the encrypted DB file is gone; an
-    ///      interruption here leaves the wrap+salt+SE-key intact
-    ///      pointing at no DB → on next launch `bootstrap()` sees
-    ///      "keys present, no DB" and treats it as an orphan-wipe
-    ///      recovery, re-rolling everything fresh.
-    ///   3. Erase the SE key + Keychain wrap + salt + params (so
-    ///      even the orphan-DB-file (in case unlink failed) is
-    ///      undecryptable).
-    ///   4. Erase the AppPasscode slots if requested (duress path).
-    ///   5. Re-bootstrap a fresh SQLCipher store with new keys.
+    ///   1. Erase the SE key + Keychain wrap + salt + params + staged
+    ///      salt. This is the irreversible step: the moment the SE
+    ///      wrap is gone the on-disk DB is undecryptable. A kill right
+    ///      after this leaves "DB file present, no key material",
+    ///      which `bootstrap()`'s orphan check #1 unlinks on next
+    ///      launch.
+    ///   2. Erase the AppPasscode slots (duress path). Done
+    ///      immediately after the key material so the lock-gate
+    ///      surface and the key material disappear together; a kill
+    ///      between steps 1 and 2 is caught by `bootstrap()` (orphan
+    ///      check #1 now also drops passcode slots), so even that
+    ///      window presents as a clean install.
+    ///   3. Wipe the attachment sandbox tree — already-undecryptable
+    ///      plaintext bytes; interruption here is merely incomplete
+    ///      cleanup, not a confidentiality or distinguishability gap.
+    ///   4. Close the open `Database` and unlink `.sqlite` + WAL + SHM.
+    ///   5. Scrub the remaining cross-process / app-wide persistence
+    ///      surfaces: `UserDefaults.standard` and the App Group suite
+    ///      (duress path) — see the inline note for why neither is
+    ///      duress-aware on its own.
+    ///   6. Re-bootstrap a fresh SQLCipher store with new keys.
     ///
     /// Optionally preserves a subset of `AppState` settings (relay
     /// host + UX prefs) in the post-wipe state. **Onboarding flags
@@ -331,39 +411,83 @@ enum Storage {
     /// the user (or coercer) is presented with a fresh-install
     /// experience indistinguishable from a clean app install.
     ///
-    /// `clearPasscodes: true` (the duress path) also wipes the
-    /// `AppPasscode` slots and the cross-process shared unread-count
-    /// snapshot.
+    /// Returns `true` only if the irreversible step (the Keychain key
+    /// material erase) was fully confirmed. A `false` return means a
+    /// key-material delete could not be confirmed (e.g.
+    /// `errSecInteractionNotAllowed` mid-wipe) — the duress caller
+    /// must NOT report a completed wipe in that case.
+    @discardableResult
     static func eraseAndReinitialize(
         preserving snapshot: AppState? = nil,
         clearPasscodes: Bool = false,
-    ) {
-        // 1. Attachment sandbox — every received photo/video/PDF the
-        //    user exchanged goes here first. The chat rows that
-        //    reference these files are wiped in step 2; clearing the
-        //    bytes first means even an interrupted wipe leaves no
-        //    plaintext readable by `find`.
-        AttachmentSandbox.eraseEverything()
-        // 2. Unlink the SQLCipher database BEFORE touching key
-        //    material. An interruption between steps 2 and 3 leaves
-        //    "no DB, fresh keys" which the next bootstrap detects via
-        //    the orphan check and recovers from.
-        SQLiteStorage.unlinkDatabaseFiles()
-        // 3. Key material — wrap, salt, params, SE key.
-        DBKey.eraseKeyMaterial()
-        // 4. Passcode slots (duress path only). Cleared after key
-        //    material so an interruption at this boundary still
-        //    presents as fresh-install on next launch.
+    ) -> Bool {
+        // 1. Key material — wrap, salt, params, rotation stamp, staged
+        //    salt, SE key. IRREVERSIBLE and FIRST: once this completes
+        //    the encrypted DB on disk can never be opened again, so a
+        //    force-quit at any later step can only ever leave an
+        //    orphan DB the next launch unlinks. `eraseKeyMaterial`
+        //    returns success/failure — a partial failure is still
+        //    safer than the old "attachments first" order, but the
+        //    duress caller surfaces an incomplete wipe rather than
+        //    claiming success (see `ChatStore.duressWipe`).
+        //
+        //    A key-material delete can transiently fail (e.g.
+        //    `errSecInteractionNotAllowed`). `eraseKeyMaterial` is
+        //    idempotent — deleting an already-gone slot is a no-op —
+        //    so retry a bounded number of times before accepting a
+        //    partial erase, rather than merely recording it
+        //    incomplete. A wipe still confirmed incomplete after the
+        //    retries propagates to the duress caller via the return
+        //    value.
+        var keyMaterialErased = DBKey.eraseKeyMaterial()
+        var keyEraseRetries = 0
+        while !keyMaterialErased && keyEraseRetries < 2 {
+            keyEraseRetries += 1
+            keyMaterialErased = DBKey.eraseKeyMaterial()
+        }
+        // 2. Passcode slots (duress path only). Cleared right after
+        //    the key material so the lock-gate surface and the key
+        //    material vanish together. A kill between steps 1 and 2
+        //    leaves passcode slots with no DB and no key material;
+        //    `SQLiteStorage.bootstrap` reconciles that on next launch
+        //    by dropping the orphan slots, so the window still
+        //    presents as a clean install.
         if clearPasscodes {
             AppPasscode.eraseAll()
-            // Cross-process unread-count snapshot. The NSE writes
-            // here while the app is dead; the value sits in
-            // plaintext in the App Group container's plist (atomic
-            // rewrites, but historical generations can be recovered
-            // from flash). Clear it explicitly on duress.
-            SharedAppGroup.defaults?.removeObject(forKey: SharedAppGroup.unreadCountKey)
         }
-        // 5. Re-bootstrap fresh state.
+        // 3. Attachment sandbox — every received photo/video/PDF the
+        //    user exchanged. These bytes are already undecryptable-DB
+        //    orphans by now; clearing them is cleanup, not a
+        //    confidentiality boundary.
+        AttachmentSandbox.eraseEverything()
+        // 4. Unlink the SQLCipher database file + WAL + SHM sidecars.
+        SQLiteStorage.unlinkDatabaseFiles()
+        // 5. Scrub the app-wide persistence surfaces that are not the
+        //    SQLCipher store and survive everything above. On the
+        //    duress path the post-wipe surface must be a function only
+        //    of the small named allowlist of preserved UX prefs — so
+        //    we clear, rather than rely on each key being individually
+        //    duress-aware.
+        if clearPasscodes {
+            // `UserDefaults.standard`: e.g.
+            // `pizzini.identityResetBannerPending`. Any future key
+            // written here would otherwise inherit wipe-immunity.
+            // Removing the whole persistent domain is the
+            // defence-in-depth sweep.
+            if let bundleId = Bundle.main.bundleIdentifier {
+                UserDefaults.standard.removePersistentDomain(forName: bundleId)
+            }
+            // App Group suite: the NSE writes `unreadCount` /
+            // `nseBadgeFloor` / `mainAppActiveEpoch` here while the app
+            // is dead. A single `removeObject(unreadCount)` was dead
+            // code — `refreshAppBadge` rewrote all four keys ~200µs
+            // later. Drop the whole suite so the post-wipe App Group
+            // plist is absent, matching a never-launched fresh
+            // install. (`ChatStore.duressWipe` deliberately skips its
+            // trailing `refreshAppBadge` so this stays cleared.)
+            UserDefaults.standard.removePersistentDomain(forName: SharedAppGroup.identifier)
+        }
+        // 6. Re-bootstrap fresh state.
         do {
             try SQLiteStorage.bootstrap()
             try StorageMigration.run(storage: SQLiteStorage.shared)
@@ -424,9 +548,15 @@ enum Storage {
                 }
                 _ = persist(appState: preserved)
             }
+            // The re-bootstrap opened a fresh, genuinely-empty store —
+            // any prior swallowed cold-load error / unrecoverable-key
+            // flag no longer describes current reality.
+            clearColdLoadError()
+            unrecoverableKeyMaterialFailure = false
         } catch {
             pzLog("[pizzini.storage] eraseAndReinitialize failed: \(error)")
         }
+        return keyMaterialErased
     }
 
     /// Wipe the database. Called by "Reset identity" and "Reset
@@ -469,6 +599,9 @@ enum Storage {
                     blockIdentity(id)
                 }
             }
+            // Fresh, genuinely-empty store reopened — any prior
+            // swallowed cold-load error no longer describes reality.
+            clearColdLoadError()
         } catch {
             pzLog("[pizzini.storage] resetEverything failed: \(error)")
         }

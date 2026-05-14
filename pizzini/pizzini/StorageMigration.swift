@@ -193,8 +193,22 @@ enum StorageMigration {
     }
 
     private static func verifyReadback(storage: SQLiteStorage) throws {
-        if let _ = Keychain.read(account: legacyDeviceStoreAccount) {
-            guard let _ = try storage.loadDeviceStore() else {
+        // Device-store readback. The migration has TWO sources for
+        // the libsignal blob — the full `device-store` slot and the
+        // older `long-term-identity` seed (rehydrated into a fresh
+        // `Session` then serialized). `deleteAllLegacySlots()` runs
+        // unconditionally after this verify and secure-deletes BOTH,
+        // and the threat model is explicit that there is no other
+        // identity recovery (no mnemonic, no backup). So whenever
+        // EITHER source was present going in, the SQLCipher copy must
+        // be confirmed present AND non-empty before the source is
+        // destroyed — a `saveDeviceStore` that returned success while
+        // persisting a zero-length blob (an UPSERT no-op, a future
+        // regression in the blob path) would otherwise wipe the only
+        // copy of the user's identity seed with no verification gate.
+        if Keychain.read(account: legacyDeviceStoreAccount) != nil
+            || Keychain.read(account: legacyIdentityAccount) != nil {
+            guard let blob = try storage.loadDeviceStore(), !blob.isEmpty else {
                 throw MigrationError.deviceStoreNotReadable
             }
         }

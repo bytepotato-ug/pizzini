@@ -281,6 +281,25 @@ enum HashChainToken {
 
     // MARK: - Internal helpers
 
+    // AUDIT-DECISION-NEEDED: the v2 chain step below is a bare
+    // `BLAKE3(value)` with no domain-separation tag and no chain-id
+    // mixed in. Chain isolation is therefore only a probabilistic
+    // property of the 32-byte seed being random and never reused —
+    // not a structural property of the hash. The proper fix is a
+    // domain-separated step, `BLAKE3(b"pizzini.chain-token.v2" ||
+    // chain_id || value)`, but that is a wire-format change that must
+    // land on the relay side (`chain_validator_store`) BYTE-FOR-BYTE
+    // identically or every existing chain breaks. There is no chain
+    // *version* field to gate on today: `HashChainToken.Chain` has no
+    // version, and the relay distinguishes v1 (84-byte token) from v2
+    // (52-byte token) purely by length — there is no clean
+    // version-negotiation hook to let old chains keep the bare hash
+    // while new chains adopt the domain-separated one. Changing the
+    // step unilaterally here would desync every in-flight chain.
+    // Needs a coordinated design decision (add a chain-version byte to
+    // the `Chain` wire layout + the relay validator, then gate) before
+    // it can be implemented safely. Left as-is for now.
+
     /// Apply BLAKE3 `n` times. `n == 0` returns the input unchanged.
     /// Hash primitive must match the relay's `chain_validator_store`
     /// bit-for-bit — both sides use BLAKE3 so the app's hash audit

@@ -27,9 +27,13 @@ import PizziniTor
 /// legitimate to clients — to do so they would need access to
 /// the offline-stored operator signing key. Even a malicious
 /// operator can't backdate signatures (each entry carries a
-/// `signed_at` timestamp covered by the signature; clients can
-/// optionally enforce monotonic ordering against a previously-
-/// observed timestamp).
+/// `signed_at` timestamp covered by the signature). On top of
+/// that, `fetchAndCache` enforces monotonic ordering: it persists
+/// the highest `signed_at` it has ever observed and rejects a
+/// fetched log whose maximum `signed_at` regresses — so an
+/// attacker who serves a strictly-older but otherwise-valid log
+/// slice (same SHAs, same count, older timestamps) is caught even
+/// though the count-based rollback guard would not see it.
 ///
 /// **What this does NOT defend against**: an attacker who
 /// exfiltrates the operator's signing key. Defence-in-depth
@@ -315,6 +319,62 @@ extension TransparencyLog {
         return parseLog(data)
     }
 
+    /// Sidecar file holding the highest `signed_at` ever observed
+    /// across every fetched log. Lives next to the log cache in
+    /// `Library/Caches/` — both share the same durability (iOS may
+    /// evict either under disk pressure, which simply restarts the
+    /// monotonicity tracking, the same way it restarts the
+    /// count-based rollback guard).
+    private static func watermarkURL() throws -> URL {
+        let cachesDir = try FileManager.default.url(
+            for: .cachesDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true,
+        )
+        return cachesDir.appendingPathComponent("pizzini-transparency-log-watermark", isDirectory: false)
+    }
+
+    /// Parse an entry's `signed_at` (RFC3339 UTC, e.g.
+    /// `2026-05-13T09:56:16Z`) into a `Date`. Returns nil for any
+    /// unparseable value — a log whose newest entry has an
+    /// unparseable timestamp cannot be monotonicity-checked, which
+    /// `fetchAndCache` treats as a hard reject (fail-closed).
+    private static func parseSignedAt(_ raw: String) -> Date? {
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime]
+        return fmt.date(from: raw)
+    }
+
+    /// Highest `signed_at` across `log`'s VALID entries, or nil if
+    /// the log has no valid entries or none with a parseable
+    /// timestamp.
+    private static func maxSignedAt(in log: [SignedEntry]) -> Date? {
+        log.compactMap { entry -> Date? in
+            guard verify(entry) == .valid else { return nil }
+            return parseSignedAt(entry.signedAt)
+        }.max()
+    }
+
+    /// Read the persisted high-water `signed_at`, if any.
+    private static func loadWatermark() -> Date? {
+        guard let url = try? watermarkURL(),
+              let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8),
+              let epoch = TimeInterval(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return nil }
+        return Date(timeIntervalSince1970: epoch)
+    }
+
+    /// Persist `date` as the new high-water `signed_at`. Best-effort:
+    /// a write failure just means the next fetch re-evaluates against
+    /// the prior (or absent) watermark.
+    private static func storeWatermark(_ date: Date) {
+        guard let url = try? watermarkURL() else { return }
+        let text = String(date.timeIntervalSince1970)
+        try? Data(text.utf8).write(to: url, options: [.atomic])
+    }
+
     /// Count entries in `log` whose signature passes against the
     /// configured operator key. Used by the rollback guard +
     /// returned to the host so the UI can render
@@ -424,6 +484,22 @@ extension TransparencyLog {
             }
         }
 
+        // Monotonic-timestamp rollback defence. The count + missing-SHA
+        // guard above does not catch an attacker who serves a
+        // strictly-older but otherwise-valid log slice — same count,
+        // same SHAs, older `signed_at` values. Persist the highest
+        // `signed_at` ever observed and refuse a fetched log whose
+        // newest valid entry's `signed_at` regresses below it. A log
+        // whose newest entry has an unparseable timestamp cannot be
+        // checked, so it is rejected (fail-closed) rather than
+        // accepted unchecked.
+        guard let newMax = maxSignedAt(in: entries) else {
+            throw FetchError.rollback
+        }
+        if let watermark = loadWatermark(), newMax < watermark {
+            throw FetchError.rollback
+        }
+
         // Persist. Atomic write so a crash mid-write leaves the
         // old cache intact, not a half-truncated file.
         do {
@@ -432,6 +508,10 @@ extension TransparencyLog {
         } catch {
             throw FetchError.cache("write failed: \(error.localizedDescription)")
         }
+        // Advance the high-water mark only after the cache write
+        // landed — if the write failed we did not actually accept
+        // this log, so the watermark must not move.
+        storeWatermark(newMax)
 
         return entries
     }

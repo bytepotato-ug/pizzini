@@ -274,11 +274,46 @@ enum AppPasscode {
     /// atomic single-row layout on first access — so users upgrading
     /// from a build that wrote the old slot pair don't get silently
     /// locked out.
+    ///
+    /// **Constant Keychain-read count.** `check(_:)`'s constant
+    /// wall-clock guarantee covers the Argon2id derivations but the
+    /// pre-derivation Keychain probing must also be slot-set
+    /// independent: a set slot used to cost one read, an unset slot
+    /// three (the atomic read miss falling through to two legacy
+    /// reads). That delta leaks whether a duress passcode is
+    /// configured. So when the atomic slot IS present we still issue
+    /// the same two legacy-account probes the miss path makes — same
+    /// three reads either way — and discard their results.
     private static func readSlot(_ account: String) -> Data? {
         if let data = Keychain.read(account: account), data.count == slotLen {
+            // Atomic slot hit. Issue the two legacy probes anyway so
+            // the observable Keychain-read count is identical to the
+            // miss path; results discarded.
+            probeLegacyAccounts(for: account)
             return data
         }
         return migrateLegacySlot(into: account)
+    }
+
+    /// Issue (and discard) one read against each legacy account that
+    /// `migrateLegacySlot` would read, so a slot-hit pays the same
+    /// fixed Keychain-read count as a slot-miss. No side effects —
+    /// purely to keep `check(_:)`'s pre-derivation cost independent of
+    /// which slots are configured.
+    private static func probeLegacyAccounts(for account: String) {
+        switch account {
+        case realSlotAccount:
+            _ = Keychain.read(account: legacyRealHashAccount)
+            _ = Keychain.read(account: legacyRealSaltAccount)
+        case duressSlotAccount:
+            _ = Keychain.read(account: legacyDuressHashAccount)
+            _ = Keychain.read(account: legacyDuressSaltAccount)
+        default:
+            // Unknown account — issue two reads against the real
+            // legacy accounts so the count still matches.
+            _ = Keychain.read(account: legacyRealHashAccount)
+            _ = Keychain.read(account: legacyRealSaltAccount)
+        }
     }
 
     /// Read the (hash, salt) pair from the legacy two-row layout if
@@ -298,8 +333,15 @@ enum AppPasscode {
         default:
             return nil
         }
-        guard let legacyHash = Keychain.read(account: legacyHashAccount),
-              let legacySalt = Keychain.read(account: legacySaltAccount),
+        // Read BOTH legacy rows unconditionally — not via a
+        // short-circuiting `guard let … , let …`, which would skip
+        // the second read when the first misses. A slot-miss must
+        // issue the same fixed Keychain-read count as a slot-hit;
+        // otherwise the read-count delta leaks whether the slot
+        // (e.g. a duress passcode) is configured at all.
+        let legacyHash = Keychain.read(account: legacyHashAccount)
+        let legacySalt = Keychain.read(account: legacySaltAccount)
+        guard let legacyHash, let legacySalt,
               legacyHash.count == hashLen,
               legacySalt.count == saltLen else {
             return nil
@@ -358,13 +400,17 @@ enum AppPasscode {
         }
     }
 
-    /// Overwrite-then-delete a Keychain slot. iOS's `SecItemDelete`
-    /// unlinks the Keychain row from `keychain-2.db` but does not
-    /// promise NAND-flash wipe of the underlying ciphertext. Writing
-    /// a fresh random blob of the same size first forces the keychain
-    /// daemon to re-encrypt the row under a new IV, which on most
-    /// modern iOS releases supersedes the prior ciphertext block —
-    /// raising the bar against Cellebrite-class flash forensics.
+    /// Best-effort overwrite, then delete, a Keychain slot.
+    ///
+    /// `SecItemDelete` unlinks the row from `keychain-2.db`; the
+    /// overwrite-with-noise first is a best-effort hardening step, NOT
+    /// a guarantee. iOS does not promise that updating a row's value
+    /// rewrites the prior ciphertext page in place — `keychain-2.db`
+    /// is on a wear-levelled copy-on-write filesystem and the update
+    /// may allocate a fresh page, leaving the old one recoverable
+    /// until the filesystem reuses it. The real at-rest protection is
+    /// the iOS class-key model: the row's ciphertext is itself
+    /// class-key-encrypted, and the deletion is the load-bearing step.
     /// Falls back to plain delete if the overwrite write fails.
     static func secureDelete(account: String) {
         // Only overwrite if a row exists; otherwise plain delete is

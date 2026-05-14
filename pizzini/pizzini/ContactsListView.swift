@@ -622,6 +622,13 @@ struct ContactsListView: View {
         // `hasStrings` covers the "is there text on the board"
         // signal we'd want from `string?.count` without the
         // content read.
+        // Take exactly one `UIPasteboard.general` reference for the
+        // whole user action and pass it down into the content read.
+        // The pasteboard is a mutable, generation-counted system
+        // object; acquiring a second reference in the content reader
+        // would let the logged metadata and the parsed card describe
+        // two different observations (a TOCTOU on the generation
+        // counter). One reference → one observation.
         let pb = UIPasteboard.general
         let entryTypes = pb.types.joined(separator: ",")
         pzLog(
@@ -629,7 +636,7 @@ struct ContactsListView: View {
             + "items=\(pb.items.count) types=[\(entryTypes)] "
             + "hasStrings=\(pb.hasStrings) hasURLs=\(pb.hasURLs)"
         )
-        let raw = Self.readPasteboardContactCard()
+        let raw = Self.readPasteboardContactCard(from: pb)
         let outcome = store.evaluatePastedContact(raw)
         pzLog(
             "[pizzini.paste] paste tap: outcome=\(Self.describe(outcome)) "
@@ -729,13 +736,17 @@ struct ContactsListView: View {
     /// the pasteboard is genuinely empty" from "the pasteboard
     /// has data under a type we don't know how to read."
     ///
+    /// Takes the caller's already-acquired `UIPasteboard` reference
+    /// rather than reaching for `UIPasteboard.general` itself, so the
+    /// metadata logged by `handlePasteFromClipboard` and the content
+    /// parsed here come from one observation of the pasteboard.
+    ///
     /// Static so the logic is unit-testable in principle (the
     /// `UIPasteboard.general` global makes the integration side
     /// hard to fake without a wrapper protocol, but the policy
     /// can still be exercised against a closure-based stub if a
     /// future refactor wants to add coverage).
-    private static func readPasteboardContactCard() -> String {
-        let pb = UIPasteboard.general
+    private static func readPasteboardContactCard(from pb: UIPasteboard) -> String {
         if let s = pb.string, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return s
         }

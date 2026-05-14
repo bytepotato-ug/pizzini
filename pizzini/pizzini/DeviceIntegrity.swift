@@ -21,7 +21,12 @@ import UIKit
 ///   anyone determined enough to jailbreak will patch the splash out.
 ///   We render the chat normally and surface a banner.
 /// - Phone home. No telemetry; consistent with the README's "no
-///   analytics" hard rule. NSLog only, for forensic post-mortem.
+///   analytics" hard rule. The only record of an integrity flag is
+///   the in-app banner + Settings notice — nothing recoverable from
+///   the system log on a release build. The log call is `os_log` at
+///   `.debug` level, which release iOS drops unless debug logging is
+///   explicitly enabled, so a coercer reading a later sysdiagnose
+///   cannot confirm the check fired (F-NEW-905).
 /// - Use private APIs. `sysctl(KERN_PROC)`, `_dyld_image_count`,
 ///   `FileManager.fileExists`, and `UIApplication.canOpenURL` are all
 ///   public; this is App-Store-safe.

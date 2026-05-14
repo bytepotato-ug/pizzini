@@ -27,13 +27,21 @@
 //!     unix-seconds expiry — entries past their TTL are dropped
 //!     when the file is read, so a restart-after-7d doesn't surface
 //!     ghost frames to a freshly-reconnected peer.
-//!   • Per-peer cap (`MAX_PENDING_PER_PEER`) enforced on enqueue,
-//!     same constant as before — DoS safeguard against a malicious
-//!     sender spraying frames at a long-offline recipient.
+//!   • Per-peer cap (`max_per_peer`) enforced on enqueue — DoS
+//!     safeguard against a malicious sender spraying frames at a
+//!     single long-offline recipient.
+//!   • Global caps (`max_distinct_peers`, `max_total_frames`,
+//!     `max_total_bytes`) enforced on enqueue — DoS safeguard against
+//!     a malicious sender spraying frames at *many* fabricated
+//!     `to_id`s (the no-token CHAIN_SEED_DELIVERY pipe makes `to_id`
+//!     attacker-chosen). The per-peer cap alone does not bound the
+//!     store when `to_id` cardinality is unbounded. When a global
+//!     cap would be exceeded the enqueue fails closed — the frame is
+//!     refused, never another peer's frame evicted — so an attacker
+//!     cannot displace a legitimate recipient's queued messages.
 //!
-//! On-disk footprint is bounded by `MAX_PENDING_PER_PEER * peers *
-//! frame_size`. For the relay's expected scale (single-digit users,
-//! ~1-2KB sealed envelopes), the worst case is a few hundred KB.
+//! On-disk footprint is hard-bounded by `max_total_frames` /
+//! `max_total_bytes` regardless of `to_id` cardinality.
 //!
 //! What this module is NOT doing: distinguishing between "delivered
 //! to the relay" (frame is in the disk queue) and "actually reached
@@ -98,6 +106,14 @@ impl PendingFrame {
     pub fn is_expired(&self, now_unix: u64) -> bool {
         self.expires_at_unix <= now_unix
     }
+
+    /// Decoded frame length in bytes. The stored form is hex, so the
+    /// raw length is half the hex string's length — computed without
+    /// allocating a decode buffer, since the global byte-count cap
+    /// in `PendingStore::enqueue` calls this on every queued frame.
+    pub fn byte_len(&self) -> usize {
+        self.bytes_hex.len() / 2
+    }
 }
 
 /// Inner JSON document. A single `queues` map keyed by hex-encoded
@@ -119,10 +135,28 @@ pub struct PendingStore {
     pending_path: PathBuf,
     key: [u8; encrypted_file::KEY_LEN],
     queues: HashMap<Vec<u8>, VecDeque<PendingFrame>>,
-    /// Per-peer queue cap, applied on `enqueue`. Same constant the
-    /// pre-persistence implementation used; passed in by the caller
-    /// so `main.rs` retains it as the single source of truth.
+    /// Per-peer queue cap, applied on `enqueue`. Passed in by the
+    /// caller so `main.rs` retains it as the single source of truth.
     max_per_peer: usize,
+    /// Global cap on the number of distinct peer queues.
+    max_distinct_peers: usize,
+    /// Global cap on the total frame count across all queues.
+    max_total_frames: usize,
+    /// Global cap on the total queued-frame byte count across all
+    /// queues (measured on the decoded frame bytes).
+    max_total_bytes: usize,
+}
+
+/// Outcome of an `enqueue`. `Stored` means the frame was queued and
+/// persisted; `RejectedGlobalCap` means a global ceiling
+/// (`max_distinct_peers` / `max_total_frames` / `max_total_bytes`)
+/// would have been exceeded, so the frame was refused and nothing
+/// was mutated — failing closed rather than evicting another peer's
+/// frames on an attacker's behalf.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    Stored,
+    RejectedGlobalCap,
 }
 
 // Manual `Debug` to redact the key — same reasoning as
@@ -142,14 +176,21 @@ impl std::fmt::Debug for PendingStore {
 impl PendingStore {
     /// Load (or create) the persistent store at `state_dir`. Frames
     /// past their TTL are dropped at load time. `max_per_peer` is
-    /// the per-peer queue cap enforced on subsequent `enqueue`
-    /// calls.
+    /// the per-peer queue cap; `max_distinct_peers` /
+    /// `max_total_frames` / `max_total_bytes` are the global
+    /// ceilings — all enforced on subsequent `enqueue` calls.
     ///
     /// Fails (returns `Err`) on a corrupt key file or a tampered
     /// pending blob — refusing to start is the right call there.
     /// Continuing with an empty queue after partial corruption
     /// would silently lose every paired peer's in-flight messages.
-    pub fn load_or_create(state_dir: &Path, max_per_peer: usize) -> io::Result<Self> {
+    pub fn load_or_create(
+        state_dir: &Path,
+        max_per_peer: usize,
+        max_distinct_peers: usize,
+        max_total_frames: usize,
+        max_total_bytes: usize,
+    ) -> io::Result<Self> {
         fs::create_dir_all(state_dir)?;
         encrypted_file::restrict_permissions(state_dir, 0o700);
         let pending_path = state_dir.join(PENDING_FILE_NAME);
@@ -176,6 +217,9 @@ impl PendingStore {
             key,
             queues,
             max_per_peer,
+            max_distinct_peers,
+            max_total_frames,
+            max_total_bytes,
         })
     }
 
@@ -191,23 +235,81 @@ impl PendingStore {
         self.queues.len()
     }
 
+    /// Total decoded-frame bytes queued across all peers. Used by the
+    /// global byte-count cap in `enqueue`.
+    fn total_bytes(&self) -> usize {
+        self.queues
+            .values()
+            .flat_map(|q| q.iter())
+            .map(|f| f.byte_len())
+            .sum()
+    }
+
     /// Append a frame to `peer_id`'s queue, evicting the oldest
     /// frame first if doing so would exceed the per-peer cap.
-    /// Persists atomically before returning.
+    /// Persists atomically before returning `EnqueueOutcome::Stored`.
     ///
-    /// The eviction strategy ("drop oldest") matches the
+    /// Fails closed with `EnqueueOutcome::RejectedGlobalCap` (no
+    /// mutation, no persist) if storing the frame would push the
+    /// store past any global ceiling: the number of distinct peer
+    /// queues, the total frame count, or the total byte count.
+    /// Refusing — rather than evicting some other peer's frames —
+    /// keeps a malicious sender spraying fabricated `to_id`s from
+    /// either growing the store without bound or displacing a
+    /// legitimate recipient's queued messages.
+    ///
+    /// The per-peer eviction strategy ("drop oldest") matches the
     /// pre-persistence implementation: a recipient reconnecting
     /// after a long absence should see the most recent messages,
     /// even at the cost of dropping the oldest. Sender-side TTL
     /// + retry caps already bound how long a sender keeps trying;
     /// this just decides which N of M to keep.
-    pub fn enqueue(&mut self, peer_id: Vec<u8>, frame: PendingFrame) -> io::Result<()> {
+    pub fn enqueue(
+        &mut self,
+        peer_id: Vec<u8>,
+        frame: PendingFrame,
+    ) -> io::Result<EnqueueOutcome> {
+        let is_new_peer = !self.queues.contains_key(&peer_id);
+        // Global distinct-peer cap: a frame to a not-yet-seen `to_id`
+        // is refused once the store already holds the maximum number
+        // of distinct queues.
+        if is_new_peer && self.queues.len() >= self.max_distinct_peers {
+            return Ok(EnqueueOutcome::RejectedGlobalCap);
+        }
+        // Global frame-count cap. The per-peer eviction below can
+        // free a slot, so this is only a hard reject when the
+        // recipient's own queue is not already at its per-peer cap
+        // (i.e. accepting the frame genuinely adds to the total).
+        let queue_len = self.queues.get(&peer_id).map(|q| q.len()).unwrap_or(0);
+        let per_peer_eviction = queue_len >= self.max_per_peer;
+        let total_frames = self.total_frames();
+        if !per_peer_eviction && total_frames >= self.max_total_frames {
+            return Ok(EnqueueOutcome::RejectedGlobalCap);
+        }
+        // Global byte-count cap. Account for the bytes the per-peer
+        // eviction would reclaim so a steady-state full per-peer
+        // queue can still rotate without tripping the global cap.
+        let incoming = frame.byte_len();
+        let reclaimed = if per_peer_eviction {
+            self.queues
+                .get(&peer_id)
+                .and_then(|q| q.front())
+                .map(|f| f.byte_len())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if self.total_bytes() + incoming > self.max_total_bytes + reclaimed {
+            return Ok(EnqueueOutcome::RejectedGlobalCap);
+        }
+
         let queue = self.queues.entry(peer_id).or_default();
         while queue.len() >= self.max_per_peer {
             queue.pop_front();
         }
         queue.push_back(frame);
-        self.persist()
+        self.persist()?;
+        Ok(EnqueueOutcome::Stored)
     }
 
     /// Remove and return `peer_id`'s entire queue (typically called
@@ -298,6 +400,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const TEST_CAP: usize = 5;
+    // Generous global caps for tests that aren't exercising them —
+    // high enough that only the per-peer cap is in play.
+    const TEST_MAX_PEERS: usize = 1024;
+    const TEST_MAX_FRAMES: usize = 16_384;
+    const TEST_MAX_BYTES: usize = 64 * 1024 * 1024;
 
     fn fresh_state_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -307,6 +414,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pizzini-pending-test-{label}-{nanos}"));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// `load_or_create` with the per-test per-peer `cap` and the
+    /// generous global caps above — keeps the bulk of the tests on
+    /// the original two-arg shape.
+    fn open(dir: &Path, cap: usize) -> PendingStore {
+        PendingStore::load_or_create(dir, cap, TEST_MAX_PEERS, TEST_MAX_FRAMES, TEST_MAX_BYTES)
+            .unwrap()
     }
 
     fn frame_with_ttl(body: u8, ttl_secs: u64) -> PendingFrame {
@@ -322,7 +437,7 @@ mod tests {
         let alice = vec![0xAA; 33];
         let bob = vec![0xBB; 33];
         {
-            let mut store = PendingStore::load_or_create(&dir, TEST_CAP).unwrap();
+            let mut store = open(&dir, TEST_CAP);
             store.enqueue(alice.clone(), frame_with_ttl(0x11, 3600)).unwrap();
             store.enqueue(alice.clone(), frame_with_ttl(0x22, 3600)).unwrap();
             store.enqueue(bob.clone(), frame_with_ttl(0x33, 3600)).unwrap();
@@ -330,7 +445,7 @@ mod tests {
         {
             // Re-open: persistence survived the close, queues retain
             // arrival order, hex round-trip is symmetric.
-            let mut store = PendingStore::load_or_create(&dir, TEST_CAP).unwrap();
+            let mut store = open(&dir, TEST_CAP);
             assert_eq!(store.total_frames(), 3);
             assert_eq!(store.peers_with_queues(), 2);
             let drained = store.drain(&alice).unwrap();
@@ -345,7 +460,7 @@ mod tests {
     fn drain_removes_peer_queue_from_store() {
         let dir = fresh_state_dir("drainremoves");
         let alice = vec![0x11; 33];
-        let mut store = PendingStore::load_or_create(&dir, TEST_CAP).unwrap();
+        let mut store = open(&dir, TEST_CAP);
         store.enqueue(alice.clone(), frame_with_ttl(1, 3600)).unwrap();
         assert_eq!(store.total_frames(), 1);
         let drained = store.drain(&alice).unwrap();
@@ -357,7 +472,7 @@ mod tests {
         // And the persisted state agrees: reloaded store sees the
         // empty queue too.
         drop(store);
-        let reopened = PendingStore::load_or_create(&dir, TEST_CAP).unwrap();
+        let reopened = open(&dir, TEST_CAP);
         assert_eq!(reopened.total_frames(), 0);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -366,7 +481,7 @@ mod tests {
     fn per_peer_cap_evicts_oldest() {
         let dir = fresh_state_dir("cap");
         let alice = vec![0xCC; 33];
-        let mut store = PendingStore::load_or_create(&dir, 3).unwrap();
+        let mut store = open(&dir, 3);
         for i in 0..6u8 {
             store
                 .enqueue(alice.clone(), frame_with_ttl(0x10 + i, 3600))
@@ -387,7 +502,7 @@ mod tests {
         let dir = fresh_state_dir("expired");
         let alice = vec![0xAA; 33];
         {
-            let mut store = PendingStore::load_or_create(&dir, TEST_CAP).unwrap();
+            let mut store = open(&dir, TEST_CAP);
             // Fresh frame survives; "expired 1h ago" frame dropped.
             let now = encrypted_file::unix_now();
             store
@@ -398,7 +513,7 @@ mod tests {
                 .unwrap();
             store.enqueue(alice.clone(), frame_with_ttl(0xAB, 3600)).unwrap();
         }
-        let mut reopened = PendingStore::load_or_create(&dir, TEST_CAP).unwrap();
+        let mut reopened = open(&dir, TEST_CAP);
         assert_eq!(reopened.total_frames(), 1);
         let drained = reopened.drain(&alice).unwrap();
         assert_eq!(drained.len(), 1);
@@ -411,7 +526,7 @@ mod tests {
         let dir = fresh_state_dir("gc");
         let alice = vec![0xAA; 33];
         let bob = vec![0xBB; 33];
-        let mut store = PendingStore::load_or_create(&dir, TEST_CAP).unwrap();
+        let mut store = open(&dir, TEST_CAP);
         let now = encrypted_file::unix_now();
         store.enqueue(alice.clone(), PendingFrame::new(vec![1; 8], now.saturating_sub(60))).unwrap();
         store.enqueue(alice.clone(), frame_with_ttl(2, 3600)).unwrap();
@@ -429,7 +544,14 @@ mod tests {
         let dir = fresh_state_dir("badkey");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(KEY_FILE_NAME), b"too short").unwrap();
-        let err = PendingStore::load_or_create(&dir, TEST_CAP).unwrap_err();
+        let err = PendingStore::load_or_create(
+            &dir,
+            TEST_CAP,
+            TEST_MAX_PEERS,
+            TEST_MAX_FRAMES,
+            TEST_MAX_BYTES,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -438,7 +560,7 @@ mod tests {
     fn tampered_pending_file_refuses_to_load() {
         let dir = fresh_state_dir("tampered");
         {
-            let mut store = PendingStore::load_or_create(&dir, TEST_CAP).unwrap();
+            let mut store = open(&dir, TEST_CAP);
             store.enqueue(vec![0x11; 33], frame_with_ttl(0xAA, 3600)).unwrap();
         }
         let path = dir.join(PENDING_FILE_NAME);
@@ -446,7 +568,14 @@ mod tests {
         let mid = (bytes.len() - 1).max(encrypted_file::NONCE_LEN);
         bytes[mid] ^= 0x01;
         fs::write(&path, bytes).unwrap();
-        let err = PendingStore::load_or_create(&dir, TEST_CAP).unwrap_err();
+        let err = PendingStore::load_or_create(
+            &dir,
+            TEST_CAP,
+            TEST_MAX_PEERS,
+            TEST_MAX_FRAMES,
+            TEST_MAX_BYTES,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("decrypt") || err.kind() == ErrorKind::InvalidData,
             "unexpected error: {err}",
@@ -457,10 +586,132 @@ mod tests {
     #[test]
     fn empty_dir_starts_empty() {
         let dir = fresh_state_dir("empty");
-        let store = PendingStore::load_or_create(&dir, TEST_CAP).unwrap();
+        let store = open(&dir, TEST_CAP);
         assert_eq!(store.total_frames(), 0);
         assert!(dir.join(KEY_FILE_NAME).exists());
         assert!(!dir.join(PENDING_FILE_NAME).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_distinct_peer_cap_refuses_new_to_ids() {
+        // An attacker picking a fresh fabricated `to_id` per frame is
+        // bounded by the distinct-peer cap regardless of how few
+        // frames each queue holds.
+        let dir = fresh_state_dir("globalpeers");
+        let mut store =
+            PendingStore::load_or_create(&dir, TEST_CAP, 3, TEST_MAX_FRAMES, TEST_MAX_BYTES)
+                .unwrap();
+        for i in 0..3u8 {
+            assert_eq!(
+                store
+                    .enqueue(vec![i; 33], frame_with_ttl(i, 3600))
+                    .unwrap(),
+                EnqueueOutcome::Stored,
+            );
+        }
+        // 4th distinct peer is refused — fail closed, store unchanged.
+        assert_eq!(
+            store
+                .enqueue(vec![0xFF; 33], frame_with_ttl(0xFF, 3600))
+                .unwrap(),
+            EnqueueOutcome::RejectedGlobalCap,
+        );
+        assert_eq!(store.peers_with_queues(), 3);
+        // An already-known peer can still enqueue (up to its per-peer
+        // cap) — the distinct-peer cap only gates *new* queues.
+        assert_eq!(
+            store.enqueue(vec![0u8; 33], frame_with_ttl(1, 3600)).unwrap(),
+            EnqueueOutcome::Stored,
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_frame_count_cap_refuses_overflow() {
+        // Total frame count is hard-bounded even when no single
+        // per-peer queue is full.
+        let dir = fresh_state_dir("globalframes");
+        let mut store =
+            PendingStore::load_or_create(&dir, TEST_CAP, TEST_MAX_PEERS, 4, TEST_MAX_BYTES)
+                .unwrap();
+        // Two peers, two frames each — exactly fills the global cap.
+        for p in 0..2u8 {
+            for f in 0..2u8 {
+                assert_eq!(
+                    store
+                        .enqueue(vec![p; 33], frame_with_ttl(f, 3600))
+                        .unwrap(),
+                    EnqueueOutcome::Stored,
+                );
+            }
+        }
+        assert_eq!(store.total_frames(), 4);
+        // One more frame to an existing peer (not at its per-peer
+        // cap) is refused by the global frame-count cap.
+        assert_eq!(
+            store.enqueue(vec![0u8; 33], frame_with_ttl(9, 3600)).unwrap(),
+            EnqueueOutcome::RejectedGlobalCap,
+        );
+        assert_eq!(store.total_frames(), 4);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_byte_cap_refuses_overflow() {
+        // Total queued bytes are hard-bounded. `frame_with_ttl`
+        // produces 64-byte frames; a 200-byte cap admits 3 of them.
+        let dir = fresh_state_dir("globalbytes");
+        let mut store =
+            PendingStore::load_or_create(&dir, TEST_CAP, TEST_MAX_PEERS, TEST_MAX_FRAMES, 200)
+                .unwrap();
+        for i in 0..3u8 {
+            assert_eq!(
+                store
+                    .enqueue(vec![i; 33], frame_with_ttl(i, 3600))
+                    .unwrap(),
+                EnqueueOutcome::Stored,
+            );
+        }
+        // 4th 64-byte frame would push past 200 bytes — refused.
+        assert_eq!(
+            store
+                .enqueue(vec![0xAB; 33], frame_with_ttl(0xAB, 3600))
+                .unwrap(),
+            EnqueueOutcome::RejectedGlobalCap,
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_peer_rotation_still_works_at_global_byte_cap() {
+        // A peer whose own queue is full can still rotate (evict
+        // oldest, push newest) without tripping the global byte cap —
+        // the reclaimed bytes are accounted for.
+        let dir = fresh_state_dir("globalrotate");
+        // per-peer cap 2, byte cap exactly 2 frames' worth (128).
+        let mut store =
+            PendingStore::load_or_create(&dir, 2, TEST_MAX_PEERS, TEST_MAX_FRAMES, 128).unwrap();
+        let alice = vec![0xAA; 33];
+        assert_eq!(
+            store.enqueue(alice.clone(), frame_with_ttl(1, 3600)).unwrap(),
+            EnqueueOutcome::Stored,
+        );
+        assert_eq!(
+            store.enqueue(alice.clone(), frame_with_ttl(2, 3600)).unwrap(),
+            EnqueueOutcome::Stored,
+        );
+        // Queue is at its per-peer cap and the store is at the byte
+        // cap — but this enqueue evicts the oldest first, so it is
+        // a rotation, not growth: it must still succeed.
+        assert_eq!(
+            store.enqueue(alice.clone(), frame_with_ttl(3, 3600)).unwrap(),
+            EnqueueOutcome::Stored,
+        );
+        let drained = store.drain(&alice).unwrap();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].bytes()[0], 2);
+        assert_eq!(drained[1].bytes()[0], 3);
         let _ = fs::remove_dir_all(&dir);
     }
 }

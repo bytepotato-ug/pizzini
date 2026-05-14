@@ -18,8 +18,8 @@ mod hashcash;
 mod store;
 pub use hashcash::{hashcash_compute, hashcash_verify, HASHCASH_DEFAULT_BITS};
 pub use store::{
-    extract_bundle_verify_key, DeviceStore, EncryptResult, SealReceived, DELIVERY_TOKEN_LEN,
-    DELIVERY_TOKEN_NONCE_LEN, DELIVERY_TOKEN_SIG_LEN, DELIVERY_TOKEN_TTL_SECS,
+    extract_bundle_verify_key, DeviceStore, EncryptResult, SealReceiveError, SealReceived,
+    DELIVERY_TOKEN_LEN, DELIVERY_TOKEN_NONCE_LEN, DELIVERY_TOKEN_SIG_LEN, DELIVERY_TOKEN_TTL_SECS,
     DELIVERY_TOKEN_VERIFY_KEY_LEN,
 };
 
@@ -517,6 +517,11 @@ pub unsafe extern "C" fn pizzini_store_ensure_sender_certificate(
     unsafe { copy_or_size_out(&bytes, out_buf, out_buf_cap, out_len) }
 }
 
+/// Wire size of a `message_id`: a 16-byte opaque identifier the host
+/// mints per message and the relay never sees (it rides inside the
+/// USMC contents header).
+pub const PIZZINI_MESSAGE_ID_LEN: usize = 16;
+
 /// Sealed-sender SEND. Wraps `plaintext` in a libsignal ratchet
 /// ciphertext, prefixes the 16-byte `message_id` and 1-byte `is_prekey`
 /// at the USMC layer, seals to `peer_identity_pub`, and writes the wire
@@ -525,7 +530,8 @@ pub unsafe extern "C" fn pizzini_store_ensure_sender_certificate(
 ///
 /// # Safety
 /// All non-null pointers must describe valid slices of the declared sizes.
-/// `message_id` must point to exactly 16 readable bytes.
+/// `message_id_16` must point to `message_id_len` readable bytes, and
+/// `message_id_len` must equal `PIZZINI_MESSAGE_ID_LEN`.
 #[allow(clippy::too_many_arguments)]
 #[no_mangle]
 pub unsafe extern "C" fn pizzini_store_seal_send(
@@ -533,6 +539,7 @@ pub unsafe extern "C" fn pizzini_store_seal_send(
     peer_identity: *const u8,
     peer_identity_len: usize,
     message_id_16: *const u8,
+    message_id_len: usize,
     plaintext: *const u8,
     plaintext_len: usize,
     out_sealed: *mut u8,
@@ -548,12 +555,17 @@ pub unsafe extern "C" fn pizzini_store_seal_send(
     {
         return PIZZINI_ERR_INVALID_ARG;
     }
+    // The 16-byte length is now passed explicitly so the boundary can
+    // reject a short buffer instead of trusting a hard-coded `16`.
+    if message_id_len != PIZZINI_MESSAGE_ID_LEN {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
     // SAFETY: preconditions asserted.
     let s = unsafe { &mut *store };
     let peer = unsafe { std::slice::from_raw_parts(peer_identity, peer_identity_len) };
     let pt = unsafe { std::slice::from_raw_parts(plaintext, plaintext_len) };
-    let msg_id_slice = unsafe { std::slice::from_raw_parts(message_id_16, 16) };
-    let mut msg_id = [0u8; 16];
+    let msg_id_slice = unsafe { std::slice::from_raw_parts(message_id_16, message_id_len) };
+    let mut msg_id = [0u8; PIZZINI_MESSAGE_ID_LEN];
     msg_id.copy_from_slice(msg_id_slice);
     let bytes = match s.seal_send(peer, &msg_id, pt) {
         Ok(b) => b,
@@ -600,19 +612,32 @@ pub unsafe extern "C" fn pizzini_store_mint_delivery_token(
 /// Writes 32 bytes to `out_hash_32`.
 ///
 /// # Safety
-/// `input` must point to `input_len` readable bytes; `out_hash_32`
-/// must point to 32 writable bytes.
+/// `input` must point to `input_len` readable bytes; it may be NULL
+/// only when `input_len == 0`. `out_hash_32` must point to 32 writable
+/// bytes.
 #[no_mangle]
 pub unsafe extern "C" fn pizzini_blake3_hash(
     input: *const u8,
     input_len: usize,
     out_hash_32: *mut u8,
 ) -> i32 {
-    if input.is_null() || out_hash_32.is_null() {
+    if out_hash_32.is_null() {
         return PIZZINI_ERR_INVALID_ARG;
     }
-    // SAFETY: caller asserted input/output validity.
-    let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
+    // A zero-length input is legitimate — BLAKE3 of the empty string is
+    // well-defined — and Swift's `Data().withUnsafeBytes` yields a NULL
+    // baseAddress for empty `Data`. NULL with a non-zero len is a caller
+    // bug. Mirrors `pizzini_argon2id_derive`'s `pass_len == 0` handling.
+    if input.is_null() && input_len != 0 {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // SAFETY: caller asserted input/output validity; an empty slice is
+    // substituted rather than calling `from_raw_parts(null, 0)`.
+    let bytes = if input_len == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(input, input_len) }
+    };
     let hash = blake3::hash(bytes);
     unsafe {
         std::ptr::copy_nonoverlapping(hash.as_bytes().as_ptr(), out_hash_32, 32);
@@ -1233,6 +1258,13 @@ pub unsafe extern "C" fn pizzini_bundle_extract_verify_key(
 /// own protocol overhead). Sizing a retry buffer to this bound is
 /// always sufficient.
 ///
+/// Returns `PIZZINI_ERR_BAD_SIGNATURE` when the bytes are
+/// attacker-attributable — the sealed-sender certificate fails to
+/// validate against the claimed contact's pinned identity, or the
+/// claimed sender is not a known contact. Returns `PIZZINI_ERR_INTERNAL`
+/// for every other failure (parse errors, ratchet errors, store I/O),
+/// which is deliberately indistinguishable from benign corruption.
+///
 /// # Safety
 /// All non-null pointers must describe valid slices of the declared sizes.
 /// `out_message_id_16` must point to 16 writable bytes.
@@ -1287,9 +1319,17 @@ pub unsafe extern "C" fn pizzini_store_seal_receive(
     // Caps satisfy the upper bounds, so the actual lengths after
     // `seal_receive` will fit by construction. Now do the destructive
     // ratchet step.
+    //
+    // A cert-validation failure or unknown-sender contact-gate
+    // rejection is attacker-attributable — the relay or a paired peer
+    // handed us forged/unauthorized bytes — so it surfaces as
+    // `PIZZINI_ERR_BAD_SIGNATURE`, distinct from a generic internal
+    // error. The host may still choose to keep the user-facing surface
+    // indistinguishable, but the FFI contract carries the truth.
     let received = match s.seal_receive(sealed_bytes) {
         Ok(r) => r,
-        Err(_) => return PIZZINI_ERR_INTERNAL,
+        Err(SealReceiveError::BadSignature(_)) => return PIZZINI_ERR_BAD_SIGNATURE,
+        Err(SealReceiveError::Internal(_)) => return PIZZINI_ERR_INTERNAL,
     };
     let sender_len = received.sender_identity_pub.len();
     let plaintext_len = received.plaintext.len();
@@ -1348,12 +1388,15 @@ pub const PIZZINI_DISTRIBUTION_ID_LEN: usize = 16;
 ///
 /// # Safety
 /// `store` and `distribution_id_16` must be non-null;
-/// `distribution_id_16` must point to exactly 16 readable bytes.
+/// `distribution_id_16` must point to `distribution_id_len` readable
+/// bytes, and `distribution_id_len` must equal
+/// `PIZZINI_DISTRIBUTION_ID_LEN`.
 #[allow(clippy::too_many_arguments)]
 #[no_mangle]
 pub unsafe extern "C" fn pizzini_store_sender_key_distribution_create(
     store: *mut store::DeviceStore,
     distribution_id_16: *const u8,
+    distribution_id_len: usize,
     out_skdm: *mut u8,
     out_skdm_cap: usize,
     out_skdm_len: *mut usize,
@@ -1365,9 +1408,14 @@ pub unsafe extern "C" fn pizzini_store_sender_key_distribution_create(
     {
         return PIZZINI_ERR_INVALID_ARG;
     }
+    // The 16-byte length is now passed explicitly so the boundary can
+    // reject a short buffer instead of trusting a hard-coded constant.
+    if distribution_id_len != PIZZINI_DISTRIBUTION_ID_LEN {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
     // SAFETY: caller asserted preconditions above.
     let s = unsafe { &mut *store };
-    let id_slice = unsafe { std::slice::from_raw_parts(distribution_id_16, PIZZINI_DISTRIBUTION_ID_LEN) };
+    let id_slice = unsafe { std::slice::from_raw_parts(distribution_id_16, distribution_id_len) };
     let mut distribution_id = [0u8; PIZZINI_DISTRIBUTION_ID_LEN];
     distribution_id.copy_from_slice(id_slice);
     let skdm = match s.sender_key_distribution_create(distribution_id) {
@@ -1386,7 +1434,9 @@ pub unsafe extern "C" fn pizzini_store_sender_key_distribution_create(
 ///
 /// # Safety
 /// All pointers must be non-null and refer to memory of the declared
-/// sizes; `out_distribution_id_16` must point to 16 writable bytes.
+/// sizes; `out_distribution_id_16` must point to
+/// `out_distribution_id_cap` writable bytes, and `out_distribution_id_cap`
+/// must equal `PIZZINI_DISTRIBUTION_ID_LEN`.
 #[allow(clippy::too_many_arguments)]
 #[no_mangle]
 pub unsafe extern "C" fn pizzini_store_sender_key_distribution_process(
@@ -1396,12 +1446,18 @@ pub unsafe extern "C" fn pizzini_store_sender_key_distribution_process(
     skdm: *const u8,
     skdm_len: usize,
     out_distribution_id_16: *mut u8,
+    out_distribution_id_cap: usize,
 ) -> i32 {
     if store.is_null()
         || sender_identity.is_null()
         || skdm.is_null()
         || out_distribution_id_16.is_null()
     {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
+    // The 16-byte output length is now passed explicitly so the boundary
+    // can reject a short buffer instead of trusting a hard-coded constant.
+    if out_distribution_id_cap != PIZZINI_DISTRIBUTION_ID_LEN {
         return PIZZINI_ERR_INVALID_ARG;
     }
     // SAFETY: caller asserted preconditions.
@@ -1428,12 +1484,15 @@ pub unsafe extern "C" fn pizzini_store_sender_key_distribution_process(
 ///
 /// # Safety
 /// All pointers must be non-null and refer to memory of the declared
-/// sizes; `distribution_id_16` must point to exactly 16 readable bytes.
+/// sizes; `distribution_id_16` must point to `distribution_id_len`
+/// readable bytes, and `distribution_id_len` must equal
+/// `PIZZINI_DISTRIBUTION_ID_LEN`.
 #[allow(clippy::too_many_arguments)]
 #[no_mangle]
 pub unsafe extern "C" fn pizzini_store_group_encrypt(
     store: *mut store::DeviceStore,
     distribution_id_16: *const u8,
+    distribution_id_len: usize,
     plaintext: *const u8,
     plaintext_len: usize,
     out_ciphertext: *mut u8,
@@ -1448,9 +1507,14 @@ pub unsafe extern "C" fn pizzini_store_group_encrypt(
     {
         return PIZZINI_ERR_INVALID_ARG;
     }
+    // The 16-byte length is now passed explicitly so the boundary can
+    // reject a short buffer instead of trusting a hard-coded constant.
+    if distribution_id_len != PIZZINI_DISTRIBUTION_ID_LEN {
+        return PIZZINI_ERR_INVALID_ARG;
+    }
     // SAFETY: caller asserted preconditions.
     let s = unsafe { &mut *store };
-    let id_slice = unsafe { std::slice::from_raw_parts(distribution_id_16, PIZZINI_DISTRIBUTION_ID_LEN) };
+    let id_slice = unsafe { std::slice::from_raw_parts(distribution_id_16, distribution_id_len) };
     let mut distribution_id = [0u8; PIZZINI_DISTRIBUTION_ID_LEN];
     distribution_id.copy_from_slice(id_slice);
     let pt = unsafe { std::slice::from_raw_parts(plaintext, plaintext_len) };
@@ -1876,7 +1940,7 @@ mod tests {
             pizzini_store_seal_send(
                 alice,
                 bob_id.as_ptr(), bob_id.len(),
-                msg_id.as_ptr(),
+                msg_id.as_ptr(), msg_id.len(),
                 plaintext.as_ptr(), plaintext.len(),
                 sealed.as_mut_ptr(), sealed.len(), &mut sealed_len,
             )
@@ -1954,19 +2018,35 @@ mod tests {
     // finding numbering — fix-review N-004. Renamed so a future maintainer
     // grepping for the F-XX they care about lands on the right test.
 
-    /// `pizzini_blake3_hash` MUST reject a NULL input pointer with
-    /// `INVALID_ARG`, even when `input_len == 0`. The doc comment on the
-    /// symbol promises this; this test pins the contract so a future
-    /// refactor that "treats len=0 as a valid empty slice" doesn't slip
-    /// in. Surface 7 (FFI), independent of the audit's specific findings.
+    /// `pizzini_blake3_hash` MUST treat `(NULL, 0)` as the empty input
+    /// and hash it — BLAKE3 of the empty string is well-defined, and
+    /// Swift's `Data().withUnsafeBytes` yields a NULL baseAddress for
+    /// empty `Data`. A NULL pointer with a non-zero length is still a
+    /// caller bug and MUST be rejected with `INVALID_ARG`. Surface 7
+    /// (FFI).
     #[test]
-    fn pizzini_blake3_hash_rejects_null_input_pointer() {
+    fn pizzini_blake3_hash_accepts_null_zero_length_input() {
+        // (NULL, 0) hashes the empty slice and succeeds.
         let mut out = [0u8; 32];
         let rc = unsafe {
             pizzini_blake3_hash(std::ptr::null(), 0, out.as_mut_ptr())
         };
-        // Code says null input -> INVALID_ARG per the if-guard.
-        assert_eq!(rc, PIZZINI_ERR_INVALID_ARG, "null input slipped past check");
+        assert_eq!(rc, PIZZINI_OK, "(null, 0) must hash the empty input");
+        assert_eq!(
+            out,
+            *blake3::hash(&[]).as_bytes(),
+            "(null, 0) must produce BLAKE3 of the empty string",
+        );
+
+        // NULL with a non-zero length is still a caller bug.
+        let mut out2 = [0u8; 32];
+        let rc2 = unsafe {
+            pizzini_blake3_hash(std::ptr::null(), 1, out2.as_mut_ptr())
+        };
+        assert_eq!(
+            rc2, PIZZINI_ERR_INVALID_ARG,
+            "null input with non-zero len slipped past check",
+        );
     }
 
     // ───── Argon2id FFI ─────────────────────────────────────────────────
@@ -2201,7 +2281,7 @@ mod tests {
             pizzini_store_seal_send(
                 alice,
                 bob_id.as_ptr(), bob_id.len(),
-                msg_id.as_ptr(),
+                msg_id.as_ptr(), msg_id.len(),
                 plaintext.as_ptr(), plaintext.len(),
                 sealed.as_mut_ptr(), sealed.len(), &mut sealed_len,
             )

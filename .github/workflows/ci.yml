@@ -60,7 +60,13 @@ jobs:
         with:
           toolchain: "1.84.0"
       - name: Install cargo-audit
-        run: cargo install --locked cargo-audit --version "^0.21"
+        # `^0.21` could not parse newer RustSec advisory-db TOML
+        # frontmatter (e.g. RUSTSEC-2026-0073) and errored out loading
+        # the database — turning this gate red on every commit
+        # regardless of our dep tree. `^0.22` ships the updated
+        # `rustsec` parser. Bump deliberately when the parser falls
+        # behind the advisory-db format again.
+        run: cargo install --locked cargo-audit --version "^0.22"
       - name: cargo audit --deny warnings
         run: cargo audit --deny warnings
 

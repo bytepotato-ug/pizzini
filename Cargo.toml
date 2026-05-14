@@ -19,3 +19,10 @@ overflow-checks = true
 
 [profile.release.package."*"]
 opt-level = 3
+
+# A Rust panic must never unwind across the `extern "C"` FFI boundary
+# into the Swift runtime. `panic = "abort"` is set on every profile —
+# not release-only — so a debug XCFramework build cannot reintroduce
+# cross-FFI unwinding regardless of the toolchain version in use.
+[profile.dev]
+panic = "abort"

@@ -46,6 +46,42 @@ final class ChatStore: NSObject {
     /// entry. `nil` until the first STATUS_RESPONSE lands.
     var relayStatus: RelayStatus?
 
+    /// Verdict of comparing the running relay's reported
+    /// `binarySha256` against the verified transparency log. Computed
+    /// in `relayClient(_:didReceiveStatus:)` on every reconnect — NOT
+    /// merely on demand in the Settings view — so it is an
+    /// enforceable signal, not just badge state. The actual
+    /// enforcement ACTION (disconnect / block sends / signed grace
+    /// window) is decision-gated on policy; see the
+    /// `AUDIT-DECISION-NEEDED` marker in `didReceiveStatus`.
+    enum RelayAttestationVerdict: Sendable, Equatable {
+        /// No STATUS_RESPONSE yet, or no operator verify key is
+        /// configured in this build — verification has not run.
+        case notEvaluated
+        /// The reported binary SHA appears in a verified, signed
+        /// transparency-log entry. The relay is running an audited
+        /// build.
+        case verified
+        /// A non-empty verified log was available and the reported
+        /// binary SHA does NOT appear in it. Either a tampered
+        /// binary or a deploy the operator has not yet signed into
+        /// the log.
+        case mismatch
+        /// The transparency log could not be verified at all — empty
+        /// cache, blocked/failed fetch, no signed entries. The client
+        /// cannot tell whether this relay is audited. This is NOT
+        /// equivalent to `verified` — an adversary who simply blocks
+        /// the log fetch must not silently downgrade the client to
+        /// "looks fine."
+        case unverifiable
+    }
+
+    /// Latest per-reconnect attestation verdict. Drives both the
+    /// Settings badge and (once the enforcement policy is decided)
+    /// the interruption path. `.notEvaluated` until the first
+    /// STATUS_RESPONSE is compared against the log.
+    private(set) var relayAttestationVerdict: RelayAttestationVerdict = .notEvaluated
+
     /// Re-pair UX: set true after the user explicitly resets their
     /// identity via Settings → Reset everything. Drives a one-shot
     /// alert in `ContactsListView` that tells them anyone who had
@@ -104,6 +140,31 @@ final class ChatStore: NSObject {
     /// — there's no out-of-module consumer).
     var outbox: OutboxStore
     private(set) var initError: String?
+
+    /// True when `Storage.bootstrap()` failed because no derivable key
+    /// can decrypt the on-disk database, OR a cold-load query against
+    /// an opened store threw. In either case the app must NOT present
+    /// a running chat surface against `AppState()` defaults — the
+    /// in-memory security posture would be weaker than what is
+    /// persisted on disk, and an empty chat list would be
+    /// indistinguishable from a fresh install while the user's real
+    /// (encrypted, intact) state sits on disk. `ContentView` keys its
+    /// recoverable-error banner off `initError`; this flag additionally
+    /// gates `ChatStore.init` from installing observers / connecting
+    /// the relay against the half-initialised defaults. A benign
+    /// schema-downgrade self-heals inside `SQLiteStorage.bootstrap`
+    /// and never sets this.
+    private(set) var unrecoverableStorageState: Bool = false
+
+    /// True when the most recent `duressWipe()` could NOT confirm
+    /// every key-material delete (e.g. a Keychain delete returned a
+    /// non-success `OSStatus` because the device was in a
+    /// locked-after-first-unlock state). The duress flow's contract
+    /// is cryptographic erasure; it must not silently report a
+    /// completed wipe while a usable decryption path may survive.
+    /// `ContentView` can surface this so the user knows to retry the
+    /// wipe rather than trusting it landed.
+    private(set) var duressWipeIncomplete: Bool = false
 
     /// In-memory ring buffer of recent group-flow events. NOT
     /// persisted — this is a runtime diagnostic, not an audit log.
@@ -370,6 +431,38 @@ final class ChatStore: NSObject {
             forKey: Self.identityResetBannerPendingDefaultsKey,
         )
         super.init()
+        // Unrecoverable storage state — refuse to come up against
+        // half-initialised defaults. Two causes, both meaning the
+        // in-memory graph is NOT a faithful picture of what is on
+        // disk:
+        //   1. `Storage.bootstrap()` failed because no derivable key
+        //      opens the on-disk DB (SE key handle gone, tampered
+        //      material) — `SQLiteStorage.shared` is nil, every
+        //      Storage accessor degrades to `AppState()` defaults.
+        //   2. A cold-load query against an opened store threw (torn
+        //      WAL, `SQLITE_CORRUPT`) — `loadAppState`/`loadOutbox`
+        //      returned defaults but the real data is intact on disk.
+        // In either case constructing a live ChatStore — connecting
+        // the relay under a defaults posture, installing scene
+        // observers, registering a push token — would present a
+        // running surface weaker than what is persisted. Set
+        // `initError` (so ContentView's existing recoverable-error
+        // banner shows, which already suppresses onboarding) and the
+        // `unrecoverableStorageState` flag, then stop: no relay, no
+        // observers, no badge write. A benign schema-downgrade
+        // self-heals inside `SQLiteStorage.bootstrap` and never
+        // reaches here.
+        if Storage.unrecoverableKeyMaterialFailure {
+            self.unrecoverableStorageState = true
+            self.initError = "Storage key material is unavailable — the database on this "
+                + "device cannot be opened."
+            return
+        }
+        if let coldLoadError = Storage.lastColdLoadError {
+            self.unrecoverableStorageState = true
+            self.initError = "Stored data could not be read: \(coldLoadError)"
+            return
+        }
         // Migration: pre-fleet installs persisted dev hosts like
         // `127.0.0.1`. Per `docs/relay-architecture.md` D1 every
         // production relay is Tor-only, so a legitimate BYO value
@@ -513,12 +606,31 @@ final class ChatStore: NSObject {
                 pzLog(
                     "[pizzini.translog] refreshed: \(fresh.count) entries, \(TransparencyLog.verifiedCount(in: fresh)) verified",
                 )
+                // The log just changed — re-evaluate the attestation
+                // verdict against the cached relay status. The
+                // STATUS_RESPONSE and the log fetch race on reconnect;
+                // whichever lands second must recompute so the stored
+                // enforceable signal reflects both inputs.
+                if let status = self.relayStatus {
+                    self.relayAttestationVerdict = self.computeAttestationVerdict(for: status)
+                    pzLog("[pizzini] relay attestation verdict (post-log-refresh): \(self.relayAttestationVerdict)")
+                }
             } catch let err as TransparencyLog.FetchError {
                 self.transparencyLogError = err
                 pzLog("[pizzini.translog] fetch failed: \(err)")
+                // A failed fetch means we still cannot verify — if a
+                // status is cached, downgrade the verdict accordingly
+                // rather than leaving a stale `.verified` standing on
+                // a log we can no longer confirm.
+                if let status = self.relayStatus {
+                    self.relayAttestationVerdict = self.computeAttestationVerdict(for: status)
+                }
             } catch {
                 self.transparencyLogError = .http(error.localizedDescription)
                 pzLog("[pizzini.translog] fetch failed (unexpected): \(error)")
+                if let status = self.relayStatus {
+                    self.relayAttestationVerdict = self.computeAttestationVerdict(for: status)
+                }
             }
         }
     }
@@ -1508,6 +1620,13 @@ final class ChatStore: NSObject {
                 plaintext: inner,
             )
         } catch {
+            // `mintV2DeliveryToken` already advanced + persisted the
+            // chain cursor before this call. The encrypt failed, so
+            // no frame carrying `v2Token.index` will reach the relay
+            // layer — roll the cursor back so a transient failure
+            // doesn't permanently burn a chain index and pull
+            // rotation / exhaustion forward.
+            rollbackV2DeliveryToken(forContactAt: idx, mintedIndex: v2Token.index)
             appendSystem("Encrypt failed: \(error)", to: idx)
             return
         }
@@ -1528,8 +1647,49 @@ final class ChatStore: NSObject {
         )
         outbox.entries[messageId] = entry
         Storage.upsertOutboxEntry(entry)
-        persistSession()
+        // Fail-closed: `encryptSealed` advanced the ratchet. If that
+        // advance is not durably committed, the sealed bytes must NOT
+        // reach the wire — a later cold launch would rehydrate from a
+        // stale snapshot behind the wire state. Abort the broadcast
+        // and mark the row failed (a terminal state — `shouldRetry`
+        // returns false for it): the ciphertext was produced from
+        // ratchet state that will not survive a relaunch, so it can
+        // never be safely re-broadcast. Recovery is a fresh user-
+        // initiated send, which re-encrypts from scratch once the
+        // session persists cleanly again.
+        guard persistSession() else {
+            entry.failedAt = now
+            outbox.entries[messageId] = entry
+            Storage.upsertOutboxEntry(entry)
+            appendSystem(
+                "Couldn't save secure state — message not sent. Send it again.",
+                to: idx,
+            )
+            diagLog(
+                "send",
+                "v2 SEND → \(short(contact.identityPub)) ABORTED — session persist failed; "
+                + "msgid=\(hex(messageId)) queued failed (no ciphertext on wire)"
+            )
+            return
+        }
         let readyCount = readyRelays.count
+        // AUDIT-DECISION-NEEDED: the SAME `wireToken` (chain_id, index,
+        // value) is broadcast to every relay in the fanout. A v2
+        // delivery token is a pure bearer credential — the relay's
+        // `check_delivery_token` authenticates it against the
+        // recipient's chain state with no binding to the submitting
+        // connection. So a malicious relay in the fleet can replay an
+        // observed token to the sibling relays: the first acceptance
+        // advances `last_index`, and the sender's genuine fan-out copy
+        // then loses to `OutOfRange` on those siblings — a silent
+        // message-suppression / censorship primitive against the
+        // exact adversary the multi-relay fanout exists to neutralise.
+        // The fix is a wire-protocol change (per-relay token minting,
+        // or binding token presentation to the HELLO-authenticated
+        // connection, or a per-relay chain namespace) and needs
+        // design sign-off before it can land — `from_id` binding is
+        // not available because SEND is sealed-sender. Left as the
+        // current broadcast pending that decision.
         broadcastToRelays {
             $0.sendSealed(
                 toPeer: contact.identityPub,
@@ -1820,7 +1980,26 @@ final class ChatStore: NSObject {
                 )
                 outbox.entries[messageId] = entry
                 Storage.upsertOutboxEntry(entry)
-                persistSession()
+                // Fail-closed: encryptSealed advanced the ratchet. If
+                // the advance is not durably committed, this chunk's
+                // ciphertext must not reach the wire. Mark the chunk's
+                // outbox row failed (terminal) and abort the rest of
+                // the attachment — ciphertext produced from ratchet
+                // state that will not survive a relaunch can never be
+                // safely re-broadcast, so recovery is a fresh user-
+                // initiated re-send of the attachment, which
+                // re-encrypts every chunk afresh.
+                guard persistSession() else {
+                    entry.failedAt = now
+                    outbox.entries[messageId] = entry
+                    Storage.upsertOutboxEntry(entry)
+                    appendSystem(
+                        "Couldn't save secure state at chunk \(i)/\(chunks.count) — "
+                        + "attachment not sent. Send it again.",
+                        to: idx,
+                    )
+                    return
+                }
                 broadcastToRelays {
                     $0.sendSealed(
                         toPeer: contactId,
@@ -2016,6 +2195,36 @@ final class ChatStore: NSObject {
         return token
     }
 
+    /// Roll the contact's outbound-chain cursor back by one and
+    /// re-persist. Called on the encrypt-failure path AFTER a
+    /// `mintV2DeliveryToken` advanced the cursor but the frame that
+    /// would have carried that index was never handed to the relay
+    /// layer. Without this, every transient `encryptSealed` failure
+    /// permanently shortens the chain by one and brings `shouldRotate`
+    /// / exhaustion forward. Invariant: a chain index is consumed iff
+    /// a frame carrying it actually reached the wire path.
+    ///
+    /// Only rolls back if the chain still looks exactly like the one
+    /// the token was minted from (`nextIndex == mintedIndex + 1`, i.e.
+    /// no other mint advanced the cursor in between) — a defensive
+    /// no-op otherwise.
+    @MainActor
+    private func rollbackV2DeliveryToken(forContactAt idx: Int, mintedIndex: Int) {
+        guard idx >= 0, idx < state.contacts.count,
+              var chain = state.contacts[idx].outboundTokenChain,
+              chain.nextIndex == mintedIndex + 1 else {
+            return
+        }
+        chain.nextIndex = mintedIndex
+        state.contacts[idx].outboundTokenChain = chain
+        Storage.upsertContact(state.contacts[idx])
+        diagLog(
+            "send",
+            "rolled back v2 token idx=\(mintedIndex) for "
+            + "\(short(state.contacts[idx].identityPub)) — encrypt failed, index not consumed"
+        )
+    }
+
     /// Audit M1: recipient side. Sender's outbound chain to us hit
     /// the 80 % `shouldRotate` threshold and they've asked us to
     /// mint + ship a fresh one. Identical to the
@@ -2130,7 +2339,15 @@ final class ChatStore: NSObject {
             pzLog("[pizzini] chainRefreshRequest encrypt failed: \(error)")
             return false
         }
-        persistSession()
+        // Fail-closed: the ratchet advanced in `encryptSealed`; if the
+        // advance is not durably committed, the sealed bytes must not
+        // reach the wire. Return false (no broadcast) — the caller
+        // treats that the same as an encrypt failure and the reactive
+        // refresh path retries later.
+        guard persistSession() else {
+            pzLog("[pizzini] chainRefreshRequest ABORTED — session persist failed; no ciphertext on wire")
+            return false
+        }
         let wireToken = HashChainToken.encode(v2Token)
         broadcastToRelays {
             $0.sendSealed(
@@ -2174,7 +2391,23 @@ final class ChatStore: NSObject {
                 messageId: Self.makeMessageId(),
                 plaintext: inner,
             )
-            persistSession()
+            // Fail-closed: the ratchet advanced in `encryptSealed`. If
+            // the advance is not durably committed, the sealed frame
+            // must not reach the wire — return false so the caller
+            // treats it like an encrypt failure and the retry path
+            // re-serves the chain once Keychain writes recover. The
+            // `sendRegisterChain` broadcast above is harmless to leave
+            // standing (it carries no ratchet state — it just
+            // registers a root the relay will accept later).
+            guard persistSession() else {
+                diagLog(
+                    "chain",
+                    "chainSeedDelivery → \(short(peer)) ABORTED — session persist failed; "
+                    + "no ciphertext on wire"
+                )
+                _ = client
+                return false
+            }
             let fanout = readyRelays.count
             broadcastToRelays {
                 $0.sendChainSeedFrame(toPeer: peer, sealedCiphertext: sealed)
@@ -2460,10 +2693,17 @@ final class ChatStore: NSObject {
                 messageId: Self.makeMessageId(),
                 plaintext: inner,
             )
-            // Same root-cause guard as `emitAck`: persist before the
-            // socket write so a force-quit between encrypt and the
-            // next chat send can't roll the ratchet back.
-            persistSession()
+            // Fail-closed: the ratchet advanced in `encryptSealed`. If
+            // the advance is not durably committed, do NOT put the
+            // receipt on the wire — a cold launch would rehydrate
+            // behind the wire state. Read receipts are not in the
+            // retry walk, so the recovery is the next mark-read after
+            // Keychain writes recover (it ships a fresh receipt
+            // covering the same-or-newer highestMessageId).
+            guard persistSession() else {
+                pzLog("[pizzini] read-receipt ABORTED — session persist failed; no ciphertext on wire")
+                return
+            }
             broadcastToRelays {
                 $0.sendSealed(
                     toPeer: contact.identityPub,
@@ -2674,30 +2914,51 @@ final class ChatStore: NSObject {
     /// enters the duress passcode at the lock screen.
     ///
     /// Steps, in order:
-    ///   1. Snapshot the UX settings (relay host, Face ID, panic
-    ///      mode, etc.) so the post-wipe app looks lived-in rather
-    ///      than freshly installed (design Q2 → option b).
+    ///   1. Snapshot `state` so `Storage.eraseAndReinitialize` can
+    ///      carry a narrow allowlist of UX prefs into the post-wipe
+    ///      `AppState`. **What actually survives the duress path is
+    ///      only `relayHost` plus the screenshot-self-test cache
+    ///      (`qrBlockEffective` / `qrBlockTestedOSVersion`).** Face ID,
+    ///      auto-lock, panic mode, and `onboardingCompleted` are
+    ///      DELIBERATELY reset to fresh-install defaults — preserving
+    ///      a Face-ID-on or onboarded posture would make the device
+    ///      show a lock screen / skip onboarding, which a genuinely
+    ///      fresh install does not, breaking the "indistinguishable
+    ///      from a clean install" goal. (The brief and README still
+    ///      describe a larger preserved set; the code here is
+    ///      authoritative — see `Storage.eraseAndReinitialize`.)
     ///   2. Tear down the relay socket + retry timer so no in-
     ///      flight encrypt can reach the network with the soon-to-
     ///      be-orphaned session.
-    ///   3. `Storage.eraseAndReinitialize` — deletes the SQLCipher
-    ///      file, the Secure-Enclave key, the Argon2id salt + params
-    ///      + wrapped seed, and the AppPasscode slots; re-opens a
-    ///      fresh empty DB.
+    ///   3. `Storage.eraseAndReinitialize` — erases the key material
+    ///      FIRST (the single irreversible step), then the AppPasscode
+    ///      slots, the attachment tree, the SQLCipher file, and the
+    ///      `UserDefaults.standard` + App Group persistence surfaces;
+    ///      re-opens a fresh empty DB.
     ///   4. Reset every in-memory ChatStore field to its cold-launch
     ///      defaults: load AppState + outbox from the fresh DB, mint
-    ///      a brand-new libsignal identity, reconnect the relay
-    ///      under the new identity.
+    ///      a brand-new libsignal identity.
     ///
-    /// Returns synchronously — the caller (LockManager) drops the
-    /// lock + the UI shows the now-empty chat list. From a
-    /// coercer's perspective the timing is indistinguishable from a
-    /// real unlock (Argon2id verify dominates wall-clock either way).
+    /// Returns synchronously. The caller (`LockOverlayView`) pads the
+    /// passcode-submit → lock-drop latency to a fixed ceiling so the
+    /// duress unlock is not wall-clock-distinguishable from a real
+    /// one — the wipe below is fast but NOT constant-time, so the
+    /// padding lives in the caller, not here.
     func duressWipe() {
         let snapshot = state
         teardownRelay()
         session = nil
         myIdentityPublicCached = nil
+        // Reset the identity-reset banner flag BEFORE the wipe. The
+        // setter's `didSet` writes the value to `UserDefaults.standard`;
+        // doing it here means that write lands first and is then
+        // dropped along with the rest of the standard persistent
+        // domain by `eraseAndReinitialize` step 5. Net result: the
+        // in-memory mirror is `false` AND the standard defaults plist
+        // is absent — byte-identical to a never-launched fresh
+        // install. (Setting it AFTER the wipe would re-create the
+        // plist with a single key, a telltale a fresh install lacks.)
+        identityResetBannerPending = false
         // Drop the APNs device token under the OLD identity. iOS mints
         // a fresh device token on the next registerForRemoteNotifications
         // call — so a relay-adjacent adversary who recorded the
@@ -2706,11 +2967,23 @@ final class ChatStore: NSObject {
         // The next onboarding pass (which the duress wipe routes the
         // user through, by clearing `onboardingCompleted`) re-registers.
         UIApplication.shared.unregisterForRemoteNotifications()
-        Storage.eraseAndReinitialize(preserving: snapshot, clearPasscodes: true)
+        let wipeComplete = Storage.eraseAndReinitialize(preserving: snapshot, clearPasscodes: true)
+        // Cryptographic erasure must not be silently reported as done
+        // when a key-material delete could not be confirmed.
+        // `eraseAndReinitialize` already retried the erase a bounded
+        // number of times (see its step 1); this records whether it
+        // still came up short. Deliberately NOT surfaced as a visible
+        // banner: the duress path routes the user straight into the
+        // fresh-install onboarding surface, and a "wipe incomplete"
+        // banner there would itself be a duress tell a coercer could
+        // read. Kept as queryable state for diagnostics / a future
+        // safe-context recovery prompt.
+        duressWipeIncomplete = !wipeComplete
         state = Storage.loadAppState()
         outbox = Storage.loadOutbox()
         diagEvents.removeAll()
         keychainWriteFailing = false
+        unrecoverableStorageState = false
         initError = nil
         do {
             let s = try Storage.loadOrCreateSession()
@@ -2727,7 +3000,18 @@ final class ChatStore: NSObject {
         } catch {
             initError = String(describing: error)
         }
-        refreshAppBadge()
+        // Deliberately do NOT call `refreshAppBadge()` here. That
+        // method rewrites every App Group key — including a
+        // `mainAppActiveEpoch` wall-clock timestamp — which would
+        // immediately repopulate the App Group plist that step 5 of
+        // `eraseAndReinitialize` just dropped, leaving a "something
+        // happened on this device at time T" residue. The post-wipe
+        // App Group plist must stay absent (matching a never-launched
+        // fresh install) until the user re-onboards. We still clear
+        // the visible app-icon badge directly — a stale pre-wipe
+        // count on the home screen would itself be a telltale — but
+        // via `setBadgeCount` only, touching no App Group key.
+        UNUserNotificationCenter.current().setBadgeCount(0) { _ in }
     }
 
     // MARK: - Helpers
@@ -2780,12 +3064,24 @@ final class ChatStore: NSObject {
     /// senderKeyDistributionCreate / group_decrypt — those advance
     /// libsignal's internal stores the same way 1:1 ratchet
     /// operations do.
-    func persistSession() {
+    ///
+    /// **Returns `true` only if the blob was durably committed.** The
+    /// send pipeline is fail-closed on this: a call site that has just
+    /// `encryptSealed`'d (advancing the ratchet) MUST check the return
+    /// value and abort the wire send on `false` — emitting ciphertext
+    /// from ratchet state that is not yet on disk means a later cold
+    /// launch rehydrates from a stale snapshot behind the wire state.
+    /// Non-send call sites (post-decrypt flushes, per-row persists)
+    /// may ignore the result; the `keychainWriteFailing` banner still
+    /// warns the user about chronic failure either way.
+    @discardableResult
+    func persistSession() -> Bool {
         persistSessionImpl()
     }
 
-    private func persistSessionImpl() {
-        guard let session else { return }
+    @discardableResult
+    private func persistSessionImpl() -> Bool {
+        guard let session else { return false }
         do {
             try Storage.persist(session: session)
             // Clear the warning the moment a write succeeds. Chronic
@@ -2794,13 +3090,18 @@ final class ChatStore: NSObject {
             if keychainWriteFailing {
                 keychainWriteFailing = false
             }
+            return true
         } catch {
             // F-602: surface to UI via the published flag. Storage layer
             // already NSLog'd the underlying errSec status — the banner
             // tells the user to investigate before they trust further
             // ✓✓ indicators (which would otherwise be lying about
-            // delivery in the worst case).
+            // delivery in the worst case). The `false` return is the
+            // fail-closed signal: send call sites abort the wire send
+            // so no ciphertext from un-committed ratchet state leaves
+            // the device.
             keychainWriteFailing = true
+            return false
         }
     }
 
@@ -3135,7 +3436,72 @@ extension ChatStore: RelayClientDelegate {
                 "[pizzini] relay attest: v\(status.crateVersion) commit=\(status.gitSha)"
                     + " dirty=\(status.gitDirty) sha256=\(self.hex(status.binarySha256))",
             )
+            // Actually COMPUTE the transparency-log comparison here,
+            // on every STATUS_RESPONSE — not lazily inside the
+            // Settings view body. The result is stored in
+            // `relayAttestationVerdict` as an enforceable signal so a
+            // future enforcement gate has a verdict to read without
+            // re-deriving it. This closes the "verification is real
+            // but advisory-only / discoverable only via Settings"
+            // gap: the verdict now exists at the connection layer.
+            let verdict = self.computeAttestationVerdict(for: status)
+            self.relayAttestationVerdict = verdict
+            pzLog("[pizzini] relay attestation verdict: \(verdict)")
+
+            // AUDIT-DECISION-NEEDED: enforcement action on a non-clean
+            // verdict. The verdict above is now computed and stored,
+            // but the protective ACTION is gated on a policy decision
+            // that is not ours to make unilaterally:
+            //   - `.mismatch`  — hard-disconnect this relay? block
+            //     only sends (let receives drain)? or allow a signed,
+            //     time-bounded grace window so a legitimately-new
+            //     deploy that is not yet in the log isn't a
+            //     bootstrapping deadlock?
+            //   - `.unverifiable` — should an un-checkable relay feed
+            //     the SAME interruption path as a mismatched one
+            //     (fail-closed), or only a louder warning?
+            // Both options change user-visible behaviour and the BYO /
+            // new-deploy story, so the enforcement is left as this
+            // marked stub. When the policy lands, the action hooks in
+            // here, keyed off `verdict`; `RelayAttestationView` and
+            // `FAQView` copy must be reconciled with whatever is
+            // chosen (the FAQ currently claims the app "refuses to
+            // talk to" an unattested relay, which is not yet true).
+            switch verdict {
+            case .mismatch, .unverifiable:
+                pzLog("[pizzini] relay attestation \(verdict) — enforcement policy pending (AUDIT-DECISION-NEEDED)")
+            case .verified, .notEvaluated:
+                break
+            }
         }
+    }
+
+    /// Compare a relay's reported `binarySha256` against the verified
+    /// transparency log and return an enforceable verdict. Fail-closed
+    /// on the "could not verify" case: an empty or unfetchable log is
+    /// `.unverifiable`, never silently treated as `.verified` — an
+    /// adversary who merely blocks the log fetch must not be able to
+    /// downgrade the client to "looks fine."
+    @MainActor
+    private func computeAttestationVerdict(for status: RelayStatus) -> RelayAttestationVerdict {
+        // No operator verify key in this build → verification can't
+        // run at all. `.notEvaluated` (the Settings view already
+        // renders an explicit "not configured" state for this).
+        guard TransparencyLogConfig.operatorVerifyKey != nil else {
+            return .notEvaluated
+        }
+        // An empty / no-valid-entries log means we have nothing to
+        // check against — the fetch was blocked, the cache is empty,
+        // or every entry failed signature verification. Cannot
+        // conclude "verified"; this is the fail-open hole the audit
+        // flagged, so it is its own verdict.
+        guard TransparencyLog.verifiedCount(in: transparencyLog) > 0 else {
+            return .unverifiable
+        }
+        let reportedSha = hex(status.binarySha256)
+        return TransparencyLog.contains(binarySha256Hex: reportedSha, in: transparencyLog)
+            ? .verified
+            : .mismatch
     }
 
 
@@ -3611,12 +3977,18 @@ extension ChatStore: RelayClientDelegate {
                 messageId: Self.makeMessageId(),
                 plaintext: inner,
             )
-            // CRITICAL: persist immediately. encryptSealed advanced the
-            // ratchet; if the app is killed before the next persistAll,
-            // the on-disk session rolls back one step and our NEXT
-            // outbound encrypt reuses an already-consumed counter that
-            // the peer will reject as DuplicatedMessage.
-            persistSession()
+            // Fail-closed: encryptSealed advanced the ratchet. If that
+            // advance is not durably committed, the ACK must NOT reach
+            // the wire — emitting it would mean a later cold launch
+            // rehydrates a session behind the wire state, and the
+            // NEXT outbound encrypt reuses an already-consumed
+            // counter. Aborting just means no ✓✓ this round; the
+            // peer's retry re-triggers an ACK once Keychain writes
+            // recover, with the ratchet state consistent again.
+            guard persistSession() else {
+                pzLog("[pizzini] ACK to \(self.short(toPeer)) ABORTED — session persist failed; no ciphertext on wire")
+                return
+            }
             // D3 fanout: the sender of the SEND we're acking may be
             // connected to any subset of the fleet. Fan the ACK out
             // so they get ✓✓ via whichever relay's queue holds their

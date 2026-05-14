@@ -228,13 +228,19 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
               already in your contacts. Both sides must scan each \
               other.
             • Hashcash. First-contact bundle requests cost ~1 second \
-              of CPU work. Trivial on a phone, expensive in bulk.
+              of CPU work — a small speed bump, not a hard wall \
+              (a single core can still grind out proofs in bulk). \
+              The load-bearing flood control is the relay-side \
+              per-recipient cap on accepted bundle requests, which \
+              is enforced per recipient per hour and persists across \
+              relay restarts.
             • Recipient-issued hash-chain tokens. Once you’ve paired, \
               your contact gets a 32-byte chain seed minted by you \
               and registered with the relay; every send derives one \
-              token from that seed. A hostile peer can’t forge tokens \
-              without your seed, and the relay rejects any unsigned \
-              attempt.
+              token from that seed by hashing along a chain. A \
+              hostile peer can’t produce a valid token without your \
+              seed, and the relay rejects any token that doesn’t \
+              hash-chain to your registered chain root.
 
             Together these mean a leaked relay address is annoying \
             (your friends might switch) but not catastrophic — \
@@ -242,27 +248,31 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
 
             What if I don’t want to run my own?
 
-            Today: there is no centrally-operated production Pizzini \
-            relay. The app starts pointing at 127.0.0.1, which only \
-            works in the simulator. On a real phone you have to type \
-            in the address of whichever relay your community is \
-            running.
+            You don’t have to. Pizzini ships with a bundled fleet of \
+            three production Tor onion services (Germany, Norway, \
+            USA). On a fresh install Settings → Relay host is empty, \
+            and an empty host means your phone fans out across all \
+            three bundled relays in parallel — the first to deliver \
+            wins, the others drop the duplicate. No setup, no \
+            address to type in.
 
-            Roadmap: the README plans stateless relays in multiple \
-            jurisdictions, deployed initially in Switzerland, Iceland, \
-            and Panama, reachable over Tor onion services rather than \
-            clearnet IPs. Combined with the post-audit “multi-relay \
-            client fanout” feature, an app would be able to try \
-            several relays in parallel so a single one going offline \
-            wouldn’t take your group offline. None of that \
-            infrastructure is live yet; production rollout is queued \
-            behind the first external audit.
+            Typing an address into Settings → Relay host is a BYO \
+            override: it replaces the bundled fleet with the single \
+            relay you name. Clearing the field returns you to the \
+            bundled-fleet fanout.
+
+            One operator currently runs all three bundled relays, so \
+            the “multiple jurisdictions” framing is about resilience \
+            to a single relay going offline, not yet about \
+            independent operators — see “The transparency log” below \
+            and the project README for where that stands.
 
             Today’s constraint to keep in mind: there is no \
             inter-relay federation. Both peers in a conversation must \
-            connect to the same relay instance for messages to route. \
-            If your group changes relays, everyone updates Settings → \
-            Relay host on the same day.
+            be reachable through a shared relay for messages to \
+            route — the bundled fleet satisfies that for everyone on \
+            a default install. If your group moves to a BYO relay, \
+            everyone updates Settings → Relay host on the same day.
             """
         case .qrCode:
             return """
@@ -285,51 +295,62 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             """
         case .screenCapture:
             return """
-            Pizzini does not allow screenshots of itself. The whole \
-            app is wrapped in an iOS secure-text-entry container, \
-            which the screenshot pipeline renders as a solid black \
-            frame. Screenshots, screen recording, AirPlay mirroring, \
-            and remote-screen-sharing tools all see black instead of \
-            your chats, contacts, settings, or QR. This is on by \
-            default and there is no toggle for it — there is no \
-            legitimate reason to screenshot a private end-to-end-\
-            encrypted conversation.
+            Pizzini does not allow screenshots of itself. Two \
+            separate pipelines handle two separate threats, because \
+            iOS treats them differently:
 
-            The technique is not a documented Apple API. Apple uses \
-            the same secure-text-entry behaviour for password fields \
-            and has been narrowing it across recent iOS releases. \
-            Pizzini runs a self-test on first launch and after every \
-            iOS major-version update to confirm the trick still \
-            works on your device. If the test ever fails on a \
-            future iOS, Pizzini falls back gracefully (no wrap, no \
-            broken accessibility) and surfaces a "Screenshot \
+            • Screenshots and the multitasking snapshot. The app \
+              window is masked at the Core Animation layer so that \
+              the screenshot pipeline — and the snapshot iOS takes \
+              when you switch away — captures a solid black frame \
+              instead of your chats, contacts, settings, or QR. \
+              This is on by default and there is no toggle for it; \
+              there is no legitimate reason to screenshot a private \
+              end-to-end-encrypted conversation.
+            • Live screen recording and external displays. A \
+              recording or a mirrored display is a different iOS \
+              pipeline that the screenshot mask does not cover, so \
+              Pizzini watches the recording/external-display flags \
+              and drops an opaque shield over the live screen while \
+              either is active. The toolbar stays interactive so \
+              you can navigate out without exposing what was on \
+              screen. AirPlay mirroring counts as a recording, as \
+              do Lightning/USB-C-attached monitors and the iPad \
+              Stage Manager external display.
+
+            The screenshot mask is not a documented Apple API. It \
+            relies on the secure-text-entry behaviour Apple uses \
+            for password fields, which Apple has been narrowing \
+            across recent iOS releases. Pizzini runs a self-test on \
+            first launch and after every iOS major-version update \
+            to confirm the technique still works on your device. If \
+            the test ever fails on a future iOS, Pizzini falls back \
+            gracefully (the mask is simply not installed; \
+            accessibility is unaffected, since the mask never \
+            touched the view hierarchy) and surfaces a "Screenshot \
             protection — degraded" notice in Settings so you know \
             screenshots are no longer blocked. We'd ship a fix in \
             the next release.
 
-            On top of the wrap, Pizzini also covers the live screen \
-            with an opaque shield while iOS reports a screen \
-            recording or an external display. The toolbar stays \
-            interactive so you can navigate out without seeing what \
-            was on screen. AirPlay mirroring counts as a recording. \
-            The same path catches Lightning/USB-C-attached monitors \
-            and the iPad Stage Manager external display.
-
-            What the wrap CANNOT mask: iOS-rendered chrome that \
+            What the mask CANNOT cover: iOS-rendered chrome that \
             draws above the app. System permission alerts ("Pizzini \
             wants to use the camera"), the title and message in iOS \
             confirmation dialogs and alerts, and the status-bar \
             elements (clock, wifi, battery) at the very top of every \
             screen are drawn by the system at a layer outside the \
-            wrap. The multitasking snapshot itself is covered \
-            separately by Pizzini's privacy shield, which is also a \
-            solid black view.
+            app window. The multitasking snapshot is covered by the \
+            same window mask; on top of that, a separate privacy- \
+            shield window is raised as you switch away so the \
+            keyboard's QuickType predictions are dismissed before \
+            iOS captures the snapshot.
 
-            Costs of the wrap, so you know up front: long-press → \
-            Copy on a chat bubble does not work, VoiceOver inside the \
-            wrapped views is degraded, and dictation may not work on \
-            the message composer. These trade-offs are accepted by \
-            default; we don't ship a switch to turn them off.
+            How the mask is built, so you know what it does and \
+            doesn't touch: it is a Core Animation–level reparent of \
+            the app window, not a wrapper around the SwiftUI views. \
+            The view hierarchy is left untouched, so long-press → \
+            Copy on a chat bubble, VoiceOver, and dictation in the \
+            message composer all keep working normally. The mask is \
+            on by default and there is no switch to turn it off.
 
             What none of this defends against:
 
@@ -396,8 +417,13 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
 
             What the warning does NOT mean: Pizzini does not refuse \
             to run, does not phone home, and does not log who you \
-            are. The detection is local-only; it goes to the system \
-            log for forensic review and to this banner. We \
+            are. The detection is local-only and leaves no trail you \
+            could pull back later: the only record of an integrity \
+            flag is the in-app banner and the Settings notice. The \
+            underlying log call is deliberately emitted at a debug \
+            level that release builds of iOS drop, so a coercer who \
+            later reads a sysdiagnose cannot even confirm the check \
+            fired on your device. We \
             deliberately do not block jailbroken devices because some \
             users in our threat model use jailbroken phones for good \
             reasons (research, accessibility, privacy tooling iOS \
@@ -668,8 +694,20 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             return """
             Pizzini publishes a signed transparency log of every relay \
             binary the operator deploys. Each entry is signed with the \
-            operator’s Ed25519 key, so a relay running an unannounced \
-            build is detectable — your app refuses to talk to it.
+            operator’s Ed25519 key. On every reconnect your app asks \
+            the relay for its running binary’s SHA-256 and checks it \
+            against the log, so a relay running an unannounced build \
+            is detected. The result is surfaced in Settings → Relay \
+            attestation as one of three states: verified (the binary \
+            matches a signed log entry), mismatch (the binary is in \
+            no signed entry — possibly a tampered build), or \
+            “could not verify” (the log fetch failed or was blocked, \
+            shown amber rather than as a neutral “not loaded yet”). \
+            Today this is detection-and-surfacing only: the app does \
+            NOT yet automatically refuse to talk to a mismatched or \
+            unverifiable relay — enforcement is pending a policy \
+            decision. Until then, check the attestation screen if it \
+            matters to you.
 
             Today the log is hosted on GitHub at \
             raw.githubusercontent.com. Your phone fetches it over \

@@ -334,6 +334,18 @@ public final class RelayClient: @unchecked Sendable {
             } else {
                 stopCoverTimer()
             }
+            // End-to-end dial budget: the watchdog only guards the
+            // in-flight `.connecting` / `.connectingToTor` phases.
+            // Any terminal transition — reached `.connected`, gave up
+            // with `.failed`, or socket `.idle` — means the dial is
+            // over, so disarm it. `.connecting` / `.connectingToTor`
+            // leave it running (the dial is still progressing).
+            switch state {
+            case .connected, .failed, .idle:
+                cancelDialDeadline()
+            case .connecting, .connectingToTor:
+                break
+            }
         }
     }
 
@@ -379,6 +391,30 @@ public final class RelayClient: @unchecked Sendable {
     private static let maxSocksRetries: Int = 4
     private static let socksRetryDelay: TimeInterval = 5
 
+    /// End-to-end wall-clock budget for a single `connect(to:)` →
+    /// `.connected` transition on the .onion path. The per-phase
+    /// deadlines (`TorController.bootstrapHardDeadline` 4 min,
+    /// `hsFetchDeadline` 90 s, plus `maxSocksRetries × socksRetryDelay`
+    /// = 20 s of SOCKS backoff) are sequential and additive — without
+    /// a shared cap, a hostile network that slow-drips each phase can
+    /// keep the user on a non-error "Connecting…" state for >5.5 min.
+    /// This budget guarantees a single bounded, documented time to an
+    /// actionable `.failed` state regardless of how the per-phase
+    /// deadlines compose. It is sized as a BACKSTOP *above* the
+    /// additive sum of the per-phase deadlines (bootstrap 240 s +
+    /// HSFETCH 90 s + SOCKS retries ~20 s ≈ 350 s) so it only ever
+    /// trips on a genuinely stuck dial — never on an honest-but-slow
+    /// cold start — while still staying inside "the user thinks the
+    /// app is broken".
+    private static let dialBudget: TimeInterval = 7 * 60
+    /// Watchdog enforcing `dialBudget`. Armed on the .onion path in
+    /// `connect(to:)`, fires once if the dial hasn't reached
+    /// `.connected` by the deadline, and is torn down on every
+    /// terminal transition (`.connected` / `.failed` / `.idle`) and
+    /// on `disconnect()`. Lives on `queue` like the cover timer so
+    /// all state mutation stays on the one serial queue.
+    private var dialDeadlineTimer: DispatchSourceTimer?
+
     public init(
         myIdentity: Data,
         myDeliveryTokenVerifyKey: Data,
@@ -411,6 +447,11 @@ public final class RelayClient: @unchecked Sendable {
         // on for the LAN-loopback test harness in
         // `RelayClientLanTests`.
         if let canonical = OnionHost.canonical(host) {
+            // Arm the single end-to-end dial budget before the
+            // multi-phase onion setup begins. Disarmed on the next
+            // terminal transition (see `state` didSet) or
+            // `disconnect()`.
+            armDialDeadline()
             startTorConnection(host: canonical, port: nwPort)
             return
         }
@@ -711,7 +752,22 @@ public final class RelayClient: @unchecked Sendable {
         targetHost: String,
         targetPort: UInt16
     ) {
-        let req = Socks5.connectRequest(host: targetHost, port: targetPort)
+        let req: Data
+        do {
+            req = try Socks5.connectRequest(host: targetHost, port: targetPort)
+        } catch {
+            // An over-length host can't be dialled — fail closed
+            // rather than abort. OnionHost.canonical gates every host
+            // into this path today, so this is a defence-in-depth
+            // surface, not a reachable user flow.
+            handleSocksFailure(
+                reason: "socks connect request: \(error)",
+                socksPort: socksPort,
+                targetHost: targetHost,
+                targetPort: targetPort
+            )
+            return
+        }
         conn.send(content: req, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
             if let error {
@@ -859,6 +915,10 @@ public final class RelayClient: @unchecked Sendable {
         }
         connection = nil
         readBuffer.removeAll()
+        // Drop the dial-budget watchdog — there's no dial in flight
+        // after a disconnect. `connect()` re-arms it for the next
+        // onion dial.
+        cancelDialDeadline()
     }
 
     /// SEND v2 — sealed envelope, sender-chosen TTL (clamped to 7 days
@@ -1136,6 +1196,52 @@ public final class RelayClient: @unchecked Sendable {
         }
         payload.append(random)
         writeFrame(payload, on: connection)
+    }
+
+    // ─── F-tor-01: end-to-end dial budget ─────────────────────────────
+
+    /// Arm the single wall-clock watchdog for the whole onion dial.
+    /// Idempotent — a fresh `connect()` cancels any prior timer
+    /// first. When it fires, the dial has spent the full `dialBudget`
+    /// across bootstrap + HSFETCH + SOCKS retries without reaching
+    /// `.connected`; surface `.failed` with a network-diagnostic
+    /// reason so the host's retry timer / Reconnect button picks it
+    /// up and the user gets an actionable state instead of an
+    /// indefinite "Connecting…".
+    private func armDialDeadline() {
+        cancelDialDeadline()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + Self.dialBudget)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            // Only the in-flight phases are still the watchdog's
+            // concern; a terminal state would already have cancelled
+            // this timer, but re-check defensively.
+            switch self.state {
+            case .connecting, .connectingToTor:
+                relayLog.error("dial: end-to-end budget of \(Int(Self.dialBudget))s exceeded — surfacing .failed")
+                // Tear down whatever connection / retry is in flight
+                // so a late SOCKS callback can't flip us back off
+                // `.failed`.
+                if let conn = self.connection {
+                    conn.stateUpdateHandler = nil
+                    conn.cancel()
+                }
+                self.connection = nil
+                self.state = .failed("network unreachable: onion dial exceeded \(Int(Self.dialBudget))s budget")
+            case .connected, .failed, .idle:
+                break
+            }
+        }
+        timer.resume()
+        dialDeadlineTimer = timer
+    }
+
+    /// Disarm the dial-budget watchdog. Called on every terminal
+    /// state transition and from `disconnect()`. Idempotent.
+    private func cancelDialDeadline() {
+        dialDeadlineTimer?.cancel()
+        dialDeadlineTimer = nil
     }
 
     private func scheduleRead() {

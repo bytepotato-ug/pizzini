@@ -333,15 +333,23 @@ struct ContentView: View {
     /// First-line headline for the integrity banner — names the most
     /// load-bearing detected condition. Order: jailbreak > dylib >
     /// debugger (debugger only surfaces in release per the monitor).
+    ///
+    /// The checks behind these flags are best-effort and easily evaded
+    /// (see `DeviceIntegrity.swift`'s header), so the headline reports
+    /// *indicators*, not a device verdict — it must never claim more
+    /// certainty than the detection can support. There is deliberately
+    /// no "device looks clean" counterpart: the absence of this banner
+    /// is not an affirmation, because a competent adversary produces no
+    /// indicators at all.
     private var integrityHeadline: String {
         if integrity.isJailbroken {
-            return "This device appears jailbroken"
+            return "Possible jailbreak indicators detected"
         }
         if integrity.hasSuspiciousDylib {
-            return "A debugging or hook framework is loaded"
+            return "A debugging or hook framework may be loaded"
         }
         if integrity.isDebuggerAttached {
-            return "A debugger is attached to Pizzini"
+            return "A debugger appears to be attached to Pizzini"
         }
         return "Device integrity warning"
     }
@@ -477,11 +485,15 @@ struct ProfileView: View {
     @State private var copyConfirmation = false
 
     /// Seconds until the `Copy as text` button's pasteboard entry
-    /// auto-expires. 5 min is the smallest window that comfortably
-    /// covers the realistic share flow (open messenger → find chat
-    /// → type a one-liner → paste) while still bounding clipboard
-    /// exposure for the user who copies and walks away.
-    static let pasteboardExpirySeconds: TimeInterval = 300
+    /// auto-expires. The card is written to the *system-wide*
+    /// pasteboard, which any other app on the device can read for as
+    /// long as it sits there — so the window is kept short. 60 s
+    /// covers a quick paste-and-go (switch to the messenger, paste)
+    /// while keeping the exposure window tight for the user who
+    /// copies and walks away. `expirationDate` is best-effort (some
+    /// iOS versions ignore it), so an app-side timer below clears the
+    /// pasteboard at the same deadline as a hard backstop.
+    static let pasteboardExpirySeconds: TimeInterval = 60
 
     var body: some View {
         ScrollView {
@@ -621,23 +633,25 @@ struct ProfileView: View {
         if let card {
             VStack(spacing: 8) {
                 Button {
-                    // localOnly + 5-minute expiration: keeps the identity
-                    // off Universal Clipboard (would otherwise sync to
-                    // every macOS device on the same iCloud account)
-                    // and auto-clears the system pasteboard if the user
-                    // forgets to paste-and-go.
+                    // This writes the identity card to
+                    // `UIPasteboard.general` — the SYSTEM-WIDE
+                    // pasteboard. `localOnly: true` only suppresses
+                    // Universal Clipboard sync to other devices on the
+                    // same iCloud account; it does NOT scope the write
+                    // to Pizzini. Any other app on this device can read
+                    // the card (e.g. on `UIPasteboard.changedNotification`)
+                    // until it is cleared. There is no app-private
+                    // pasteboard that survives a hand-off to a
+                    // third-party messenger, so this exposure is
+                    // inherent to the text-copy affordance — the window
+                    // is kept short and force-cleared instead.
                     //
-                    // 60 s (the prior value) was too short for the
-                    // realistic share flow — open the recipient app,
-                    // navigate to the right chat, type a quick
-                    // explanation, then paste. A user reported
-                    // copying their card, switching to messenger,
-                    // and finding "Nothing to paste" on the receiving
-                    // device because the system pasteboard had
-                    // auto-cleared between the two app switches.
-                    // 5 min covers the realistic flow and still
-                    // bounds exposure if the user puts the phone
-                    // down and forgets.
+                    // `expirationDate` asks iOS to drop the item after
+                    // the window, but iOS honours it inconsistently
+                    // across versions. The `asyncAfter` below clears
+                    // the pasteboard ourselves at the same deadline so
+                    // the card cannot outlive the stated window while
+                    // Pizzini is alive, regardless of the OS.
                     //
                     // Routed through `setObjects(_:localOnly:expirationDate:)`
                     // — the modern UIPasteboard write API. The prior code
@@ -676,6 +690,21 @@ struct ProfileView: View {
                         localOnly: true,
                         expirationDate: Date().addingTimeInterval(Self.pasteboardExpirySeconds),
                     )
+                    // Capture the generation counter from the write we
+                    // just made (a metadata-only accessor — does not
+                    // trigger the paste banner). At the expiry deadline
+                    // we clear the pasteboard ourselves, but only if it
+                    // hasn't changed since: if `changeCount` moved, the
+                    // user (or another app) replaced the contents and
+                    // wiping would destroy whatever they put there.
+                    let writeGeneration = UIPasteboard.general.changeCount
+                    DispatchQueue.main.asyncAfter(
+                        deadline: .now() + Self.pasteboardExpirySeconds
+                    ) {
+                        guard UIPasteboard.general.changeCount == writeGeneration else { return }
+                        UIPasteboard.general.items = []
+                        pzLog("[pizzini.paste] copy card: cleared expired pasteboard entry")
+                    }
                     pzLog(
                         "[pizzini.paste] copy card: wrote cardLen=\(cardLen)"
                         + " (no pasteboard read — would trigger Handoff banner)"
@@ -688,7 +717,7 @@ struct ProfileView: View {
                     Label(copyConfirmation ? "Copied" : "Copy as text", systemImage: copyConfirmation ? "checkmark" : "doc.on.doc")
                 }
                 .buttonStyle(.bordered)
-                Text("Pasting it into another app exposes your identity the same way a photo does. Use only with someone you'd hand the QR to.")
+                Text("This copies your identity to the device clipboard. Until it clears (about a minute), any other app on this device can read it — not just the one you paste into. Use only with someone you'd hand the QR to, and paste it right away.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .multilineTextAlignment(.center)

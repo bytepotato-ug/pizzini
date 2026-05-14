@@ -73,6 +73,12 @@ struct GroupChatView: View {
             }
             logSection
         }
+        // Cover group chat content during a screen recording or
+        // external display, exactly as the 1:1 `ChatView` does. Sits
+        // inside the NavigationStack's child view so the nav bar
+        // (search, gear) stays interactive — the user can pop back out
+        // without mirroring group messages to a TV.
+        .screenCaptureShielded()
     }
 
     private var logSection: some View {

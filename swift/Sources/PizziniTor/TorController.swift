@@ -1374,11 +1374,19 @@ public final class TorController: ObservableObject {
             return
         }
         torLog.notice("path: changed \(previous ?? "<nil>", privacy: .public) → \(fp, privacy: .public) — rotating circuits")
-        sendNewnymSignal()
-        NotificationCenter.default.post(
-            name: .pizziniTorNetworkPathChanged,
-            object: self,
-        )
+        // Await tor's acknowledgement of NEWNYM (or a short fixed
+        // grace period) BEFORE posting the redial notification. If
+        // the redial's fresh SOCKS5 dials began before tor honoured
+        // the rotation signal, the new streams could attach to a
+        // circuit built on the pre-change path — exactly the
+        // unlinkability the rotation exists to provide.
+        Task { @MainActor in
+            await self.sendNewnymSignalAndWait()
+            NotificationCenter.default.post(
+                name: .pizziniTorNetworkPathChanged,
+                object: self,
+            )
+        }
     }
 
     /// Pure decision: should a fingerprint transition fire a
@@ -1402,18 +1410,43 @@ public final class TorController: ObservableObject {
     /// relay-redial drops the SOCKS5 TCP socket which forces a new
     /// circuit on reconnect. NEWNYM is the right primitive here:
     /// SIGNAL RELOAD would also rotate guard-set selection logic
-    /// which is overkill for a wifi→cellular handoff. No-op if the
+    /// which is overkill for a wifi→cellular handoff.
+    ///
+    /// Returns only once tor has acknowledged the signal with `250`,
+    /// or after a short fixed grace period elapses without an ack —
+    /// the caller (`handlePathChange`) must not post its redial
+    /// notification until one of those happens, so the redial can't
+    /// race ahead of the rotation. No-op (returns immediately) if the
     /// control channel isn't currently authenticated.
-    private func sendNewnymSignal() {
+    private func sendNewnymSignalAndWait() async {
         guard let controller = torController, controller.isConnected else {
             torLog.debug("path: NEWNYM skipped — controller not connected")
             return
         }
-        controller.sendCommand("SIGNAL", arguments: ["NEWNYM"], data: nil) { @Sendable codes, _, stop in
-            let ok = codes.first?.intValue == 250
-            torLog.debug("path: NEWNYM \(ok ? "OK" : "rejected")")
-            stop.pointee = true
-            return true
+        // Grace period bound: if tor's control queue is wedged we
+        // still proceed with the redial rather than stall the
+        // path-change flow indefinitely. A redial after this bound is
+        // no worse than the pre-fix behaviour; the common case is a
+        // sub-millisecond `250` ack that resolves well inside it.
+        let gracePeriod: TimeInterval = 2
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            let single = SingleFire()
+            controller.sendCommand("SIGNAL", arguments: ["NEWNYM"], data: nil) { @Sendable codes, _, stop in
+                let ok = codes.first?.intValue == 250
+                torLog.debug("path: NEWNYM \(ok ? "OK" : "rejected")")
+                stop.pointee = true
+                if single.claim() {
+                    cont.resume()
+                }
+                return true
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(gracePeriod * 1_000_000_000))
+                if single.claim() {
+                    torLog.debug("path: NEWNYM ack not seen within \(Int(gracePeriod))s grace — proceeding with redial")
+                    cont.resume()
+                }
+            }
         }
     }
 
@@ -1517,14 +1550,24 @@ public final class TorController: ObservableObject {
         // `OnionTrafficOnly` flag (restricts the SOCKS proxy to
         // .onion targets — defence-in-depth in case RelayClient
         // ever forgets to honour `.hasSuffix(".onion")`).
+        // tor's stdout from the embedded daemon is captured by the
+        // iOS unified-log pipeline, so anything tor emits is
+        // recoverable from a `sysdiagnose`. `notice` includes
+        // per-connection / circuit lines; in a release build that is
+        // a forensic relay-activity timeline. Release builds get
+        // `err` only — tor still surfaces genuine startup failures
+        // but nothing per-connection. Debug builds keep `notice` for
+        // local cold-start debugging in Console.app.
+        #if DEBUG
+        let logDirective = "notice stdout"
+        #else
+        let logDirective = "err stdout"
+        #endif
         config.options = [
             // Loopback-only. No external interface should ever bind
             // tor's SOCKS port — RelayClient dials 127.0.0.1.
             "SocksPort": "127.0.0.1:\(Self.fixedSocksPort) OnionTrafficOnly",
-            // Suppress tor's stderr log spam in Release builds.
-            // `Log notice` keeps startup signal without dumping
-            // per-circuit debug noise into the system console.
-            "Log": "notice stdout",
+            "Log": logDirective,
             // Disable IPv6-only bridges and similar features that
             // would slow first-hop selection on iOS-typical networks.
             "ClientUseIPv6": "1",

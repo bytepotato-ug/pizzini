@@ -89,4 +89,21 @@ struct ScreenCaptureMonitorTests {
         monitor._testSetExternalDisplay(false)
         #expect(!monitor.hasExternalDisplay)
     }
+
+    /// Drives the screenshot-mask self-test end to end. `run()` is
+    /// exposed "for tests" but had no caller; this asserts it produces
+    /// a definite verdict without crashing. The simulator does not
+    /// honour `isSecureTextEntry` masking the way hardware does, so the
+    /// *value* is not asserted — only that the self-test resolves the
+    /// secure layer, renders its sentinel, samples the result, and
+    /// returns. A regression that breaks `resolveSecureLayer` or the
+    /// `drawHierarchy` probe surfaces here as a crash or a hang.
+    @Test("SecureScreenshotSelfTest.run() produces a verdict without crashing")
+    func selfTestRuns() {
+        let result = SecureScreenshotSelfTest.run()
+        // `Bool` is total — reaching this line at all is the assertion
+        // that `run()` did not crash or trap. Touch the value so the
+        // compiler cannot elide the call.
+        #expect(result == true || result == false)
+    }
 }

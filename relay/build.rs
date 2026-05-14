@@ -27,16 +27,39 @@ fn main() {
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=../.git/index");
 
-    let git_sha = run_git(&["rev-parse", "HEAD"]).unwrap_or_else(|| {
-        // Not-a-git-checkout fallback (e.g. building from a `cargo
-        // package` tarball). Make the absence loud so a release
-        // build is obviously not transparency-log-eligible.
-        "unknown".to_string()
-    });
-    let dirty = run_git(&["status", "--porcelain"])
-        .map(|s| if s.trim().is_empty() { "0" } else { "1" })
-        .unwrap_or("unknown")
-        .to_string();
+    // On the release profile the embedded provenance must be a
+    // deterministic function of the commit, never of the build
+    // host's git configuration (e.g. a `safe.directory` miss under
+    // a container bind-mount making `git` fail). A release build
+    // that cannot read its own commit refuses to build rather than
+    // baking the "unknown" sentinel — which would also change the
+    // binary digest and silently break the reproducible-build
+    // contract the transparency log depends on.
+    let is_release = std::env::var("PROFILE").as_deref() == Ok("release");
+    let git_sha = match run_git(&["rev-parse", "HEAD"]) {
+        Some(sha) => sha,
+        None if is_release => panic!(
+            "relay build.rs: `git rev-parse HEAD` failed on the release \
+             profile. The relay's transparency-log self-attestation requires \
+             a real commit sha; refusing to bake the \"unknown\" sentinel. If \
+             building inside a container over a bind-mount, run `git config \
+             --global --add safe.directory <repo>` first."
+        ),
+        // Not-a-git-checkout fallback for non-release builds (e.g.
+        // building from a `cargo package` tarball, or a dev build
+        // outside a checkout). Make the absence loud in the embedded
+        // value so it is obviously not transparency-log-eligible.
+        None => "unknown".to_string(),
+    };
+    let dirty = match run_git(&["status", "--porcelain"]) {
+        Some(s) => if s.trim().is_empty() { "0" } else { "1" }.to_string(),
+        None if is_release => panic!(
+            "relay build.rs: `git status --porcelain` failed on the release \
+             profile. Cannot determine whether the working tree is clean; \
+             refusing to bake the \"unknown\" sentinel."
+        ),
+        None => "unknown".to_string(),
+    };
 
     println!("cargo:rustc-env=PIZZINI_GIT_SHA={git_sha}");
     println!("cargo:rustc-env=PIZZINI_GIT_DIRTY={dirty}");

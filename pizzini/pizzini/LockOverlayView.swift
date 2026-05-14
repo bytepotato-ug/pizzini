@@ -164,10 +164,34 @@ struct LockOverlayView: View {
         }
     }
 
+    /// Fixed wall-clock ceiling, measured from the moment
+    /// `handlePasscodeOutcome` is entered to the moment the lock
+    /// drops. The duress branch runs a full cryptographic erasure
+    /// (Keychain wipes, DB unlink, attachment-tree delete, a fresh
+    /// Argon2id derivation + libsignal keygen in the re-bootstrap)
+    /// before it can drop the lock; a real unlock does almost nothing
+    /// before it drops the lock. Left unpadded, the duress unlock
+    /// takes visibly longer — a stopwatch-equipped coercer reads that
+    /// delta as "a duress passcode was just used." Padding BOTH the
+    /// real and the duress branch to this fixed ceiling makes the
+    /// passcode-submit → lock-drop latency statistically identical
+    /// for `.real` and `.duress`. The value must comfortably exceed
+    /// the worst-case `duressWipe()` wall-clock on the slowest
+    /// supported device.
+    private static let unlockLatencyCeiling: TimeInterval = 3.0
+
     private func handlePasscodeOutcome(_ outcome: LockManager.PasscodeOutcome) {
+        let start = CFAbsoluteTimeGetCurrent()
         switch outcome {
         case .unlocked:
-            lockManager.isPasscodeSheetPresented = false
+            // Pad to the fixed ceiling so a real unlock is not
+            // observably faster than a duress wipe. The pad runs as
+            // an async sleep — the sheet stays up (still showing the
+            // neutral passcode UI, no flash of contacts) until the
+            // ceiling elapses, then the lock drops.
+            dropLockAfterPadding(from: start) {
+                lockManager.isPasscodeSheetPresented = false
+            }
         case .duress:
             // **Order matters.** Wipe BEFORE dropping the lock so
             // the chat list view that mounts under the cleared
@@ -182,11 +206,42 @@ struct LockOverlayView: View {
             // arriving after the first cleared the passcode slots).
             lockManager.beginDuressWipe()
             store.duressWipe()
-            lockManager.unlockAfterDuress()
+            // The wipe is done; pad the *remaining* time to the same
+            // fixed ceiling the real-unlock branch pays, then drop
+            // the lock. If the wipe already overran the ceiling the
+            // pad is zero — the ceiling is sized so that is the rare
+            // case, not the norm.
+            dropLockAfterPadding(from: start) {
+                lockManager.unlockAfterDuress()
+            }
         case .wrong:
             // Sheet stays up; PasscodeEntryView shows the error
-            // and lets the user retry.
+            // and lets the user retry. No lock-drop event to pad —
+            // a `.wrong` entry is already observably distinct from
+            // `.real`/`.duress` (the app simply stays locked).
             break
+        }
+    }
+
+    /// Sleep until `unlockLatencyCeiling` has elapsed since `start`,
+    /// then run `drop` on the main actor. A non-blocking async pad —
+    /// the lock overlay + passcode sheet stay on screen (showing the
+    /// neutral passcode UI, never the real contacts) for the duration,
+    /// so the only thing the pad equalises is the wall-clock to the
+    /// lock-drop, not anything visible mid-pad.
+    private func dropLockAfterPadding(
+        from start: CFAbsoluteTime,
+        _ drop: @escaping () -> Void,
+    ) {
+        let elapsed = CFAbsoluteTimeGetCurrent() - start
+        let remaining = Self.unlockLatencyCeiling - elapsed
+        guard remaining > 0 else {
+            drop()
+            return
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+            drop()
         }
     }
 }

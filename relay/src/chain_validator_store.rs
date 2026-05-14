@@ -194,6 +194,22 @@ impl ChainValidatorStore {
         let delta = index - state.last_index;
         let mut current = *value;
         for _ in 0..delta {
+            // AUDIT-DECISION-NEEDED: the chain step is a bare
+            // `BLAKE3(value)` with no domain-separation tag and no
+            // `chain_id` binding, so chain isolation rests on seed
+            // entropy rather than on the hash construction. The
+            // audited remediation is a wire-format change to
+            // `BLAKE3(b"pizzini.chain-token.v2" || chain_id ||
+            // value)` — but it MUST match the iOS prover
+            // (`HashChainToken.applyHash`) bit-for-bit, and there is
+            // currently NO chain-version field anywhere in the wire
+            // token (`parse_v2_token`), the registration
+            // (`ChainRegistration`), or the stored state
+            // (`StoredEntry`) to gate old vs. new chains on. Changing
+            // the step unconditionally would invalidate every
+            // already-registered chain on both sides. This needs a
+            // versioning hook designed in first — do not change the
+            // hash step here without that.
             let out = blake3::hash(&current);
             current.copy_from_slice(out.as_bytes());
         }

@@ -432,7 +432,7 @@ public final class Session: @unchecked Sendable {
                         pizzini_store_seal_send(
                             handle,
                             peerPtr.bindMemory(to: UInt8.self).baseAddress, UInt(peer.count),
-                            idPtr.bindMemory(to: UInt8.self).baseAddress,
+                            idPtr.bindMemory(to: UInt8.self).baseAddress, UInt(messageId.count),
                             ptPtr.bindMemory(to: UInt8.self).baseAddress, UInt(plaintext.count),
                             outPtr.baseAddress, UInt(outPtr.count), &sealedLen
                         )
@@ -449,7 +449,7 @@ public final class Session: @unchecked Sendable {
                             pizzini_store_seal_send(
                                 handle,
                                 peerPtr.bindMemory(to: UInt8.self).baseAddress, UInt(peer.count),
-                                idPtr.bindMemory(to: UInt8.self).baseAddress,
+                                idPtr.bindMemory(to: UInt8.self).baseAddress, UInt(messageId.count),
                                 ptPtr.bindMemory(to: UInt8.self).baseAddress, UInt(plaintext.count),
                                 outPtr.baseAddress, UInt(outPtr.count), &sealedLen
                             )
@@ -597,7 +597,7 @@ public final class Session: @unchecked Sendable {
             distBytes.withUnsafeBufferPointer { distPtr in
                 pizzini_store_sender_key_distribution_create(
                     handle,
-                    distPtr.baseAddress,
+                    distPtr.baseAddress, UInt(distPtr.count),
                     buf, cap, len,
                 )
             }
@@ -624,7 +624,7 @@ public final class Session: @unchecked Sendable {
                         UInt(senderIdentity.count),
                         skdmPtr.bindMemory(to: UInt8.self).baseAddress,
                         UInt(skdm.count),
-                        distPtr.baseAddress,
+                        distPtr.baseAddress, UInt(distPtr.count),
                     )
                 }
             }
@@ -649,7 +649,7 @@ public final class Session: @unchecked Sendable {
                 plaintext.withUnsafeBytes { ptPtr -> Int32 in
                     pizzini_store_group_encrypt(
                         handle,
-                        distPtr.baseAddress,
+                        distPtr.baseAddress, UInt(distPtr.count),
                         ptPtr.bindMemory(to: UInt8.self).baseAddress,
                         UInt(plaintext.count),
                         buf, cap, len,

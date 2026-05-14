@@ -28,6 +28,13 @@
 #define PIZZINI_MSG_TYPE_WHISPER 1
 
 /**
+ * Wire size of a `message_id`: a 16-byte opaque identifier the host
+ * mints per message and the relay never sees (it rides inside the
+ * USMC contents header).
+ */
+#define PIZZINI_MESSAGE_ID_LEN 16
+
+/**
  * Wire size of one IdentityKey public half: 1-byte DJB type prefix +
  * 32-byte Curve25519 point. The SAS derivation rejects any input that
  * is not exactly this many bytes, on either side.
@@ -368,12 +375,14 @@ int32_t pizzini_store_ensure_sender_certificate(struct DeviceStore *store,
  *
  * # Safety
  * All non-null pointers must describe valid slices of the declared sizes.
- * `message_id` must point to exactly 16 readable bytes.
+ * `message_id_16` must point to `message_id_len` readable bytes, and
+ * `message_id_len` must equal `PIZZINI_MESSAGE_ID_LEN`.
  */
 int32_t pizzini_store_seal_send(struct DeviceStore *store,
                                 const uint8_t *peer_identity,
                                 uintptr_t peer_identity_len,
                                 const uint8_t *message_id_16,
+                                uintptr_t message_id_len,
                                 const uint8_t *plaintext,
                                 uintptr_t plaintext_len,
                                 uint8_t *out_sealed,
@@ -405,8 +414,9 @@ int32_t pizzini_store_mint_delivery_token(struct DeviceStore *store,
  * Writes 32 bytes to `out_hash_32`.
  *
  * # Safety
- * `input` must point to `input_len` readable bytes; `out_hash_32`
- * must point to 32 writable bytes.
+ * `input` must point to `input_len` readable bytes; it may be NULL
+ * only when `input_len == 0`. `out_hash_32` must point to 32 writable
+ * bytes.
  */
 int32_t pizzini_blake3_hash(const uint8_t *input, uintptr_t input_len, uint8_t *out_hash_32);
 
@@ -654,6 +664,13 @@ int32_t pizzini_bundle_extract_verify_key(const uint8_t *bundle,
  * own protocol overhead). Sizing a retry buffer to this bound is
  * always sufficient.
  *
+ * Returns `PIZZINI_ERR_BAD_SIGNATURE` when the bytes are
+ * attacker-attributable — the sealed-sender certificate fails to
+ * validate against the claimed contact's pinned identity, or the
+ * claimed sender is not a known contact. Returns `PIZZINI_ERR_INTERNAL`
+ * for every other failure (parse errors, ratchet errors, store I/O),
+ * which is deliberately indistinguishable from benign corruption.
+ *
  * # Safety
  * All non-null pointers must describe valid slices of the declared sizes.
  * `out_message_id_16` must point to 16 writable bytes.
@@ -678,10 +695,13 @@ int32_t pizzini_store_seal_receive(struct DeviceStore *store,
  *
  * # Safety
  * `store` and `distribution_id_16` must be non-null;
- * `distribution_id_16` must point to exactly 16 readable bytes.
+ * `distribution_id_16` must point to `distribution_id_len` readable
+ * bytes, and `distribution_id_len` must equal
+ * `PIZZINI_DISTRIBUTION_ID_LEN`.
  */
 int32_t pizzini_store_sender_key_distribution_create(struct DeviceStore *store,
                                                      const uint8_t *distribution_id_16,
+                                                     uintptr_t distribution_id_len,
                                                      uint8_t *out_skdm,
                                                      uintptr_t out_skdm_cap,
                                                      uintptr_t *out_skdm_len);
@@ -695,14 +715,17 @@ int32_t pizzini_store_sender_key_distribution_create(struct DeviceStore *store,
  *
  * # Safety
  * All pointers must be non-null and refer to memory of the declared
- * sizes; `out_distribution_id_16` must point to 16 writable bytes.
+ * sizes; `out_distribution_id_16` must point to
+ * `out_distribution_id_cap` writable bytes, and `out_distribution_id_cap`
+ * must equal `PIZZINI_DISTRIBUTION_ID_LEN`.
  */
 int32_t pizzini_store_sender_key_distribution_process(struct DeviceStore *store,
                                                       const uint8_t *sender_identity,
                                                       uintptr_t sender_identity_len,
                                                       const uint8_t *skdm,
                                                       uintptr_t skdm_len,
-                                                      uint8_t *out_distribution_id_16);
+                                                      uint8_t *out_distribution_id_16,
+                                                      uintptr_t out_distribution_id_cap);
 
 /**
  * Encrypt `plaintext` for the chain identified by `distribution_id`.
@@ -714,10 +737,13 @@ int32_t pizzini_store_sender_key_distribution_process(struct DeviceStore *store,
  *
  * # Safety
  * All pointers must be non-null and refer to memory of the declared
- * sizes; `distribution_id_16` must point to exactly 16 readable bytes.
+ * sizes; `distribution_id_16` must point to `distribution_id_len`
+ * readable bytes, and `distribution_id_len` must equal
+ * `PIZZINI_DISTRIBUTION_ID_LEN`.
  */
 int32_t pizzini_store_group_encrypt(struct DeviceStore *store,
                                     const uint8_t *distribution_id_16,
+                                    uintptr_t distribution_id_len,
                                     const uint8_t *plaintext,
                                     uintptr_t plaintext_len,
                                     uint8_t *out_ciphertext,

@@ -279,6 +279,31 @@ pub struct SealReceived {
     pub is_duplicate: bool,
 }
 
+/// Failure modes of `seal_receive`, kept distinct so the FFI can hand
+/// the host an attacker-attributable error code instead of collapsing
+/// everything to a generic internal error.
+///
+/// `BadSignature` covers the two paths where the bytes themselves are
+/// untrustworthy — the sealed-sender certificate fails to validate
+/// against the claimed contact's pinned identity, or the claimed
+/// sender is not a known contact at all. Both mean "a relay or paired
+/// peer handed me forged/unauthorized bytes," which is exactly the
+/// signal `PIZZINI_ERR_BAD_SIGNATURE` exists to carry. Everything
+/// else (parse failures, ratchet errors, store I/O) is `Internal`.
+#[derive(Debug)]
+pub enum SealReceiveError {
+    /// Cert-validation failure or unknown-sender contact-gate rejection.
+    BadSignature(SignalProtocolError),
+    /// Any other failure — indistinguishable from a benign internal error.
+    Internal(SignalProtocolError),
+}
+
+impl From<SignalProtocolError> for SealReceiveError {
+    fn from(e: SignalProtocolError) -> Self {
+        SealReceiveError::Internal(e)
+    }
+}
+
 impl DeviceStore {
     pub fn fresh() -> Result<Self, SignalProtocolError> {
         let mut rng = OsRng.unwrap_err();
@@ -892,7 +917,7 @@ impl DeviceStore {
     pub fn seal_receive(
         &mut self,
         sealed: &[u8],
-    ) -> Result<SealReceived, SignalProtocolError> {
+    ) -> Result<SealReceived, SealReceiveError> {
         let usmc = match sealed_sender_decrypt_to_usmc(sealed, &self.inner.identity_store)
             .now_or_never()
             .expect("in-mem store is sync")
@@ -900,7 +925,7 @@ impl DeviceStore {
             Ok(u) => u,
             Err(e) => {
                 eprintln!("seal_receive: sealed_sender_decrypt_to_usmc failed: {e}");
-                return Err(e);
+                return Err(SealReceiveError::Internal(e));
             }
         };
 
@@ -918,8 +943,12 @@ impl DeviceStore {
                 "seal_receive: rejecting unknown sender {}",
                 hex_lower(&claimed_bytes)
             );
-            return Err(SignalProtocolError::InvalidArgument(
-                "sealed sender claim does not match a known contact".into(),
+            // Attacker-attributable: a relay or paired peer presented an
+            // envelope from an identity that is not one of our contacts.
+            return Err(SealReceiveError::BadSignature(
+                SignalProtocolError::InvalidArgument(
+                    "sealed sender claim does not match a known contact".into(),
+                ),
             ));
         }
 
@@ -930,8 +959,13 @@ impl DeviceStore {
                 "seal_receive: cert validation failed for sender {}",
                 hex_lower(&claimed_bytes)
             );
-            return Err(SignalProtocolError::InvalidArgument(
-                "sealed sender certificate does not validate against the contact's identity".into(),
+            // Attacker-attributable: the embedded sealed-sender certificate
+            // does not validate against the contact's pinned identity.
+            return Err(SealReceiveError::BadSignature(
+                SignalProtocolError::InvalidArgument(
+                    "sealed sender certificate does not validate against the contact's identity"
+                        .into(),
+                ),
             ));
         }
 
@@ -948,9 +982,9 @@ impl DeviceStore {
                 inner_bytes.len(),
                 hex_lower(&claimed_bytes)
             );
-            return Err(SignalProtocolError::InvalidArgument(
+            return Err(SealReceiveError::Internal(SignalProtocolError::InvalidArgument(
                 "sealed sender inner content shorter than message_id||is_prekey||ratchet[1+]".into(),
-            ));
+            )));
         }
         let mut message_id = [0u8; 16];
         message_id.copy_from_slice(&inner_bytes[..16]);
@@ -969,9 +1003,9 @@ impl DeviceStore {
                 "seal_receive: USMC msg_type / is_prekey byte disagreement from {} (usmc={usmc_is_prekey}, byte={is_prekey})",
                 hex_lower(&claimed_bytes)
             );
-            return Err(SignalProtocolError::InvalidArgument(
+            return Err(SealReceiveError::Internal(SignalProtocolError::InvalidArgument(
                 "sealed sender USMC msg_type disagrees with inner is_prekey byte".into(),
-            ));
+            )));
         }
 
         let parsed = if is_prekey {
@@ -1028,7 +1062,7 @@ impl DeviceStore {
                     hex_lower(&claimed_bytes),
                     hex_lower(&message_id),
                 );
-                return Err(e);
+                return Err(SealReceiveError::Internal(e));
             }
         };
 
@@ -1241,7 +1275,16 @@ impl DeviceStore {
         // The identity-keypair decode failure earlier in this function
         // is still terminal — the store is meaningless without an
         // identity. Only per-peer session entries are skip-tolerant.
+        //
+        // Invariant: a peer is trusted iff its identity is pinned. When
+        // a session is skipped its `save_identity` re-pin is skipped
+        // too, so the peer MUST also be dropped from the `peers` index
+        // — otherwise the `seal_receive` contact gate would keep
+        // trusting a peer with no pinned identity, silently degrading
+        // it from identity-pinned to TOFU. Skipped peers are collected
+        // here and removed from `peers` after the loop.
         let mut skipped_sessions: u32 = 0;
+        let mut skipped_peers: Vec<Vec<u8>> = Vec::new();
         for _ in 0..session_count {
             let peer = r.u16_blob()?;
             let session_bytes = r.u32_blob()?;
@@ -1253,6 +1296,7 @@ impl DeviceStore {
                         hex_short(peer),
                     );
                     skipped_sessions += 1;
+                    skipped_peers.push(peer.to_vec());
                     continue;
                 }
             };
@@ -1268,6 +1312,7 @@ impl DeviceStore {
                     hex_short(peer),
                 );
                 skipped_sessions += 1;
+                skipped_peers.push(peer.to_vec());
                 continue;
             }
             // Re-pin the peer's identity in the identity store so future
@@ -1280,6 +1325,7 @@ impl DeviceStore {
                         hex_short(peer),
                     );
                     skipped_sessions += 1;
+                    skipped_peers.push(peer.to_vec());
                     continue;
                 }
             };
@@ -1294,12 +1340,19 @@ impl DeviceStore {
                     hex_short(peer),
                 );
                 skipped_sessions += 1;
+                skipped_peers.push(peer.to_vec());
                 continue;
             }
         }
+        if !skipped_peers.is_empty() {
+            // Drop every skipped peer from the trusted set so the
+            // contact gate and the identity store agree: no pinned
+            // identity ⇒ not trusted. The peer must explicitly re-pair.
+            peers.retain(|p| !skipped_peers.contains(p));
+        }
         if skipped_sessions > 0 {
             eprintln!(
-                "[pizzini.crypto-core] from_serialized: skipped {} corrupted session record(s); affected peers must re-pair",
+                "[pizzini.crypto-core] from_serialized: skipped {} corrupted session record(s); affected peers dropped from the trusted set and must re-pair",
                 skipped_sessions,
             );
         }
@@ -1885,7 +1938,9 @@ mod tests {
         // Note: we deliberately do NOT call bob.register_peer(&alice_id).
         let sealed = alice.seal_send(&bob_id, &[0u8; 16], b"surprise").unwrap();
         let err = bob.seal_receive(&sealed).unwrap_err();
-        assert!(matches!(err, SignalProtocolError::InvalidArgument(_)));
+        // The unknown-sender rejection is attacker-attributable, so it
+        // must surface as `BadSignature`, not a generic internal error.
+        assert!(matches!(err, SealReceiveError::BadSignature(_)));
     }
 
     #[test]

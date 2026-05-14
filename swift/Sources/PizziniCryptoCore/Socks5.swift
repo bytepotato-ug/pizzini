@@ -29,12 +29,18 @@ enum Socks5 {
     ///
     /// `host` is the bare target hostname (e.g. `"pizzini2…onion"`).
     /// `port` is the destination TCP port the proxy should dial.
-    static func connectRequest(host: String, port: UInt16) -> Data {
+    /// Throws `FrameError.hostTooLong` when `host` exceeds the RFC 1928
+    /// 255-byte DST.ADDR limit — a pure wire-frame builder must never
+    /// abort the process on caller-supplied input, regardless of any
+    /// upstream validation.
+    static func connectRequest(host: String, port: UInt16) throws -> Data {
         // RFC 1928 caps DST.ADDR for domain targets at 255 bytes (it's
         // a single-byte length prefix). Onion v3 hostnames are 62
         // chars; nothing realistic gets close to the limit.
         let hostBytes = Data(host.utf8)
-        precondition(hostBytes.count <= 255, "SOCKS5 domain target exceeds 255 bytes")
+        guard hostBytes.count <= 255 else {
+            throw FrameError.hostTooLong(hostBytes.count)
+        }
 
         var out = Data(capacity: 4 + 1 + hostBytes.count + 2)
         out.append(0x05)                       // VER
@@ -54,6 +60,15 @@ enum Socks5 {
         case shortRead
         case badVersion(UInt8)
         case noAcceptableMethods
+        /// CONNECT request target hostname exceeded the RFC 1928
+        /// 255-byte DST.ADDR limit. Associated value is the offending
+        /// byte count.
+        case hostTooLong(Int)
+        /// Accumulated CONNECT-reply bytes exceeded the RFC 1928
+        /// 262-byte maximum reply size before a complete frame
+        /// parsed. A reply larger than the protocol maximum is not a
+        /// short read to keep accumulating — it is a framing error.
+        case replyTooLong(Int)
         /// CONNECT request rejected by the proxy. Code values are
         /// RFC 1928 §6: 0x01 general failure, 0x02 not allowed by
         /// ruleset, 0x03 net unreachable, 0x04 host unreachable, 0x05
@@ -84,6 +99,10 @@ enum Socks5 {
                 return String(format: "SOCKS5 version mismatch (got 0x%02x, expected 0x05)", v)
             case .noAcceptableMethods:
                 return "SOCKS5 proxy rejected NO-AUTH method"
+            case .hostTooLong(let n):
+                return "SOCKS5 domain target exceeds 255 bytes (\(n))"
+            case .replyTooLong(let n):
+                return "SOCKS5 reply exceeds 262-byte maximum (\(n))"
             case .rejected(let code):
                 return "SOCKS5 \(Self.repName(code)) (REP=0x\(String(format: "%02x", code)))"
             case .unsupportedReplyAddressType(let t):
@@ -132,6 +151,10 @@ enum Socks5 {
         case incomplete
     }
 
+    /// Largest possible SOCKS5 CONNECT reply: 4-byte header + 1-byte
+    /// domain-length prefix + 255-byte DST.ADDR + 2-byte BND.PORT.
+    static let maxConnectReplyBytes = 4 + 1 + 255 + 2 // 262
+
     /// Try to parse a SOCKS5 CONNECT reply out of `data`. The reply
     /// shape is `VER REP RSV ATYP BND.ADDR BND.PORT`, where BND.ADDR's
     /// length depends on ATYP:
@@ -142,6 +165,14 @@ enum Socks5 {
     /// is 10 bytes (IPv4 reply with zero-padding); the maximum is
     /// 4 + 1 + 255 + 2 = 262 bytes for a max-length domain reply.
     static func tryParseConnectReply(_ data: Data) throws -> ConnectParseResult {
+        // Fail closed on any input larger than the protocol's maximum
+        // reply size. A buffer past 262 bytes can never resolve to a
+        // valid `.complete` (the parser consumes at most 262), so the
+        // caller's read loop must not keep accumulating — that is an
+        // unbounded-growth path on a misbehaving proxy.
+        guard data.count <= maxConnectReplyBytes else {
+            throw FrameError.replyTooLong(data.count)
+        }
         guard data.count >= 4 else { return .incomplete }
         let bytes = Array(data.prefix(4))
         guard bytes[0] == 0x05 else { throw FrameError.badVersion(bytes[0]) }

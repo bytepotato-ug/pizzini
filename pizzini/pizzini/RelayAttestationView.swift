@@ -26,13 +26,6 @@ import SwiftUI
 struct RelayAttestationView: View {
     @Bindable var store: ChatStore
 
-    /// Reads through to the store-owned transparency log so
-    /// SwiftUI re-renders the section whenever the cache or the
-    /// last-fetched timestamp changes.
-    private var transparencyLog: [TransparencyLog.SignedEntry] {
-        store.transparencyLog
-    }
-
     var body: some View {
         List {
             switch store.relayState {
@@ -139,27 +132,42 @@ struct RelayAttestationView: View {
         }
     }
 
-    /// The single primary line — green check, red exclamation, or
-    /// neutral "log not loaded yet."
+    /// The single primary line, driven by the connection-layer
+    /// `relayAttestationVerdict` (computed on every reconnect, not
+    /// lazily here). Four states — and crucially "could not verify"
+    /// is amber+warning, NOT a neutral grey "not loaded yet": an
+    /// adversary who simply blocks the log fetch must not be able to
+    /// present an unverifiable relay as if it were merely awaiting a
+    /// first fetch. The amber state is coupled to the same
+    /// `.unverifiable` verdict that feeds the (decision-gated)
+    /// enforcement path in `ChatStore.didReceiveStatus`.
     @ViewBuilder
     private func statusRow(reportedSha256 sha: String) -> some View {
-        if transparencyLog.isEmpty {
-            HStack(spacing: 10) {
-                Image(systemName: "tray").foregroundStyle(.secondary)
-                Text("Log not loaded yet.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-        } else if TransparencyLog.contains(binarySha256Hex: sha, in: transparencyLog) {
+        switch store.relayAttestationVerdict {
+        case .verified:
             HStack(spacing: 10) {
                 Image(systemName: "checkmark.seal.fill").foregroundStyle(.green)
                 Text("This relay matches a signed operator log entry.")
                     .font(.caption)
             }
-        } else {
+        case .mismatch:
             HStack(spacing: 10) {
                 Image(systemName: "exclamationmark.shield.fill").foregroundStyle(.red)
                 Text("This relay is NOT in any signed log entry.")
                     .font(.caption.weight(.semibold))
+            }
+        case .unverifiable:
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                Text("Could not verify this relay — the transparency log is unavailable.")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.orange)
+            }
+        case .notEvaluated:
+            HStack(spacing: 10) {
+                Image(systemName: "hourglass").foregroundStyle(.secondary)
+                Text("Verifying this relay against the transparency log…")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
     }
@@ -197,16 +205,19 @@ struct RelayAttestationView: View {
     }
 
     private func statusFooter(reportedSha256 sha: String, urlConfigured: Bool) -> Text {
-        if transparencyLog.isEmpty {
-            if urlConfigured {
-                return Text("Tap Refresh log to fetch the operator's signed log over HTTPS. Each entry's signature is verified against the operator's pinned public key.")
-            } else {
-                return Text("No log URL configured. Set TransparencyLogConfig.logURLString to enable automatic fetching.")
-            }
-        } else if TransparencyLog.contains(binarySha256Hex: sha, in: transparencyLog) {
+        switch store.relayAttestationVerdict {
+        case .verified:
             return Text("The running binary's SHA-256 was signed by the operator into the public transparency log. The relay is running an audited build.")
-        } else {
+        case .mismatch:
             return Text("The running binary's SHA-256 does not appear in the operator's signed transparency log. Possible causes: a brand-new deploy the operator hasn't announced yet, a stale log on your device, or a tampered binary on the server. Do not send sensitive messages until the operator publishes a matching entry.")
+        case .unverifiable:
+            if urlConfigured {
+                return Text("The transparency log could not be verified — the fetch failed, was blocked, or returned no signed entries. Until it loads, this relay's binary cannot be checked against any audited build. Tap Refresh log to retry.")
+            } else {
+                return Text("No log URL configured. Set TransparencyLogConfig.logURLString to enable automatic fetching. Without it, this relay's binary cannot be verified.")
+            }
+        case .notEvaluated:
+            return Text("Verification runs automatically on every reconnect. Each log entry's signature is checked against the operator's pinned public key.")
         }
     }
 

@@ -246,11 +246,22 @@ private struct ZoomableImageSheet: View {
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            Color.black.ignoresSafeArea()
-            Image(uiImage: image)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .ignoresSafeArea()
+            // Shield the decoded image content only. `.fullScreenCover`
+            // presents above the chat-level shield, and live recording
+            // is a separate pipeline from the window-level mask, so the
+            // full-screen image needs its own shield. The dismiss
+            // button is deliberately kept OUTSIDE the shield: an opaque
+            // shield over the viewer's only exit would trap the user in
+            // the full-screen view while a recording / external display
+            // is active.
+            ZStack {
+                Color.black.ignoresSafeArea()
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .ignoresSafeArea()
+            }
+            .screenCaptureShielded()
             Button(action: dismiss) {
                 Image(systemName: "xmark.circle.fill")
                     .font(.title)

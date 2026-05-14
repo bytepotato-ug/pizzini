@@ -17,8 +17,8 @@ private let screenCapLog = Logger(subsystem: "app.pizzini", category: "screencap
 /// field would otherwise wire up — first-responder, caret, selection
 /// rects, edit menu — because we never want it to actually receive
 /// input. The subclass MUST be `final` and `@objc` so the Objective-C
-/// runtime metadata that `findCanvas` uses (class-name reflection)
-/// surfaces consistently across iOS versions.
+/// runtime metadata that `resolveSecureLayer` uses (class-name
+/// reflection) surfaces consistently across iOS versions.
 ///
 /// **Honesty about what this is** (developer comments — NEVER user
 /// copy): `isSecureTextEntry` is not a documented screenshot-masking
@@ -44,17 +44,24 @@ final class NonInteractiveSecureTextField: UITextField {
     override func canPerformAction(_ action: Selector, withSender _: Any?) -> Bool { false }
 }
 
-/// Walks `textField.subviews` looking for the masked canvas view.
+/// Resolves the single `CALayer` that iOS marks as "skip in screen
+/// captures" inside a secure `UITextField` — the one and only layer
+/// both the production `WindowSecureMask` reparent AND the
+/// `SecureScreenshotSelfTest` must target. Routing both code paths
+/// through this function guarantees the self-test validates exactly
+/// the layer production reparents under; there is no second path that
+/// can pick a different one.
 ///
 /// Strategy:
-/// 1. Prefer a subview whose class name matches Apple's known pattern
-///    (`_UITextLayoutCanvasView`, `UITextLayoutCanvasView`, or any
-///    `*Canvas*` class) — robust to subview-order shuffles.
-/// 2. Fall back to `.last` (correct on iOS 16-26) and then `.first`
-///    (correct on the older code paths some references still
+/// 1. Prefer the layer of a subview whose class name matches Apple's
+///    known pattern (`_UITextLayoutCanvasView`, `UITextLayoutCanvasView`,
+///    or any `*Canvas*` class) — robust to subview/sublayer-order
+///    shuffles, which Apple has done across iOS major releases.
+/// 2. Fall back to `layer.sublayers.last` (correct on iOS 16-26) and
+///    then `.first` (correct on older code paths some references still
 ///    document) so we degrade gracefully if the class names change.
 @MainActor
-func findSecureCanvas(in textField: UITextField) -> UIView? {
+func resolveSecureLayer(in textField: UITextField) -> CALayer? {
     for sv in textField.subviews {
         let name = String(describing: type(of: sv))
         // Common class names across iOS versions:
@@ -62,11 +69,14 @@ func findSecureCanvas(in textField: UITextField) -> UIView? {
         //   UITextLayoutCanvasView (iOS 14-15-ish)
         //   _UITextFieldCanvasView (older)
         // Substring "Canvas" is the stable signal across all three.
+        // A subview's layer is itself a sublayer of `textField.layer`,
+        // so returning it keeps us in the same layer tree the fallback
+        // walks.
         if name.contains("Canvas") {
-            return sv
+            return sv.layer
         }
     }
-    return textField.subviews.last ?? textField.subviews.first
+    return textField.layer.sublayers?.last ?? textField.layer.sublayers?.first
 }
 
 /// Runtime self-test for the `isSecureTextEntry` screenshot-mask side
@@ -122,25 +132,35 @@ enum SecureScreenshotSelfTest {
         let secureField = NonInteractiveSecureTextField()
         secureField.isSecureTextEntry = true
         secureField.frame = CGRect(x: 0, y: 0, width: probeSize, height: probeSize)
+        secureField.layoutIfNeeded()
 
-        // Structural check first — if we cannot find the canvas at
-        // all, the trick is unreachable on this OS. Uses the same
-        // finder as `WindowSecureMask` so a class-name shuffle catches
-        // both.
-        guard let canvas = findSecureCanvas(in: secureField) else { return false }
-        canvas.isUserInteractionEnabled = true
+        // Structural check first — if we cannot find the secure layer
+        // at all, the trick is unreachable on this OS. Resolves the
+        // SAME layer `WindowSecureMask` reparents under, so a class-
+        // name / sublayer-order shuffle catches both code paths.
+        guard let secureLayer = resolveSecureLayer(in: secureField) else { return false }
 
-        let sentinel = UIView(frame: CGRect(x: 0, y: 0, width: probeSize, height: probeSize))
-        sentinel.backgroundColor = sentinelColor
-        sentinel.translatesAutoresizingMaskIntoConstraints = false
-        canvas.subviews.forEach { $0.removeFromSuperview() }
-        canvas.addSubview(sentinel)
-        NSLayoutConstraint.activate([
-            sentinel.leadingAnchor.constraint(equalTo: canvas.leadingAnchor),
-            sentinel.trailingAnchor.constraint(equalTo: canvas.trailingAnchor),
-            sentinel.topAnchor.constraint(equalTo: canvas.topAnchor),
-            sentinel.bottomAnchor.constraint(equalTo: canvas.bottomAnchor),
-        ])
+        // The 64×64 probe proves the trick works *somewhere*, but
+        // `WindowSecureMask` hosts the production mask on a
+        // DEFAULT-frame (0×0) field. Independently confirm the secure
+        // layer also resolves in that exact configuration — without
+        // this, a future iOS that only instantiates the secure canvas
+        // for a sized field would let the self-test pass while
+        // production silently fails to mask. Fail closed.
+        let productionShapeField = NonInteractiveSecureTextField()
+        productionShapeField.isSecureTextEntry = true
+        productionShapeField.layoutIfNeeded()
+        guard resolveSecureLayer(in: productionShapeField) != nil else { return false }
+
+        // Mirror `WindowSecureMask`: add the sentinel as a sublayer of
+        // the secure layer, exactly as production parents `window.layer`
+        // under it. Validating a layer the production path does not use
+        // is precisely the bug this test guards against.
+        let sentinel = CALayer()
+        sentinel.frame = CGRect(x: 0, y: 0, width: probeSize, height: probeSize)
+        sentinel.backgroundColor = sentinelColor.cgColor
+        secureLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        secureLayer.addSublayer(sentinel)
         secureField.layoutIfNeeded()
 
         let renderer = UIGraphicsImageRenderer(size: secureField.bounds.size)

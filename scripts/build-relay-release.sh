@@ -72,7 +72,7 @@ export SOURCE_DATE_EPOCH
 
 if [[ -z "${PIZZINI_RELEASE_NO_DOCKER:-}" ]]; then
     # Outer invocation: re-exec ourselves inside the pinned
-    # `rust:1.95.0-bookworm-slim` image with the repo bind-mounted
+    # `rust:1.95.0-bookworm` image with the repo bind-mounted
     # at /work. The inner invocation sets PIZZINI_RELEASE_NO_DOCKER
     # so we don't recurse, and INSIDE_DOCKER so it knows to use
     # the in-container paths for the path-remap.
@@ -126,6 +126,14 @@ if [[ -z "${PIZZINI_RELEASE_NO_DOCKER:-}" ]]; then
             apt-get update -qq
             apt-get install -y --no-install-recommends protobuf-compiler pkg-config >/dev/null
             mkdir -p /build-home
+            # The bind-mounted repo is owned by HOST_UID but the
+            # container runs as root, so git >= 2.35 refuses /work
+            # for "dubious ownership" and `relay/build.rs` would fall
+            # back to a "unknown" git sha — making the embedded
+            # provenance (and therefore the binary digest) depend on
+            # the host git config instead of the commit. Mark /work
+            # trusted so build.rs always reads the real commit.
+            git config --global --add safe.directory /work
             # Inside-container path-remap: every host-side path
             # disappears, replaced by the fixed sentinels.
             export RUSTFLAGS="--remap-path-prefix=/work=/build --remap-path-prefix=/build-home=/build-home"
@@ -181,12 +189,21 @@ echo "    target: x86_64-unknown-linux-gnu"
 #    builder-specific absolute paths embedded in DWARF debug info
 #    (which would otherwise differ between $HOME=/Users/alice
 #    and $HOME=/home/bob and silently make the binaries diverge).
-#    Inside docker we use the in-container path "/work" + "/build-home"
-#    constants; on the opt-out path we substitute the host's actual
-#    paths, which is only valid on the canonical builder.
+#    Both build modes must remap onto the SAME fixed `/build` +
+#    `/build-home` sentinels, or the opt-out binary is not
+#    digest-identical to the docker one and host paths leak into
+#    the DWARF section. Inside docker the live paths already ARE
+#    `/work` + `/build-home`; on the opt-out path the live
+#    `$REPO_ROOT` / `$HOME` are the remap *sources* and `/build` /
+#    `/build-home` the *targets* — so the embedded paths come out
+#    identical regardless of where the operator's repo and home
+#    actually live. `CARGO_HOME` is pinned under `$HOME` (its
+#    default) so the vendored-crate source paths fall under the
+#    `$HOME=/build-home` remap rather than leaking a host path.
 if [[ -n "${INSIDE_DOCKER:-}" ]]; then
     export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=/work=/build --remap-path-prefix=/build-home=/build-home"
 else
+    export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
     export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$REPO_ROOT=/build --remap-path-prefix=$HOME=/build-home"
 fi
 # Cargo refuses to update the lockfile. `--offline` (set via

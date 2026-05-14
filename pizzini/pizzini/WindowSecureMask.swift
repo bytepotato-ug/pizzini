@@ -140,7 +140,7 @@ final class WindowSecureMask: NSObject {
         // bookkeeping.
         if masked.contains(key) {
             if let field = fields[key],
-               field.layer.sublayers?.last?.sublayers?.contains(window.layer) == true {
+               resolveSecureLayer(in: field)?.sublayers?.contains(window.layer) == true {
                 return
             }
             // Layer chain is broken — clear bookkeeping and fall
@@ -170,20 +170,26 @@ final class WindowSecureMask: NSObject {
             // text, no background.
             field.backgroundColor = .clear
             window.addSubview(field)
+            // Force the field's layout pass so its secure canvas
+            // subview/sublayer exists before `resolveSecureLayer`
+            // walks for it.
+            field.layoutIfNeeded()
 
             // The reparent. Step-by-step:
             //   - parent.addSublayer(field.layer) puts the secure
             //     field's layer beside the window in the screen's
             //     render tree.
-            //   - field.layer.sublayers.last is the secure container
-            //     layer that iOS marks as "skip in screenshots".
+            //   - `resolveSecureLayer` returns the secure container
+            //     layer that iOS marks as "skip in screenshots" — the
+            //     SAME layer `SecureScreenshotSelfTest` validates.
             //     Adding window.layer as its sublayer moves the entire
             //     app window underneath the secure mark.
             // Visually unchanged because the window's frame and
             // CATransform are untouched; only its layer position in
             // the render tree moved.
+            guard let secureLayer = resolveSecureLayer(in: field) else { return }
             parent.addSublayer(field.layer)
-            field.layer.sublayers?.last?.addSublayer(window.layer)
+            secureLayer.addSublayer(window.layer)
 
             self.masked.insert(key)
             self.fields[key] = field

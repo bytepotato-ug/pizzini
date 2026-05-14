@@ -108,12 +108,13 @@
 //! brings the app forward. On reconnect, the queue drains.
 
 mod apns;
+mod bundle_req_rate_store;
 mod chain_validator_store;
 mod encrypted_file;
 mod pending_store;
 mod push_token_store;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -125,6 +126,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 
 use crate::apns::{ApnsClient, ApnsConfig};
+use crate::bundle_req_rate_store::BundleReqRateStore;
 use crate::pending_store::{PendingFrame, PendingStore};
 use crate::push_token_store::PushTokenStore;
 
@@ -414,10 +416,27 @@ const MAX_FRAME_BYTES: u32 = 1024 * 1024;
 const MIN_PUSH_TOKEN_BYTES: usize = 16;
 const MAX_PUSH_TOKEN_BYTES: usize = 64;
 
-/// Per-peer pending-queue cap. The queue is purely in-memory; this cap
-/// bounds RAM use and the post-seizure leak surface. 100 frames is a
-/// generous chat burst.
+/// Per-peer pending-queue cap. This cap bounds RAM use and the
+/// post-seizure leak surface. 100 frames is a generous chat burst.
 const MAX_PENDING_PER_PEER: usize = 100;
+/// Global ceiling on the offline-queue store, independent of how many
+/// distinct `to_id` values appear. Without these, a single
+/// authenticated peer can pick a fresh fabricated `to_id` for every
+/// frame (the no-token CHAIN_SEED_DELIVERY pipe makes `to_id`
+/// attacker-chosen) and grow both the in-RAM map and the on-disk
+/// encrypted `pending.bin` without bound. The store fails closed —
+/// refusing the enqueue, never evicting another peer's frames — once
+/// any of these is hit, so an attacker cannot displace a legitimate
+/// recipient's queued messages either.
+///
+/// `MAX_PENDING_DISTINCT_PEERS`: cap on the number of distinct peer
+/// queues. `MAX_PENDING_TOTAL_FRAMES` / `MAX_PENDING_TOTAL_BYTES`:
+/// aggregate frame-count / byte-count ceilings across all queues.
+/// Sized for the relay's expected scale (single-digit users, ~1-2 KB
+/// sealed envelopes) with generous headroom.
+const MAX_PENDING_DISTINCT_PEERS: usize = 1024;
+const MAX_PENDING_TOTAL_FRAMES: usize = 16_384;
+const MAX_PENDING_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 /// Hard ceiling on a sender-chosen TTL. Anything past 7 days is clamped
 /// down on enqueue. Bounds the seizure-window leak the same way the
 /// previous fixed 24h cap did, while letting senders explicitly choose
@@ -486,6 +505,17 @@ fn parse_v2_token(bytes: &[u8]) -> Result<ParsedV2Token, &'static str> {
 /// proper defense; hashcash is the spam filter. Bumping bits keeps
 /// the spam filter relevant against modern hardware until the relay
 /// gains that rate-limit.
+//
+// AUDIT-DECISION-NEEDED: a single modern CPU core sustains ~16k
+// valid 22-bit proofs/hour, so 22 bits does not by itself bound
+// first-contact bundle-request flooding. The per-(recipient, hour)
+// cap is now durable across restarts (`BundleReqRateStore`), so the
+// open decision is: raise this difficulty (at a real cost to the
+// honest A14-class phone, ~1 s/proof today), or rely solely on the
+// now-durable per-recipient cap as the load-bearing control and
+// leave hashcash as a cheap nuisance filter? Do not change this
+// constant without that decision — and if raised, it must be
+// coordinated with the iOS hashcash compute side bit-for-bit.
 const HASHCASH_BITS: u32 = 22;
 /// Domain-separation tag baked into the hashcash challenge digest. F-301:
 /// without a tag + length prefix, two distinct (peer_id, hour) pairs can
@@ -556,6 +586,16 @@ const HELLO_REPLAY_GC_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// rotations to grief a target is bounded at 4× per peer per minute.
 const CHAIN_SEED_DELIVERY_RATE_CAP: usize = 4;
 const CHAIN_SEED_DELIVERY_RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Cap on the number of *distinct* `to_id` values one connection may
+/// target via `FRAME_TYPE_CHAIN_SEED_DELIVERY`. The per-(from, to)
+/// rate limit bounds frames-per-pair but not pair *cardinality*: a
+/// single authenticated peer picking a fresh fabricated `to_id` per
+/// batch never trips it, yet drives the persistent pending store. A
+/// legitimate client delivers chain seeds to its own contacts only —
+/// dozens, not thousands — so a per-connection ceiling here bounds
+/// the no-token pipe without affecting real use. Tracked in a
+/// connection-local set, so it resets when the connection closes.
+const CHAIN_SEED_DELIVERY_MAX_DISTINCT_TO_IDS: usize = 256;
 /// Rate-limit table for `FRAME_TYPE_CHAIN_SEED_DELIVERY`. Keyed by
 /// `(from_id, to_id)`; value is a deque of timestamps of recently
 /// accepted frames within the rate window. Entries with empty
@@ -563,6 +603,15 @@ const CHAIN_SEED_DELIVERY_RATE_WINDOW: Duration = Duration::from_secs(60);
 type ChainSeedRate = Arc<Mutex<HashMap<(PeerId, PeerId), VecDeque<Instant>>>>;
 /// GC cadence for the chain-seed-delivery rate-limit map.
 const CHAIN_SEED_RATE_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Global cardinality cap on the `ChainSeedRate` map. The GC only
+/// drops *empty* deques, so a sustained attacker who keeps every
+/// `(from, to)` deque non-empty grows the map without bound. Once
+/// the map holds this many distinct `(from, to)` pairs, a frame that
+/// would introduce a *new* pair is refused — fail closed — until the
+/// GC reclaims room. Sized well above any plausible legitimate
+/// fan-out of concurrent chain-seed deliveries across all
+/// connections.
+const CHAIN_SEED_RATE_MAX_ENTRIES: usize = 16_384;
 
 /// Per-(recipient, hour) cap on accepted `BUNDLE_REQUEST` frames.
 /// Hashcash + the (recipient, hour) hashcash bucket already gate
@@ -574,9 +623,13 @@ const CHAIN_SEED_RATE_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const BUNDLE_REQ_PER_RECIPIENT_PER_HOUR: u32 = 8;
 /// Rate-limit table for accepted `BUNDLE_REQUEST` frames. Keyed by
 /// `(recipient_peer_id, hour_bucket)`; value is the running count
-/// for that bucket. Entries age out via `spawn_bundle_req_rate_gc`
-/// — anything older than two buckets is dead weight.
-type BundleReqRate = Arc<Mutex<HashMap<(PeerId, u64), u32>>>;
+/// for that bucket. Persisted (encrypted-at-rest, atomic write on
+/// every increment, hour-bucket TTL purge on load) via
+/// `BundleReqRateStore` so the per-(recipient, hour) ceiling
+/// survives a relay restart — an in-memory-only counter handed every
+/// recipient a fresh full budget on every process bounce. Entries
+/// also age out via `spawn_bundle_req_rate_gc`.
+type BundleReqRate = Arc<Mutex<BundleReqRateStore>>;
 /// GC cadence for the bundle-request rate-limit map. Buckets are
 /// hour-wide, so a 30-minute tick guarantees a bucket is evicted
 /// within at most 90 minutes of its end.
@@ -697,8 +750,17 @@ async fn main() -> std::io::Result<()> {
             None
         }
         Err(e) => {
-            eprintln!("  apns: misconfigured — push disabled: {e}");
-            None
+            // Fail closed: a half-specified APNs config (or a
+            // missing APNS_ENDPOINT with keys present) means the
+            // operator intended push and got the deployment wrong.
+            // Refuse to start rather than silently coming up with
+            // push disabled or pointed at the wrong APNs
+            // environment — both fail invisibly at the worst time.
+            eprintln!("[pizzini-relay] FATAL: APNs misconfigured: {e}");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("APNs misconfigured: {e}"),
+            ));
         }
     };
 
@@ -729,14 +791,20 @@ async fn main() -> std::io::Result<()> {
     // cap is `MAX_PENDING_PER_PEER` — the single source of truth on
     // this constant stays in main.rs so a future tune doesn't need
     // to chase it through two files.
-    let pending_store_inst = PendingStore::load_or_create(&state_dir, MAX_PENDING_PER_PEER)
-        .map_err(|e| {
-            eprintln!(
-                "[pizzini-relay] FATAL: could not open pending-queue store at {}: {e}",
-                state_dir.display(),
-            );
-            e
-        })?;
+    let pending_store_inst = PendingStore::load_or_create(
+        &state_dir,
+        MAX_PENDING_PER_PEER,
+        MAX_PENDING_DISTINCT_PEERS,
+        MAX_PENDING_TOTAL_FRAMES,
+        MAX_PENDING_TOTAL_BYTES,
+    )
+    .map_err(|e| {
+        eprintln!(
+            "[pizzini-relay] FATAL: could not open pending-queue store at {}: {e}",
+            state_dir.display(),
+        );
+        e
+    })?;
     println!(
         "  pending-queue store: {} ({} frames across {} peers after TTL purge)",
         state_dir.display(),
@@ -746,7 +814,25 @@ async fn main() -> std::io::Result<()> {
     let pending: Pending = Arc::new(Mutex::new(pending_store_inst));
     let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
     let hello_replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
-    let bundle_req_rate: BundleReqRate = Arc::new(Mutex::new(HashMap::new()));
+    // Persistent per-(recipient, hour) BUNDLE_REQUEST acceptance
+    // counter. Built BEFORE the listener so a corrupt state file
+    // surfaces at startup, not silently mid-traffic — and so the
+    // per-recipient flood cap is in effect from the first frame
+    // rather than reset to zero by the restart.
+    let bundle_req_rate_inst =
+        BundleReqRateStore::load_or_create(&state_dir, current_hour_bucket()).map_err(|e| {
+            eprintln!(
+                "[pizzini-relay] FATAL: could not open bundle-request rate store at {}: {e}",
+                state_dir.display(),
+            );
+            e
+        })?;
+    println!(
+        "  bundle-request rate store: {} ({} live (recipient,hour) buckets after TTL purge)",
+        state_dir.display(),
+        bundle_req_rate_inst.len(),
+    );
+    let bundle_req_rate: BundleReqRate = Arc::new(Mutex::new(bundle_req_rate_inst));
     let chain_seed_rate: ChainSeedRate = Arc::new(Mutex::new(HashMap::new()));
     // v2 hash-chain delivery-token validators.
     let chain_validator_inst =
@@ -1141,6 +1227,11 @@ async fn read_loop(
     our_tx: &mpsc::UnboundedSender<Vec<u8>>,
     status_snapshot: &Arc<RelayStatus>,
 ) -> std::io::Result<()> {
+    // Connection-local set of distinct `to_id`s this connection has
+    // targeted via CHAIN_SEED_DELIVERY. Bounds the no-token pipe's
+    // `to_id` cardinality per source — see
+    // `CHAIN_SEED_DELIVERY_MAX_DISTINCT_TO_IDS`. Resets on disconnect.
+    let mut chain_seed_to_ids: HashSet<PeerId> = HashSet::new();
     loop {
         // Idle-timeout window resets per frame. A legitimate client
         // in a quiet conversation can sit silently for up to
@@ -1388,10 +1479,26 @@ async fn read_loop(
                 // logs / operator monitoring).
                 let bucket = current_hour_bucket();
                 let over_cap = {
-                    let mut map = bundle_req_rate.lock().await;
-                    let entry = map.entry((parsed.to_id.clone(), bucket)).or_insert(0);
-                    *entry = entry.saturating_add(1);
-                    *entry > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR
+                    let mut store = bundle_req_rate.lock().await;
+                    match store.increment(parsed.to_id.clone(), bucket) {
+                        Ok(count) => count > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR,
+                        Err(e) => {
+                            // The persistent counter could not be
+                            // written. Fail closed — reject this
+                            // bundle request rather than forwarding
+                            // it on an unverified-cap path. The
+                            // in-memory count was still bumped, so
+                            // subsequent requests in this process
+                            // are still bounded; only the persist
+                            // failed. Don't drop the connection over
+                            // an I/O hiccup.
+                            eprintln!(
+                                "[pizzini-relay] warn: bundle-req rate persist failed for {}: {e}",
+                                short_hex(&parsed.to_id),
+                            );
+                            true
+                        }
+                    }
                 };
                 if over_cap {
                     dev_peer_elog!(
@@ -1481,41 +1588,89 @@ async fn read_loop(
                     );
                     continue;
                 }
-                // Per-(from, to) sliding-window rate limit. Pruning
-                // happens inline on every check so the deque stays
-                // bounded by `CHAIN_SEED_DELIVERY_RATE_CAP` even if
-                // the GC tick hasn't fired recently.
-                let over_cap = {
-                    let now = Instant::now();
-                    let cutoff = now - CHAIN_SEED_DELIVERY_RATE_WINDOW;
-                    let mut map = chain_seed_rate.lock().await;
-                    let entry = map
-                        .entry((parsed.from_id.clone(), parsed.to_id.clone()))
-                        .or_default();
-                    while let Some(front) = entry.front() {
-                        if *front < cutoff {
-                            entry.pop_front();
-                        } else {
-                            break;
-                        }
-                    }
-                    if entry.len() >= CHAIN_SEED_DELIVERY_RATE_CAP {
-                        true
-                    } else {
-                        entry.push_back(now);
-                        false
-                    }
-                };
-                if over_cap {
+                // Per-connection cap on distinct `to_id` cardinality.
+                // CHAIN_SEED_DELIVERY carries no delivery token, so
+                // `to_id` is attacker-chosen; the per-(from, to) rate
+                // limit below bounds frames-per-pair but not the
+                // number of distinct pairs. A connection that has
+                // already targeted the maximum number of distinct
+                // recipients is refused any further fresh `to_id` —
+                // an existing one still passes (and is still subject
+                // to the per-pair rate limit).
+                if !chain_seed_to_ids.contains(&parsed.to_id)
+                    && chain_seed_to_ids.len() >= CHAIN_SEED_DELIVERY_MAX_DISTINCT_TO_IDS
+                {
                     dev_peer_elog!(
-                        "rejecting CHAIN_SEED_DELIVERY {} → {}: per-pair rate cap ({}) exceeded in {}s window",
+                        "rejecting CHAIN_SEED_DELIVERY {} → {}: connection exceeded {} distinct to_ids",
                         short_hex(&parsed.from_id),
                         short_hex(&parsed.to_id),
-                        CHAIN_SEED_DELIVERY_RATE_CAP,
-                        CHAIN_SEED_DELIVERY_RATE_WINDOW.as_secs(),
+                        CHAIN_SEED_DELIVERY_MAX_DISTINCT_TO_IDS,
                     );
                     continue;
                 }
+                // Per-(from, to) sliding-window rate limit. Pruning
+                // happens inline on every check so the deque stays
+                // bounded by `CHAIN_SEED_DELIVERY_RATE_CAP` even if
+                // the GC tick hasn't fired recently. A global
+                // cardinality cap on the map itself fails the frame
+                // closed if accepting it would introduce a new
+                // `(from, to)` pair past `CHAIN_SEED_RATE_MAX_ENTRIES`
+                // — the GC only reclaims empty deques, so without
+                // this a sustained attacker grows the map unbounded.
+                enum RateOutcome {
+                    Ok,
+                    PerPairCap,
+                    GlobalCardinalityCap,
+                }
+                let rate_outcome = {
+                    let now = Instant::now();
+                    let cutoff = now - CHAIN_SEED_DELIVERY_RATE_WINDOW;
+                    let mut map = chain_seed_rate.lock().await;
+                    let key = (parsed.from_id.clone(), parsed.to_id.clone());
+                    if !map.contains_key(&key) && map.len() >= CHAIN_SEED_RATE_MAX_ENTRIES {
+                        RateOutcome::GlobalCardinalityCap
+                    } else {
+                        let entry = map.entry(key).or_default();
+                        while let Some(front) = entry.front() {
+                            if *front < cutoff {
+                                entry.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                        if entry.len() >= CHAIN_SEED_DELIVERY_RATE_CAP {
+                            RateOutcome::PerPairCap
+                        } else {
+                            entry.push_back(now);
+                            RateOutcome::Ok
+                        }
+                    }
+                };
+                match rate_outcome {
+                    RateOutcome::Ok => {}
+                    RateOutcome::PerPairCap => {
+                        dev_peer_elog!(
+                            "rejecting CHAIN_SEED_DELIVERY {} → {}: per-pair rate cap ({}) exceeded in {}s window",
+                            short_hex(&parsed.from_id),
+                            short_hex(&parsed.to_id),
+                            CHAIN_SEED_DELIVERY_RATE_CAP,
+                            CHAIN_SEED_DELIVERY_RATE_WINDOW.as_secs(),
+                        );
+                        continue;
+                    }
+                    RateOutcome::GlobalCardinalityCap => {
+                        dev_peer_elog!(
+                            "rejecting CHAIN_SEED_DELIVERY {} → {}: chain-seed rate map at global cap ({})",
+                            short_hex(&parsed.from_id),
+                            short_hex(&parsed.to_id),
+                            CHAIN_SEED_RATE_MAX_ENTRIES,
+                        );
+                        continue;
+                    }
+                }
+                // Frame accepted — record the (possibly new) `to_id`
+                // against this connection's distinct-to_id budget.
+                chain_seed_to_ids.insert(parsed.to_id.clone());
                 let frame_len = frame.len();
                 let map = routes.lock().await;
                 if let Some(target) = map.get(&parsed.to_id) {
@@ -1566,16 +1721,32 @@ async fn enqueue_pending(
     let expires_at_unix = encrypted_file::unix_now() + ttl.as_secs();
     let entry = PendingFrame::new(frame, expires_at_unix);
     let mut store = pending.lock().await;
-    if let Err(e) = store.enqueue(recipient.to_vec(), entry) {
-        // Persist failure is logged but doesn't fail the connection.
-        // The in-memory copy of the queue is still valid for this
-        // process's lifetime — push delivery (already best-effort)
-        // continues to work; only the cross-restart guarantee is at
-        // risk. Better than dropping the connection over an I/O hiccup.
-        eprintln!(
-            "[pizzini-relay] warn: pending enqueue persist failed for {}: {e}",
-            short_hex(recipient),
-        );
+    match store.enqueue(recipient.to_vec(), entry) {
+        Ok(pending_store::EnqueueOutcome::Stored) => {}
+        Ok(pending_store::EnqueueOutcome::RejectedGlobalCap) => {
+            // The offline-queue store hit a global ceiling (distinct
+            // peers / total frames / total bytes). Fail closed: the
+            // frame is dropped rather than the store grown without
+            // bound or another peer's queue evicted. This is the
+            // intended response to a sender spraying fabricated
+            // `to_id`s — the relay's footprint stays bounded.
+            dev_peer_elog!(
+                "[pizzini-relay] pending enqueue refused for {}: global queue cap reached",
+                short_hex(recipient),
+            );
+        }
+        Err(e) => {
+            // Persist failure is logged but doesn't fail the
+            // connection. The in-memory copy of the queue is still
+            // valid for this process's lifetime — push delivery
+            // (already best-effort) continues to work; only the
+            // cross-restart guarantee is at risk. Better than
+            // dropping the connection over an I/O hiccup.
+            eprintln!(
+                "[pizzini-relay] warn: pending enqueue persist failed for {}: {e}",
+                short_hex(recipient),
+            );
+        }
     }
 }
 
@@ -1795,6 +1966,16 @@ fn leading_zero_bits(bytes: &[u8]) -> u32 {
     count
 }
 
+/// Upper bound on the random delay applied to a push trigger before
+/// the APNs POST is sent. Mirrors the iOS group-text fanout jitter
+/// posture ([0, 25 s] random offset, each leg on its own dispatch):
+/// `maybe_send_push` already spawns the send on its own task, so the
+/// jitter is just a leading sleep on that task. Without it the push
+/// POST's wall-clock time is a faithful copy of the message-arrival
+/// time — this decorrelates a relay-originated, recipient-correlated
+/// network event from the inbound frame that triggered it.
+const PUSH_JITTER_MAX: Duration = Duration::from_secs(25);
+
 /// Look up the recipient's push token; if present and APNs is configured,
 /// fire a payload-opaque "New message" wake-up. Errors are logged only —
 /// push is best-effort and must never break relay forwarding.
@@ -1810,7 +1991,16 @@ async fn maybe_send_push(
     };
     let recipient_dbg = short_hex(recipient);
     let client = client.clone();
+    // Random [0, PUSH_JITTER_MAX] offset, drawn before the task is
+    // spawned so the lock on `push_tokens` is not held across it.
+    let jitter = {
+        use rand::Rng as _;
+        Duration::from_millis(
+            rand::rng().random_range(0..=PUSH_JITTER_MAX.as_millis() as u64),
+        )
+    };
     tokio::spawn(async move {
+        tokio::time::sleep(jitter).await;
         match client.send_wakeup(&token).await {
             Ok(_) => dev_peer_log!("push: sent wake-up to {recipient_dbg}"),
             Err(e) => dev_peer_elog!("push: failed for {recipient_dbg}: {e}"),
@@ -2008,23 +2198,24 @@ fn spawn_bundle_req_rate_gc(rate: BundleReqRate) {
         let mut tick = tokio::time::interval(BUNDLE_REQ_RATE_GC_INTERVAL);
         loop {
             tick.tick().await;
-            // Drop any bucket older than (now − 1) — entries from
-            // hour H are still consulted during hour H+1 only via
-            // the hashcash skew window, not the rate-limit table
-            // (which is per-bucket — the next hour starts a fresh
-            // counter). Two hours of slack keeps the table tiny
-            // and is comfortably above any clock-skew tolerance.
+            // Drop buckets past the store's retention window. The
+            // rate limiter only consults the current hour bucket;
+            // older buckets are dead weight. `gc_stale` re-persists
+            // only if it actually dropped something, so an idle
+            // relay doesn't rewrite the file on every tick.
             let now = current_hour_bucket();
-            let cutoff = now.saturating_sub(1);
-            let mut map = rate.lock().await;
-            let before = map.len();
-            map.retain(|(_, bucket), _| *bucket >= cutoff);
-            let after = map.len();
-            if before != after {
-                println!(
-                    "bundle-req-rate GC: pruned {} → {after}",
-                    before - after,
-                );
+            let mut store = rate.lock().await;
+            match store.gc_stale(now) {
+                Ok(0) => {}
+                Ok(pruned) => {
+                    println!(
+                        "bundle-req-rate GC: pruned {pruned} → {}",
+                        store.len(),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[pizzini-relay] warn: bundle-req-rate GC persist failed: {e}");
+                }
             }
         }
     });
@@ -2880,61 +3071,75 @@ mod tests {
     }
 
     /// Audit H2b: per-(recipient, hour) BUNDLE_REQUEST cap. The
-    /// rate-limit table is just a `HashMap<(PeerId, u64), u32>`; this
-    /// pins the increment-and-check arithmetic so a future refactor
-    /// that switches to a different storage shape preserves the
-    /// semantics. Verifies that the first
+    /// counter is now backed by the persistent `BundleReqRateStore`;
+    /// this pins the increment-and-check arithmetic so a future
+    /// refactor preserves the semantics. Verifies that the first
     /// `BUNDLE_REQ_PER_RECIPIENT_PER_HOUR` increments are inside the
-    /// cap and the next one trips it.
+    /// cap and the next one trips it, that distinct recipients /
+    /// hour buckets get independent counters, and — the F-S4-02
+    /// property — that the counter survives a store reload.
     #[tokio::test]
     async fn bundle_req_rate_cap_trips_at_cap_plus_one() {
-        let rate: BundleReqRate = Arc::new(Mutex::new(HashMap::new()));
+        let tmp = tempfile::TempDir::new().unwrap();
         let recipient: PeerId = vec![0x77u8; 33];
         let bucket: u64 = 1_000_000;
+        let rate: BundleReqRate = Arc::new(Mutex::new(
+            BundleReqRateStore::load_or_create(tmp.path(), bucket).unwrap(),
+        ));
         // First `BUNDLE_REQ_PER_RECIPIENT_PER_HOUR` increments must
         // each leave the counter at-or-below the cap (i.e., not over).
         for i in 1..=BUNDLE_REQ_PER_RECIPIENT_PER_HOUR {
-            let over_cap = {
-                let mut map = rate.lock().await;
-                let entry = map.entry((recipient.clone(), bucket)).or_insert(0);
-                *entry = entry.saturating_add(1);
-                *entry > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR
-            };
+            let count = rate
+                .lock()
+                .await
+                .increment(recipient.clone(), bucket)
+                .unwrap();
             assert!(
-                !over_cap,
+                count <= BUNDLE_REQ_PER_RECIPIENT_PER_HOUR,
                 "increment #{i} must stay inside the cap of {}",
                 BUNDLE_REQ_PER_RECIPIENT_PER_HOUR,
             );
         }
         // Increment #(cap + 1) must trip the limit.
-        let over_cap = {
-            let mut map = rate.lock().await;
-            let entry = map.entry((recipient.clone(), bucket)).or_insert(0);
-            *entry = entry.saturating_add(1);
-            *entry > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR
-        };
-        assert!(over_cap, "increment #(cap + 1) must exceed the cap");
+        let count = rate
+            .lock()
+            .await
+            .increment(recipient.clone(), bucket)
+            .unwrap();
+        assert!(
+            count > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR,
+            "increment #(cap + 1) must exceed the cap",
+        );
         // A different recipient in the same bucket has its own
         // counter and starts fresh.
         let other: PeerId = vec![0x88u8; 33];
-        let other_over_cap = {
-            let mut map = rate.lock().await;
-            let entry = map.entry((other.clone(), bucket)).or_insert(0);
-            *entry = entry.saturating_add(1);
-            *entry > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR
-        };
-        assert!(!other_over_cap, "fresh recipient must not be capped");
+        let other_count = rate.lock().await.increment(other, bucket).unwrap();
+        assert!(
+            other_count <= BUNDLE_REQ_PER_RECIPIENT_PER_HOUR,
+            "fresh recipient must not be capped",
+        );
         // The same recipient in a different bucket also starts fresh.
         let other_bucket: u64 = bucket + 1;
-        let next_hour_over_cap = {
-            let mut map = rate.lock().await;
-            let entry = map.entry((recipient.clone(), other_bucket)).or_insert(0);
-            *entry = entry.saturating_add(1);
-            *entry > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR
-        };
+        let next_hour_count = rate
+            .lock()
+            .await
+            .increment(recipient.clone(), other_bucket)
+            .unwrap();
         assert!(
-            !next_hour_over_cap,
+            next_hour_count <= BUNDLE_REQ_PER_RECIPIENT_PER_HOUR,
             "fresh hour bucket must restart the counter for the same recipient",
+        );
+        // F-S4-02: the per-(recipient, hour) count must survive a
+        // process restart. Drop the store, reload from the same
+        // dir in the same hour — the `recipient`/`bucket` counter is
+        // still over the cap, NOT reset to zero.
+        drop(rate);
+        let mut reloaded =
+            BundleReqRateStore::load_or_create(tmp.path(), bucket).unwrap();
+        let count_after_reload = reloaded.increment(recipient, bucket).unwrap();
+        assert!(
+            count_after_reload > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR,
+            "the cap counter must survive a relay restart, not reset to zero",
         );
     }
 

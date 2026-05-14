@@ -50,6 +50,21 @@ final class SQLiteStorage {
         self.databasePath = path
     }
 
+    /// Bootstrap outcomes that the host (`AppDelegate` / `ChatStore`)
+    /// must treat as an explicit unrecoverable state rather than
+    /// degrading silently into an `AppState()`-defaults session.
+    enum BootstrapError: Error {
+        /// The on-disk database exists but no key the code can
+        /// derive — stored params, the staged rotation salt, or any
+        /// historically-shipped preset — opens it. Either the SE key
+        /// handle is gone (Keychain restored onto hardware whose SE
+        /// can't reproduce it) or the persisted material has been
+        /// tampered with. The app must NOT proceed to construct a
+        /// live store against defaults: the in-memory security
+        /// posture would be weaker than what is encrypted on disk.
+        case keyMaterialUnavailable(detail: String)
+    }
+
 #if DEBUG
     /// Test-only entry point: bypass DBKey + the Keychain-bound
     /// derivation chain. Tests pass an opened `Database` (typically
@@ -73,6 +88,11 @@ final class SQLiteStorage {
     /// behaviour or to reset between test cases.
     static func _resetForTesting() {
         shared = nil
+        // Also clear the process-global bootstrap/cold-load error
+        // statics on `Storage` — they outlive a single test otherwise
+        // and would leak unrecoverable-state into the next test's
+        // `ChatStore.init`.
+        Storage._resetStaticsForTesting()
     }
 #endif
 
@@ -97,9 +117,17 @@ final class SQLiteStorage {
         let fm = FileManager.default
         // Orphan check #1: DB file exists but the SE wrap doesn't.
         // The file is forensically useless (no key can ever decrypt
-        // it). Unlink it and the next path proceeds as fresh-install.
+        // it). This is the state an interrupted duress wipe leaves
+        // after step 1 (key material erased) but before step 4 (DB
+        // unlinked). Unlink the DB AND drop any leftover AppPasscode
+        // slots — a duress wipe killed between key-material erase and
+        // passcode-slot erase would otherwise boot to a passcode lock
+        // gate over an empty app, which a true fresh install never
+        // does. Both must go so the next launch proceeds as a clean
+        // fresh-install.
         if fm.fileExists(atPath: path), !DBKey.isInitialized {
             unlinkDatabaseFiles()
+            AppPasscode.eraseAll()
         }
         // Orphan check #2: DB file does NOT exist but Keychain has
         // material from a previous install (iOS keeps Keychain
@@ -114,6 +142,19 @@ final class SQLiteStorage {
             DBKey.eraseKeyMaterial()
             AppPasscode.eraseAll()
         }
+        // Reconciliation #3: no DB file AND no key material, but
+        // AppPasscode slots are still present. Neither orphan check
+        // above fires (one needs the DB file, the other needs the
+        // key material), so a duress wipe killed between step 2
+        // (passcode-slot erase) and step 4 (DB unlink) — or any
+        // partial-failure variant — would otherwise leave a lock gate
+        // standing over a fresh-install-shaped store. Drop the orphan
+        // slots so the post-wipe surface is byte-identical to a clean
+        // install regardless of where the wipe was interrupted.
+        if !fm.fileExists(atPath: path), !DBKey.isInitialized,
+           AppPasscode.isPasscodeSet || AppPasscode.isDuressPasscodeSet {
+            AppPasscode.eraseAll()
+        }
 
         // Run Argon2id with the same params the DB was originally
         // keyed under. On first launch `loadStoredParams()` returns
@@ -121,9 +162,23 @@ final class SQLiteStorage {
         // what was persisted at first keying so a future tuning
         // bump doesn't break existing installs.
         let params = DBKey.loadStoredParams()
-        let key = try DBKey.deriveKey(params: params)
 
-        var db = try Database(path: path, rawKey: key)
+        // Open the database, with a recovery walk for the cases where
+        // the stored-params-derived key does NOT open the on-disk DB:
+        //   1. A rotation crash between `db.rekey` and the salt
+        //      promotion left the DB encrypted under a salt only
+        //      present in the staging slot — retry with the staged
+        //      salt (and promote it on success).
+        //   2. A tampered-but-floor-passing params row (or a stored
+        //      preset that predates a tuning bump) — retry under each
+        //      historically-shipped preset.
+        // Only if EVERY candidate fails the SQLCipher smoke-read do we
+        // give up: that means no key the code can derive opens the
+        // file, which is an unrecoverable state the host must surface
+        // (`BootstrapError.keyMaterialUnavailable`) rather than
+        // proceed against `AppState()` defaults.
+        let dbFileExists = fm.fileExists(atPath: path)
+        var db = try openWithRecovery(path: path, params: params, dbFileExists: dbFileExists)
         do {
             try Migrator.run(on: db)
         } catch SchemaError.onDiskAheadOfCode(let onDisk, let code) {
@@ -133,7 +188,9 @@ final class SQLiteStorage {
             // existing DB still carries the older `user_version`).
             // No users yet, so the right move is to wipe the DB +
             // every Keychain entry that paired with it, then
-            // reopen fresh as if first launch.
+            // reopen fresh as if first launch. This benign
+            // schema-downgrade self-heal is deliberately NOT routed
+            // through the unrecoverable-state path.
             storageLog.notice(
                 "schema downgrade detected (onDisk=\(onDisk, privacy: .public), code=\(code, privacy: .public)); wiping for fresh start",
             )
@@ -143,10 +200,11 @@ final class SQLiteStorage {
             unlinkDatabaseFiles()
             DBKey.eraseKeyMaterial()
             AppPasscode.eraseAll()
-            // Re-derive a fresh key and open a clean DB.
+            // Re-derive a fresh key and open a clean DB. The file no
+            // longer exists, so `openWithRecovery` mints fresh
+            // material and never enters the recovery walk.
             let freshParams = DBKey.loadStoredParams()
-            let freshKey = try DBKey.deriveKey(params: freshParams)
-            db = try Database(path: path, rawKey: freshKey)
+            db = try openWithRecovery(path: path, params: freshParams, dbFileExists: false)
             try Migrator.run(on: db)
         }
         let inst = SQLiteStorage(db: db, path: path)
@@ -176,6 +234,92 @@ final class SQLiteStorage {
                 storageLog.error("at-rest key rotation FAILED: \(String(describing: error), privacy: .private)")
             }
         }
+    }
+
+    /// Open the database, walking a finite set of key candidates if
+    /// the stored-params-derived key fails the SQLCipher smoke-read.
+    ///
+    /// Candidate order:
+    ///   1. The stored-params key (the common path; on a fresh
+    ///      install this mints the SE wrap / salt and always works).
+    ///   2. The staged rotation salt — recovers a DB left encrypted
+    ///      under a salt that was never promoted because a rotation
+    ///      crashed between `db.rekey` and the salt write. Promoted
+    ///      to the live slot on success.
+    ///   3. Each historically-shipped Argon2id preset — recovers a DB
+    ///      whose params row was tampered to a different (but still
+    ///      code-known) preset, or that was keyed before a tuning bump.
+    ///
+    /// A non-`keyingFailed` `DatabaseError` (open failure, PRAGMA
+    /// failure) on a brand-new file propagates immediately — those are
+    /// not key-mismatch symptoms. If the file exists and every key
+    /// candidate fails — including the case where `DBKey.deriveKey`
+    /// itself throws because the SE key handle is gone but the wrap
+    /// row persists — throws `BootstrapError.keyMaterialUnavailable`.
+    /// When the file does not exist, only the first candidate runs
+    /// (a wrong key against a fresh `CREATE` would never `keyingFail`).
+    private static func openWithRecovery(
+        path: String,
+        params: Argon2id.Params,
+        dbFileExists: Bool,
+    ) throws -> Database {
+        // Candidate 1: the stored-params key. `deriveKey` itself can
+        // throw — e.g. `DBKeyError.unwrapFailed` when the SE key
+        // handle is gone (Keychain restored onto hardware whose SE
+        // cannot reproduce it) but the wrap row persists. Against an
+        // EXISTING DB file that is exactly the F-K02 unrecoverable
+        // state: the key material cannot decrypt the on-disk store.
+        // Against a non-existent file it is a genuine fault on a fresh
+        // install and propagates as-is.
+        let primaryKey: Data
+        do {
+            primaryKey = try DBKey.deriveKey(params: params)
+        } catch let dbKeyError as DBKey.DBKeyError {
+            guard dbFileExists else { throw dbKeyError }
+            throw BootstrapError.keyMaterialUnavailable(
+                detail: "key derivation failed against an existing database: \(dbKeyError)",
+            )
+        }
+        do {
+            return try Database(path: path, rawKey: primaryKey)
+        } catch DatabaseError.keyingFailed(let code) {
+            // A wrong key only manifests as `keyingFailed` against an
+            // EXISTING encrypted file. If the file did not exist, the
+            // open just CREATE'd a fresh DB and a keyingFailed here is
+            // a genuine SQLCipher fault, not a recoverable mismatch.
+            guard dbFileExists else {
+                throw DatabaseError.keyingFailed(code: code)
+            }
+            storageLog.notice("primary DB key failed smoke-read (code=\(code, privacy: .public)); entering recovery walk")
+        }
+
+        // Candidate 2: the staged rotation salt. `try?` flattens the
+        // `Data?` return, so a single optional-bind yields the key.
+        if let stagedKey = try? DBKey.deriveKeyWithStagedSalt(params: params) {
+            if let db = try? Database(path: path, rawKey: stagedKey) {
+                storageLog.notice("DB opened with staged rotation salt; promoting to live slot")
+                DBKey.promoteStagedSalt()
+                return db
+            }
+        }
+
+        // Candidate 3: every historically-shipped preset.
+        for preset in DBKey.historicallyShippedParams {
+            guard let presetKey = try? DBKey.deriveKey(params: preset, persistParams: false) else {
+                continue
+            }
+            if let db = try? Database(path: path, rawKey: presetKey) {
+                storageLog.notice("DB opened under a historically-shipped Argon2id preset")
+                return db
+            }
+        }
+
+        // Every code-known key candidate failed the smoke-read. The
+        // file is intact but undecryptable by this device — surface
+        // it as an explicit unrecoverable state.
+        throw BootstrapError.keyMaterialUnavailable(
+            detail: "no derivable key opens the on-disk database",
+        )
     }
 
     /// Unlink the SQLCipher database file + its WAL/SHM sidecars.

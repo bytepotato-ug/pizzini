@@ -75,9 +75,32 @@ impl ApnsConfig {
                     .into(),
             );
         }
+        // `APNS_ENDPOINT` must be set explicitly once APNs keys are
+        // configured. Silently defaulting to Sandbox here means a
+        // production/TestFlight build (whose device tokens are bound
+        // to one APNs environment) gets `BadDeviceToken` rejections
+        // the moment the two sides drift — with no operator-visible
+        // signal. Fail closed: an APNs deployment with no explicit
+        // environment is a misconfiguration, not a Sandbox default.
         let endpoint = match std::env::var("APNS_ENDPOINT").as_deref() {
             Ok("production") | Ok("prod") => ApnsEndpoint::Production,
-            _ => ApnsEndpoint::Sandbox,
+            Ok("sandbox") | Ok("dev") => ApnsEndpoint::Sandbox,
+            Ok(other) => {
+                return Err(format!(
+                    "APNS_ENDPOINT={other:?} is not recognised. Set it to \
+                     'production' or 'sandbox' explicitly."
+                ));
+            }
+            Err(_) => {
+                return Err(
+                    "APNs is configured (APNS_AUTH_KEY_PATH / APNS_TEAM_ID / \
+                     APNS_KEY_ID set) but APNS_ENDPOINT is unset. Set it to \
+                     'production' or 'sandbox' explicitly — the relay will \
+                     not guess, because a wrong guess silently breaks every \
+                     wake-up push."
+                        .into(),
+                );
+            }
         };
         let bundle_id =
             std::env::var("APNS_TOPIC").unwrap_or_else(|_| "com.bytepotato.pizzini".to_string());
