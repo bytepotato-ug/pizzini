@@ -464,7 +464,7 @@ final class ChatStore: NSObject {
             return
         }
         // Migration: pre-fleet installs persisted dev hosts like
-        // `127.0.0.1`. Per `docs/relay-architecture.md` D1 every
+        // `127.0.0.1`. Per the relay architecture doc (D1), every
         // production relay is Tor-only, so a legitimate BYO value
         // is a strictly-validated v3 onion. Anything else (LAN IPs,
         // hostnames, localhost, mixed-case ASCII, Unicode look-alike

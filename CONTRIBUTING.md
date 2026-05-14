@@ -82,8 +82,9 @@ Acceptable scope prefixes seen in the repo today:
 
 - `crypto-core/` — touch with extreme care. Libsignal is pinned at
   v0.93.2. Don't introduce custom crypto, ever.
-- Anything that affects the threat model — read
-  [`docs/threat-model.md`](docs/threat-model.md) first.
+- Anything that affects the threat model — make sure you understand
+  the threat model before touching it; ask a maintainer if you're
+  unsure.
 - Identity / persistence / wipe paths — duress wipe must preserve
   the "empty but lived-in" invariant. The coercer-watching design
   is real and the codebase encodes it; don't undo it.
@@ -121,10 +122,8 @@ Some UX choices look weird until you remember the threat model:
   on the source device are a UX regression we've shipped and
   rolled back twice.
 
-If you don't understand the threat model, read
-[`docs/threat-model.md`](docs/threat-model.md) before changing
-security-adjacent code. If there's no answer to your question
-there, ask before touching the code.
+If you don't understand the threat model, ask a maintainer before
+changing security-adjacent code.
 
 ## License
 

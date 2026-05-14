@@ -79,6 +79,15 @@ pizzini-relay-state/
 # must never land in the public repo — keep them out of version
 # control entirely.
 .audit-*/
+audit-*/
+
+# Internal design / operations docs. Kept locally for maintainers and
+# operators; deliberately not published in this public repo. Removed
+# from tracking 2026-05-15 — see commit history.
+docs/threat-model.md
+docs/relay-architecture.md
+docs/red-team-brief.md
+docs/operator-runbook.md
 
 # Operator transparency-log signing key. The signing key MUST NEVER
 # enter the repo — leaks invalidate every published attestation.

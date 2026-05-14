@@ -289,7 +289,7 @@ private struct SettingsRow: View {
 }
 
 /// Relay screen — surfaces the bundled trusted fleet (read-only) plus
-/// an optional BYO host override per `docs/relay-architecture.md` D5.
+/// an optional BYO host override per the relay architecture doc (D5).
 ///
 /// The trusted-fleet section is the default routing target: messages
 /// fan out across every alive onion (D3). The BYO field is for

@@ -226,7 +226,7 @@ NEXT STEPS:
      not clearnet). Then bounce Tor and confirm the address comes up.
 
   3) Add the six addresses to the app's bundled allowlist (per
-     docs/relay-architecture.md D5) and ship a release.
+     the relay architecture doc, D5) and ship a release.
 
 EOF
 

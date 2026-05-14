@@ -1,7 +1,7 @@
 // Bundled allowlist of trusted production relays. The list is
 // compile-time, signed-as-code under the iOS app's binary identity,
-// and never fetched at runtime — see `docs/relay-architecture.md`
-// **D5** for why a remote-update channel is deliberately not added.
+// and never fetched at runtime — see the relay architecture doc
+// (D5) for why a remote-update channel is deliberately not added.
 //
 // Reaching this list directly is an explicit choice over typing onion
 // addresses (D5 again): a 56-character base32 onion is a paste-attack
@@ -35,7 +35,7 @@ import Foundation
 /// allowlist, removing it is a breaking change for pre-existing
 /// paired contacts whose state pre-dates the change.
 public struct RelayDescriptor: Sendable, Equatable, Hashable, Codable {
-    /// User-facing country label per `docs/relay-architecture.md` D4.
+    /// User-facing country label per the relay architecture doc (D4).
     /// Picked at relay-deploy time; intentionally decoupled from the
     /// onion vanity prefix (which is a stable numeric token, not a
     /// country code) so a relay can be re-jurisdictioned without

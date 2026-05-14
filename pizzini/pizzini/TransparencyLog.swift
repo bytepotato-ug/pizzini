@@ -402,7 +402,7 @@ extension TransparencyLog {
     ///     service hostname." Until the operator ships an onion
     ///     mirror of the transparency log, we accept the IP-leak
     ///     trade-off for content-signed integrity. See
-    ///     `docs/threat-model.md` "Known limitations".
+    ///     the threat-model doc, "Known limitations".
     static func fetchAndCache(
         from url: URL? = TransparencyLogConfig.logURL,
         urlSession: URLSession? = nil,

@@ -10,10 +10,10 @@ Signal is the reference. Pizzini diverges where Signal made compromises we don't
 
 - **No phone number.** Pairwise random IDs. Pairing happens via QR or invite link, out of band.
 - **Tor-only transport.** No clearnet fallback. Sealed sender over onion routing.
-- **Stateless relays, app-side fanout across a bundled fleet.** Relays hold no per-user accounts and no plaintext message bodies. The current fleet is three Tor onion services hosted in DE / NO / US — but all three are run by a single operator on one provider, so the "multiple jurisdictions / no single seizable server" property is aspirational: it only holds once independent operators run independent infrastructure (see [`docs/threat-model.md`](docs/threat-model.md) "Known limitations"). Two routing maps persist across restarts under ChaCha20-Poly1305 with 0600 permissions: the offline-message queue (libsignal-sealed ciphertexts, sender-chosen TTL up to 7 days, per-peer cap) and the APNs push-token map (30-day TTL). Live route tables, verify-key caches, hashcash buckets, and token replay sets stay in memory only and are wiped on restart. Encryption at rest is defence-in-depth against operator mistakes, not against an attacker who has seized the machine.
+- **Stateless relays, app-side fanout across a bundled fleet.** Relays hold no per-user accounts and no plaintext message bodies. The current fleet is three Tor onion services hosted in DE / NO / US — but all three are run by a single operator on one provider, so the "multiple jurisdictions / no single seizable server" property is aspirational: it only holds once independent operators run independent infrastructure. Two routing maps persist across restarts under ChaCha20-Poly1305 with 0600 permissions: the offline-message queue (libsignal-sealed ciphertexts, sender-chosen TTL up to 7 days, per-peer cap) and the APNs push-token map (30-day TTL). Live route tables, verify-key caches, hashcash buckets, and token replay sets stay in memory only and are wiped on restart. Encryption at rest is defence-in-depth against operator mistakes, not against an attacker who has seized the machine.
 - **Cryptographic erasure on duress.** Real wipe, not pretend mode.
 - **Post-quantum from day one.** PQXDH and Triple Ratchet, via libsignal.
-- **Reproducible builds, signed transparency log.** Relay binaries are reproducible under a pinned Docker toolchain (`scripts/build-relay-release.sh`); each SHA-256 is signed by the operator's Ed25519 key and committed to `transparency-log.ndjson`. iOS clients verify the running relay against the log on every reconnect. Multi-maintainer co-signing is a known gap; see [`docs/threat-model.md`](docs/threat-model.md).
+- **Reproducible builds, signed transparency log.** Relay binaries are reproducible under a pinned Docker toolchain (`scripts/build-relay-release.sh`); each SHA-256 is signed by the operator's Ed25519 key and committed to `transparency-log.ndjson`. iOS clients verify the running relay against the log on every reconnect. Multi-maintainer co-signing is a known gap.
 
 ## Stack
 
@@ -41,7 +41,7 @@ Signal is the reference. Pizzini diverges where Signal made compromises we don't
 
 - No custom crypto. libsignal does the work.
 - No phone-number-based identity, ever.
-- No clearnet transport. (One exception: the transparency-log fetch from `raw.githubusercontent.com` goes over plain HTTPS — see [`docs/threat-model.md`](docs/threat-model.md) "Metadata posture".)
+- No clearnet transport. (One exception: the transparency-log fetch from `raw.githubusercontent.com` goes over plain HTTPS.)
 - No analytics, telemetry, or third-party SDKs.
 - No automatic media loading. Pegasus 2021 was an iMessage zero-click via image parsing.
 - No in-app preview of any attachment. Text, image, archive — all the same. Recipient taps "Save to Files" and the OS owns what's inside.
@@ -51,10 +51,7 @@ Signal is the reference. Pizzini diverges where Signal made compromises we don't
 
 ## Architecture
 
-Production deployment, relay topology, and other architectural decisions live in `docs/`:
-
-- [`docs/relay-architecture.md`](docs/relay-architecture.md) covers Tor-only transport, multi-jurisdiction independent onions, app-side fanout (instead of OnionBalance), numeric onion vanity prefixes (`pizzini2/3/4` are the live relays; the trailing digit is drawn from Tor v3 base32's `a-z` + `2-7` alphabet, so `pizzini5/6/7` are the unused slots), and the bundled allowlist with BYO override. It also lists alternatives considered and rejected so the same conversations don't get re-litigated.
-- [`docs/threat-model.md`](docs/threat-model.md) covers known gaps and assumptions.
+Tor-only transport; three multi-jurisdiction independent onion services with app-side fanout (rather than an OnionBalance frontend); numeric onion vanity prefixes (`pizzini2/3/4` are the live relays; the trailing digit is drawn from Tor v3 base32's `a-z` + `2-7` alphabet, so `pizzini5/6/7` are the unused slots); a bundled relay allowlist with a BYO override.
 
 ## Repo layout
 
@@ -108,7 +105,7 @@ Pizzini is in pre-audit private beta. The protocol surface, storage layer, and r
 Shipping today:
 
 - PQXDH and Triple Ratchet end-to-end, sealed sender, recipient-issued v2 delivery tokens (BLAKE3 hash chains), and first-contact hashcash PoW.
-- Multi-relay Tor onion fanout across a three-relay fleet hosted in Germany, Norway, and the USA (one operator, one provider — independent-operator deployment is still future work; see [`docs/threat-model.md`](docs/threat-model.md)). App-side broadcast; libsignal's `SealedSenderResult.isDuplicate` handles receive dedup. APNs push registers on exactly one primary relay so an offline-recipient burst doesn't produce N wake-ups.
+- Multi-relay Tor onion fanout across a three-relay fleet hosted in Germany, Norway, and the USA (one operator, one provider — independent-operator deployment is still future work). App-side broadcast; libsignal's `SealedSenderResult.isDuplicate` handles receive dedup. APNs push registers on exactly one primary relay so an offline-recipient burst doesn't produce N wake-ups.
 - Persistent offline-message queue at each relay (ChaCha20-Poly1305, sender-chosen TTL up to 7 days, per-peer cap). APNs payloads carry no peer information; a Notification Service Extension increments the app-icon badge while the app is force-quit.
 - Group chat: sender-key fanout, explicit invitation accept and decline, chunked sealed-sender attachments, per-recipient outbox with ⏳ / ✓ / ✓✓ / 👁 / ✗ status, panic-mode wipe.
 - Storage: SQLCipher v4.6.1, eleven normalised tables, Argon2id-stretched key derivation from a Secure-Enclave-wrapped seed. One-shot Keychain to SQLCipher migration with verify-before-delete.

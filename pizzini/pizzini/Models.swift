@@ -663,7 +663,7 @@ struct AppState: Codable, Sendable {
     // BYO override: the user typed an address into Settings →
     // Custom relay, and we treat it verbatim as a single-relay
     // target (dev `127.0.0.1`, community-run onions, etc.). See
-    // `docs/relay-architecture.md` D5 for the override contract.
+    // the relay architecture doc (D5) for the override contract.
     static let defaultRelayHost = ""
 
     init(
