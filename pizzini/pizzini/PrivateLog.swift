@@ -27,16 +27,15 @@ import os.log
 nonisolated func pzLog(_ message: @autoclosure () -> String) {
     #if DEBUG
     let body = message()
-    os_log(.debug, "%{public}@", body)
-    // QA-debug persistent log. Single evaluation of `message()` —
-    // even though pzLog is a hot path, the file write is dispatched
-    // off-thread on QALog's serial utility queue so the caller pays
-    // only the string-interpolation cost (which DEBUG was already
-    // paying for the os_log line above).
-    //
-    // Categorise as "log" so QA-log readers can distinguish
-    // pzLog-origin lines from `diagLog` events (which carry their
-    // own per-flow category like "relay", "group", "pair", …).
+    // Wall-clock `HH:MM:SS.mmm` prefix on the Xcode-console output so
+    // when-did-X-happen analysis works without enabling Xcode's
+    // console-timestamp preference per developer. Matches the format
+    // embedded Tor's own `[notice]` lines use, so a mixed log capture
+    // sorts cleanly side-by-side. We do NOT prefix the QA-log copy
+    // because QALog.record already stamps each line with an ISO-8601
+    // wall-clock — prefixing here would emit duplicate timestamps in
+    // the persistent file.
+    os_log(.debug, "%{public}@", "\(pzLogStampHHMMSSmmm()) \(body)")
     QALog.record(category: "log", message: body)
     #else
     // Release: drop the message entirely. The `@autoclosure` means
@@ -44,4 +43,26 @@ nonisolated func pzLog(_ message: @autoclosure () -> String) {
     // line with peer-id formatting has zero cost in shipped builds.
     _ = ()
     #endif
+}
+
+/// Local-time `HH:MM:SS.mmm` used as the wall-clock prefix on
+/// every `pzLog` Xcode-console line. Format matches embedded
+/// Tor's `[notice]` lines so a mixed log capture sorts cleanly
+/// side-by-side. Cheap (~1 µs on an iPhone 15 Pro, dominated by
+/// the `DateComponents` extraction); pzLog is hot but not THAT
+/// hot, so we don't bother caching the formatter.
+nonisolated private func pzLogStampHHMMSSmmm() -> String {
+    let now = Date()
+    let comp = Calendar(identifier: .gregorian).dateComponents(
+        [.hour, .minute, .second, .nanosecond],
+        from: now,
+    )
+    let ms = (comp.nanosecond ?? 0) / 1_000_000
+    return String(
+        format: "%02d:%02d:%02d.%03d",
+        comp.hour ?? 0,
+        comp.minute ?? 0,
+        comp.second ?? 0,
+        ms,
+    )
 }
