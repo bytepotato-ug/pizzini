@@ -88,6 +88,7 @@ docs/threat-model.md
 docs/relay-architecture.md
 docs/red-team-brief.md
 docs/operator-runbook.md
+docs/operator-hardening.md
 docs/delivery-token-v2-rollout.md
 
 # Operator transparency-log signing key. The signing key MUST NEVER
