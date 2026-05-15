@@ -96,11 +96,16 @@ struct ChatView: View {
     /// log slice — keeping a mirror here avoids an off-by-one when
     /// multiple frames batch.
     @State private var lastSeenLogCount = 0
-    /// How close to the bottom (in points) still counts as
-    /// "at the bottom" for the jump-to-bottom pill. A few points
-    /// of slack avoids the pill flickering on momentum-scroll
-    /// overshoots and rounding inside `ScrollGeometry`.
-    private static let atBottomThreshold: CGFloat = 24
+    /// Stable identifier for the 1pt invisible sentinel row at
+    /// the very end of the log. `.onScrollVisibilityChange` on
+    /// the sentinel is what drives `isAtBottom` — when the
+    /// sentinel is on screen we're at the absolute bottom of
+    /// content; when it scrolls off we're reading history.
+    /// Using a real view's visibility instead of `ScrollGeometry`
+    /// math sidesteps `safeAreaInset(.bottom)`, keyboard insets,
+    /// and `.defaultScrollAnchor` quirks that all skew
+    /// `contentOffset.y` vs `contentSize`.
+    private static let bottomSentinelID = "pizzini.chat.bottomSentinel"
     @Environment(\.dismiss) private var dismiss
 
     private var contact: Contact? {
@@ -644,6 +649,28 @@ struct ChatView: View {
                         ),
                     ).id(entry.id)
                 }
+                // Sentinel for the WhatsApp/Signal-style
+                // jump-to-bottom pill. A 1pt-tall transparent
+                // view sits as the very last row of the log;
+                // `.onScrollVisibilityChange` on it tells us
+                // exactly whether the absolute bottom of the
+                // content is currently on screen. This is much
+                // more reliable than ScrollGeometry math —
+                // safeAreaInset(.bottom) for the composer,
+                // keyboard insets, and `.defaultScrollAnchor`
+                // all skew `contentOffset.y` vs `contentSize`,
+                // so a derived "are we at the bottom" boolean
+                // was producing false negatives. Visibility of
+                // a real view is unambiguous.
+                Color.clear
+                    .frame(height: 1)
+                    .id(Self.bottomSentinelID)
+                    .onScrollVisibilityChange(threshold: 0.01) { visible in
+                        isAtBottom = visible
+                        if visible {
+                            unreadWhileScrolledUp = 0
+                        }
+                    }
             }
             .padding(.horizontal)
             .padding(.vertical, 12)
@@ -683,34 +710,10 @@ struct ChatView: View {
         .defaultScrollAnchor(.bottom, for: .sizeChanges)
         .scrollPosition($scrollPosition)
         .scrollDismissesKeyboard(.interactively)
-        // Track "is the user at the bottom?" so the
-        // jump-to-bottom pill knows when to show. iOS 18's
-        // ScrollGeometry gives us live contentOffset + sizes
-        // every frame; deriving the boolean inline and emitting
-        // only on change keeps the `.action` callback to the
-        // moments that actually flip the state. Threshold
-        // absorbs momentum-scroll overshoots and rounding inside
-        // ScrollGeometry so the pill doesn't flicker.
-        .onScrollGeometryChange(for: Bool.self) { geom in
-            let maxOffset = max(0, geom.contentSize.height - geom.containerSize.height)
-            return geom.contentOffset.y >= maxOffset - Self.atBottomThreshold
-        } action: { _, atBottom in
-            isAtBottom = atBottom
-            if atBottom {
-                // Reaching the bottom clears the unread tally —
-                // the user can see the new rows now. Matches
-                // WhatsApp/Signal: the pill counter resets the
-                // instant you arrive at the bottom, whether you
-                // tapped the pill, manually scrolled, or sent a
-                // message.
-                unreadWhileScrolledUp = 0
-            }
-        }
         // Floating jump-to-bottom pill (WhatsApp/Signal/Telegram
-        // pattern). Visible only when the user is scrolled up
-        // reading history. Tapping animates to the bottom and
-        // clears the unread tally (via the at-bottom callback
-        // above). Padded so it floats clear of the composer.
+        // pattern). The visibility of the bottom sentinel inside
+        // the LazyVStack drives `isAtBottom`; this overlay just
+        // shows the pill when the sentinel is offscreen.
         .overlay(alignment: .bottomTrailing) {
             jumpToBottomPill
                 .padding(.trailing, 16)

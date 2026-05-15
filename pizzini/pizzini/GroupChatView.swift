@@ -72,7 +72,12 @@ struct GroupChatView: View {
     @State private var isAtBottom = true
     @State private var unreadWhileScrolledUp = 0
     @State private var lastSeenLogCount = 0
-    private static let atBottomThreshold: CGFloat = 24
+    /// Stable identifier for the 1pt invisible sentinel row at
+    /// the very end of the group log. See `ChatView` for the
+    /// rationale — visibility of a real view sidesteps the
+    /// `ScrollGeometry` quirks introduced by `safeAreaInset`
+    /// and `.defaultScrollAnchor`.
+    private static let bottomSentinelID = "pizzini.group.bottomSentinel"
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -348,6 +353,19 @@ struct GroupChatView: View {
                         )
                         .id(row.id)
                     }
+                    // Bottom sentinel — see `ChatView` for the
+                    // rationale. Visibility-of-a-real-view is a
+                    // more reliable "are we at the bottom" signal
+                    // than ScrollGeometry math.
+                    Color.clear
+                        .frame(height: 1)
+                        .id(Self.bottomSentinelID)
+                        .onScrollVisibilityChange(threshold: 0.01) { visible in
+                            isAtBottom = visible
+                            if visible {
+                                unreadWhileScrolledUp = 0
+                            }
+                        }
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
@@ -377,18 +395,8 @@ struct GroupChatView: View {
             .defaultScrollAnchor(.bottom, for: .sizeChanges)
             .scrollPosition($scrollPosition)
             .scrollDismissesKeyboard(.interactively)
-            // At-bottom tracker + jump-to-bottom pill — same
-            // shape as `ChatView.messages`. See the comment
-            // block there for the rationale.
-            .onScrollGeometryChange(for: Bool.self) { geom in
-                let maxOffset = max(0, geom.contentSize.height - geom.containerSize.height)
-                return geom.contentOffset.y >= maxOffset - Self.atBottomThreshold
-            } action: { _, atBottom in
-                isAtBottom = atBottom
-                if atBottom {
-                    unreadWhileScrolledUp = 0
-                }
-            }
+            // Floating jump-to-bottom pill — visibility of the
+            // sentinel above drives `isAtBottom`.
             .overlay(alignment: .bottomTrailing) {
                 jumpToBottomPill
                     .padding(.trailing, 16)
