@@ -453,141 +453,158 @@ struct ContactsListView: View {
     }
 
     // ─── Relay state indicator (nav bar toolbar item) ─────────────────
-    // Shown only on this screen. Three visual modes:
-    //   • `.connected`           — `EmptyView` (no chrome).
-    //   • connecting / idle /
-    //     connectingToTor        — small inline ProgressView (mini
-    //                              size, tinted to the system accent
-    //                              so it reads as "working", not
-    //                              "broken"). No text, no tap action.
-    //   • `.failed`              — red 22×22 circle with a white
-    //                              exclamation glyph; tap fires
-    //                              `forceReconnectRelays`. The colour
-    //                              is the only signal that this is a
-    //                              non-self-resolving state.
-    /// Short label for the toolbar connecting-pill. The label-from-
-    /// state mapping lives in `ChatStore.connectionPillLabel` so
-    /// it can be unit-pinned without spinning up the view (the pill
-    /// is the user's continuous signal of network health — a copy
-    /// regression here is exactly the bug RELEASE-CHECKLIST catches
-    /// and we'd still rather catch in CI).
-    private var connectingShortLabel: String {
-        ChatStore.connectionPillLabel(
-            for: store.relayState,
-            connectedRelays: store.readyRelays.count,
-            totalRelays: store.relays.count,
-        ) ?? ""
+    // Five states, all driven by the pure derivation in
+    // `ChatStore.pillState`:
+    //   • `.bootstrappingTor`  — grey capsule, label "Bootstrapping
+    //                            Tor N%", no tap action.
+    //   • `.connectingRelays`  — amber capsule, label "Connecting M
+    //                            of N", no tap action.
+    //   • `.connected`         — green capsule, "Connected", auto-
+    //                            hides after a 2 s grace via
+    //                            `connectedShownAt` below.
+    //   • `.partial`           — amber capsule, label "M of N
+    //                            relays", persists. Tells the user
+    //                            the fleet has degraded redundancy
+    //                            but is still serving traffic.
+    //   • `.failed`            — red capsule, label "Couldn't
+    //                            connect — tap to retry", taps
+    //                            kick `forceReconnectRelays`.
+    /// Local @State driving the post-`.connected` 2-second auto-
+    /// hide. We stash the timestamp the state first reached
+    /// `.connected` and stop rendering the pill once
+    /// `connectedHideAfterSeconds` has elapsed since.
+    @State private var connectedShownAt: Date?
+    private static let connectedHideAfterSeconds: TimeInterval = 2
+
+    /// Current pill state. Computed every render from the store's
+    /// live state, so we never lag the fleet by a frame.
+    ///
+    /// Reads `perRelayState` (observable @Observable member) rather
+    /// than `relays.map { $0.state }` — `RelayClient` is a plain
+    /// final class outside the @Observable graph, so its `state`
+    /// var doesn't trigger redraws. `perRelayState` is kept in
+    /// lockstep with the fleet by the delegate handler.
+    private var pillState: ChatStore.PillState {
+        let pct = store.torBootstrapProgress
+        let healths: [ChatStore.RelayHealth] = store.perRelayState.values.map {
+            ChatStore.RelayHealth($0)
+        }
+        return ChatStore.pillState(bootstrap: pct, relays: healths)
     }
 
-    /// Sentence-long explainer shown as the top item of the menu the
-    /// connecting-pill opens. Tells the user *why* the spinner is
-    /// spinning, in plain language, without making them navigate to
-    /// Settings → Relays for the full breakdown.
-    private var connectingMenuExplainer: String {
-        switch store.relayState {
-        case .connectingToTor(let progress):
-            let pct = progress > 0 ? " (\(progress)%)" : ""
-            return "Bootstrapping the embedded Tor client\(pct). The relay sockets dial as soon as Tor is ready."
-        case .connecting:
-            return "Tor is up. Dialing the trusted relay fleet via .onion. Usually completes in a couple of seconds."
-        case .idle:
-            return "Starting up the connection. This usually takes a second after launch."
-        case .connected, .failed:
-            return ""
+    /// Capsule fill colour for the current pill state. Static method
+    /// so a screenshot smoke test can render every state without a
+    /// live ChatStore.
+    private static func pillBackground(for tint: ChatStore.PillState.Tint) -> Color {
+        switch tint {
+        case .grey:  return Color(.secondarySystemFill)
+        case .amber: return Color.orange.opacity(0.20)
+        case .green: return Color.green.opacity(0.25)
+        case .red:   return Color.red
         }
     }
 
-    /// VoiceOver label. Combines short status + the Tor phase string
-    /// for the screen-reader path, where the visible short label is
-    /// not enough context on its own.
-    private var connectingAccessibilityLabel: String {
-        let phase = store.torBootstrapPhase
-        let phaseSuffix = phase.isEmpty || phase == "Connected" ? "" : " \(phase)."
-        switch store.relayState {
-        case .connectingToTor(let progress):
-            let pct = progress > 0 ? " \(progress) percent." : ""
-            return "Connecting through Tor.\(pct)\(phaseSuffix)"
-        case .connecting:
-            return "Connecting to relays.\(phaseSuffix)"
-        case .idle:
-            return "Starting up.\(phaseSuffix)"
-        case .connected:
-            return "Connected."
-        case .failed:
-            return "Not connected."
+    /// Foreground (label) colour for the current pill tint. Red
+    /// uses white-on-red for contrast; the rest defer to system
+    /// foregrounds.
+    private static func pillForeground(for tint: ChatStore.PillState.Tint) -> Color {
+        switch tint {
+        case .red:   return .white
+        case .green: return Color.green
+        case .amber: return Color.orange
+        case .grey:  return .secondary
         }
     }
 
     @ViewBuilder
     private var relayStateIndicator: some View {
-        switch store.relayState {
-        case .connected:
+        let state = pillState
+        // Hide the pill entirely once `.connected` has been visible
+        // long enough — the user has confirmation we made it, and
+        // healthy steady state shouldn't waste toolbar real estate.
+        // Every non-connected state pulls the timestamp back to nil
+        // so the next `.connected` arrival starts a fresh 2 s grace.
+        if shouldHidePill(for: state) {
             EmptyView()
-        case .idle, .connecting, .connectingToTor:
-            // Replaces a bare `ProgressView` that left users staring at
-            // a spinning circle with no explanation. The pill carries
-            // (a) an always-non-empty short label so the user reads
-            // the actual phase ("Tor 73%" / "Connecting" / "Starting"),
-            // (b) a capsule background so it reads as an intentional
-            // status indicator instead of a runaway loading wheel, and
-            // (c) a tap-to-open menu with the full phase explainer +
-            // an inline Reconnect action so the user doesn't have to
-            // navigate to Settings to act on a stuck handshake.
-            Menu {
-                Section {
-                    Text(connectingMenuExplainer)
+        } else {
+            pillBody(for: state)
+        }
+    }
+
+    /// Should the pill be hidden? Returns true only when the pill
+    /// state is `.connected` AND the auto-hide grace has elapsed.
+    /// Side effect: refreshes `connectedShownAt` as state crosses
+    /// into/out of `.connected`.
+    private func shouldHidePill(for state: ChatStore.PillState) -> Bool {
+        switch state {
+        case .connected:
+            if let shownAt = connectedShownAt {
+                if Date().timeIntervalSince(shownAt) >= Self.connectedHideAfterSeconds {
+                    return true
                 }
-                Button {
-                    store.forceReconnectRelays()
-                } label: {
-                    Label("Reconnect now", systemImage: "arrow.clockwise")
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    ProgressView()
-                        .controlSize(.mini)
-                    Text(connectingShortLabel)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: true, vertical: false)
-                }
-                .padding(.horizontal, 9)
-                .padding(.vertical, 4)
-                .background(Capsule().fill(Color(.secondarySystemFill)))
+                return false
             }
-            .accessibilityLabel(connectingAccessibilityLabel)
-            .accessibilityHint("Tap for connection details or to reconnect now.")
-        case .failed:
+            // First frame of `.connected` — stamp the timestamp on
+            // the next runloop tick (we can't mutate @State from
+            // inside `body` evaluation) and keep showing the pill
+            // until the grace elapses.
+            DispatchQueue.main.async {
+                connectedShownAt = Date()
+            }
+            return false
+        default:
+            if connectedShownAt != nil {
+                DispatchQueue.main.async {
+                    connectedShownAt = nil
+                }
+            }
+            return false
+        }
+    }
+
+    @ViewBuilder
+    private func pillBody(for state: ChatStore.PillState) -> some View {
+        let bg = Self.pillBackground(for: state.tint)
+        let fg = Self.pillForeground(for: state.tint)
+        let content = HStack(spacing: 6) {
+            if showsSpinner(for: state) {
+                ProgressView()
+                    .controlSize(.mini)
+                    .tint(fg)
+            }
+            Text(state.label)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(fg)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(Capsule().fill(bg))
+        if state.isTappable {
             Button {
                 store.forceReconnectRelays()
             } label: {
-                HStack(spacing: 6) {
-                    ZStack {
-                        Circle()
-                            .fill(Color.red)
-                            .frame(width: 22, height: 22)
-                        Image(systemName: "exclamationmark")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(.white)
-                    }
-                    // After 5 failed auto-reconnects in a row we stop
-                    // silently retrying and let the user drive the
-                    // next attempt. Surface a plain-language label
-                    // next to the badge so the affordance reads as
-                    // "tap me" rather than "background status icon".
-                    if store.manualReconnectRequired {
-                        Text("Reconnect")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.red)
-                    }
-                }
+                content
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(
-                store.manualReconnectRequired
-                    ? "Pizzini is not connected. Tap to reconnect."
-                    : "Pizzini is not connected. Retrying."
-            )
+            .accessibilityLabel("Couldn't connect. Tap to retry.")
+        } else {
+            content
+                .accessibilityLabel(state.label)
+        }
+    }
+
+    /// Spinner appears for in-progress states (bootstrapping,
+    /// connecting, partial-but-recovering, idle). `.connected`
+    /// shows no spinner — the user is done waiting. `.failed`
+    /// shows none either — that's a tap-to-act state, not a
+    /// loading state.
+    private func showsSpinner(for state: ChatStore.PillState) -> Bool {
+        switch state {
+        case .bootstrappingTor, .connectingRelays, .partial, .idle:
+            return true
+        case .connected, .failed:
+            return false
         }
     }
 

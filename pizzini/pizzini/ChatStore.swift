@@ -614,6 +614,14 @@ final class ChatStore: NSObject {
     /// so the user can see the app is making progress.
     var torBootstrapPhase: String = ""
 
+    /// Live mirror of `TorController.shared.bootstrapProgress`.
+    /// Updated by the captive-portal stall watcher (which already
+    /// polls progress every second) so the pill state machine can
+    /// read it without a separate polling Task. Range 0-100;
+    /// 100 means Tor is bootstrapped and the SOCKS port is ready.
+    /// Drives the `.bootstrappingTor` branch of `pillState`.
+    var torBootstrapProgress: Int = 0
+
     /// Latest captive-portal probe verdict. `nil` until a stalled
     /// bootstrap triggers the probe (Tor progress <50% for >30 s).
     /// Set to `.none` if the probe came back clean (Tor is just slow
@@ -691,10 +699,18 @@ final class ChatStore: NSObject {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 guard let self else { return }
                 if Task.isCancelled { return }
+                let pct = await TorController.shared.bootstrapProgress
+                // Mirror the live progress onto the observable
+                // `torBootstrapProgress` so the multi-state pill in
+                // ContactsListView redraws as bootstrap climbs. The
+                // watcher is the only periodic Tor-progress reader
+                // in ChatStore — running a second polling Task just
+                // for the pill would be wasteful when this one is
+                // already on a 1 s tick.
+                self.torBootstrapProgress = pct
                 // Already fired this cycle — keep the task alive in
                 // case the watcher is cancelled but skip the work.
                 if self.captivePortalProbeFired { continue }
-                let pct = await TorController.shared.bootstrapProgress
                 if pct >= Self.captivePortalStallProgress {
                     // Progress climbed past the threshold — clear
                     // any accumulated stall window. A subsequent
@@ -1079,53 +1095,181 @@ final class ChatStore: NSObject {
         return "\(head)…"
     }
 
-    /// Pure mapping from the connection state machine to the short
-    /// label shown in the toolbar pill. The relay-state alone is not
-    /// enough — once Tor is bootstrapped, the user wants to see how
-    /// far along the relay fanout is ("Connecting 1 of 3"), and that
-    /// requires the per-relay readiness count alongside the aggregate
-    /// state.
-    ///
-    /// Returns `nil` when the pill should be hidden (i.e. `.connected`
-    /// with at least one healthy relay — the user has working send/
-    /// receive and chrome would only get in the way). Caller handles
-    /// `.failed` separately (the red badge with its own tap target);
-    /// this function returns `nil` for `.failed` too so the only
-    /// non-nil returns are the spinner-bearing transient states.
-    ///
-    /// `public nonisolated` so the iOS app's test target can pin
-    /// every branch — the pill is the user's sole continuous signal
-    /// of whether the network is healthy, and a copy regression here
-    /// is the kind of bug `RELEASE-CHECKLIST.md` was written to
-    /// catch and we'd still rather catch in CI.
-    public nonisolated static func connectionPillLabel(
-        for state: RelayClient.State,
-        connectedRelays: Int,
-        totalRelays: Int,
-    ) -> String? {
-        switch state {
-        case .connectingToTor(let progress):
-            // Tor's STATUS_CLIENT BOOTSTRAP events drive `progress`
-            // (0-100). The full label spells out "Tor" so a user
-            // who doesn't know what "Tor" is in isolation still
-            // sees the sentence "Connecting Tor… N%" and can map
-            // it to the onboarding explainer.
-            return progress > 0 ? "Connecting Tor… \(progress)%" : "Connecting Tor…"
-        case .connecting:
-            // Tor is up; SOCKS handshakes to the .onion fleet are
-            // in flight. `connectedRelays` is 0 here (otherwise the
-            // aggregate would be `.connected`); the count gives the
-            // user a sense of progress through the fleet rather
-            // than a bare "Connecting…" spinner.
-            if totalRelays > 0 {
-                return "Connecting \(connectedRelays) of \(totalRelays)"
+    /// Coarse health snapshot of a single relay, as seen by the
+    /// pill state machine. Strips the failure-string detail so the
+    /// pill function stays pure-data and Equatable for tests.
+    public enum RelayHealth: Equatable, Sendable {
+        case bootstrapping(progress: Int)
+        case connecting
+        case connected
+        case failed
+        case idle
+
+        /// Project a full `RelayClient.State` down to the coarse
+        /// pill input. The failure-message string is dropped — the
+        /// pill renders one fleet-level label, not per-relay error
+        /// detail.
+        public init(_ state: RelayClient.State) {
+            switch state {
+            case .connectingToTor(let p): self = .bootstrapping(progress: p)
+            case .connecting:             self = .connecting
+            case .connected:              self = .connected
+            case .failed:                 self = .failed
+            case .idle:                   self = .idle
             }
-            return "Connecting"
-        case .idle:
-            return "Starting"
-        case .connected, .failed:
-            return nil
         }
+    }
+
+    /// Multi-state connection pill. Driven by a pure derivation
+    /// function so every branch can be unit-pinned without spinning
+    /// up a ChatStore + a Tor instance. The pill is the user's only
+    /// continuous signal of whether Pizzini can send and receive,
+    /// and the load-bearing copy bug (`version = "0.0.0"`) escaped
+    /// for months because nothing pinned the rendered string. Each
+    /// case maps 1:1 to a tint colour and a piece of copy; the
+    /// derivation is pure on top of two inputs (Tor bootstrap
+    /// percent + the coarse relay-health array).
+    public enum PillState: Equatable, Sendable {
+        /// Tor's bootstrap is still in flight. `progress` is the
+        /// latest BOOTSTRAP STATUS_CLIENT integer, 0–100.
+        case bootstrappingTor(progress: Int)
+        /// Tor is up. SOCKS dials to the .onion fleet are in flight
+        /// and zero relays have reached `.connected` yet.
+        case connectingRelays(connected: Int, total: Int)
+        /// Every relay in the fleet is `.connected`. Auto-hides
+        /// after a 2-second grace so the pill confirms "we made it"
+        /// before disappearing.
+        case connected
+        /// At least one relay is `.connected` and at least one is
+        /// NOT — the fleet has degraded redundancy but the user
+        /// has working send/receive. Surface so the user knows
+        /// retries are happening; the silent per-relay retry will
+        /// flip back to `.connected` on its own once the dead route
+        /// recovers.
+        case partial(connected: Int, total: Int)
+        /// Every relay failed. The user can tap to re-dial; auto-
+        /// reconnect is also in flight in the background, but the
+        /// pill becomes a tap target so the user isn't stuck
+        /// waiting if they want to retry now.
+        case failed
+        /// Pre-connection: fleet built, no relay has started
+        /// dialing yet. Brief — the next state transition is
+        /// usually `.bootstrappingTor` within a frame or two.
+        case idle
+
+        /// Visual tint bucket. The capsule background renders one
+        /// of three colours so the user can read the pill at a
+        /// glance even without parsing the label. Grey = working
+        /// on it (pre-network); amber = working on it (network
+        /// reachable, dialing); green = healthy; red = the user
+        /// needs to act.
+        public enum Tint: Equatable, Sendable {
+            case grey
+            case amber
+            case green
+            case red
+        }
+
+        public var tint: Tint {
+            switch self {
+            case .bootstrappingTor, .idle:        return .grey
+            case .connectingRelays, .partial:     return .amber
+            case .connected:                      return .green
+            case .failed:                         return .red
+            }
+        }
+
+        /// User-facing label for this state. Strings are pinned in
+        /// `PillStateLabelTests`; a copy edit must update the test
+        /// at the same time.
+        public var label: String {
+            switch self {
+            case .bootstrappingTor(let p):
+                return p > 0 ? "Bootstrapping Tor \(p)%" : "Bootstrapping Tor"
+            case .connectingRelays(_, let total):
+                // Mid-dial: `connected` is always 0 here (the
+                // derivation guarantees it — once any relay is
+                // `.connected`, the state is `.connected` or
+                // `.partial`, never `.connectingRelays`). Show
+                // "Connecting 0 of N" so the count is consistent
+                // with `.partial`'s "M of N" format.
+                return "Connecting 0 of \(total)"
+            case .connected:
+                return "Connected"
+            case .partial(let connected, let total):
+                return "\(connected) of \(total) relays"
+            case .failed:
+                return "Couldn't connect — tap to retry"
+            case .idle:
+                return "Starting"
+            }
+        }
+
+        /// True when tapping the pill should kick a manual
+        /// reconnect. Only `.failed` is tap-actionable — the other
+        /// states are self-resolving and a tap would just thrash
+        /// the in-flight dial.
+        public var isTappable: Bool {
+            if case .failed = self { return true }
+            return false
+        }
+    }
+
+    /// Pure derivation of the pill state from the two raw inputs:
+    /// Tor's bootstrap percent and the coarse per-relay health
+    /// array. The relay-state aggregation is part of this function
+    /// so the pill never disagrees with the underlying fleet (a
+    /// subtle bug class: aggregator says `.connected` but pill
+    /// says `.partial` because they were computed from different
+    /// snapshots).
+    ///
+    /// Order of evaluation:
+    ///   1. If bootstrap < 100 AND no relay has yet reached
+    ///      `.connected`, we're in the bootstrap phase.
+    ///      `.bootstrappingTor`.
+    ///   2. Otherwise, count connected vs total:
+    ///      • 0 / N with N > 0 and any non-failed → connectingRelays
+    ///      • all N failed → failed
+    ///      • all N connected → connected
+    ///      • 1..<N connected → partial
+    ///   3. Empty fleet → idle (the brief teardown→connectRelay
+    ///      window has zero relays).
+    public nonisolated static func pillState(
+        bootstrap: Int,
+        relays: [RelayHealth],
+    ) -> PillState {
+        let total = relays.count
+        let connected = relays.filter { $0 == .connected }.count
+        let failed = relays.filter { $0 == .failed }.count
+        // Bootstrap phase: tor isn't ready yet AND nothing is up.
+        // Once at least one relay reaches `.connected`, we leave
+        // the bootstrap branch even if the percent is still <100
+        // (which can happen briefly on a warm reconnect).
+        if bootstrap < 100, connected == 0 {
+            // Only show the bootstrap pill while at least one
+            // relay is actively in the bootstrap phase (or we
+            // haven't started dialing yet). If the fleet is
+            // entirely `.failed` we want the failed pill, not
+            // a stuck-at-N% bootstrap label.
+            if total == 0 || failed < total {
+                return .bootstrappingTor(progress: bootstrap)
+            }
+        }
+        if total == 0 {
+            return .idle
+        }
+        if failed == total {
+            return .failed
+        }
+        if connected == 0 {
+            // Tor is up (or close to it) but no SOCKS handshake
+            // has completed yet.
+            return .connectingRelays(connected: 0, total: total)
+        }
+        if connected == total {
+            return .connected
+        }
+        return .partial(connected: connected, total: total)
     }
 
     /// **D3 broadcaster.** Invoke `body` on every currently-ready
