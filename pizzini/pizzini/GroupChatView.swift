@@ -64,6 +64,15 @@ struct GroupChatView: View {
     /// own row even when they were scrolled up reading history at
     /// the moment they tapped Send.
     @State private var scrollPosition = ScrollPosition(edge: .bottom)
+    /// At-bottom tracker for the jump-to-bottom pill. See the
+    /// matching state in `ChatView` for the full rationale —
+    /// same WhatsApp/Signal-style pattern, same threshold,
+    /// same lifecycle (reset on every chat-open and on every
+    /// scroll-to-bottom).
+    @State private var isAtBottom = true
+    @State private var unreadWhileScrolledUp = 0
+    @State private var lastSeenLogCount = 0
+    private static let atBottomThreshold: CGFloat = 24
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -224,6 +233,20 @@ struct GroupChatView: View {
             // `markRead` for 1:1 chats.
             store.markGroupRead(groupID: groupID)
             applyInitialFocusIfNeeded()
+            // Seed the log-count mirror + belt-and-braces
+            // scroll-to-bottom on open — same pattern as
+            // `ChatView.onAppear`. The `.defaultScrollAnchor(
+            // .bottom, for: .initialOffset)` above gets us 95%
+            // of the way; this closes the lazy-stack timing
+            // gap on cold opens with mixed-height bubbles.
+            lastSeenLogCount = group?.log.count ?? 0
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 16_000_000)
+                scrollPosition.scrollTo(edge: .bottom)
+                try? await Task.sleep(nanoseconds: 16_000_000)
+                scrollPosition.scrollTo(edge: .bottom)
+                unreadWhileScrolledUp = 0
+            }
         }
         .onDisappear {
             if store.activeSurface == .group(groupId: groupID) {
@@ -239,13 +262,28 @@ struct GroupChatView: View {
             // instead of rendering against a now-nil group.
             if newId == nil { dismiss() }
         }
-        .onChange(of: group?.log.count ?? 0) { _, _ in
+        .onChange(of: group?.log.count ?? 0) { oldValue, newValue in
             // A new row landed while the user is looking at this
             // group. Mark-read ships fresh receipts so the sender's
             // outbox flips ✓✓ → 👁 on the just-arrived message
             // without the user having to re-enter the chat — same
             // shape as `ChatView`'s 1:1 onChange.
             store.markGroupRead(groupID: groupID)
+            // Count new peer rows toward the jump-to-bottom
+            // badge ONLY when the user is scrolled up reading
+            // history. At-bottom users already see the new row
+            // arrive via the size-changes anchor.
+            defer { lastSeenLogCount = newValue }
+            guard !isAtBottom else { return }
+            guard newValue > oldValue, let log = group?.log else { return }
+            let delta = newValue - oldValue
+            let newRows = log.suffix(delta)
+            let incoming = newRows.reduce(0) { count, row in
+                (row.side == .peer && row.kind != .system) ? count + 1 : count
+            }
+            if incoming > 0 {
+                unreadWhileScrolledUp += incoming
+            }
         }
         // Query change → anchor the find-bar to the newest match,
         // same shape as `ChatView`. Empty query → clear anchor.
@@ -339,12 +377,69 @@ struct GroupChatView: View {
             .defaultScrollAnchor(.bottom, for: .sizeChanges)
             .scrollPosition($scrollPosition)
             .scrollDismissesKeyboard(.interactively)
+            // At-bottom tracker + jump-to-bottom pill — same
+            // shape as `ChatView.messages`. See the comment
+            // block there for the rationale.
+            .onScrollGeometryChange(for: Bool.self) { geom in
+                let maxOffset = max(0, geom.contentSize.height - geom.containerSize.height)
+                return geom.contentOffset.y >= maxOffset - Self.atBottomThreshold
+            } action: { _, atBottom in
+                isAtBottom = atBottom
+                if atBottom {
+                    unreadWhileScrolledUp = 0
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                jumpToBottomPill
+                    .padding(.trailing, 16)
+                    .padding(.bottom, 12)
+            }
         } else {
             // Transient state: between `state.groups.remove(at:)` and
             // the auto-dismiss `onChange` firing. Don't surface any
             // distracting UI — a blank background for one frame is
             // less jarring than a "Group missing" red flag.
             Color.clear
+        }
+    }
+
+    /// Circular jump-to-bottom button — same WhatsApp/Signal-style
+    /// pill `ChatView` renders. See that view's `jumpToBottomPill`
+    /// for the rationale. Identical shape so the two surfaces feel
+    /// the same.
+    @ViewBuilder
+    private var jumpToBottomPill: some View {
+        if !isAtBottom {
+            Button {
+                withAnimation {
+                    scrollPosition.scrollTo(edge: .bottom)
+                }
+                unreadWhileScrolledUp = 0
+            } label: {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: "chevron.down.circle.fill")
+                        .font(.system(size: 36))
+                        .foregroundStyle(.primary, .regularMaterial)
+                        .shadow(radius: 2, y: 1)
+                    if unreadWhileScrolledUp > 0 {
+                        Text("\(unreadWhileScrolledUp)")
+                            .font(.caption2.bold().monospacedDigit())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Color.accentColor, in: Capsule())
+                            .offset(x: 6, y: -6)
+                            .accessibilityHidden(true)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(
+                unreadWhileScrolledUp > 0
+                    ? "\(unreadWhileScrolledUp) new messages, jump to bottom"
+                    : "Jump to bottom"
+            )
+            .transition(.opacity.combined(with: .scale(scale: 0.85)))
         }
     }
 

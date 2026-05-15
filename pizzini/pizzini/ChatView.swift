@@ -70,6 +70,37 @@ struct ChatView: View {
     //      tapped Send still needs to see their own message arrive,
     //      and the anchor alone won't yank them down for that case.
     @State private var scrollPosition = ScrollPosition(edge: .bottom)
+    /// Whether the message list is currently scrolled at (or within
+    /// `atBottomThreshold` of) the absolute bottom. Drives the
+    /// WhatsApp/Signal-style jump-to-bottom pill: when false AND
+    /// new incoming messages land, we show a floating button
+    /// instead of yanking the user out of the history they were
+    /// reading. Seeded `true` because `.defaultScrollAnchor(
+    /// .bottom, for: .initialOffset)` parks the list at the
+    /// bottom on first layout; the `.onScrollGeometryChange`
+    /// hook below corrects this on the first scroll event if the
+    /// initial layout actually landed elsewhere.
+    @State private var isAtBottom = true
+    /// Count of incoming `.peer` messages that arrived while the
+    /// user was NOT at-bottom. Shown as a badge on the
+    /// jump-to-bottom pill — matches the WhatsApp/Signal/Telegram
+    /// pattern where the user can see how many new messages are
+    /// waiting below before deciding to jump down. Reset to 0
+    /// whenever the list scrolls back to the bottom (manually or
+    /// programmatically) or the chat is opened anew.
+    @State private var unreadWhileScrolledUp = 0
+    /// Tracks `contact.log.count` between updates so the
+    /// `.onChange` below can compute the delta and count only the
+    /// NEW rows. SwiftUI's `.onChange` gives us `oldValue` and
+    /// `newValue`, but we also need to read the corresponding
+    /// log slice — keeping a mirror here avoids an off-by-one when
+    /// multiple frames batch.
+    @State private var lastSeenLogCount = 0
+    /// How close to the bottom (in points) still counts as
+    /// "at the bottom" for the jump-to-bottom pill. A few points
+    /// of slack avoids the pill flickering on momentum-scroll
+    /// overshoots and rounding inside `ScrollGeometry`.
+    private static let atBottomThreshold: CGFloat = 24
     @Environment(\.dismiss) private var dismiss
 
     private var contact: Contact? {
@@ -181,6 +212,39 @@ struct ChatView: View {
                 store.activeSurface = .oneOnOne(peerIdentity: contact.identityPub)
                 store.markRead(contactID: contactID)
                 applyInitialFocusIfNeeded(contact: contact)
+                // Seed the log-count mirror so the first
+                // `.onChange` delta is computed correctly. Without
+                // this the very first inbound row after open would
+                // be counted as unread even when we're at-bottom.
+                lastSeenLogCount = contact.log.count
+                // Defensive belt-and-braces on
+                // `.defaultScrollAnchor(.bottom, for: .initialOffset)`.
+                // That anchor is the right idea but is flaky with
+                // a LazyVStack of variable-height rows (attachment
+                // bubbles especially) — the first layout can land
+                // a few hundred points above the absolute bottom
+                // because the lazy stack hadn't yet realised the
+                // tail rows when the anchor calculated. One
+                // explicit `scrollTo(.bottom)` on the next
+                // runloop tick after layout closes the gap with
+                // no visible jump on a healthy open and a small
+                // correcting nudge when the lazy timing slips.
+                // No-animation: we want this to be invisible to
+                // the user on the common case.
+                Task { @MainActor in
+                    // Two ticks: one for the lazy stack to
+                    // realise the tail, a second for the anchor
+                    // to settle.
+                    try? await Task.sleep(nanoseconds: 16_000_000)
+                    scrollPosition.scrollTo(edge: .bottom)
+                    try? await Task.sleep(nanoseconds: 16_000_000)
+                    scrollPosition.scrollTo(edge: .bottom)
+                    // Reset the unread tally too — opening a chat
+                    // ALWAYS lands you at the bottom, so the badge
+                    // count from a prior session should not carry
+                    // over.
+                    unreadWhileScrolledUp = 0
+                }
             }
             .onDisappear {
                 if store.activeSurface == .oneOnOne(peerIdentity: contact.identityPub) {
@@ -188,8 +252,26 @@ struct ChatView: View {
                 }
                 store.markRead(contactID: contactID)
             }
-            .onChange(of: contact.log.count) { _, _ in
+            .onChange(of: contact.log.count) { oldValue, newValue in
                 store.markRead(contactID: contactID)
+                // Count the new INCOMING rows since the last
+                // observation. Outgoing rows (`side == .me`) and
+                // system rows (`kind == .system`) don't count
+                // toward the unread badge — only peer messages
+                // the user hasn't seen yet. If the user is
+                // already at-bottom the new rows are already on
+                // screen, so don't bump the badge.
+                defer { lastSeenLogCount = newValue }
+                guard !isAtBottom else { return }
+                guard newValue > oldValue else { return }
+                let delta = newValue - oldValue
+                let newRows = contact.log.suffix(delta)
+                let incoming = newRows.reduce(0) { count, row in
+                    (row.side == .peer && row.kind != .system) ? count + 1 : count
+                }
+                if incoming > 0 {
+                    unreadWhileScrolledUp += incoming
+                }
             }
             // When the user edits the query the current match anchors
             // to the newest hit so they read forward into history with
@@ -601,6 +683,90 @@ struct ChatView: View {
         .defaultScrollAnchor(.bottom, for: .sizeChanges)
         .scrollPosition($scrollPosition)
         .scrollDismissesKeyboard(.interactively)
+        // Track "is the user at the bottom?" so the
+        // jump-to-bottom pill knows when to show. iOS 18's
+        // ScrollGeometry gives us live contentOffset + sizes
+        // every frame; deriving the boolean inline and emitting
+        // only on change keeps the `.action` callback to the
+        // moments that actually flip the state. Threshold
+        // absorbs momentum-scroll overshoots and rounding inside
+        // ScrollGeometry so the pill doesn't flicker.
+        .onScrollGeometryChange(for: Bool.self) { geom in
+            let maxOffset = max(0, geom.contentSize.height - geom.containerSize.height)
+            return geom.contentOffset.y >= maxOffset - Self.atBottomThreshold
+        } action: { _, atBottom in
+            isAtBottom = atBottom
+            if atBottom {
+                // Reaching the bottom clears the unread tally —
+                // the user can see the new rows now. Matches
+                // WhatsApp/Signal: the pill counter resets the
+                // instant you arrive at the bottom, whether you
+                // tapped the pill, manually scrolled, or sent a
+                // message.
+                unreadWhileScrolledUp = 0
+            }
+        }
+        // Floating jump-to-bottom pill (WhatsApp/Signal/Telegram
+        // pattern). Visible only when the user is scrolled up
+        // reading history. Tapping animates to the bottom and
+        // clears the unread tally (via the at-bottom callback
+        // above). Padded so it floats clear of the composer.
+        .overlay(alignment: .bottomTrailing) {
+            jumpToBottomPill
+                .padding(.trailing, 16)
+                .padding(.bottom, 12)
+        }
+    }
+
+    /// Circular jump-to-bottom button with optional unread badge.
+    /// Visible only when the user is scrolled away from the
+    /// bottom — at-bottom it's invisible AND non-interactive
+    /// (no SwiftUI ghost hit-target eating composer taps).
+    /// `unreadWhileScrolledUp` drives the orange badge; zero
+    /// hides the badge but keeps the chevron button so the user
+    /// can still jump down manually when scrolled up with no
+    /// new traffic.
+    @ViewBuilder
+    private var jumpToBottomPill: some View {
+        if !isAtBottom {
+            Button {
+                withAnimation {
+                    scrollPosition.scrollTo(edge: .bottom)
+                }
+                // Optimistic clear; the at-bottom callback will
+                // reassert this once layout settles, but the
+                // visual response is instant.
+                unreadWhileScrolledUp = 0
+            } label: {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: "chevron.down.circle.fill")
+                        .font(.system(size: 36))
+                        .foregroundStyle(.primary, .regularMaterial)
+                        .shadow(radius: 2, y: 1)
+                    if unreadWhileScrolledUp > 0 {
+                        Text("\(unreadWhileScrolledUp)")
+                            .font(.caption2.bold().monospacedDigit())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Color.accentColor, in: Capsule())
+                            // Sits just outside the top-right of
+                            // the chevron. The offset is hand-
+                            // tuned to mirror Telegram's badge
+                            // placement on a 36pt SF Symbol.
+                            .offset(x: 6, y: -6)
+                            .accessibilityHidden(true)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(
+                unreadWhileScrolledUp > 0
+                    ? "\(unreadWhileScrolledUp) new messages, jump to bottom"
+                    : "Jump to bottom"
+            )
+            .transition(.opacity.combined(with: .scale(scale: 0.85)))
+        }
     }
 
     private func composer(disabled: Bool, contact: Contact) -> some View {
