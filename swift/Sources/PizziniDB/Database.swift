@@ -60,7 +60,7 @@ public final class Database {
         // the hex-PRAGMA form would. The two forms are NOT
         // interchangeable; any existing database keyed via PRAGMA
         // would become un-decryptable if opened via the bare-bytes
-        // path. F-NEW-301 fix uses the C API + hex form so the SQL
+        // path. The fix uses the C API + hex form so the SQL
         // never reaches `sqlite3_exec` (and can't be captured into
         // a thrown `DatabaseError.executeFailed.sql` that an NSLog
         // caller would dump to the unified log). The hex string
@@ -110,7 +110,7 @@ public final class Database {
     }
 
     /// Re-encrypt the entire database under `newRawKey`. Used by
-    /// USP #8 (timed key erasure) — the host derives a fresh
+    /// Timed key erasure — the host derives a fresh
     /// 32-byte key from a fresh Argon2id salt on a weekly cadence
     /// and calls this to rotate the at-rest encryption. After a
     /// successful `rekey` followed by `VACUUM`, the previous key

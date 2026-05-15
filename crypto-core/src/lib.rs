@@ -989,7 +989,7 @@ pub unsafe extern "C" fn pizzini_verify_identity_signature(
     signature: *const u8,
     signature_len: usize,
 ) -> i32 {
-    // F-NEW-101: keep the no-tag FFI in source but route every caller
+    // Keep the no-tag FFI in source but route every caller
     // through the v2 form. Internal callers use `_v2` directly; the
     // no-tag form here is the legacy shim and is removed from cbindgen
     // via the #[doc(hidden)] attribute. Future call sites MUST take
@@ -1024,7 +1024,7 @@ pub unsafe extern "C" fn pizzini_verify_identity_signature(
     }
 }
 
-/// F-NEW-101: domain-separated identity signature verify. The signed
+/// Domain-separated identity signature verify. The signed
 /// bytes the verifier reconstructs are
 /// `u16_be(context_tag_len) || context_tag || message`. A caller that
 /// forgets to pass the tag — or passes a different tag than the
@@ -1103,8 +1103,8 @@ pub unsafe extern "C" fn pizzini_store_identity_sign(
     out_len: *mut usize,
 ) -> i32 {
     // Legacy tag-less signing path. Kept for ABI continuity but no
-    // longer called by Swift (RelayClient.swift uses the _v2 form
-    // post-F-NEW-101). Any future caller MUST prefer the _v2 form.
+    // longer called by Swift (RelayClient.swift uses the _v2 form).
+    // Any future caller MUST prefer the _v2 form.
     if store.is_null() || payload.is_null() || out_sig.is_null() || out_len.is_null() {
         return PIZZINI_ERR_INVALID_ARG;
     }
@@ -1129,7 +1129,7 @@ pub unsafe extern "C" fn pizzini_store_identity_sign(
     PIZZINI_OK
 }
 
-/// F-NEW-101: domain-separated identity sign. Signs
+/// Domain-separated identity sign. Signs
 /// `u16_be(context_tag_len) || context_tag || payload`. The tag MUST
 /// be non-empty; passing an empty tag returns `PIZZINI_ERR_INVALID_ARG`
 /// to prevent a misuse path from silently producing legacy-format

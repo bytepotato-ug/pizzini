@@ -43,7 +43,7 @@ struct DatabaseTests {
         }
     }
 
-    @Test("USP #8: rekey rotates the encryption key + previous key fails afterwards")
+    @Test("Rekey rotates the encryption key + previous key fails afterwards")
     func rekeyRotatesKey() throws {
         let path = NSTemporaryDirectory() + "pizzini-test-\(UUID()).db"
         defer {

@@ -249,7 +249,7 @@ struct ChatGroupApplyRejectionTests {
         #expect(env.group.apply(op) == .rejectedAuthorization)
     }
 
-    @Test("USP #5: ghost-member op (wrong priorMemberSetRoot) is rejected with rejectedMemberSetMismatch")
+    @Test("Ghost-member op (wrong priorMemberSetRoot) is rejected with rejectedMemberSetMismatch")
     func ghostMemberOpIsRejected() throws {
         var env = try Env.bootstrap()
         // Simulate the ghost-member attack: an admin's local view
@@ -809,7 +809,7 @@ func realSignedCreate(
     )
 }
 
-/// USP #5: `priorMemberSetRoot` defaults to the empty-set root,
+/// `priorMemberSetRoot` defaults to the empty-set root,
 /// which works for codec-only tests that never run the op through
 /// `apply`. Tests that exercise the apply path MUST pass the
 /// current `group.memberSetRoot` explicitly; otherwise the apply

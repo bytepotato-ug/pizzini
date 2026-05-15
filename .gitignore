@@ -48,7 +48,7 @@ swift/Sources/PizziniTorObjC/torheaders/
 *.swp
 *.swo
 
-# Secrets — never commit. F-NEW-1002: extra specificity to defeat
+# Secrets — never commit. Extra specificity to defeat
 # accidental `git add -f` autocomplete on common secret filename
 # shapes. AuthKey_*.p8 (APNs auth keys) and assorted private-key
 # variants get explicit names so even a wildcard-disabling shell

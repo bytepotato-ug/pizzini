@@ -166,7 +166,7 @@ struct GroupBootstrapSignatureTests {
 
 @Suite("GroupBootstrap memberSetRoot self-consistency")
 struct GroupBootstrapMemberSetRootTests {
-    @Test("USP #5: verifyMemberSetRoot returns true when admin's claim matches the members list")
+    @Test("verifyMemberSetRoot returns true when admin's claim matches the members list")
     func consistentBootstrapPasses() throws {
         let alice = try Session()
         let aliceId = try alice.identityPublic()
@@ -175,7 +175,7 @@ struct GroupBootstrapMemberSetRootTests {
         #expect(bootstrap.verifyMemberSetRoot() == true)
     }
 
-    @Test("USP #5: verifyMemberSetRoot returns false when the admin shipped a ghost-member list")
+    @Test("verifyMemberSetRoot returns false when the admin shipped a ghost-member list")
     func ghostedBootstrapFails() throws {
         let alice = try Session()
         let aliceId = try alice.identityPublic()

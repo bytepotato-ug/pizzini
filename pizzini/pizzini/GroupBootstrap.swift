@@ -37,7 +37,7 @@ import PizziniCryptoCore
 ///   [32] lastOpDigest
 ///   [33] operatorIdentityPub          (the issuing admin)
 ///   u64  timestampMillis
-///   [32] memberSetRoot                (USP #5: canonical hash of the
+///   [32] memberSetRoot                (canonical hash of the
 ///                                        `members` array below. New joiner
 ///                                        recomputes against the parsed
 ///                                        list and rejects if the admin
@@ -72,7 +72,7 @@ struct GroupBootstrap: Sendable, Equatable {
     let lastOpDigest: Data
     let operatorIdentity: Data
     let timestampMillis: UInt64
-    /// USP #5: canonical BLAKE3 root of `members` at the time the
+    /// Canonical BLAKE3 root of `members` at the time the
     /// admin signed the snapshot. The receiver recomputes
     /// `ChatGroup.memberSetRoot(of: members)` and refuses to
     /// bootstrap on mismatch — defends against a malicious admin
@@ -250,7 +250,7 @@ struct GroupBootstrap: Sendable, Equatable {
         )
     }
 
-    /// USP #5: structural self-consistency check. Computes
+    /// Structural self-consistency check. Computes
     /// `ChatGroup.memberSetRoot(of: members)` and compares to the
     /// `memberSetRoot` field stamped by the issuing admin. A
     /// mismatch means the admin's signed `members` list doesn't
@@ -306,7 +306,7 @@ enum GroupBootstrapError: Error, Equatable, Sendable {
 // ─── Wire helpers ────────────────────────────────────────────────────
 //
 // `GroupRole.wireByte` / `init?(wireByte:)` lived as a fileprivate
-// helper here before USP #5 (verifiable group membership) needed it
+// helper here before verifiable group membership needed it
 // from `Group.swift::memberSetRoot`. The definition was promoted to
 // module-internal in `GroupOp.swift`; this file now relies on that
 // single source of truth.

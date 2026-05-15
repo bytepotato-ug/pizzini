@@ -52,7 +52,7 @@ extension ChatGroup {
         /// developer logs; the host surfaces a generic "operation
         /// failed" if anything user-facing is needed.
         case rejectedMalformed(String)
-        /// USP #5. Op's `priorMemberSetRoot` does not match the
+        /// Op's `priorMemberSetRoot` does not match the
         /// receiver's locally-computed canonical root over the
         /// current member set. The operator either:
         ///   - Forked the membership (silently added a ghost member
@@ -222,7 +222,7 @@ extension ChatGroup {
             return .rejectedAuthorization
         }
 
-        // Phase 5.5: USP #5 — verifiable group membership.
+        // Phase 5.5: Verifiable group membership.
         //
         // The operator stamped this op with a canonical hash of the
         // member set they believed to be current at signing time.
@@ -282,7 +282,7 @@ extension ChatGroup {
         // Decode + sort once so the drain is monotonic. Ops we can't
         // decode are dropped here rather than surviving the queue.
         //
-        // F-NEW-501 retention is enforced at queue-INSERT time via
+        // retention is enforced at queue-INSERT time via
         // `queuePending`'s per-operator cap rather than as a
         // timestamp filter here. The audit's original suggestion
         // ("drop ops whose claimed timestamp is > 30d old") is
@@ -339,7 +339,7 @@ extension ChatGroup {
     private mutating func queuePending(signedBytes: Data) {
         if pendingOps.count >= ChatGroup.pendingOpsCap { return }
         if pendingOps.contains(signedBytes) { return }
-        // F-NEW-501 — per-operator sub-cap. Without this, one
+        // Per-operator sub-cap. Without this, one
         // compromised admin can sign `pendingOpsCap` future-epoch ops
         // and pin the entire queue, silently dropping every other
         // admin's legitimate future ops. With it, the worst-case

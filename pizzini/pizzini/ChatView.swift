@@ -1403,7 +1403,7 @@ extension View {
                     isPresented.wrappedValue = false
                 }
                 .ignoresSafeArea()
-                // F-NEW-709 follow-on: QLPreviewController runs in-
+                // Follow-on: QLPreviewController runs in-
                 // process, so the window-level secure mask DOES cover
                 // it in screenshots. But live screen-recording is
                 // a separate pipeline (the `isCaptured` flag) — apply

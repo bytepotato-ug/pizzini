@@ -61,7 +61,7 @@ struct ChatGroup: Codable, Identifiable, Sendable {
     /// integrity, so persisting the raw blob is both safe and simpler
     /// than threading `Codable` conformance through `GroupOpKind`'s
     /// associated-value cases. Decode + verify on each application
-    /// attempt; drop after `ChatGroup.pendingOpRetention` (F-NEW-501
+    /// attempt; drop after `ChatGroup.pendingOpRetention` (
     /// fix — the retention is now actually enforced by `replayPending`).
     var pendingOps: [Data]
 
@@ -237,7 +237,7 @@ struct ChatGroup: Codable, Identifiable, Sendable {
     /// legitimate gap (a member offline catching up).
     static let pendingOpsCap: Int = 1024
 
-    /// Per-operator sub-cap on `pendingOps` (F-NEW-501). Each admin
+    /// Per-operator sub-cap on `pendingOps`. Each admin
     /// can occupy at most this many queue slots; the global cap
     /// (`pendingOpsCap`) bounds the total. Without the sub-cap, one
     /// compromised admin could fill the queue with future-epoch ops
@@ -254,7 +254,7 @@ struct ChatGroup: Codable, Identifiable, Sendable {
     }
 
     /// Domain-separated canonical hash of the current member set
-    /// (USP #5: verifiable group membership). Stable across every
+    /// Verifiable group membership. Stable across every
     /// participant's local view of the same group state — feed it
     /// into the next outgoing `GroupOp.priorMemberSetRoot` so the
     /// receiver's `apply` step can detect equivocation (a "ghost

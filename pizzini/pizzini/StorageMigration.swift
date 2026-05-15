@@ -96,7 +96,7 @@ enum StorageMigration {
     /// overwritten with same-sized noise before delete so the on-disk
     /// `keychain-2.db` page is re-encrypted under a fresh IV before
     /// the row is unlinked — defense in depth against NAND-level
-    /// recovery of the pre-deletion ciphertext (F-NEW-403 mitigation
+    /// recovery of the pre-deletion ciphertext (mitigation
     /// applied here too since these blobs are the same threat shape).
     private static func deleteAllLegacySlots() {
         for account in [

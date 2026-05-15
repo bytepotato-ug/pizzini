@@ -114,7 +114,7 @@ struct ChatGroupReceiveGateTests {
         let signed = try createOp.encoded()
         var group = try #require(ChatGroup.create(
             fromCreate: createOp, signedBytes: signed, localIdentityPub: aliceId))
-        // Admin removes Carol. USP #5: `priorMemberSetRoot` MUST
+        // Admin removes Carol. `priorMemberSetRoot` MUST
         // match the local view at apply time, otherwise apply
         // returns `.rejectedMemberSetMismatch` and the test would
         // log "RemoveMember apply failed". The default empty-set
@@ -191,7 +191,7 @@ struct ChatGroupSendGateTests {
         group.myCurrentDistributionId = UUID()
         // Baseline: Bob can post.
         #expect(group.canSend(asLocal: bobId) == true)
-        // Admin removes Bob. USP #5: prior-member-set-root must
+        // Admin removes Bob. Prior-member-set-root must
         // match the local view; the default empty-set root would
         // be rejected by apply.
         let removeOp = try realSignedOp(

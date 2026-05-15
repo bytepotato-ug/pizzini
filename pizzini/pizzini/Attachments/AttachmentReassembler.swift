@@ -104,7 +104,7 @@ final class AttachmentReassembler {
     func feed(envelope: FileChunkEnvelope, fromPeer peer: Data) -> FeedResult {
         let key = peer + envelope.attachmentId
 
-        // **Replay defense (F-NEW-602).** If we've previously
+        // **Replay defense.** If we've previously
         // completed this attachmentId, reject every subsequent chunk
         // — the sender can't legitimately re-open the same id, and
         // accepting the chunk would truncate-overwrite the existing
@@ -117,7 +117,7 @@ final class AttachmentReassembler {
 
         // First-chunk-of-attachment: set up the disk dir + record.
         if pending[key] == nil {
-            // **Per-peer in-flight cap (F-NEW-603).** Refuse to accept
+            // **Per-peer in-flight cap.** Refuse to accept
             // a new attachmentId for this peer if they're already at
             // the cap. The reaper's 24h TTL will free slots; until
             // then a malicious sender can't pin unbounded disk by
@@ -200,7 +200,7 @@ final class AttachmentReassembler {
             case .success(let completion):
                 pending.removeValue(forKey: key)
                 // Mark this attachmentId as completed so a subsequent
-                // re-send under the same id is rejected (F-NEW-602).
+                // re-send under the same id is rejected.
                 // The 24h reaper clears stale entries; on a duress
                 // wipe `AttachmentSandbox.eraseEverything()` clears
                 // the on-disk files and a fresh ChatStore drops the

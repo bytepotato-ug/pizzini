@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generate the operator's transparency-log signing key (USP #1).
+# Generate the operator's transparency-log signing key.
 #
 # Run this ONCE per operator, on an airgapped/offline machine that
 # never sees the public internet. The output is two files:

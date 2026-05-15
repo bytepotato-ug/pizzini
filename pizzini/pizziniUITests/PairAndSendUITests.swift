@@ -20,7 +20,7 @@ final class PairAndSendUITests: XCTestCase {
         // Welcome → Continue, Icons → Continue, Notifications →
         // Skip, Biometric → "Use app passcode instead" → set passcode.
         //
-        // F-NEW-701: onboarding no longer offers "Skip — I'll add it
+        // onboarding no longer offers "Skip — I'll add it
         // later" on the biometric step. The user must enable Face ID
         // or set an app passcode before reaching the home screen.
         // The simulator can't enrol Face ID via UI test, so we go

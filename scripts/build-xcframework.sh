@@ -43,7 +43,7 @@ rustup target add "${ALL_TARGETS[@]}" >/dev/null
 echo "==> Building crypto-core ($PROFILE) for ${#ALL_TARGETS[@]} target(s)"
 target_args=()
 for t in "${ALL_TARGETS[@]}"; do target_args+=(--target "$t"); done
-# Match the iOS app's deployment target. F-NEW-1008 fix: the
+# Match the iOS app's deployment target. Fix: the
 # `Package.swift` SwiftPM target is `.iOS(.v18)` (bumped 2026-05-11);
 # the previous default `17.0` here would build crypto-core against
 # iOS 17 SDK while the app linked against iOS 18. Stale link
@@ -51,7 +51,7 @@ for t in "${ALL_TARGETS[@]}"; do target_args+=(--target "$t"); done
 # env var.
 export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-18.0}"
 
-# F-NEW-1005 reproducible-build hardening. Three changes:
+# reproducible-build hardening. Three changes:
 #
 #   1. `SOURCE_DATE_EPOCH` from the git commit time of the working
 #      tree. Tools that honour it (lipo on recent Xcode, some

@@ -14,8 +14,8 @@
 //! Difficulty: 18 leading zero bits ≈ 1 second of CPU on a modern
 //! phone. Verifier cost: a single BLAKE3 hash, sub-microsecond.
 
-/// Default hashcash difficulty in leading-zero bits. F-NEW-209:
-/// raised from 18 → 22. Phone-side cost stays under ~1s on the
+/// Default hashcash difficulty in leading-zero bits.
+/// Raised from 18 → 22. Phone-side cost stays under ~1s on the
 /// slowest A14-class device. A desktop-GPU attacker drops from
 /// ~190 k proofs/s (at 18 bits) to ~12 proofs/s (at 22 bits) on a
 /// RTX 4090 — still trivially defeats hashcash as the sole gate,

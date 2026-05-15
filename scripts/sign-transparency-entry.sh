@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sign a single transparency-log entry (USP #1).
+# Sign a single transparency-log entry.
 #
 # Pipe the JSON entry emitted by `scripts/build-relay-release.sh`
 # into stdin; this script emits a signed wrapper to stdout.

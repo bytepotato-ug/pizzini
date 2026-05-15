@@ -216,7 +216,7 @@ final class SQLiteStorage {
         // explicitly and the cost is one no-op syscall per file.
         try? inst.reassertDatabaseFileAttributes()
 
-        // USP #8: rotate the at-rest encryption key if it's been
+        // Rotate the at-rest encryption key if it's been
         // longer than `DBKey.rotationInterval` since the last
         // rotation. Runs INLINE on bootstrap — Argon2id + rekey +
         // VACUUM total ~1–5 s on a typical DB. That's a one-time
@@ -229,7 +229,7 @@ final class SQLiteStorage {
         if DBKey.rotationDue() {
             do {
                 _ = try DBKey.rotateKeyMaterial(liveDB: db, params: params)
-                storageLog.notice("at-rest key rotated (USP #8)")
+                storageLog.notice("at-rest key rotated")
             } catch {
                 storageLog.error("at-rest key rotation FAILED: \(String(describing: error), privacy: .private)")
             }

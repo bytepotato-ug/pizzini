@@ -3,7 +3,7 @@ import Foundation
 import Testing
 @testable import pizzini
 
-/// USP #1 second half: verify the Swift-side parser + signature
+/// Verify the Swift-side parser + signature
 /// check matches what `scripts/sign-transparency-entry.sh`
 /// produces.
 

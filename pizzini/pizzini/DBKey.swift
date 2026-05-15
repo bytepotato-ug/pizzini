@@ -73,7 +73,7 @@ enum DBKey {
     static let paramsAccount = "db-kdf-params"
     /// Application tag for the SE-resident P-256 wrapping key.
     static let enclaveTag = "app.pizzini.db-wrap-key".data(using: .utf8)!
-    /// USP #8: wall-clock (epoch seconds, big-endian u64) of the
+    /// Wall-clock (epoch seconds, big-endian u64) of the
     /// last at-rest-key rotation. Read on launch to decide whether
     /// `rotationDue` should fire; written by `rotateKeyMaterial`.
     /// Missing slot is treated as "rotate immediately" — the first
@@ -154,7 +154,7 @@ enum DBKey {
         ok = Keychain.delete(account: wrapAccount) && ok
         ok = secureDeleteKeychainSlot(account: saltAccount) && ok
         ok = secureDeleteKeychainSlot(account: paramsAccount) && ok
-        // USP #8: the rotation timestamp lives in Keychain too — if
+        // The rotation timestamp lives in Keychain too — if
         // we left it around, a future reinstall would inherit a
         // stale "last rotated" mark and the first-launch initial
         // rotation would be skipped. Drop the slot here so reinstall
@@ -438,7 +438,7 @@ enum DBKey {
         !acceptedParamPresets.contains(p)
     }
 
-    // MARK: - USP #8: timed at-rest key rotation
+    // MARK: - Timed at-rest key rotation
 
     /// True iff the at-rest key has not been rotated within
     /// `rotationInterval`. The first post-install launch always

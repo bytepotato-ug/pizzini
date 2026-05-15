@@ -54,7 +54,7 @@ pub const DEFAULT_STATE_DIR: &str = "./pizzini-relay-state";
 const TOKENS_FILE_NAME: &str = "push_tokens.bin";
 const KEY_FILE_NAME: &str = "push_tokens.key";
 
-/// Per-store AAD. F-NEW-206: domain-separates this store's
+/// Per-store AAD. Domain-separates this store's
 /// ciphertext from siblings' even when keys collide. The version
 /// suffix is bumped if the inner JSON shape ever changes
 /// incompatibly.
@@ -154,7 +154,7 @@ impl PushTokenStore {
         let map = match fs::read(&tokens_path) {
             Ok(bytes) => {
                 // Try the domain-AAD decrypt first; on failure (pre-
-                // F-NEW-206 file written without AAD), fall back to
+                // file written without AAD), fall back to
                 // the no-AAD decrypt. Either way, the next persist
                 // writes the file back with AAD so subsequent reads
                 // take the fast path.
@@ -210,7 +210,7 @@ impl PushTokenStore {
 
     /// Drop entries whose `last_refreshed_unix` is older than
     /// `max_age` from now. Persists if any were dropped. Returns the
-    /// count of dropped entries for logging. F-NEW-208 — the previous
+    /// count of dropped entries for logging. The previous
     /// design only purged on load, so a long-running relay
     /// accumulated tokens indefinitely between restarts.
     pub fn gc_expired(&mut self, max_age: Duration) -> io::Result<usize> {

@@ -32,7 +32,7 @@ blake3 = { version = "1", default-features = false }
 # `push_token_store.rs` for the threat-model framing of the persistence.
 chacha20poly1305 = "0.10"
 # SHA-256 of the running relay binary, computed once at startup and
-# returned via the STATUS_RESPONSE frame (USP #1: reproducible
+# returned via the STATUS_RESPONSE frame (reproducible
 # builds + binary self-attestation). SHA-256 (not BLAKE3, which the
 # rest of the relay uses) is the convention every release
 # announcement and external `sha256sum` invocation speaks, so users

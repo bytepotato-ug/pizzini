@@ -1515,7 +1515,7 @@ public final class TorController: ObservableObject {
     private func makeConfiguration(dataDir: URL) -> TORConfiguration {
         let config = TORConfiguration()
         config.ignoreMissingTorrc = true
-        // F-NEW: we deliberately skip writing geoip/geoip6 — the
+        // We deliberately skip writing geoip/geoip6 — the
         // tor circuit selection logic for client-only doesn't need
         // them, and shipping the ~3MB pair would bloat the app
         // without buying us anything.

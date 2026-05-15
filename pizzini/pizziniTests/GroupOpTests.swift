@@ -124,7 +124,7 @@ struct GroupOpCodecTests {
     }
 }
 
-@Suite("ChatGroup.memberSetRoot (USP #5 canonical hash)")
+@Suite("ChatGroup.memberSetRoot (canonical hash)")
 struct MemberSetRootTests {
     @Test("the empty member set has a well-defined deterministic root")
     func emptySetIsDeterministic() {

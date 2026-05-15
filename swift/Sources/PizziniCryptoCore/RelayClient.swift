@@ -17,7 +17,7 @@ import PizziniTor
 /// with `subsystem:app.pizzini.tor` for the full cold-start picture.
 private let relayLog = Logger(subsystem: "app.pizzini.relay", category: "connect")
 
-/// USP #1: snapshot of the running relay binary's identity.
+/// Snapshot of the running relay binary's identity.
 /// Returned by `RelayClient.requestStatus()` and delivered to the
 /// host via `relayClient(_:didReceiveStatus:)`. The host shows it
 /// in Settings and (eventually) compares against an
@@ -62,7 +62,7 @@ public protocol RelayClientDelegate: AnyObject, Sendable {
         didReceiveBundleFrom fromPeer: Data,
         bundle: Data
     )
-    /// USP #1: relay answered our `requestStatus()` with the
+    /// Relay answered our `requestStatus()` with the
     /// running binary's self-attestation snapshot.
     func relayClient(_ client: RelayClient, didReceiveStatus status: RelayStatus)
     /// A `FRAME_TYPE_CHAIN_SEED_DELIVERY` arrived. The payload is a
@@ -117,7 +117,7 @@ public final class RelayClient: @unchecked Sendable {
     public static let protocolVersion: UInt8 = 3
     /// Domain-separation tag for the HELLO signing payload. MUST match
     /// `HELLO_SIGNING_TAG` in `relay/src/main.rs`.
-    /// Domain-separated HELLO signing tag. F-NEW-205: includes the
+    /// Domain-separated HELLO signing tag. Includes the
     /// protocol version so a captured signature can't be reinterpreted
     /// under a different wire version. Must match
     /// `HELLO_SIGNING_TAG` in `relay/src/main.rs`.
@@ -235,7 +235,7 @@ public final class RelayClient: @unchecked Sendable {
     // 7 was FRAME_TYPE_TOKEN_ISSUE in v1; removed alongside hash-chain
     // token cutover. The wire slot is reserved — don't reuse for an
     // unrelated frame type without a matching relay-side decision.
-    /// USP #1: client → relay "what build are you running?". Empty
+    /// Client → relay "what build are you running?". Empty
     /// payload (just the frame type). Match `FRAME_TYPE_STATUS_REQUEST`
     /// in `relay/src/main.rs`.
     private static let frameTypeStatusRequest: UInt8 = 8
@@ -248,7 +248,7 @@ public final class RelayClient: @unchecked Sendable {
     /// so a future hash bump (e.g. SHA-512) lands without
     /// disturbing this client.
     private static let statusBinHashLen: Int = 32
-    /// USP #4 (pacing pass): cover-traffic frame. Body is exactly
+    /// Pacing pass: cover-traffic frame. Body is exactly
     /// `coverPayloadLen` random bytes. The relay receives + drops.
     /// Match `FRAME_TYPE_COVER` in `relay/src/main.rs`.
     private static let frameTypeCover: UInt8 = 10
@@ -325,7 +325,7 @@ public final class RelayClient: @unchecked Sendable {
             queue.async {
                 delegate?.relayClient(client, didChange: snapshot)
             }
-            // USP #4 (pacing pass): cover-traffic timer follows
+            // Pacing pass: cover-traffic timer follows
             // connection state. Started when we transition into
             // `.connected`, torn down on any other state so the
             // timer can't fire against a dead socket.
@@ -362,12 +362,12 @@ public final class RelayClient: @unchecked Sendable {
     private let signer: HelloSigner
     private var connection: NWConnection?
     private var readBuffer = Data()
-    /// USP #4: wall-clock of the last outgoing frame (real OR
+    /// Wall-clock of the last outgoing frame (real OR
     /// cover). The cover timer skips emission if a real frame
     /// has happened within `coverInterval` — active conversations
     /// produce no overhead.
     private var lastFrameSentAt = Date()
-    /// USP #4: repeating timer driving cover emission. Lives on
+    /// Repeating timer driving cover emission. Lives on
     /// `queue` so all reads/writes against `lastFrameSentAt` and
     /// the connection happen on the same serial queue.
     private var coverTimer: DispatchSourceTimer?
@@ -1033,7 +1033,7 @@ public final class RelayClient: @unchecked Sendable {
         writeFrame(payload, on: connection)
     }
 
-    /// USP #1: ask the relay which build it is running. The relay
+    /// Ask the relay which build it is running. The relay
     /// replies asynchronously via `didReceiveStatus`. The query is
     /// idempotent — issuing it on every reconnect is the recommended
     /// pattern (the Settings panel reads the latest snapshot).
@@ -1111,7 +1111,7 @@ public final class RelayClient: @unchecked Sendable {
         _ = nonce.withUnsafeMutableBytes { buf in
             SecRandomCopyBytes(kSecRandomDefault, buf.count, buf.baseAddress!)
         }
-        // F-NEW-101: the `signer` closure now signs via the domain-
+        // The `signer` closure now signs via the domain-
         // separated v2 FFI, which prepends `u16_be(tag_len) || tag`
         // to the payload internally. The relay's verify reconstructs
         // the same bytes via `build_hello_signing_payload`.
@@ -1145,7 +1145,7 @@ public final class RelayClient: @unchecked Sendable {
         let len = UInt32(payload.count).bigEndian
         withUnsafeBytes(of: len) { frame.append(contentsOf: $0) }
         frame.append(payload)
-        // USP #4: every outgoing frame — real or cover — pushes
+        // Every outgoing frame — real or cover — pushes
         // `lastFrameSentAt` forward so the cover timer skips
         // emission for at least `coverInterval` afterwards.
         lastFrameSentAt = Date()
@@ -1158,7 +1158,7 @@ public final class RelayClient: @unchecked Sendable {
         })
     }
 
-    // ─── USP #4: cover-traffic pacing ─────────────────────────────────
+    // ─── Cover-traffic pacing ─────────────────────────────────
 
     private func startCoverTimer() {
         // Idempotent re-arm. Reconnect → state cycles through
@@ -1213,7 +1213,7 @@ public final class RelayClient: @unchecked Sendable {
         writeFrame(payload, on: connection)
     }
 
-    // ─── F-tor-01: end-to-end dial budget ─────────────────────────────
+    // ─── End-to-end dial budget ───────────────────────────────────────
 
     /// Arm the single wall-clock watchdog for the whole onion dial.
     /// Idempotent — a fresh `connect()` cancels any prior timer
@@ -1353,7 +1353,7 @@ public final class RelayClient: @unchecked Sendable {
                 )
             }
         case Self.frameTypeStatusResponse:
-            // USP #1. Payload after frame-type byte:
+            // Payload after frame-type byte:
             //   u8  protocol_version
             //   u8  git_dirty                  (0 clean / 1 dirty / 2 unknown)
             //   u16 crate_version_len + bytes

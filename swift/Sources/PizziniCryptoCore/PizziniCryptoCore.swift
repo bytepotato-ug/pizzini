@@ -234,7 +234,7 @@ public final class Session: @unchecked Sendable {
     /// Sign `payload` with the local IdentityKey's private half,
     /// domain-separated by `contextTag`.
     ///
-    /// **F-NEW-101**: the tag is MANDATORY and non-empty. The signed
+    /// The tag is MANDATORY and non-empty. The signed
     /// bytes are `u16_be(tag.count) || tag || payload` — a verifier
     /// reconstructing the same bytes can confirm the signature was
     /// produced for that specific context. A caller that passes a
@@ -377,7 +377,7 @@ public final class Session: @unchecked Sendable {
 
     /// Canonical domain-separation tags. Adding a new use-site MUST
     /// add a new tag here rather than reusing an existing one — that
-    /// is the entire point of the F-NEW-101 fix.
+    /// is the entire point of the fix.
     public enum SignatureContext {
         /// HELLO possession proof — included for completeness even
         /// though `RelayClient` constructs the literal directly.
@@ -385,7 +385,7 @@ public final class Session: @unchecked Sendable {
         /// `GroupOp` signature (Create / AddMember / RemoveMember /
         /// RotateSenderKey / GroupChat / Rename).
         // v2: GroupOp wire format gained the 32-byte
-        // `priorMemberSetRoot` field (USP #5: verifiable group
+        // `priorMemberSetRoot` field (verifiable group
         // membership). Bumping the tag in lockstep with the wire
         // bump ensures any in-flight v1 signature fails verification
         // under v2 — no downgrade-attack path that lets a v1 op
@@ -393,7 +393,7 @@ public final class Session: @unchecked Sendable {
         public static let groupOp: Data = Data("pizzini.group.op.v2".utf8)
         /// `GroupBootstrap` snapshot signature.
         // v2: GroupBootstrap wire format gained the 32-byte
-        // `memberSetRoot` field (USP #5: self-consistency check the
+        // `memberSetRoot` field (self-consistency check the
         // joiner runs against the admin's `members[]` list).
         // Lockstep bump with the v1 → v2 wire change ensures
         // pre-v2 snapshots fail signature verification on a v2
@@ -816,7 +816,7 @@ public enum SafetyNumber {
 /// **MUST stay in sync with the relay's `HASHCASH_BITS` constant in
 /// `relay/src/main.rs` and the Rust crate's `HASHCASH_DEFAULT_BITS` in
 /// `crypto-core/src/hashcash.rs`.** A drift here (e.g. iOS at 18 while
-/// the relay enforces 22, the F-NEW-209 bump) causes every iOS
+/// the relay enforces 22, the bump) causes every iOS
 /// BUNDLE_REQUEST to be rejected by the relay with `invalid hashcash`
 /// and no peer can ever complete the PreKey handshake. The pairing UI
 /// stalls indefinitely on "Waiting for handshake".

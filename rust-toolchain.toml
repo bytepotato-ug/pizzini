@@ -1,10 +1,10 @@
-# Pin the Rust toolchain for reproducible builds (USP #1).
+# Pin the Rust toolchain for reproducible builds.
 #
 # Every build environment that picks up this repo will install and
 # use this exact compiler version, so two independent builds of the
 # same git commit by two different operators on two different
 # machines produce bit-for-bit identical relay binaries — the
-# foundation of the "verifiable transparency log" USP.
+# foundation of the "verifiable transparency log".
 #
 # Bumping the channel is a deliberate act: every relay-binary hash
 # published in the transparency log is tied to this version, so a

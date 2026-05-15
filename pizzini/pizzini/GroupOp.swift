@@ -18,7 +18,7 @@ import PizziniCryptoCore
 ///                                all-zero for the Create op)
 ///   [33] operatorIdentityPub   (libsignal-native serialised IdentityKey)
 ///   u64  timestampMillis
-///   [32] priorMemberSetRoot    (USP #5: canonical hash of the member
+///   [32] priorMemberSetRoot    (canonical hash of the member
 ///                                set the operator believed to be
 ///                                current at signing time. Receiver
 ///                                recomputes against their local view
@@ -88,7 +88,7 @@ struct GroupOp: Sendable, Equatable {
     let operatorIdentity: Data
     let timestampMillis: UInt64
     /// Canonical hash of the member set the operator believed to be
-    /// current at the moment they signed this op (USP #5). The
+    /// current at the moment they signed this op. The
     /// receiver recomputes this from their own local view and
     /// rejects the op on mismatch — defeats the ghost-member
     /// equivocation attack where an admin silently adds a member

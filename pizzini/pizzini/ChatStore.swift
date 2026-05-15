@@ -38,7 +38,7 @@ final class ChatStore: NSObject {
     /// client crosses through `.connectingToTor → .connecting →
     /// .connected`. Mirrored from the delegate's `didChange`.
     var perRelayState: [String: RelayClient.State] = [:]
-    /// USP #1: most-recent self-attestation snapshot from the relay
+    /// Most-recent self-attestation snapshot from the relay
     /// (binary SHA-256, git commit, dirty bit, crate version).
     /// Refreshed on every successful (re)connect; rendered in
     /// Settings → Relay info so users can compare the running
@@ -110,7 +110,7 @@ final class ChatStore: NSObject {
     func dismissIdentityResetBanner() {
         identityResetBannerPending = false
     }
-    /// USP #1 second half: cached transparency-log entries loaded
+    /// Cached transparency-log entries loaded
     /// from disk on launch and refreshed in the background on
     /// every successful relay (re)connect. Reads pass through
     /// `TransparencyLog.contains(binarySha256Hex:in:)` to drive
@@ -190,7 +190,7 @@ final class ChatStore: NSObject {
     /// emit the same text via os_log at .debug level (only enabled
     /// on a debug build / when the user has attached Console.app
     /// to a non-release build, mirroring DeviceIntegrity's logging
-    /// policy at F-NEW-905). Trims the buffer to `diagBufferCap`
+    /// policy at ). Trims the buffer to `diagBufferCap`
     /// from the front. Always called from `@MainActor`-bound code
     /// so the array mutation is race-free.
     ///
@@ -417,7 +417,7 @@ final class ChatStore: NSObject {
     override init() {
         self.state = Storage.loadAppState()
         self.outbox = Storage.loadOutbox()
-        // USP #1 second half: pre-load any previously-cached
+        // Pre-load any previously-cached
         // transparency-log entries so the Settings panel can
         // render an immediate answer without waiting for the
         // first reconnect to repopulate.
@@ -589,7 +589,7 @@ final class ChatStore: NSObject {
         torBootstrapPhase = label
     }
 
-    /// USP #1 second half: refresh the transparency log from the
+    /// Refresh the transparency log from the
     /// operator's configured public URL. Idempotent — safe to
     /// call on every reconnect plus a manual button. Network
     /// failures and rollback rejections surface via
@@ -721,7 +721,7 @@ final class ChatStore: NSObject {
                 myIdentity: myId,
                 myDeliveryTokenVerifyKey: verifyKey,
                 signer: { payload in
-                    // F-NEW-101: HELLO signatures are domain-separated
+                    // HELLO signatures are domain-separated
                     // by the `hello` context tag. The FFI prepends
                     // `u16(tag_len) || tag` before signing.
                     try? signingSession.identitySign(
@@ -1461,7 +1461,7 @@ final class ChatStore: NSObject {
     /// Aggregate cap on ALL decoy emissions per minute, across all
     /// unknown-peer ids. Defends against the attacker who rotates
     /// `from_id` every request to defeat the per-peer cooldown
-    /// (F-NEW-202): even if every iteration uses a fresh peer-id,
+    ///: even if every iteration uses a fresh peer-id,
     /// no more than `decoyAggregateBudgetPerMinute` decoys ever
     /// leave the device per minute.
     private static let decoyAggregateBudgetPerMinute: Int = 1
@@ -1483,7 +1483,7 @@ final class ChatStore: NSObject {
 
     @MainActor
     private func emitBundleResponseDecoy(toFakePeer fromPeer: Data, via client: RelayClient) {
-        // F-NEW-202 cooldown — TWO gates, both required to ship a decoy:
+        // Cooldown — TWO gates, both required to ship a decoy:
         //
         // (a) Per-unknown-peer cooldown. Prevents a single attacker
         //     identity from sustaining a stream of ~88 KB outbound
@@ -3320,7 +3320,7 @@ extension ChatStore: RelayClientDelegate {
             // timer tick. `runRetryWalk` is idempotent — if no
             // entries are due, it's a no-op.
             self.runRetryWalk()
-            // USP #1 second half: refresh the transparency log
+            // Refresh the transparency log
             // from the operator's pinned URL alongside the
             // relay-attestation refresh. The UI's match badge
             // depends on both — pulling them together keeps
@@ -3450,7 +3450,7 @@ extension ChatStore: RelayClientDelegate {
     }
 
     nonisolated func relayClient(_ client: RelayClient, didReceiveStatus status: RelayStatus) {
-        // USP #1: cache the latest relay attestation so the
+        // Cache the latest relay attestation so the
         // Settings panel can read it synchronously when the user
         // opens the relay-info row. Also a useful diagnostic line
         // in NSLog — the operator's published transparency-log
@@ -4227,7 +4227,7 @@ extension ChatStore: RelayClientDelegate {
         return head + "…"
     }
 
-    /// Full lowercase hex. Used by the USP #1 relay-info logging /
+    /// Full lowercase hex. Used by the relay-info logging /
     /// Settings row to render binary SHA-256s the operator can
     /// match against a transparency-log entry.
     nonisolated func hex(_ data: Data) -> String {

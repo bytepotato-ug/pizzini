@@ -135,7 +135,7 @@ use crate::push_token_store::PushTokenStore;
 /// is a clone + serialize, not a re-read of the binary.
 ///
 /// All fields are derived deterministically from the running
-/// binary + the build-time `PIZZINI_GIT_SHA` env vars (USP #1):
+/// binary + the build-time `PIZZINI_GIT_SHA` env vars:
 ///   * `crate_version` is `CARGO_PKG_VERSION` (e.g. `"0.0.0"`).
 ///   * `git_sha` is the 40-char hex of the source commit; `"unknown"`
 ///     when built outside a git checkout (release scripts refuse
@@ -295,7 +295,7 @@ const PROTOCOL_VERSION: u8 = 3;
 /// HELLO wire-format change (`PROTOCOL_VERSION` bump, additional
 /// fields, etc.): producing a `v2` tag makes a downgrade attack
 /// structurally impossible because a signature minted under `v3`
-/// simply doesn't verify against the `v2` verifier. F-NEW-205.
+/// simply doesn't verify against the `v2` verifier. 
 const HELLO_SIGNING_TAG: &[u8] = b"pizzini.hello.v3";
 /// Maximum clock skew between client and relay accepted on a HELLO.
 /// Keeps the replay set bounded — a fresh HELLO past this window won't
@@ -320,7 +320,7 @@ const FRAME_TYPE_REGISTER_PUSH: u8 = 5;
 const FRAME_TYPE_ACK: u8 = 6;
 // Slot 7 was FRAME_TYPE_TOKEN_ISSUE in v1. Reserved — do not re-use
 // without coordinating with the iOS RelayClient frame map.
-/// USP #1: binary self-attestation. Client → relay request, empty
+/// Binary self-attestation. Client → relay request, empty
 /// payload. Relay replies with a STATUS_RESPONSE (frame 9) carrying
 /// crate version, git commit SHA, "dirty?" bit, and SHA-256 of the
 /// running binary. iOS uses the response to surface "running build
@@ -328,13 +328,13 @@ const FRAME_TYPE_ACK: u8 = 6;
 /// a published transparency-log entry.
 const FRAME_TYPE_STATUS_REQUEST: u8 = 8;
 const FRAME_TYPE_STATUS_RESPONSE: u8 = 9;
-/// USP #4 (pacing pass). Client → relay decoy traffic emitted at a
+/// Pacing pass. Client → relay decoy traffic emitted at a
 /// constant rate when the user is connected but otherwise idle. The
 /// relay receives, validates the size envelope, and discards. The
 /// frame exists so a network observer of the Tor traffic sees a
 /// uniform-rate, uniform-size stream of cells regardless of
 /// whether the user is actively chatting — combined with the
-/// padded sealed envelopes (USP #4-lite), this hides both message
+/// padded sealed envelopes, this hides both message
 /// timing and length at the wire layer.
 const FRAME_TYPE_COVER: u8 = 10;
 /// Client → relay request to drop our APNs device token from the
@@ -412,7 +412,7 @@ const MAX_FRAME_BYTES: u32 = 1024 * 1024;
 /// grow — accept a tight range, refuse the obvious garbage (a 256-
 /// byte all-zero blob, or anything smaller than the floor) so the
 /// relay doesn't waste APNs round-trips and risk Apple flagging the
-/// auth key. F-NEW-207.
+/// auth key. 
 const MIN_PUSH_TOKEN_BYTES: usize = 16;
 const MAX_PUSH_TOKEN_BYTES: usize = 64;
 
@@ -491,7 +491,7 @@ fn parse_v2_token(bytes: &[u8]) -> Result<ParsedV2Token, &'static str> {
     Ok(ParsedV2Token { chain_id, index, value })
 }
 /// First-contact PoW difficulty. Verifier rejects anything weaker.
-/// Hashcash difficulty in leading-zero bits. F-NEW-209: raised from
+/// Hashcash difficulty in leading-zero bits. Raised from
 /// 18 → 22 so a desktop-GPU attacker no longer collapses the per-
 /// recipient gate. Math:
 ///   - 2^18 ≈ 260 k hashes per proof → ~5 µs/proof on RTX 4090 →
@@ -689,7 +689,7 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or(DEFAULT_MAX_CONNECTIONS);
     let listener = TcpListener::bind(bind).await?;
     let lan_ips = local_lan_ips();
-    // USP #1: self-attestation snapshot. Computed once at startup.
+    // Self-attestation snapshot. Computed once at startup.
     // A read failure here is fatal — the operator deployed a
     // binary that can't read its own bytes, which means the
     // STATUS_RESPONSE machinery is broken and the transparency-log
@@ -1132,7 +1132,7 @@ async fn handle_connection(
         let mut vk = verify_keys.lock().await;
         vk.insert(peer_id.clone(), (verify_key, Instant::now()));
     }
-    // F-NEW-211: gate peer-id-bearing log lines behind
+    // Gate peer-id-bearing log lines behind
     // `dev_peer_log!` so the relay's "no per-peer log lines in
     // production" hard rule is enforced in code, not just policy.
     // `dev_peer_log!` is a no-op when `debug_assertions` is off
@@ -1251,7 +1251,7 @@ async fn read_loop(
         match frame[0] {
             FRAME_TYPE_HELLO => return Err(invalid("duplicate HELLO")),
             FRAME_TYPE_STATUS_REQUEST => {
-                // USP #1: client is asking which build is running.
+                // Client is asking which build is running.
                 // Payload is a single byte (the type itself); any
                 // trailing bytes are a forward-compatibility slot
                 // and ignored. Response goes through the connection's
@@ -1274,7 +1274,7 @@ async fn read_loop(
                 return Err(invalid("STATUS_RESPONSE from client is not allowed"));
             }
             FRAME_TYPE_COVER => {
-                // USP #4: drop on the floor. The frame's only
+                // Drop on the floor. The frame's only
                 // purpose is to occupy a Tor cell slot at a constant
                 // rate; we don't read the body for anything. Size
                 // check rejects anomalies (a tiny "cover" would
@@ -1852,7 +1852,7 @@ async fn check_delivery_token(
     }
 }
 
-/// F-NEW-208: persistent push-token GC. The previous design only
+/// Persistent push-token GC. The previous design only
 /// purged expired entries during `PushTokenStore::load_or_create`,
 /// so a relay that stayed up for months accumulated every token ever
 /// registered. Periodic in-memory GC matches the documented 30-day
@@ -2098,7 +2098,7 @@ fn build_hello_signing_payload(
     timestamp_secs: u64,
     nonce: &[u8],
 ) -> Vec<u8> {
-    // F-NEW-101: domain-separation prefix matches the FFI v2
+    // Domain-separation prefix matches the FFI v2
     // contract: `u16_be(tag_len) || tag || payload`. The earlier
     // non-length-prefixed form `tag || payload` was vulnerable to
     // prefix collisions — a tag that happened to be the prefix of
@@ -2326,7 +2326,7 @@ fn parse_register_push(body: &[u8]) -> std::io::Result<Vec<u8>> {
             MAX_PUSH_TOKEN_BYTES,
         )));
     }
-    // Refuse obvious garbage (F-NEW-207): all-zero blobs and any
+    // Refuse obvious garbage: all-zero blobs and any
     // token whose bytes are entirely identical. A real APNs device
     // token has high entropy; either pattern signals a misbehaving
     // client or a planted bogus value.
@@ -2456,7 +2456,7 @@ mod tests {
         out
     }
 
-    // ───── USP #1: STATUS_RESPONSE encoding ───────────────────
+    // ───── STATUS_RESPONSE encoding ─────────────────────────
 
     fn make_status(crate_version: &str, git_sha: &str, dirty: u8, hash: [u8; 32]) -> RelayStatus {
         RelayStatus {

@@ -1482,7 +1482,7 @@ extension ChatStore {
         case let .rejectedMalformed(reason):
             pzLog("[pizzini.group] groupOp ← \(short(sender)): malformed — \(reason)")
         case let .rejectedMemberSetMismatch(local, claimed):
-            // USP #5. The operator signed an op witnessing a member
+            // The operator signed an op witnessing a member
             // set that doesn't match our local view — surfaces as a
             // stronger warning than equivocation because the
             // signature itself verified, but the operator's reality
@@ -1578,7 +1578,7 @@ extension ChatStore {
             pzLog("[pizzini.group] bootstrap ← \(short(sender)): signature INVALID")
             return
         }
-        // USP #5 self-consistency: the admin's signed `members[]`
+        // Self-consistency: the admin's signed `members[]`
         // must hash to the `memberSetRoot` they also signed. A
         // mismatch means the admin shipped an internally
         // inconsistent snapshot — refuse to bootstrap from it.
@@ -1922,7 +1922,7 @@ extension ChatStore {
             // it. Cosmetic; we won't use it again because
             // sendGroupMessage gates on activeMember-self.
             //
-            // F-NEW-506: if a same-drain re-add brought us back as an
+            // If a same-drain re-add brought us back as an
             // active member (admin removed-then-added in quick
             // succession), don't return early — fall through to the
             // SKDM hook below, which will mint a fresh chain via
@@ -1959,7 +1959,7 @@ extension ChatStore {
         }
         // Bidirectional SKDM (HIGH-2).
         ensureMySKDMReachesActiveMembers(groupAt: gIdx, session: session)
-        // F-NEW-502: surface a visible system row when an admin
+        // Surface a visible system row when an admin
         // added a peer who is NOT in our 1:1 contacts. The
         // cryptographic state of the group accepts the new member
         // (per the group's transitive-trust design), but the user
@@ -2024,7 +2024,7 @@ extension ChatStore {
 
     /// Build + sign a new GroupOp.
     ///
-    /// `priorMemberSetRoot` (USP #5) is the canonical hash of the
+    /// `priorMemberSetRoot` is the canonical hash of the
     /// member set the operator believed to be current at signing
     /// time. Callers in steady state pass `group.memberSetRoot`;
     /// the Create path passes `ChatGroup.memberSetRoot(of: [])`
@@ -2077,7 +2077,7 @@ extension ChatStore {
         operatorIdentity: Data,
     ) -> GroupBootstrap? {
         let now = UInt64(Date().timeIntervalSince1970 * 1000)
-        // USP #5: stamp the canonical member-set root in lockstep
+        // Stamp the canonical member-set root in lockstep
         // with the `members` array. The joiner re-derives this
         // from the parsed members and rejects the snapshot if the
         // two disagree — see `GroupBootstrap.verifyMemberSetRoot`.

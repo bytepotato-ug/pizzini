@@ -1,4 +1,4 @@
-// Embed reproducible-build provenance into the relay binary (USP #1).
+// Embed reproducible-build provenance into the relay binary.
 //
 // At compile time we capture:
 //   * `GIT_SHA`  — full 40-char hex of the source commit producing

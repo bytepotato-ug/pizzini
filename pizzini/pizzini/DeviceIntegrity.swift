@@ -26,7 +26,7 @@ import UIKit
 ///   the system log on a release build. The log call is `os_log` at
 ///   `.debug` level, which release iOS drops unless debug logging is
 ///   explicitly enabled, so a coercer reading a later sysdiagnose
-///   cannot confirm the check fired (F-NEW-905).
+///   cannot confirm the check fired.
 /// - Use private APIs. `sysctl(KERN_PROC)`, `_dyld_image_count`,
 ///   `FileManager.fileExists`, and `UIApplication.canOpenURL` are all
 ///   public; this is App-Store-safe.
@@ -80,7 +80,7 @@ final class DeviceIntegrityMonitor {
 
     private init() {
         runChecks()
-        // F-NEW-901: re-poll on every scene activation, not just at
+        // Re-poll on every scene activation, not just at
         // launch. A user who unlocks the app, attaches Frida mid-
         // session via USB, then returns to a backgrounded Pizzini
         // would otherwise never see the banner — the first-launch
@@ -129,7 +129,7 @@ final class DeviceIntegrityMonitor {
             shouldLog = false
         }
         if shouldLog {
-            // F-NEW-905: use os_log at .debug level rather than
+            // Use os_log at .debug level rather than
             // NSLog. os_log .debug is dropped on release devices
             // unless logging is explicitly enabled, so a coercer
             // who later reads sysdiagnose can't confirm "RASP fired
@@ -192,7 +192,7 @@ final class DeviceIntegrityMonitor {
             "/etc/ssh/sshd_config",
             "/bin/bash",
             "/bin/sh",
-            // F-NEW-902: rootless-jailbreak paths (palera1n, Dopamine
+            // Rootless-jailbreak paths (palera1n, Dopamine
             // 2.x, etc.). Modern jailbreaks relocate the entire
             // tree under `/var/jb/` to leave `/` mount-read-only and
             // pass Apple's signature checks more easily. The cost

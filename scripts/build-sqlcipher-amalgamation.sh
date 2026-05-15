@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-# Pinned upstream tag AND commit SHA. F-NEW-1001: a tag alone is
+# Pinned upstream tag AND commit SHA. A tag alone is
 # mutable; an attacker who compromises the Zetetic GitHub account (or
 # a TLS intermediary on the fetch) can force-push the tag and silently
 # poison the next regeneration. The commit SHA below is the
@@ -44,7 +44,7 @@ echo "==> SQLCipher $SQLCIPHER_TAG ($SQLCIPHER_PIN_SHA) → $OUT_DIR"
 
 git clone --branch "$SQLCIPHER_TAG" "$SQLCIPHER_GIT" "$WORK_DIR/src"
 
-# F-NEW-1001 sha pin verification: refuse to proceed if the tag has
+# Sha pin verification: refuse to proceed if the tag has
 # moved relative to the recorded SHA. `SQLCIPHER_PIN_SHA=auto` skips
 # the check and prints the resolved SHA — used only when bumping the
 # pin.
@@ -111,8 +111,8 @@ cat >"$OUT_DIR/include/PizziniSQLCipher.h" <<EOF
 EOF
 
 # Module map so Swift code can `import PizziniSQLCipher` and call
-# `sqlite3_open_v2`, `sqlite3_key_v2`, etc. directly. F-NEW-1010:
-# the `link "z"` directive used to pull in libz unconditionally even
+# `sqlite3_open_v2`, `sqlite3_key_v2`, etc. directly.
+# The `link "z"` directive used to pull in libz unconditionally even
 # though the amalgamation doesn't call `inflate`/`deflate` — dead
 # weight + needlessly broadens the iOS binary's dynamic dependency
 # set. SQLCipher's compress/decompress hooks require explicit
@@ -133,7 +133,7 @@ echo "$SQLCIPHER_TAG" > "$OUT_DIR/VERSION"
 # upstream commit produced this amalgamation without re-running git.
 echo "$ACTUAL_SHA" > "$OUT_DIR/COMMIT_SHA"
 
-# F-NEW-1007: sha256 sidecar for the regenerated `.c` file so CI can
+# Sha256 sidecar for the regenerated `.c` file so CI can
 # refuse a PR that ships a tampered amalgamation under the same
 # VERSION string. The expected pattern: every PR that bumps
 # SQLCipher commits both `pizzini_sqlcipher.c` AND

@@ -2,7 +2,7 @@ import CryptoKit
 import Foundation
 import PizziniTor
 
-/// USP #1, second half: client-side parser + verifier for the
+/// Client-side parser + verifier for the
 /// operator-signed transparency log of relay binary deploys.
 ///
 /// **The trust chain end-to-end:**
@@ -14,7 +14,7 @@ import PizziniTor
 ///      key via `scripts/sign-transparency-entry.sh` and appends
 ///      the signed entry to a public log file (NDJSON).
 ///   4. The relay's `STATUS_RESPONSE` frame reports the SHA-256 of
-///      `/proc/self/exe` at runtime (USP #1 first half — already
+///      `/proc/self/exe` at runtime (already
 ///      shipped).
 ///   5. This module fetches/loads the log, verifies every entry's
 ///      Ed25519 signature against the operator's pinned public key

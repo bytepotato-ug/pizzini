@@ -61,7 +61,7 @@ private struct HardenedTextInput: ViewModifier {
         content
             .autocorrectionDisabled(true)
             .textInputAutocapitalization(autocap)
-            // F-NEW-805 acknowledged below in the typography
+            // acknowledged below in the typography
             // disabler: `inputAssistantItem.leadingBarButtonGroups`
             // is also zeroed there so the keyboard's quick-suggest
             // bar (which shadows the in-RAM draft trail) is wiped.
@@ -141,7 +141,7 @@ private struct SmartTypographyDisabler: UIViewRepresentable {
                 tf.smartQuotesType = .no
                 tf.smartInsertDeleteType = .no
                 tf.spellCheckingType = .no
-                // F-NEW-805 partial mitigation: zero the input
+                // Partial mitigation: zero the input
                 // assistant's leading bar groups so the keyboard's
                 // QuickType / paste suggestions don't render the
                 // last-typed words above the bar after a send.

@@ -22,9 +22,9 @@ prior reviews. Don't be the next one.
 
 ## If you are an AI agent
 
-Most lines in this codebase were authored by Claude Code or another
-agent. That's fine if and only if the agent treats the release
-checklist as a hard gate, not an optional reference. Specifically:
+Most lines in this codebase were authored by an AI coding agent.
+That's fine if and only if the agent treats the release checklist
+as a hard gate, not an optional reference. Specifically:
 
 - Read `RELEASE-CHECKLIST.md` before claiming work is done. Tick the
   items that apply to your change.

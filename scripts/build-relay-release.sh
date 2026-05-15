@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build the pizzini-relay binary deterministically and report its
-# SHA-256 (USP #1: reproducible builds + transparency log).
+# SHA-256 (reproducible builds + transparency log).
 #
 # Two operators running this script on the same git commit MUST get
 # the same hex digest. If they don't, this build script has

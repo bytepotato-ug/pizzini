@@ -60,7 +60,7 @@ use std::path::{Path, PathBuf};
 const PENDING_FILE_NAME: &str = "pending.bin";
 const KEY_FILE_NAME: &str = "pending.key";
 
-/// Per-store AAD. F-NEW-206: domain-separates this store's
+/// Per-store AAD. Domain-separates this store's
 /// ciphertext from siblings'. Bumping the version suffix triggers a
 /// one-shot legacy decrypt on the next load.
 const AAD: &[u8] = b"pizzini.relay.pending.v1";
@@ -201,7 +201,7 @@ impl PendingStore {
         let queues = match fs::read(&pending_path) {
             Ok(bytes) => {
                 // Domain-AAD decrypt with legacy-no-AAD fallback for
-                // files written before F-NEW-206. The next persist
+                // files written before The next persist
                 // rewrites with the AAD path.
                 let plaintext = encrypted_file::decrypt_with_aad(&key, &bytes, AAD)
                     .or_else(|_| encrypted_file::decrypt(&key, &bytes))?;

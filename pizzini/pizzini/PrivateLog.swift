@@ -15,7 +15,7 @@ import os.log
 /// `os_log(.debug, …)` is dropped at the kernel level on release
 /// devices unless the device has had a privacy-violating log
 /// configuration profile installed. That matches the `DeviceIntegrity`
-/// logging policy adopted in F-NEW-905 and brings the rest of
+/// logging policy adopted in and brings the rest of
 /// ChatStore in line with it.
 ///
 /// The `%{public}@` formatter is used so the body is *readable*

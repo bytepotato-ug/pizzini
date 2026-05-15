@@ -90,7 +90,7 @@ use uuid::Uuid;
 use rand::{Rng, TryRngCore as _, rngs::OsRng};
 use sha2::Sha512;
 
-// ───── Plaintext padding (USP #4-lite — message-size hiding) ──────────
+// ───── Plaintext padding (message-size hiding) ──────────
 //
 // Every sealed-sender plaintext is padded to one of a small set of
 // bucket sizes BEFORE it enters the libsignal ratchet. The wire-visible
@@ -113,7 +113,7 @@ use sha2::Sha512;
 // size at 64 KB, so this is unreachable in steady state.
 //
 // Note: padding does NOT hide presence/timing — that's the second
-// pass of USP #4 (constant-rate cover traffic), which adds dummy
+// pass of constant-rate cover traffic, which adds dummy
 // frames during idle periods. This first pass is the length-hiding
 // half.
 const PADDING_BUCKETS: &[usize] = &[256, 1024, 4096, 16384, 65536, 262144];
@@ -817,7 +817,7 @@ impl DeviceStore {
         let mut rng = OsRng.unwrap_err();
         let peer_addr = address_for(peer_identity);
         let local_addr = address_for(&self.identity_public_bytes());
-        // USP #4: bucket-pad the plaintext BEFORE handing it to the
+        // Bucket-pad the plaintext BEFORE handing it to the
         // ratchet. The resulting libsignal ciphertext (and therefore
         // the sealed-sender envelope, and therefore the SEND-frame
         // size the relay observes) clusters at one of a handful of
@@ -886,7 +886,7 @@ impl DeviceStore {
             .expect("in-mem store is sync")?;
         let claimed_pub = usmc.sender()?.key()?;
         let sender_len = IdentityKey::new(claimed_pub).serialize().len();
-        // F-NEW-110: prefer `checked_sub` over `saturating_sub`. With
+        // Prefer `checked_sub` over `saturating_sub`. With
         // saturating, a 17-byte USMC contents produces a 0-byte upper
         // bound that passes any non-zero cap check; if the
         // `inner_bytes.len() < 18` check at `seal_receive` is ever
@@ -1030,7 +1030,7 @@ impl DeviceStore {
         .now_or_never()
         .expect("in-mem store is sync")
         {
-            // USP #4: the ratchet output is a padded plaintext; strip
+            // The ratchet output is a padded plaintext; strip
             // the in-envelope length prefix + zero tail to recover the
             // sender's original bytes. A malformed prefix from a
             // peer running mismatched padding code surfaces here as
@@ -1265,7 +1265,7 @@ impl DeviceStore {
                 .expect("in-mem store is sync")?;
         }
         let session_count = r.u32()? as usize;
-        // F-NEW-103: tolerate a single corrupted session record by
+        // Tolerate a single corrupted session record by
         // skipping that one peer rather than failing the entire load.
         // A flipped bit on flash would otherwise lose every contact's
         // session (and the cached SenderCertificate, and every group's
@@ -1941,7 +1941,7 @@ mod tests {
 
     #[test]
     fn seal_send_hides_message_length() {
-        // Core USP-4 guarantee: two messages of wildly different
+        // Core guarantee: two messages of wildly different
         // plaintext lengths produce sealed-sender envelopes whose
         // sizes are indistinguishable to the relay (they land in the
         // same bucket).
@@ -2091,7 +2091,7 @@ mod tests {
 
     #[test]
     fn from_serialized_skips_corrupted_session_record() {
-        // F-NEW-103 regression guard: a single corrupted session
+        // Regression guard: a single corrupted session
         // record must not lose the entire store. We can't easily
         // inject a deliberately-corrupted record because the
         // serializer always produces well-formed bytes, so this

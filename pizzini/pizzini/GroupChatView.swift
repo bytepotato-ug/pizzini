@@ -149,7 +149,7 @@ struct GroupChatView: View {
             }
             .background(.bar)
         }
-        // In-chat find — F-NEW-802: custom inline search bar instead
+        // In-chat find — Custom inline search bar instead
         // of `.searchable`. The drawer mount of `.searchable` left the
         // last-typed term visible across nav back-then-forward; the
         // inline bar is mounted only when `searchActive == true` and

@@ -104,8 +104,8 @@
 #define PIZZINI_DISTRIBUTION_ID_LEN 16
 
 /**
- * Default hashcash difficulty in leading-zero bits. F-NEW-209:
- * raised from 18 → 22. Phone-side cost stays under ~1s on the
+ * Default hashcash difficulty in leading-zero bits.
+ * Raised from 18 → 22. Phone-side cost stays under ~1s on the
  * slowest A14-class device. A desktop-GPU attacker drops from
  * ~190 k proofs/s (at 18 bits) to ~12 proofs/s (at 22 bits) on a
  * RTX 4090 — still trivially defeats hashcash as the sole gate,
@@ -546,7 +546,7 @@ int32_t pizzini_verify_identity_signature(const uint8_t *identity_pub,
                                           uintptr_t signature_len);
 
 /**
- * F-NEW-101: domain-separated identity signature verify. The signed
+ * Domain-separated identity signature verify. The signed
  * bytes the verifier reconstructs are
  * `u16_be(context_tag_len) || context_tag || message`. A caller that
  * forgets to pass the tag — or passes a different tag than the
@@ -592,7 +592,7 @@ int32_t pizzini_store_identity_sign(struct DeviceStore *store,
                                     uintptr_t *out_len);
 
 /**
- * F-NEW-101: domain-separated identity sign. Signs
+ * Domain-separated identity sign. Signs
  * `u16_be(context_tag_len) || context_tag || payload`. The tag MUST
  * be non-empty; passing an empty tag returns `PIZZINI_ERR_INVALID_ARG`
  * to prevent a misuse path from silently producing legacy-format

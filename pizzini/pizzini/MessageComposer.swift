@@ -95,7 +95,7 @@ struct MessageComposer<AttachContent: View>: View {
 
     private var inputField: some View {
         TextField(placeholder, text: $draft, axis: .vertical)
-            // F-NEW-801: the highest-volume sensitive-content input in
+            // The highest-volume sensitive-content input in
             // the app. Without these flags every keystroke trains
             // `~/Library/Keyboard/dynamic-text.dat`. `.sentences`
             // autocap keeps the first-letter UX nicety without

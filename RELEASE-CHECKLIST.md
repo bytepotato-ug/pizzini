@@ -112,7 +112,7 @@ the QR-camera + Tor-circuit handshake faithfully.
 - [ ] Reproducible relay build matches the operator co-signer's hash.
 - [ ] Tag the release. `git tag v1.x.y && git push --tags`.
 - [ ] Sign the new relay binary's SHA-256 with the operator key, append the transparency-log line, commit.
-- [ ] Roll out to seed nodes (commands live in `~/.claude/CLAUDE.md` under "Deploying to seed nodes").
+- [ ] Roll out to seed nodes per the operator deployment notes.
 - [ ] Tag a fresh QA log post-deploy as a 5-min smoke (paired devices send a message through the live fleet).
 
 ---

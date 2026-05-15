@@ -93,7 +93,7 @@ pub fn load_or_create_key(key_path: &Path, kind_for_error: &str) -> io::Result<[
 /// empty AAD. New call sites should prefer `encrypt_with_aad` and
 /// pass a per-store domain string (`b"pizzini.relay.replay.v1"`,
 /// `b"pizzini.relay.pending.v1"`, etc.) so the AEAD itself enforces
-/// domain separation between sibling stores (F-NEW-206 defense in
+/// domain separation between sibling stores (defense in
 /// depth against a future key-rotation bug that produces matching
 /// keys for two stores).
 #[allow(dead_code)] // Back-compat shim; new callers use `encrypt_with_aad`.

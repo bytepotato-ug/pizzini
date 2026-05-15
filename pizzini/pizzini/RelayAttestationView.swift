@@ -1,7 +1,7 @@
 import PizziniCryptoCore
 import SwiftUI
 
-/// USP #1: shows the running relay's self-attestation (binary
+/// Shows the running relay's self-attestation (binary
 /// SHA-256, git commit SHA, dirty bit, crate version) so users
 /// can verify which build is actually serving them.
 ///
@@ -92,7 +92,7 @@ struct RelayAttestationView: View {
         transparencyLogSection(reportedSha256: hex(status.binarySha256))
     }
 
-    /// USP #1 second half UI: green/red badge for "running binary
+    /// UI: green/red badge for "running binary
     /// SHA appears in the operator-signed transparency log,"
     /// plus a manual refresh button + last-fetched timestamp +
     /// error surfacing.
