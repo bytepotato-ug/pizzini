@@ -18,6 +18,17 @@ struct ContactsListView: View {
     /// button would either disappear or open a sheet that duplicates
     /// the tab.
     let onRevealMyQR: () -> Void
+    /// Tapped from the optional first-run support banner — switches
+    /// to the Settings tab so the user lands on the Support Pizzini
+    /// row. The banner is dismissible (X) and re-displays at most
+    /// every 30 days while the user is on the free tier.
+    let onOpenSupport: () -> Void
+
+    /// Live state for the first-run support banner. `@Bindable` so
+    /// dismissals update the local view tree immediately even before
+    /// the next launch.
+    @Bindable var subscriptionService: SubscriptionService = .shared
+    @Bindable var bannerState: SupportBannerState = .shared
 
     /// Driver for the `.alert(item:)` that surfaces every paste
     /// outcome that isn't `.ready`. The previous behaviour ("silently
@@ -76,6 +87,18 @@ struct ContactsListView: View {
         VStack(spacing: 0) {
             if searchActive {
                 customSearchBar
+            }
+            // First-run support banner. Visibility is policy-driven —
+            // 7 days since install + free tier + not recently dismissed
+            // — so it's silent on day 0 and silent for any supporter.
+            // Hidden while a search is active so it doesn't crowd the
+            // results.
+            if !searchActive,
+               bannerState.shouldShow(tier: subscriptionService.currentTier) {
+                SupportBanner(
+                    onTap: onOpenSupport,
+                    onDismiss: { bannerState.dismiss() }
+                )
             }
             ZStack {
                 if isSearching {

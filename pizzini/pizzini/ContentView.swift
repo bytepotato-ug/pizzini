@@ -225,7 +225,8 @@ struct ContentView: View {
                         onPasteContact: { card in
                             promptForName(card: card, source: .pastedText)
                         },
-                        onRevealMyQR: { selectedTab = .profile }
+                        onRevealMyQR: { selectedTab = .profile },
+                        onOpenSupport: { selectedTab = .settings }
                     )
                 }
             }

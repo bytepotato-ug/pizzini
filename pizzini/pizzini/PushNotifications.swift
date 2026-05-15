@@ -108,6 +108,18 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         BackgroundRefresh.register { task in
             BackgroundRefresh.handle(task: task)
         }
+        // Optional support purchases — start the Transaction.updates
+        // listener early so a renewal landing in the background or
+        // an Ask-to-Buy approval that arrived overnight is reflected
+        // in the UI on first foreground. Idempotent; safe across
+        // re-launches.
+        SubscriptionService.shared.start()
+        // First-run install date — single-shot UserDefaults write
+        // on the first launch. Triggering construction here means
+        // the timer starts the instant the user opens the app for
+        // the first time, not whenever they happen to scroll to the
+        // chat list.
+        _ = SupportBannerState.shared
         return true
     }
 
