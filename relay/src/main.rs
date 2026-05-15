@@ -578,6 +578,53 @@ type HelloReplays = Arc<Mutex<HashMap<HelloReplayKey, Instant>>>;
 /// covers anything inside the acceptance window.
 const HELLO_REPLAY_GC_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
+/// SEND dedupe table: blake3 hash of sealed_ciphertext → Instant.
+/// Keyed under the HELLO-authenticated sender, so two distinct
+/// peers cannot collide on the same payload-hash (irrelevant in
+/// practice — sealed-sender envelopes include a fresh per-message
+/// nonce — but it keeps the per-peer slot accounting clean).
+///
+/// Purpose: when a client's socket dies between SEND-on-wire and
+/// the next frame, the client reconnects and the retry walk
+/// re-broadcasts the SAME `sealed_ciphertext` (re-encryption would
+/// double-advance the ratchet and break the recipient). Without
+/// dedupe, the relay forwards / enqueues both copies; the
+/// recipient's libsignal ratchet drops the duplicate on receive,
+/// but that's wasted work, wasted offline-queue slots, and a
+/// duplicate APNs wake-up. Dedupe at the relay layer keeps the
+/// offline queue and push pipeline honest.
+///
+/// The sealed_ciphertext is the right dedupe key because it is
+/// (a) opaque to the relay (no privacy regression) and (b)
+/// guaranteed unique per logical message — libsignal's
+/// sealed-sender includes an ephemeral random nonce per encrypt,
+/// so two messages with the same plaintext produce different
+/// ciphertexts, and a retry of the same message reuses the
+/// already-computed ciphertext from the outbox entry.
+type SendDedupeKey = (PeerId, [u8; 32]);
+type SendDedupes = Arc<Mutex<HashMap<SendDedupeKey, Instant>>>;
+/// How long a `(sender, sealed_hash)` stays in the dedupe table.
+/// Sized to outlast any plausible client reconnect storm but
+/// short enough that the table doesn't grow unbounded under
+/// sustained traffic. 5 minutes covers Tor circuit rebuilds,
+/// captive-portal stalls, and the dial budget (`dialBudget` =
+/// 7 min on the client) close enough that a retry past this
+/// window is a fresh attempt the relay treats as new.
+const SEND_DEDUPE_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// Hard cap on the dedupe table size. 10k entries × 64 bytes
+/// (key 65 B + Instant 16 B + HashMap overhead) ≈ 1 MB resident.
+/// Well below any plausible legitimate burst inside the 5-minute
+/// window — a relay handling 10k SENDs/5min is already saturated
+/// on other axes. Hit the cap → silently drop the oldest entries
+/// before inserting (LRU semantics via timestamp scan; the GC
+/// path keeps the average size far below the cap, so the eviction
+/// path is the rare adversarial case).
+const SEND_DEDUPE_MAX_ENTRIES: usize = 10_000;
+/// GC cadence for the SEND dedupe table. Half the window, so an
+/// expired entry lives at most `SEND_DEDUPE_WINDOW + tick` before
+/// it's pruned. Same shape as `spawn_hello_replay_gc`.
+const SEND_DEDUPE_GC_INTERVAL: Duration = Duration::from_secs(150);
+
 /// Per-(sender, recipient) rate-limit on `FRAME_TYPE_CHAIN_SEED_DELIVERY`.
 /// Legitimate use: 1 frame per fresh pair + 1 per chain rotation
 /// (rotation is roughly per ~13 000 messages = months at typical
@@ -814,6 +861,15 @@ async fn main() -> std::io::Result<()> {
     let pending: Pending = Arc::new(Mutex::new(pending_store_inst));
     let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
     let hello_replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
+    // SEND dedupe across client reconnects. In-memory only; a
+    // process bounce wipes the table, which is fine — a SEND that
+    // arrives after a relay restart is treated as fresh and
+    // libsignal's receive-side dedupe still catches the duplicate
+    // on the recipient end. The table exists to keep the
+    // OFFLINE-QUEUE and push wake-ups honest during a single relay
+    // process lifetime, not to provide end-to-end exactly-once
+    // (which libsignal already does).
+    let send_dedupes: SendDedupes = Arc::new(Mutex::new(HashMap::new()));
     // Persistent per-(recipient, hour) BUNDLE_REQUEST acceptance
     // counter. Built BEFORE the listener so a corrupt state file
     // surfaces at startup, not silently mid-traffic — and so the
@@ -861,6 +917,7 @@ async fn main() -> std::io::Result<()> {
     spawn_push_tokens_gc(push_tokens.clone());
     spawn_bundle_req_rate_gc(bundle_req_rate.clone());
     spawn_chain_seed_rate_gc(chain_seed_rate.clone());
+    spawn_send_dedupe_gc(send_dedupes.clone());
 
     // Health endpoint — separate listener on `PIZZINI_RELAY_HEALTH_BIND`
     // (default `127.0.0.1:7778`). Replies with a one-line JSON snapshot
@@ -948,6 +1005,7 @@ async fn main() -> std::io::Result<()> {
                 let hello_replays = hello_replays.clone();
                 let bundle_req_rate_h = bundle_req_rate.clone();
                 let chain_seed_rate_h = chain_seed_rate.clone();
+                let send_dedupes_h = send_dedupes.clone();
                 let apns = apns.clone();
                 let status_snapshot = status_snapshot.clone();
                 tokio::spawn(async move {
@@ -966,6 +1024,7 @@ async fn main() -> std::io::Result<()> {
                         hello_replays,
                         bundle_req_rate_h,
                         chain_seed_rate_h,
+                        send_dedupes_h,
                         apns,
                         status_snapshot,
                         peer_addr,
@@ -1079,6 +1138,7 @@ async fn handle_connection(
     hello_replays: HelloReplays,
     bundle_req_rate: BundleReqRate,
     chain_seed_rate: ChainSeedRate,
+    send_dedupes: SendDedupes,
     apns: Option<Arc<ApnsClient>>,
     status_snapshot: Arc<RelayStatus>,
     peer_addr: SocketAddr,
@@ -1176,6 +1236,7 @@ async fn handle_connection(
         &chain_validators,
         &bundle_req_rate,
         &chain_seed_rate,
+        &send_dedupes,
         apns.clone(),
         &peer_id,
         &our_tx,
@@ -1222,6 +1283,7 @@ async fn read_loop(
     chain_validators: &ChainValidators,
     bundle_req_rate: &BundleReqRate,
     chain_seed_rate: &ChainSeedRate,
+    send_dedupes: &SendDedupes,
     apns: Option<Arc<ApnsClient>>,
     self_id: &[u8],
     our_tx: &mpsc::UnboundedSender<Vec<u8>>,
@@ -1420,6 +1482,46 @@ async fn read_loop(
                             _ => "ACK",
                         },
                         short_hex(&parsed.to_id),
+                    );
+                    continue;
+                }
+                // SEND dedupe across client reconnects. If the
+                // socket dies between the relay accepting the SEND
+                // and the client learning the bytes left, the
+                // client's retry walk re-broadcasts the SAME
+                // `sealed_ciphertext` (with a freshly-minted token,
+                // hence why the dedupe key is the sealed bytes and
+                // not the token blob). Drop the duplicate at the
+                // relay layer — forwarding it would double-fire a
+                // push wake-up and burn an offline-queue slot;
+                // libsignal would still drop the duplicate on
+                // receive but only after the recipient did all the
+                // network + push wake work. Dedupe stays SILENT to
+                // the client — no error frame, no disconnect — so
+                // the client treats the result identically to a
+                // fresh accept. That is the wire-shape equivalent
+                // of an "already_delivered" ACK in this protocol,
+                // which has no per-SEND ACK frame on the relay→
+                // client direction.
+                //
+                // Per the F-501 retry-discipline rule, this only
+                // matters when the client's outbox treats an entry
+                // as un-relayed; once `relayedAt != nil` on the
+                // client, no retry fires and the dedupe table is
+                // effectively bypassed. The dedupe table exists
+                // for the residual reconnect-race window the
+                // outbox cannot observe.
+                let body = &frame[1..];
+                let sealed = body.get(parsed.sealed_offset..).unwrap_or(&[]);
+                if dedupe_check_and_insert(send_dedupes, self_id, sealed).await {
+                    dev_peer_log!(
+                        "dedupe drop type={} from {} → {} ({} body bytes, {} sealed bytes): \
+                         retry of an already-accepted SEND",
+                        frame[0],
+                        short_hex(self_id),
+                        short_hex(&parsed.to_id),
+                        body.len(),
+                        sealed.len(),
                     );
                     continue;
                 }
@@ -2042,6 +2144,13 @@ struct ParsedSealed {
     to_id: Vec<u8>,
     ttl_seconds: u32,
     token: Vec<u8>,
+    /// Byte offset of the sealed-ciphertext inside the FRAME BODY
+    /// (i.e. after the leading frame-type byte has already been
+    /// stripped). Stored so the SEND dedupe path can hash the
+    /// sealed bytes without re-parsing the header. The token blob
+    /// is excluded because it's re-minted per retry — hashing only
+    /// the sealed_ciphertext gives a stable per-message key.
+    sealed_offset: usize,
 }
 
 fn parse_hello(body: &[u8]) -> std::io::Result<ParsedHello> {
@@ -2159,6 +2268,66 @@ async fn verify_hello_possession_proof(
     Ok(())
 }
 
+/// Check the SEND dedupe table for `(sender, blake3(sealed_ciphertext))`.
+/// On hit, return `true` and do NOT update the timestamp — the
+/// dedupe lifetime is anchored to first observation, so a sustained
+/// retry storm cannot keep the entry alive past the GC window. On
+/// miss, insert the entry and return `false`.
+///
+/// Bounded growth: at `SEND_DEDUPE_MAX_ENTRIES` the oldest entry by
+/// timestamp is evicted before the new one lands. Operates in O(N)
+/// over the table on the rare cap-hit path; the common path is the
+/// O(1) HashMap insert. See module-level comment on
+/// `SEND_DEDUPE_MAX_ENTRIES` for sizing rationale.
+async fn dedupe_check_and_insert(
+    dedupes: &SendDedupes,
+    sender_id: &[u8],
+    sealed_ciphertext: &[u8],
+) -> bool {
+    let hash = blake3::hash(sealed_ciphertext);
+    let key: SendDedupeKey = (sender_id.to_vec(), *hash.as_bytes());
+    let mut table = dedupes.lock().await;
+    if table.contains_key(&key) {
+        return true;
+    }
+    if table.len() >= SEND_DEDUPE_MAX_ENTRIES {
+        // Pathological-burst path. Evict the single oldest entry by
+        // Instant so a steady stream of distinct SENDs at the cap
+        // never grows the table. Cheap because the cap is hit only
+        // under adversarial load — the GC keeps steady-state size
+        // far below it.
+        if let Some(oldest) = table
+            .iter()
+            .min_by_key(|(_, t)| **t)
+            .map(|(k, _)| k.clone())
+        {
+            table.remove(&oldest);
+        }
+    }
+    table.insert(key, Instant::now());
+    false
+}
+
+/// GC for the SEND dedupe table. Mirrors `spawn_hello_replay_gc` —
+/// drop entries older than `SEND_DEDUPE_WINDOW` on every tick. A
+/// silent table (no SEND traffic) self-empties within one window.
+fn spawn_send_dedupe_gc(dedupes: SendDedupes) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SEND_DEDUPE_GC_INTERVAL);
+        loop {
+            tick.tick().await;
+            let cutoff = Instant::now() - SEND_DEDUPE_WINDOW;
+            let mut table = dedupes.lock().await;
+            let before = table.len();
+            table.retain(|_, t| *t > cutoff);
+            let after = table.len();
+            if before != after {
+                println!("send-dedupe GC: pruned {} → {after}", before - after);
+            }
+        }
+    });
+}
+
 fn spawn_chain_seed_rate_gc(rate: ChainSeedRate) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(CHAIN_SEED_RATE_GC_INTERVAL);
@@ -2259,16 +2428,19 @@ fn parse_bundle_request(body: &[u8]) -> std::io::Result<ParsedBundleRequest> {
 
 /// Parse the SEND v2 / ACK header. The relay validates structure and
 /// extracts to_id, ttl, token. The trailing sealed_ciphertext is not
-/// re-read here — `parse_sealed` runs purely for routing/queueing
-/// metadata and the relay forwards the raw frame bytes verbatim.
+/// re-read for routing — the relay forwards the raw frame bytes
+/// verbatim — but the SEND dedupe path needs to locate it inside
+/// the body to compute a stable per-message hash, so the offset is
+/// captured here.
 fn parse_sealed(body: &[u8]) -> std::io::Result<ParsedSealed> {
+    let total_len = body.len();
     let mut c = Cursor::new(body);
     let to_id = c.u16_blob()?.to_vec();
     let ttl_seconds = c.u32()?;
     let token = c.u16_blob()?.to_vec();
     // Remaining bytes are the sealed ciphertext — opaque to the relay.
-    let _ = c.rest();
-    Ok(ParsedSealed { to_id, ttl_seconds, token })
+    let sealed_offset = total_len - c.rest().len();
+    Ok(ParsedSealed { to_id, ttl_seconds, token, sealed_offset })
 }
 
 /// REGISTER_CHAIN body parser. The recipient's peer_id is taken from
@@ -2776,6 +2948,7 @@ mod tests {
             to_id: to_id.clone(),
             ttl_seconds: 3600,
             token: token_wire.clone(),
+            sealed_offset: 0,
         };
         check_delivery_token(&parsed, &chain_validators)
             .await
@@ -2794,6 +2967,7 @@ mod tests {
             to_id,
             ttl_seconds: 3600,
             token: bad_wire,
+            sealed_offset: 0,
         };
         let err = check_delivery_token(&bad_parsed, &chain_validators)
             .await
@@ -3237,6 +3411,136 @@ mod tests {
         assert!(
             !check_and_record(&rate, &from, &to_a).await,
             "stale entries must be pruned before the cap check; budget should reopen",
+        );
+    }
+
+    // ───── SEND dedupe across client reconnects ────────────────
+
+    #[tokio::test]
+    async fn send_dedupe_returns_true_on_second_observation() {
+        let dedupes: SendDedupes = Arc::new(Mutex::new(HashMap::new()));
+        let sender = b"sender_peer_id_bytes_33____________".to_vec();
+        let sealed = b"sealed_envelope_bytes_here_arbitrary".as_slice();
+
+        // First observation: clean accept.
+        assert!(
+            !dedupe_check_and_insert(&dedupes, &sender, sealed).await,
+            "first SEND with a fresh sealed_ciphertext must NOT be deduped",
+        );
+        // Second observation of the same (sender, sealed) — i.e. a
+        // retry across a reconnect re-uses the outbox entry's
+        // sealed_ciphertext: deduped.
+        assert!(
+            dedupe_check_and_insert(&dedupes, &sender, sealed).await,
+            "retry of the same SEND must be deduped",
+        );
+        // The entry is still in the table; a third retry is also
+        // deduped. This is what gives the recipient at-most-once
+        // delivery for the duration of the window.
+        assert!(
+            dedupe_check_and_insert(&dedupes, &sender, sealed).await,
+            "third observation must still dedupe within the window",
+        );
+    }
+
+    #[tokio::test]
+    async fn send_dedupe_distinct_payloads_pass_independently() {
+        let dedupes: SendDedupes = Arc::new(Mutex::new(HashMap::new()));
+        let sender = b"sender_peer_id_bytes".to_vec();
+        let payload_a = b"sealed-envelope-A".as_slice();
+        let payload_b = b"sealed-envelope-B".as_slice();
+
+        assert!(!dedupe_check_and_insert(&dedupes, &sender, payload_a).await);
+        assert!(!dedupe_check_and_insert(&dedupes, &sender, payload_b).await);
+        // Each is now individually deduped.
+        assert!(dedupe_check_and_insert(&dedupes, &sender, payload_a).await);
+        assert!(dedupe_check_and_insert(&dedupes, &sender, payload_b).await);
+    }
+
+    #[tokio::test]
+    async fn send_dedupe_keyed_per_sender() {
+        // Two distinct senders shipping the same sealed bytes must
+        // both pass — the dedupe key includes the
+        // HELLO-authenticated sender so a sibling peer cannot
+        // suppress someone else's SEND by pre-registering its
+        // ciphertext hash.
+        let dedupes: SendDedupes = Arc::new(Mutex::new(HashMap::new()));
+        let alice = b"alice_id_33bytes_".to_vec();
+        let bob = b"bob_id_33bytes_____".to_vec();
+        let sealed = b"identical-bytes".as_slice();
+
+        assert!(!dedupe_check_and_insert(&dedupes, &alice, sealed).await);
+        assert!(!dedupe_check_and_insert(&dedupes, &bob, sealed).await);
+        // Each is individually deduped against its own sender key.
+        assert!(dedupe_check_and_insert(&dedupes, &alice, sealed).await);
+        assert!(dedupe_check_and_insert(&dedupes, &bob, sealed).await);
+    }
+
+    #[tokio::test]
+    async fn send_dedupe_expires_past_window() {
+        let dedupes: SendDedupes = Arc::new(Mutex::new(HashMap::new()));
+        let sender = b"sender_id_bytes".to_vec();
+        let sealed = b"some-sealed-payload".as_slice();
+        // Insert manually with an Instant past the window so the
+        // GC drops it. Same shape as the chain-seed-rate test
+        // does above.
+        let stale = Instant::now()
+            .checked_sub(SEND_DEDUPE_WINDOW + Duration::from_secs(1))
+            .expect("Instant can subtract a 5m+1s offset on every supported platform");
+        {
+            let mut table = dedupes.lock().await;
+            let hash = blake3::hash(sealed);
+            table.insert((sender.clone(), *hash.as_bytes()), stale);
+        }
+        // Run the GC pass inline — drop entries older than the
+        // window. Same retain predicate as `spawn_send_dedupe_gc`.
+        {
+            let cutoff = Instant::now() - SEND_DEDUPE_WINDOW;
+            let mut table = dedupes.lock().await;
+            table.retain(|_, t| *t > cutoff);
+        }
+        // After GC the stale entry is gone — a re-send is treated
+        // as fresh. The window has elapsed; this is a separate
+        // logical message attempt.
+        assert!(
+            !dedupe_check_and_insert(&dedupes, &sender, sealed).await,
+            "stale dedupe entry must be GC'd, re-send treated as fresh",
+        );
+    }
+
+    #[tokio::test]
+    async fn send_dedupe_evicts_oldest_at_cap() {
+        // Drive the table past `SEND_DEDUPE_MAX_ENTRIES` so the
+        // eviction path runs. The smallest plausible workload
+        // would be hostile to test runtime, so jam the table to
+        // just under the cap, then assert the next miss-insert
+        // displaces the oldest entry rather than growing the
+        // table beyond the cap.
+        let dedupes: SendDedupes = Arc::new(Mutex::new(HashMap::new()));
+        let sender = b"sender_id_bytes".to_vec();
+        {
+            let mut table = dedupes.lock().await;
+            for i in 0..SEND_DEDUPE_MAX_ENTRIES {
+                let bytes = (i as u64).to_be_bytes();
+                let hash = blake3::hash(&bytes);
+                // Strictly increasing timestamps so index 0 is the
+                // oldest entry — the one the eviction path drops.
+                let t = Instant::now() + Duration::from_micros(i as u64);
+                table.insert((sender.clone(), *hash.as_bytes()), t);
+            }
+            assert_eq!(table.len(), SEND_DEDUPE_MAX_ENTRIES);
+        }
+
+        // New, never-seen ciphertext. Insert path hits the cap,
+        // evicts the single oldest entry, lands the new one.
+        let fresh = b"a-genuinely-new-sealed-ciphertext".as_slice();
+        assert!(!dedupe_check_and_insert(&dedupes, &sender, fresh).await);
+
+        let table = dedupes.lock().await;
+        assert_eq!(
+            table.len(),
+            SEND_DEDUPE_MAX_ENTRIES,
+            "the cap-hit eviction must keep the table size at cap, not exceed it",
         );
     }
 }
