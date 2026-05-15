@@ -625,6 +625,7 @@ struct ChatView: View {
                         status: rowStatus(forEntry: entry),
                         fullStatus: full,
                         onRetry: rowRetryAction(forEntry: entry, status: full),
+                        onTryAgain: rowTryAgainAction(forEntry: entry, status: full),
                         resolveURL: { info in store.attachmentURL(for: info) },
                         previewMode: store.state.attachmentPreviewMode,
                         onInfoTap: { section in faqAnchor = section },
@@ -956,6 +957,21 @@ struct ChatView: View {
         return nil
     }
 
+    /// Build a Try Again closure for an expired row (S5). Plain
+    /// text rows only — chunked attachments aren't covered (the
+    /// rollup-expired case is vanishingly rare and out of scope).
+    /// `userTryAgainExpired` drops the failed outbox entry and
+    /// calls `send(_:to:)` fresh under the current TTL clock.
+    private func rowTryAgainAction(
+        forEntry entry: PersistedMessage,
+        status: ChatRowStatus?,
+    ) -> (() -> Void)? {
+        guard status == .expired,
+              entry.kind != .attachment,
+              let mid = entry.messageId else { return nil }
+        return { [weak store] in store?.userTryAgainExpired(messageId: mid) }
+    }
+
     private func sendDraft(contact: Contact) {
         // Two paths share this entrypoint: bare-text and attachment+
         // optional-caption. The latter sends one chunked attachment
@@ -1149,6 +1165,8 @@ struct ChatRow: View {
     let fullStatus: ChatRowStatus?
     /// User taps "Retry" on a stuck-pending row.
     let onRetry: (() -> Void)?
+    /// User taps "Try Again" on a TTL-expired row (S5).
+    let onTryAgain: (() -> Void)?
     /// Resolves an inbound attachment's sandbox-relative path back to a
     /// concrete URL. Closure rather than direct ChatStore access so the
     /// row stays cheap to construct in tests / previews.
@@ -1185,6 +1203,7 @@ struct ChatRow: View {
         status: OutboxEntry.Status? = nil,
         fullStatus: ChatRowStatus? = nil,
         onRetry: (() -> Void)? = nil,
+        onTryAgain: (() -> Void)? = nil,
         resolveURL: @escaping (AttachmentInfo) -> URL? = { _ in nil },
         previewMode: AttachmentPreviewMode = .off,
         onInfoTap: ((FAQSection) -> Void)? = nil,
@@ -1196,6 +1215,7 @@ struct ChatRow: View {
         self.status = status
         self.fullStatus = fullStatus
         self.onRetry = onRetry
+        self.onTryAgain = onTryAgain
         self.resolveURL = resolveURL
         self.previewMode = previewMode
         self.onInfoTap = onInfoTap
@@ -1230,6 +1250,9 @@ struct ChatRow: View {
                         .background(bubbleColor)
                         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         .overlay(focusedMatchRing)
+                }
+                if entry.side == .me, fullStatus == .expired, entry.kind != .system {
+                    expiredBanner
                 }
                 metadata
             }
@@ -1320,6 +1343,31 @@ struct ChatRow: View {
             }
         }
         .font(.caption2)
+    }
+
+    /// Inline "Expired — peer was offline too long" banner with a
+    /// "Try Again" button. Rendered on outbound rows whose
+    /// `fullStatus == .expired`. Tapping Try Again calls
+    /// `onTryAgain` which re-queues the message under a fresh
+    /// TTL clock (`ChatStore.userTryAgainExpired`). A queued
+    /// message that aged out behind an offline peer must NOT
+    /// disappear silently — the banner is the user's signal that
+    /// the message did not land.
+    private var expiredBanner: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "nosign")
+                .foregroundStyle(.red)
+            Text("Expired — peer was offline too long")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            if let onTryAgain {
+                Button("Try again", action: onTryAgain)
+                    .font(.caption2.weight(.medium))
+                    .buttonStyle(.borderless)
+                    .tint(.accentColor)
+                    .accessibilityLabel("Try sending this message again")
+            }
+        }
     }
 
     private var timestampText: String {

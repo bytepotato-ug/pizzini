@@ -864,6 +864,41 @@ final class ChatStore: NSObject {
         Storage.upsertOutboxEntry(e)
     }
 
+    /// User-initiated re-send of a TTL-expired message. A queued
+    /// message that aged out behind an offline peer must NOT
+    /// disappear silently — the row sits at `.expired` until the
+    /// user taps Try Again. This entry-point:
+    ///
+    ///   1. Resolves the original chat-row text via the log lookup.
+    ///   2. Drops the failed outbox entry + tombstones it from
+    ///      persistent storage.
+    ///   3. Calls `send(_:to:)` which mints a fresh sentAt + token
+    ///      and re-encrypts under the current ratchet step.
+    ///
+    /// Plain text messages only — chunked attachments aren't
+    /// covered (an attachment that ages out is a rare case and the
+    /// user can re-attach the file from disk).
+    @MainActor
+    func userTryAgainExpired(messageId: Data) {
+        guard let entry = outbox.entries[messageId] else { return }
+        guard entry.failedAt != nil || entry.hasExpired(now: Date()) else { return }
+        guard let idx = contactIndex(forIdentity: entry.recipientPeerId) else { return }
+        // Recover original text from the log row. Only plain text rows
+        // carry the cleartext on disk; attachment rows have `text`
+        // populated with the caption only, not the file bytes.
+        guard let logRow = state.contacts[idx].log.last(where: {
+            $0.side == .me && $0.messageId == messageId
+        }) else { return }
+        guard logRow.kind != .attachment, !logRow.text.isEmpty else { return }
+        let text = logRow.text
+        // Drop the failed entry so the user doesn't see two indicators
+        // for the same logical message. The log row stays — sending
+        // re-pushes a fresh row under a fresh TTL clock.
+        outbox.entries.removeValue(forKey: messageId)
+        Storage.deleteOutboxEntry(messageId: messageId)
+        send(text, to: state.contacts[idx])
+    }
+
     /// User-initiated per-chunk retry for a stuck attachment. Each
     /// chunk of a chunked attachment is already its own
     /// `OutboxEntry` — the auto-retry walker covers them
