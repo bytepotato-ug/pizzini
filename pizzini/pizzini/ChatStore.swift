@@ -812,6 +812,58 @@ final class ChatStore: NSObject {
         outbox.entries[id]
     }
 
+    /// User-initiated retry of a stuck pending entry. The auto-retry
+    /// walk already re-broadcasts on a `max(30, retries*60)` baseline;
+    /// this entry-point exists so a user staring at a row that's been
+    /// pending past `OutboxEntry.userRetryThreshold` can kick the
+    /// re-broadcast without waiting for the next walker tick. Hits the
+    /// same `broadcastToRelays` path as a fresh send and re-mints the
+    /// v2 delivery token (the previous one is single-use and the
+    /// chain has very likely advanced behind it).
+    ///
+    /// Plain-message path. Attachments use
+    /// `userRetryAttachment(attachmentId:)` which re-emits only the
+    /// chunks that never reached a relay (S2).
+    @MainActor
+    func userRetry(messageId: Data) {
+        guard let entry = outbox.entries[messageId] else { return }
+        // Already relayed / delivered / failed — nothing to retry.
+        // The UI's `rowStatus` mapping won't expose a Retry button for
+        // these states, but the entry-point stays defensive against a
+        // race where the user tapped just as an ACK landed.
+        guard entry.deliveredAt == nil,
+              entry.failedAt == nil,
+              entry.relayedAt == nil
+        else { return }
+        guard let idx = contactIndex(forIdentity: entry.recipientPeerId) else { return }
+        guard relayState == .connected else { return }
+        guard let v2 = mintV2DeliveryToken(forContactAt: idx) else {
+            pzLog("[pizzini] user retry: chain missing / exhausted for \(short(entry.recipientPeerId))")
+            return
+        }
+        let wire = HashChainToken.encode(v2)
+        let count = broadcastToRelays {
+            $0.sendSealed(
+                toPeer: entry.recipientPeerId,
+                sealedCiphertext: entry.sealedCiphertext,
+                ttlSeconds: UInt32(entry.ttl),
+                token: wire,
+            )
+        }
+        var e = entry
+        e.retries += 1
+        if count > 0 {
+            // Same gate as the original send path: only flip to
+            // `.relayed` when bytes actually left ≥1 socket. A
+            // user-initiated retry while every relay happens to be
+            // mid-rotation should NOT advance the row to ✓.
+            e.relayedAt = Date()
+            e.token = Data() // F-505: scrub once relayed.
+        }
+        outbox.entries[messageId] = e
+        Storage.upsertOutboxEntry(e)
+    }
+
     /// Forwards the APNs device token to the relay so it can wake us
     /// when a SEND lands while we're disconnected. Called by
     /// `AppDelegate` once iOS has issued a token. With multi-relay

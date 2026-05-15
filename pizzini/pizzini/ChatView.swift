@@ -615,9 +615,16 @@ struct ChatView: View {
                         .padding(.top, 48)
                 }
                 ForEach(contact.log) { entry in
+                    let showReads = contact.effectiveReadReceiptsEnabled(
+                        globalDefault: store.state.defaultReadReceiptsEnabled,
+                    )
+                    let peerHasRead = showReads && entry.readAt != nil
+                    let full = rowFullStatus(forEntry: entry, peerHasRead: peerHasRead)
                     ChatRow(
                         entry: entry,
                         status: rowStatus(forEntry: entry),
+                        fullStatus: full,
+                        onRetry: rowRetryAction(forEntry: entry, status: full),
                         resolveURL: { info in store.attachmentURL(for: info) },
                         previewMode: store.state.attachmentPreviewMode,
                         onInfoTap: { section in faqAnchor = section },
@@ -640,9 +647,7 @@ struct ChatView: View {
                         // is independent so toggling back on
                         // restores the eye without reissuing
                         // anything on the wire.
-                        showReadReceipts: contact.effectiveReadReceiptsEnabled(
-                            globalDefault: store.state.defaultReadReceiptsEnabled,
-                        ),
+                        showReadReceipts: showReads,
                     ).id(entry.id)
                 }
             }
@@ -895,11 +900,48 @@ struct ChatView: View {
     /// Resolve the right OutboxEntry.Status for a chat row. Plain chat
     /// rows look up by their own messageId; attachment rows roll up
     /// across all chunks via OutboxStore.attachmentStatus(forId:).
+    /// Kept on the existing ChatStatusIcon surface; the richer
+    /// `ChatRowStatus` (with retryable / expired branches) flows
+    /// via `rowFullStatus(forEntry:peerHasRead:)` below.
     private func rowStatus(forEntry entry: PersistedMessage) -> OutboxEntry.Status? {
         if entry.kind == .attachment, let aid = entry.attachment?.attachmentId {
             return store.outbox.attachmentStatus(forId: aid)
         }
         return entry.messageId.flatMap { store.outboxEntry(forMessageId: $0)?.status }
+    }
+
+    /// Full `ChatRowStatus` for a plain-text row: drives the glyph
+    /// plus the Retry affordance. Pure mapping lives in
+    /// `Outbox.rowStatus(inputs:)`. Returns nil for inbound rows,
+    /// system rows, attachments (covered in S2), and `.me` rows
+    /// whose outbox entry has been GC'd.
+    private func rowFullStatus(
+        forEntry entry: PersistedMessage,
+        peerHasRead: Bool,
+    ) -> ChatRowStatus? {
+        guard entry.kind != .attachment,
+              let mid = entry.messageId,
+              let outboxEntry = store.outboxEntry(forMessageId: mid)
+        else { return nil }
+        let inputs = ChatRowStatusInputs.from(
+            entry: outboxEntry, now: Date(), peerHasRead: peerHasRead,
+        )
+        return pizzini.rowStatus(inputs: inputs)
+    }
+
+    /// Build a Retry closure for a stuck pending row. Returns nil
+    /// for any other state so the button doesn't render. Plain
+    /// text rows only in S1 — attachments wire up under S2 via
+    /// `userRetryAttachment(attachmentId:)`.
+    private func rowRetryAction(
+        forEntry entry: PersistedMessage,
+        status: ChatRowStatus?,
+    ) -> (() -> Void)? {
+        guard case .pending(let retryable) = status, retryable else { return nil }
+        if let mid = entry.messageId, entry.kind != .attachment {
+            return { [weak store] in store?.userRetry(messageId: mid) }
+        }
+        return nil
     }
 
     private func sendDraft(contact: Contact) {
@@ -1087,6 +1129,14 @@ struct ChatView: View {
 struct ChatRow: View {
     let entry: PersistedMessage
     let status: OutboxEntry.Status?
+    /// Richer per-row status driving affordances next to the
+    /// glyph (Retry on a stuck pending row, Try Again on an
+    /// expired row, the inline progress bar on a sending
+    /// attachment). Nil for inbound rows, system rows, and `.me`
+    /// rows whose outbox entry has been GC'd post-delivery.
+    let fullStatus: ChatRowStatus?
+    /// User taps "Retry" on a stuck-pending row.
+    let onRetry: (() -> Void)?
     /// Resolves an inbound attachment's sandbox-relative path back to a
     /// concrete URL. Closure rather than direct ChatStore access so the
     /// row stays cheap to construct in tests / previews.
@@ -1121,6 +1171,8 @@ struct ChatRow: View {
     init(
         entry: PersistedMessage,
         status: OutboxEntry.Status? = nil,
+        fullStatus: ChatRowStatus? = nil,
+        onRetry: (() -> Void)? = nil,
         resolveURL: @escaping (AttachmentInfo) -> URL? = { _ in nil },
         previewMode: AttachmentPreviewMode = .off,
         onInfoTap: ((FAQSection) -> Void)? = nil,
@@ -1130,6 +1182,8 @@ struct ChatRow: View {
     ) {
         self.entry = entry
         self.status = status
+        self.fullStatus = fullStatus
+        self.onRetry = onRetry
         self.resolveURL = resolveURL
         self.previewMode = previewMode
         self.onInfoTap = onInfoTap
@@ -1240,6 +1294,17 @@ struct ChatRow: View {
                     status: status,
                     read: showReadReceipts && entry.readAt != nil,
                 )
+            }
+            if entry.side == .me,
+               case .pending(let retryable) = fullStatus,
+               retryable,
+               let onRetry,
+               entry.kind != .system {
+                Button("Retry", action: onRetry)
+                    .font(.caption2.weight(.medium))
+                    .buttonStyle(.borderless)
+                    .tint(.accentColor)
+                    .accessibilityLabel("Retry sending this message")
             }
         }
         .font(.caption2)

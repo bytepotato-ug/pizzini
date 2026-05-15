@@ -185,6 +185,164 @@ extension OutboxEntry {
     /// there is no separate post-relay cap — there are no post-relay
     /// retries.
     static let maxRetries: Int = 10
+
+    /// How long a `pending` outbox entry sits without bytes leaving
+    /// the socket before the UI marks it user-retryable. Below this
+    /// the spinner is enough signal; above it the user has been
+    /// staring at an hourglass long enough to suspect we're stuck,
+    /// and a tappable "Retry" affordance starts being more help than
+    /// noise. Matches the 60s baseline the auto-retry walker uses
+    /// for its first re-broadcast attempt.
+    static let userRetryThreshold: TimeInterval = 60
+}
+
+/// UI-facing rollup of every condition that drives the chat-row
+/// status glyph and any inline affordance (a Retry button on a
+/// stuck row, a Try Again button on an expired row, a progress
+/// bar on an in-flight attachment). The six cases below are the
+/// *complete* set of states any outbound row can be in — if you
+/// find yourself wanting a 7th, audit whether one of these
+/// already covers it before adding.
+///
+/// Pinned in `ChatRowStatusTests` against the canonical
+/// transition table.
+enum ChatRowStatus: Equatable, Sendable {
+    /// Submitted to the outbox but bytes have NOT yet left the
+    /// socket. `retryable == true` once the entry has been sitting
+    /// past `OutboxEntry.userRetryThreshold` so the row can show
+    /// a tappable "Retry" affordance rather than an indefinite
+    /// hourglass.
+    case pending(retryable: Bool)
+    /// Bytes left the socket (relay accepted the SEND) but no
+    /// peer ACK has arrived. The first observable "we are doing
+    /// something" state after pending.
+    case sending
+    /// Peer returned at least one ACK covering this messageId.
+    /// `✓` glyph.
+    case delivered
+    /// Peer returned a read receipt covering this messageId AND
+    /// the local user honours receipts for this contact (so the
+    /// eye glyph is permitted to render). `✓✓` / eye glyph.
+    case read
+    /// `sentAt + ttl` elapsed without a peer ACK. Terminal until
+    /// the user taps "Try Again" — which re-queues the message
+    /// under the current TTL clock.
+    case expired
+    /// Retries exhausted with no relay ever accepting the bytes
+    /// (network/encrypt/persist failures). Terminal — no Try
+    /// Again path because no relay was ever reached.
+    case failed
+}
+
+/// Inputs to `rowStatus` — three orthogonal slices of the outbox
+/// row's state, deliberately split so the pure function has no
+/// hidden Date / I/O dependency.
+struct ChatRowStatusInputs: Equatable, Sendable {
+    /// Coarse outbox tier — derived from `OutboxEntry.status` or
+    /// from the chunked-attachment rollup.
+    enum Outbox: Equatable, Sendable {
+        /// No bytes on the wire yet, `pendingFor` is the elapsed
+        /// time since the entry was submitted to the outbox.
+        case pending(pendingFor: TimeInterval, retriesExhausted: Bool)
+        /// Bytes left the socket; relay accepted the SEND. No
+        /// peer ACK yet.
+        case relayed
+        /// Peer ACK received covering this messageId.
+        case delivered
+        /// Underlying `OutboxEntry.failedAt` is set — encrypt or
+        /// session-persist failed before the bytes could be
+        /// safely broadcast.
+        case failed
+    }
+    enum Ack: Equatable, Sendable {
+        case unread
+        case read
+    }
+    enum Ttl: Equatable, Sendable {
+        case active
+        case expired
+    }
+
+    var outbox: Outbox
+    var ack: Ack
+    var ttl: Ttl
+}
+
+/// Pure mapping from `(outboxState, ackState, ttlState)` to the
+/// glyph + affordance the chat row should render. Lives next to
+/// `OutboxEntry` rather than in `ChatView` so unit tests can pin
+/// the table without bringing SwiftUI in.
+///
+/// Precedence (top wins on every conflict):
+///   1. `outbox == .delivered` AND `ack == .read` → `.read`
+///   2. `outbox == .delivered`                    → `.delivered`
+///   3. `outbox == .failed`                       → `.failed`
+///   4. `ttl == .expired`                         → `.expired`
+///   5. `outbox == .relayed`                      → `.sending`
+///   6. `outbox == .pending`                      → `.pending(retryable: …)`
+///
+/// Notes on the ordering:
+///   - Delivered/read wins over expired: if the peer already
+///     ACKed and we later notice the TTL passed, the message
+///     LANDED. The row stays at ✓/eye, never flips to ✗.
+///   - Failed wins over expired: a hard encrypt/persist failure
+///     is more actionable to the user than the TTL clock running
+///     out behind it.
+///   - Expired wins over pending/sending: once the TTL is past,
+///     the message will not be accepted by the recipient even if
+///     a late ACK arrives. Surface "Try Again" rather than a
+///     hopeful spinner.
+func rowStatus(inputs: ChatRowStatusInputs) -> ChatRowStatus {
+    if inputs.outbox == .delivered {
+        return inputs.ack == .read ? .read : .delivered
+    }
+    if inputs.outbox == .failed {
+        return .failed
+    }
+    if inputs.ttl == .expired {
+        return .expired
+    }
+    if inputs.outbox == .relayed {
+        return .sending
+    }
+    if case .pending(let pendingFor, let retriesExhausted) = inputs.outbox {
+        if retriesExhausted {
+            return .failed
+        }
+        let retryable = pendingFor >= OutboxEntry.userRetryThreshold
+        return .pending(retryable: retryable)
+    }
+    // Unreachable — the enum is exhausted above; the explicit
+    // return keeps the compiler happy without adding a default
+    // branch that would swallow a future enum addition silently.
+    return .pending(retryable: false)
+}
+
+extension ChatRowStatusInputs {
+    /// Build the inputs row from a concrete `OutboxEntry` + the
+    /// current wall clock + an optional peer-read flag.
+    static func from(
+        entry: OutboxEntry,
+        now: Date,
+        peerHasRead: Bool,
+    ) -> ChatRowStatusInputs {
+        let outbox: Outbox
+        if entry.deliveredAt != nil {
+            outbox = .delivered
+        } else if entry.failedAt != nil {
+            outbox = .failed
+        } else if entry.relayedAt != nil {
+            outbox = .relayed
+        } else {
+            outbox = .pending(
+                pendingFor: now.timeIntervalSince(entry.sentAt),
+                retriesExhausted: entry.retries >= OutboxEntry.maxRetries,
+            )
+        }
+        let ack: Ack = peerHasRead ? .read : .unread
+        let ttl: Ttl = entry.hasExpired(now: now) ? .expired : .active
+        return ChatRowStatusInputs(outbox: outbox, ack: ack, ttl: ttl)
+    }
 }
 
 /// Codable container so we can persist the whole outbox in one
