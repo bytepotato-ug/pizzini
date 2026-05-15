@@ -273,6 +273,16 @@ struct ContentView: View {
                 if !store.shouldMaskAppContents {
                     screenshotDegradedBanner
                 }
+                // Captive-portal probe verdict. Fires only after a
+                // genuine stall (Tor bootstrap <50% for >30 s) — the
+                // banner replaces the otherwise-opaque "Connecting…"
+                // pill with an actionable instruction, so it stays
+                // below the other persistent warnings but above the
+                // tabbed content.
+                if let verdict = store.captivePortalVerdict,
+                   let copy = captivePortalCopy(for: verdict) {
+                    captivePortalBanner(copy: copy)
+                }
             }
         }
     }
@@ -437,6 +447,49 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Restart Pizzini")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.red)
+    }
+
+    /// Banner copy for each non-`.none` captive-portal verdict.
+    /// Returns `nil` for `.none` so the banner stays hidden when the
+    /// network is fine but Tor is just slow (the bootstrap progress
+    /// in the pill is the right surface for "Tor is working on it").
+    private func captivePortalCopy(for verdict: CaptivePortalVerdict) -> String? {
+        switch verdict {
+        case .portal:
+            return "It looks like this WiFi requires a sign-in page — try opening Safari first."
+        case .networkDown:
+            return "No internet connection."
+        case .none:
+            return nil
+        }
+    }
+
+    /// Captive-portal / network-down banner. Two states from the
+    /// same banner shell — the verdict-driven copy differs but the
+    /// surface (red, top-of-stack, dismissable-via-reconnect) is the
+    /// same. The user's only action is to switch networks or open
+    /// Safari to clear the portal; the banner self-clears on the
+    /// next successful reconnect.
+    private func captivePortalBanner(copy: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "wifi.exclamationmark")
+                .foregroundStyle(.white)
+                .imageScale(.large)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Can't reach the network")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                Text(copy)
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.95))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)

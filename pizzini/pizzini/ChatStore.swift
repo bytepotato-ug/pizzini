@@ -614,6 +614,46 @@ final class ChatStore: NSObject {
     /// so the user can see the app is making progress.
     var torBootstrapPhase: String = ""
 
+    /// Latest captive-portal probe verdict. `nil` until a stalled
+    /// bootstrap triggers the probe (Tor progress <50% for >30 s).
+    /// Set to `.none` if the probe came back clean (Tor is just slow
+    /// on this network — no banner), `.portal` to drive the "this
+    /// WiFi needs a sign-in page" banner, `.networkDown` to drive
+    /// the "no internet connection" banner. Reset to `nil` on every
+    /// reconnect / teardown so a fresh attempt isn't gated by a
+    /// stale verdict from the previous network.
+    var captivePortalVerdict: CaptivePortalVerdict?
+
+    /// Threshold for the captive-portal stall heuristic. Below this
+    /// percent, Tor's bootstrap is doing essentially nothing — either
+    /// the network is blocking the directory fetch (portal) or
+    /// there's no connectivity at all. Above this, Tor has already
+    /// completed the consensus + descriptor fetch and the slow path
+    /// is somewhere we can't help with from clearnet.
+    nonisolated static let captivePortalStallProgress: Int = 50
+    /// How long Tor's bootstrap must stay below
+    /// `captivePortalStallProgress` before the clearnet probe fires.
+    /// 30 s is long enough that a normal slow cellular start finishes
+    /// without ever triggering it, short enough that a user on a
+    /// captive-portal WiFi sees the actionable banner quickly.
+    nonisolated static let captivePortalStallSeconds: TimeInterval = 30
+
+    /// First moment we saw Tor bootstrap progress below the stall
+    /// threshold. Cleared whenever progress crosses ≥ threshold (so
+    /// a normal climb past 50% never accumulates stall time) and on
+    /// every relay teardown / fresh connect.
+    private var captivePortalLowSince: Date?
+    /// Background polling task that watches Tor bootstrap progress
+    /// and fires the captive-portal probe on stall. Cancelled in
+    /// `teardownRelay` and re-armed in `connectRelay`.
+    private var captivePortalStallTask: Task<Void, Never>?
+    /// True once the current connect cycle has fired its one probe.
+    /// Sticky for the cycle so a long stall doesn't repeatedly hit
+    /// `captive.apple.com` — one probe per connect attempt is
+    /// enough to drive the banner, and the user's next action will
+    /// reset us via teardown/reconnect.
+    private var captivePortalProbeFired: Bool = false
+
     @objc
     private func handleTorRequiresAppRestart() {
         pzLog("[pizzini] tor daemon exited — surfacing restart CTA")
@@ -628,6 +668,71 @@ final class ChatStore: NSObject {
     private func handleTorBootstrapPhaseChanged(_ notification: Notification) {
         guard let label = notification.userInfo?["label"] as? String else { return }
         torBootstrapPhase = label
+    }
+
+    /// Start watching Tor bootstrap progress for the captive-portal
+    /// stall heuristic. Called from `connectRelay`; tears down its
+    /// own previous task on each (re)start so a rapid reconnect
+    /// cycle doesn't accumulate watchers.
+    ///
+    /// The watcher polls `TorController.shared.bootstrapProgress`
+    /// every second. The math is intentionally simple — a Combine
+    /// pipeline would let us subscribe to @Published changes but
+    /// the polling cost is one Int read per second and the polling
+    /// loop is easier to reason about when the relevant property
+    /// already lives on an actor we have to hop to anyway.
+    private func startCaptivePortalStallWatcher() {
+        captivePortalStallTask?.cancel()
+        captivePortalLowSince = nil
+        captivePortalProbeFired = false
+        captivePortalVerdict = nil
+        captivePortalStallTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self else { return }
+                if Task.isCancelled { return }
+                // Already fired this cycle — keep the task alive in
+                // case the watcher is cancelled but skip the work.
+                if self.captivePortalProbeFired { continue }
+                let pct = await TorController.shared.bootstrapProgress
+                if pct >= Self.captivePortalStallProgress {
+                    // Progress climbed past the threshold — clear
+                    // any accumulated stall window. A subsequent
+                    // regression below the threshold restarts the
+                    // clock cleanly.
+                    self.captivePortalLowSince = nil
+                    continue
+                }
+                let now = Date()
+                guard let since = self.captivePortalLowSince else {
+                    self.captivePortalLowSince = now
+                    continue
+                }
+                if now.timeIntervalSince(since) >= Self.captivePortalStallSeconds {
+                    self.captivePortalProbeFired = true
+                    pzLog("[pizzini] tor bootstrap stalled at <\(Self.captivePortalStallProgress)% for >\(Int(Self.captivePortalStallSeconds)) s — probing captive.apple.com")
+                    Task { @MainActor [weak self] in
+                        let verdict = await CaptivePortalProbe.run()
+                        guard let self else { return }
+                        self.captivePortalVerdict = verdict
+                        pzLog("[pizzini] captive portal verdict: \(verdict)")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cancel the captive-portal watcher and clear its state. Called
+    /// from `teardownRelay`; the next `connectRelay` starts a fresh
+    /// watcher. The verdict itself is cleared too so the UI doesn't
+    /// keep showing "captive portal" after the user has switched
+    /// networks and reconnected.
+    private func stopCaptivePortalStallWatcher() {
+        captivePortalStallTask?.cancel()
+        captivePortalStallTask = nil
+        captivePortalLowSince = nil
+        captivePortalProbeFired = false
+        captivePortalVerdict = nil
     }
 
     /// Refresh the transparency log from the
@@ -783,6 +888,11 @@ final class ChatStore: NSObject {
         // `electPushPrimary` / the `didChange` delegate path.
         pushPrimary = nil
         scheduleRetryTimer()
+        // Re-arm the captive-portal stall watcher for this connect
+        // cycle. The watcher clears any stale verdict from the
+        // previous network so a portal banner left behind by an old
+        // WiFi can't outlive the reconnect.
+        startCaptivePortalStallWatcher()
     }
 
     /// Elect the push-token primary. Called whenever a relay
@@ -1314,6 +1424,10 @@ final class ChatStore: NSObject {
         }
         perRelayRetryTasks.removeAll()
         perRelayBackoff.removeAll()
+        // Tear down the captive-portal watcher and clear any stale
+        // verdict — a banner from the previous network must not
+        // outlive the reconnect.
+        stopCaptivePortalStallWatcher()
     }
 
     /// Foreground-entry handler. Three cases:
