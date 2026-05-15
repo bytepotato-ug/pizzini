@@ -51,8 +51,8 @@ HEADERS_OUT="$REPO_ROOT/swift/Sources/PizziniTorObjC/torheaders"
 #      from Tor/Classes/{Core,CTor}/ in the same release tag — header
 #      and API drift between the prebuilt static lib and the wrappers
 #      will surface as link errors here.
-VERSION="v409.6.1"
-SHA256="518a2984a6f693265833d31c7ed8c7cb0556765f1a3e5b2d7d0138c14b32f70d"
+VERSION="v409.8.1"
+SHA256="a7788b4ce9a5a57eda3829fde1450a88a8c3a04a82963c7c0b6e2be77b277e6c"
 URL="https://github.com/iCepa/Tor.framework/releases/download/${VERSION}/tor.xcframework.zip"
 
 REBUILD="${REBUILD:-0}"
