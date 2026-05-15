@@ -308,7 +308,7 @@ extension ChatStore {
             // Last-admin protection (or any other reject) surfaces
             // here; tell the user instead of silently failing
             // (audit MEDIUM-4).
-            appendGroupSystem(groupAt: gIdx, "Could not remove member: \(reason).")
+            appendGroupSystem(groupAt: gIdx, "Couldn't remove this member: \(reason).")
             Storage.upsertGroup(state.groups[gIdx])
             return false
         }
@@ -414,7 +414,7 @@ extension ChatStore {
         case .applied:
             break
         case let .rejectedMalformed(reason):
-            appendGroupSystem(groupAt: gIdx, "Role change failed: \(reason).")
+            appendGroupSystem(groupAt: gIdx, "Couldn't change this member's role: \(reason).")
             Storage.upsertGroup(state.groups[gIdx])
             return false
         default:
@@ -605,13 +605,13 @@ extension ChatStore {
             rotateMyGroupChain(groupId: groupId)
         }
         guard let myDist = state.groups[gIdx].myCurrentDistributionId else {
-            appendGroupSystem(groupAt: gIdx, "Group encryption not yet ready — waiting for SKDM exchange.")
+            appendGroupSystem(groupAt: gIdx, "Group encryption isn't ready yet — waiting for keys to arrive from other members.")
             Storage.upsertGroup(state.groups[gIdx])
             return false
         }
         let plaintext = Data(trimmed.utf8)
         guard let ciphertext = try? session.groupEncrypt(distributionId: myDist, plaintext: plaintext) else {
-            appendGroupSystem(groupAt: gIdx, "Encrypt failed.")
+            appendGroupSystem(groupAt: gIdx, "Couldn't encrypt this message. Try sending it again.")
             Storage.upsertGroup(state.groups[gIdx])
             return false
         }
@@ -738,7 +738,7 @@ extension ChatStore {
             appendGroupSystem(
                 groupAt: gIdx,
                 "Sent to \(recipients.count - skipped.count)/\(recipients.count) members. "
-                    + "No chain installed for: \(skipped.joined(separator: ", ")).",
+                    + "These members haven't sent their keys yet: \(skipped.joined(separator: ", ")).",
             )
         }
         Storage.upsertGroup(state.groups[gIdx])
@@ -821,7 +821,7 @@ extension ChatStore {
                 raw = try Data(contentsOf: attachmentURL, options: [.mappedIfSafe])
             } catch {
                 Task { @MainActor [weak self] in
-                    self?.appendGroupSystem(groupId: groupId, text: "Couldn't read \(safeName): \(error)")
+                    self?.appendGroupSystem(groupId: groupId, text: "Couldn't read \(safeName). Try sending it again.")
                 }
                 return
             }
@@ -832,7 +832,7 @@ extension ChatStore {
                 )
             } catch {
                 Task { @MainActor [weak self] in
-                    self?.appendGroupSystem(groupId: groupId, text: "Strip failed for \(safeName): \(error)")
+                    self?.appendGroupSystem(groupId: groupId, text: "Couldn't process \(safeName) before sending. Try a different file.")
                 }
                 return
             }
@@ -929,7 +929,7 @@ extension ChatStore {
         }
         guard !state.groups[gIdx].pendingInvitation else { return }
         guard let myDist = state.groups[gIdx].myCurrentDistributionId else {
-            appendGroupSystem(groupAt: gIdx, "Group encryption not yet ready — waiting for SKDM exchange.")
+            appendGroupSystem(groupAt: gIdx, "Group encryption isn't ready yet — waiting for keys to arrive from other members.")
             Storage.upsertGroup(state.groups[gIdx])
             return
         }
@@ -965,7 +965,7 @@ extension ChatStore {
             do {
                 ciphertext = try session.groupEncrypt(distributionId: myDist, plaintext: plaintext)
             } catch {
-                appendGroupSystem(groupAt: gIdx, "Encrypt failed at chunk \(i)/\(chunks.count): \(error)")
+                appendGroupSystem(groupAt: gIdx, "Couldn't encrypt chunk \(i)/\(chunks.count) of this attachment. Try sending it again.")
                 Storage.upsertGroup(state.groups[gIdx])
                 return
             }
@@ -1473,7 +1473,7 @@ extension ChatStore {
             )
             appendGroupSystem(
                 groupAt: gIdx,
-                "Group integrity warning: divergent op observed at epoch \(epoch).",
+                "Group integrity warning: someone signed two different versions of the same group action.",
             )
         case .rejectedSignature:
             pzLog("[pizzini.group] groupOp ← \(short(sender)): signature rejected")
@@ -1496,8 +1496,7 @@ extension ChatStore {
             )
             appendGroupSystem(
                 groupAt: gIdx,
-                "Group integrity warning: a group action arrived with a member-list signature"
-                    + " that doesn't match this device's view. Op rejected.",
+                "Group integrity warning: a group action's member list didn't match what this device has. The action was rejected.",
             )
         case let .rejectedPreJoinHistory(epoch):
             // The op is for an epoch before the local user joined this
@@ -1514,8 +1513,7 @@ extension ChatStore {
             )
             appendGroupSystem(
                 groupAt: gIdx,
-                "Cannot verify group history from before you joined "
-                    + "(an action dated to epoch \(epoch) arrived). It has not been applied.",
+                "Couldn't verify group history from before you joined this group. The action was ignored.",
             )
         }
         Storage.upsertGroup(state.groups[gIdx])

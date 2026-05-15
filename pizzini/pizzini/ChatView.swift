@@ -1391,7 +1391,7 @@ struct ChatRow: View {
         HStack(spacing: 6) {
             Image(systemName: "nosign")
                 .foregroundStyle(.red)
-            Text("Expired — peer was offline too long")
+            Text("Couldn't deliver — the recipient was offline too long")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             if let onTryAgain {

@@ -72,7 +72,7 @@ struct GroupSettingsView: View {
                     if anyMemberPendingSKDM {
                         Button {
                             if !store.resendMyKeys(groupId: groupID) {
-                                errorMessage = "Could not resend keys."
+                                errorMessage = "Couldn't resend keys. Try again."
                             } else {
                                 errorMessage = nil
                             }
@@ -129,7 +129,7 @@ struct GroupSettingsView: View {
                 onSave: { newName in
                     showRenameSheet = false
                     if !store.renameGroup(groupId: groupID, newName: newName) {
-                        errorMessage = "Could not rename the group."
+                        errorMessage = "Couldn't rename the group. Try again."
                     } else {
                         errorMessage = nil
                     }
@@ -288,7 +288,7 @@ struct GroupSettingsView: View {
             if !isOnlyAdmin {
                 Button(role: .destructive) {
                     if !store.removeFromGroup(groupId: groupID, peerIdentity: member.peerId) {
-                        errorMessage = "Could not remove this member."
+                        errorMessage = "Couldn't remove this member. Try again."
                     } else {
                         errorMessage = nil
                     }
@@ -306,7 +306,7 @@ struct GroupSettingsView: View {
             case .member:
                 Button {
                     if !store.promoteToAdmin(groupId: groupID, peerIdentity: member.peerId) {
-                        errorMessage = "Could not promote this member."
+                        errorMessage = "Couldn't promote this member. Try again."
                     } else {
                         errorMessage = nil
                     }
@@ -317,7 +317,7 @@ struct GroupSettingsView: View {
                 if hasMultipleAdmins {
                     Button {
                         if !store.demoteFromAdmin(groupId: groupID, peerIdentity: member.peerId) {
-                            errorMessage = "Could not demote this admin."
+                            errorMessage = "Couldn't demote this admin. Try again."
                         } else {
                             errorMessage = nil
                         }

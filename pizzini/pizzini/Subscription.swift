@@ -225,7 +225,7 @@ final class SubscriptionService {
                 lastError = "Purchase couldn't complete."
             }
         } catch {
-            lastError = "Purchase failed."
+            lastError = "Couldn't complete the purchase."
         }
     }
 

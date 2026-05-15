@@ -702,7 +702,7 @@ struct ContactsListView: View {
         case .alreadyPaired(let name):
             pasteAlert = PasteAlertContent(
                 title: "Already paired",
-                message: "You're already connected with \(name). Pizzini retried the bundle exchange in case the handshake was stuck.",
+                message: "You're already paired with \(name). Pizzini re-sent your bundle in case it didn't arrive the first time.",
             )
         }
     }

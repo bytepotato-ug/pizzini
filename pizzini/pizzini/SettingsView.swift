@@ -492,16 +492,16 @@ private struct RelayHostScreen: View {
         case .connected:
             return "Connected. Outbound messages are being broadcast through this relay."
         case .connecting:
-            return "TCP / SOCKS5 handshake to the onion is in progress."
+            return "Connecting to this relay through Tor."
         case let .connectingToTor(p):
-            return "Bootstrapping Tor — \(p)%. First-launch can take 5-30 seconds on a healthy network."
+            return "Connecting to Tor — \(p)%. First launch can take 5-30 seconds on a healthy network."
         case .idle:
-            return "Not connected yet. The fleet starts dialling on app launch; pull-to-refresh below or use \"Reconnect now\" to retry."
+            return "Not connected yet. Tap \"Reconnect now\" below to retry."
         case let .failed(msg):
-            return "Failed: \(msg)"
+            return "Couldn't connect: \(msg)"
         case .none:
             return store.state.relayHost.isEmpty
-                ? "This relay isn't being dialled. (Internal state mismatch — try Reconnect now.)"
+                ? "This relay isn't being contacted. Tap \"Reconnect now\" below to retry."
                 : "Bundled fleet disabled: a Custom relay is set below. Clear it to re-enable the fleet."
         }
     }
@@ -707,12 +707,12 @@ private struct ReconnectButton: View {
         switch store.relayState {
         case .connectingToTor(let progress):
             return progress > 0
-                ? "Tor bootstrap \(progress)%"
+                ? "Tor \(progress)%"
                 : "Starting Tor…"
         case .connecting, .idle:
-            return "Dialing relays via Tor…"
+            return "Connecting through Tor…"
         case .failed(let reason):
-            return reason.isEmpty ? "All relays unreachable." : reason
+            return reason.isEmpty ? "Couldn't reach any relay." : reason
         case .connected:
             return nil
         }

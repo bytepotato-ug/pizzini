@@ -136,7 +136,7 @@ struct PasscodeSetupView: View {
             } catch AppPasscode.PasscodeError.keychainWriteFailed {
                 errorMessage = "Couldn't save to Keychain — try again."
             } catch {
-                errorMessage = "Setup failed: \(error)"
+                errorMessage = "Couldn't save the passcode. Try again."
             }
         }
     }

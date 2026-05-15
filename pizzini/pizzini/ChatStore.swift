@@ -495,13 +495,12 @@ final class ChatStore: NSObject {
         // reaches here.
         if Storage.unrecoverableKeyMaterialFailure {
             self.unrecoverableStorageState = true
-            self.initError = "Storage key material is unavailable — the database on this "
-                + "device cannot be opened."
+            self.initError = "Pizzini can't unlock its database on this device."
             return
         }
         if let coldLoadError = Storage.lastColdLoadError {
             self.unrecoverableStorageState = true
-            self.initError = "Stored data could not be read: \(coldLoadError)"
+            self.initError = "Pizzini couldn't read its saved data: \(coldLoadError)"
             return
         }
         // Migration: pre-fleet installs persisted dev hosts like
@@ -1299,19 +1298,19 @@ final class ChatStore: NSObject {
         public var label: String {
             switch self {
             case .bootstrappingTor(let p):
-                return p > 0 ? "Bootstrapping Tor \(p)%" : "Bootstrapping Tor"
+                return p > 0 ? "Connecting to Tor \(p)%" : "Connecting to Tor"
             case .connectingRelays(_, let total):
                 // Mid-dial: `connected` is always 0 here (the
                 // derivation guarantees it — once any relay is
                 // `.connected`, the state is `.connected` or
-                // `.partial`, never `.connectingRelays`). Show
-                // "Connecting 0 of N" so the count is consistent
-                // with `.partial`'s "M of N" format.
-                return "Connecting 0 of \(total)"
+                // `.partial`, never `.connectingRelays`). Parens
+                // disambiguate the count from a generic mid-loading
+                // "0 of N" string.
+                return "Connecting to relays (0/\(total))"
             case .connected:
                 return "Connected"
             case .partial(let connected, let total):
-                return "\(connected) of \(total) relays"
+                return "\(connected)/\(total) relays online"
             case .failed:
                 return "Couldn't connect — tap to retry"
             case .idle:
@@ -2351,7 +2350,7 @@ final class ChatStore: NSObject {
                 raw = try Data(contentsOf: url, options: [.mappedIfSafe])
             } catch {
                 Task { @MainActor [weak self] in
-                    self?.appendSystem("Couldn't read \(safeName): \(error)", to: idx)
+                    self?.appendSystem("Couldn't read \(safeName). Try sending it again.", to: idx)
                 }
                 return
             }
@@ -2362,7 +2361,7 @@ final class ChatStore: NSObject {
                 )
             } catch {
                 Task { @MainActor [weak self] in
-                    self?.appendSystem("Strip failed for \(safeName): \(error)", to: idx)
+                    self?.appendSystem("Couldn't process \(safeName) before sending. Try a different file.", to: idx)
                 }
                 return
             }

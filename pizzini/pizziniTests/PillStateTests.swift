@@ -26,14 +26,14 @@ struct PillStateTests {
             relays: [.bootstrapping(progress: 45), .bootstrapping(progress: 45), .bootstrapping(progress: 45)],
         )
         #expect(s == .bootstrappingTor(progress: 45))
-        #expect(s.label == "Bootstrapping Tor 45%")
+        #expect(s.label == "Connecting to Tor 45%")
         #expect(s.tint == .grey)
         #expect(s.isTappable == false)
     }
 
     /// Bootstrap = 0 — pre-progress state, just after the bootstrap
     /// started. The label drops the percent so we don't read
-    /// "Bootstrapping Tor 0%" (technically truthful but unhelpfully
+    /// "Connecting to Tor 0%" (technically truthful but unhelpfully
     /// alarming).
     @Test func bootstrapZeroShowsPlainLabel() {
         let s = ChatStore.pillState(
@@ -41,7 +41,7 @@ struct PillStateTests {
             relays: [.idle],
         )
         #expect(s == .bootstrappingTor(progress: 0))
-        #expect(s.label == "Bootstrapping Tor")
+        #expect(s.label == "Connecting to Tor")
     }
 
     /// Bootstrap reached 100 even though the relay-dial hasn't
@@ -55,7 +55,7 @@ struct PillStateTests {
             relays: [.connecting, .connecting, .connecting],
         )
         #expect(s == .connectingRelays(connected: 0, total: 3))
-        #expect(s.label == "Connecting 0 of 3")
+        #expect(s.label == "Connecting to relays (0/3)")
         #expect(s.tint == .amber)
     }
 
@@ -66,20 +66,20 @@ struct PillStateTests {
             bootstrap: 100,
             relays: [.connecting, .connecting, .connecting],
         )
-        #expect(s.label == "Connecting 0 of 3")
+        #expect(s.label == "Connecting to relays (0/3)")
     }
 
-    /// A single connected relay should NOT show "Connecting 1 of 3"
-    /// — it should show the partial state (which says "1 of 3
-    /// relays", a different message) since the user has working
-    /// send/receive even with one route up.
+    /// A single connected relay should NOT show
+    /// "Connecting to relays (1/3)" — it should show the partial state
+    /// (which says "1/3 relays online", a different message) since the
+    /// user has working send/receive even with one route up.
     @Test func oneConnectedTwoConnectingShowsPartial() {
         let s = ChatStore.pillState(
             bootstrap: 100,
             relays: [.connected, .connecting, .connecting],
         )
         #expect(s == .partial(connected: 1, total: 3))
-        #expect(s.label == "1 of 3 relays")
+        #expect(s.label == "1/3 relays online")
         #expect(s.tint == .amber)
     }
 
@@ -108,7 +108,7 @@ struct PillStateTests {
             relays: [.connected, .connected, .failed],
         )
         #expect(s == .partial(connected: 2, total: 3))
-        #expect(s.label == "2 of 3 relays")
+        #expect(s.label == "2/3 relays online")
         #expect(s.tint == .amber)
         #expect(s.isTappable == false)
     }
@@ -121,7 +121,7 @@ struct PillStateTests {
             relays: [.failed, .connected, .failed],
         )
         #expect(s == .partial(connected: 1, total: 3))
-        #expect(s.label == "1 of 3 relays")
+        #expect(s.label == "1/3 relays online")
     }
 
     // MARK: failed branch
@@ -157,7 +157,7 @@ struct PillStateTests {
     @Test func emptyFleetShowsIdle() {
         let s = ChatStore.pillState(bootstrap: 0, relays: [])
         // Empty + bootstrap=0 hits the bootstrap branch (bootstrap < 100
-        // and no relay is connected). Label reads "Bootstrapping Tor"
+        // and no relay is connected). Label reads "Connecting to Tor"
         // rather than "Starting" — the user sees the same chrome they
         // see during the actual bootstrap that follows in the next
         // frame, no flicker.

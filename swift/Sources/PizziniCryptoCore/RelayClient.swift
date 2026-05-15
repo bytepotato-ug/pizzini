@@ -437,7 +437,7 @@ public final class RelayClient: @unchecked Sendable {
         state = .connecting
         socksRetries = 0
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
-            state = .failed("invalid port \(port)")
+            state = .failed("Bad relay port (\(port))")
             return
         }
         // **D1 Tor-only enforcement.** The single chokepoint for the
@@ -464,7 +464,7 @@ public final class RelayClient: @unchecked Sendable {
         #if RELAY_ALLOW_DIRECT_TCP
         startDirectConnection(host: host, port: nwPort)
         #else
-        state = .failed("refusing non-onion relay host: \(host)")
+        state = .failed("This relay isn't a Tor address.")
         #endif
     }
 
@@ -575,7 +575,7 @@ public final class RelayClient: @unchecked Sendable {
                     progressTask.cancel()
                     relayLog.error("dial: bootstrap threw after \(Self.fmtElapsed(from: dialStart)) — error=\(String(describing: error), privacy: .public)")
                     self.queue.async {
-                        self.state = .failed("tor bootstrap failed: \(error)")
+                        self.state = .failed("Couldn't start Tor: \(error)")
                     }
                     return
                 }
@@ -589,7 +589,7 @@ public final class RelayClient: @unchecked Sendable {
                 } catch {
                     relayLog.error("dial: cached-bootstrap unexpectedly threw — \(String(describing: error), privacy: .public)")
                     self.queue.async {
-                        self.state = .failed("tor bootstrap failed: \(error)")
+                        self.state = .failed("Couldn't start Tor: \(error)")
                     }
                     return
                 }
@@ -617,7 +617,7 @@ public final class RelayClient: @unchecked Sendable {
             } catch {
                 relayLog.error("dial: prepareHiddenService failed after \(Self.fmtElapsed(from: prepStart)) — \(String(describing: error), privacy: .public)")
                 self.queue.async {
-                    self.state = .failed("hs descriptor unavailable: \(error)")
+                    self.state = .failed("Couldn't find this relay through Tor: \(error)")
                 }
                 return
             }
@@ -648,7 +648,7 @@ public final class RelayClient: @unchecked Sendable {
         targetPort: UInt16
     ) {
         guard let nwSocksPort = NWEndpoint.Port(rawValue: socksPort) else {
-            state = .failed("invalid SOCKS port \(socksPort)")
+            state = .failed("Bad Tor proxy port (\(socksPort))")
             return
         }
         // Loopback IPv4 — tor's SocksPort binds 127.0.0.1 explicitly.
@@ -672,7 +672,7 @@ public final class RelayClient: @unchecked Sendable {
             case .failed(let err):
                 relayLog.error("socks: TCP failed — \(String(describing: err), privacy: .public)")
                 self.handleSocksFailure(
-                    reason: "socks tcp: \(err)",
+                    reason: "Tor proxy: \(err)",
                     socksPort: socksPort,
                     targetHost: targetHost,
                     targetPort: targetPort
@@ -698,7 +698,7 @@ public final class RelayClient: @unchecked Sendable {
             guard let self else { return }
             if let error {
                 self.handleSocksFailure(
-                    reason: "socks greeting send: \(error)",
+                    reason: "Tor proxy greeting send: \(error)",
                     socksPort: socksPort,
                     targetHost: targetHost,
                     targetPort: targetPort
@@ -721,7 +721,7 @@ public final class RelayClient: @unchecked Sendable {
             guard let self else { return }
             if let error {
                 self.handleSocksFailure(
-                    reason: "socks greeting reply: \(error)",
+                    reason: "Tor proxy greeting reply: \(error)",
                     socksPort: socksPort,
                     targetHost: targetHost,
                     targetPort: targetPort
@@ -730,7 +730,7 @@ public final class RelayClient: @unchecked Sendable {
             }
             guard let data else {
                 self.handleSocksFailure(
-                    reason: "socks greeting reply: empty",
+                    reason: "Tor proxy greeting reply: empty",
                     socksPort: socksPort,
                     targetHost: targetHost,
                     targetPort: targetPort
@@ -741,7 +741,7 @@ public final class RelayClient: @unchecked Sendable {
                 _ = try Socks5.parseGreetingReply(data)
             } catch {
                 self.handleSocksFailure(
-                    reason: "socks greeting reply: \(error)",
+                    reason: "Tor proxy greeting reply: \(error)",
                     socksPort: socksPort,
                     targetHost: targetHost,
                     targetPort: targetPort
@@ -767,7 +767,7 @@ public final class RelayClient: @unchecked Sendable {
             // into this path today, so this is a defence-in-depth
             // surface, not a reachable user flow.
             handleSocksFailure(
-                reason: "socks connect request: \(error)",
+                reason: "Tor proxy connect: \(error)",
                 socksPort: socksPort,
                 targetHost: targetHost,
                 targetPort: targetPort
@@ -778,7 +778,7 @@ public final class RelayClient: @unchecked Sendable {
             guard let self else { return }
             if let error {
                 self.handleSocksFailure(
-                    reason: "socks connect send: \(error)",
+                    reason: "Tor proxy connect send: \(error)",
                     socksPort: socksPort,
                     targetHost: targetHost,
                     targetPort: targetPort
@@ -805,7 +805,7 @@ public final class RelayClient: @unchecked Sendable {
             guard let self else { return }
             if let error {
                 self.handleSocksFailure(
-                    reason: "socks connect reply: \(error)",
+                    reason: "Tor proxy connect reply: \(error)",
                     socksPort: socksPort,
                     targetHost: targetHost,
                     targetPort: targetPort
@@ -839,7 +839,7 @@ public final class RelayClient: @unchecked Sendable {
                 }
             } catch {
                 self.handleSocksFailure(
-                    reason: "socks connect reply: \(error)",
+                    reason: "Tor proxy connect reply: \(error)",
                     socksPort: socksPort,
                     targetHost: targetHost,
                     targetPort: targetPort
@@ -1131,7 +1131,7 @@ public final class RelayClient: @unchecked Sendable {
             // Without a valid signature the relay will drop the HELLO,
             // and a half-open TCP connection is worse than a clean
             // failure. Mark .failed so the UI surfaces the error.
-            state = .failed("HELLO signing failed (identity key unavailable)")
+            state = .failed("Couldn't sign in to this relay (identity key unavailable).")
             return
         }
 
@@ -1249,7 +1249,7 @@ public final class RelayClient: @unchecked Sendable {
                     conn.cancel()
                 }
                 self.connection = nil
-                self.state = .failed("network unreachable: onion dial exceeded \(Int(Self.dialBudget))s budget")
+                self.state = .failed("Couldn't reach this relay within \(Int(Self.dialBudget))s — network might be blocking Tor.")
             case .connected, .failed, .idle:
                 break
             }
@@ -1294,7 +1294,7 @@ public final class RelayClient: @unchecked Sendable {
                 return UInt32(bigEndian: raw)
             }
             if len > Self.maxFrameBytes {
-                state = .failed("frame too large: \(len)")
+                state = .failed("This relay sent a frame larger than Pizzini accepts (\(len) bytes).")
                 return
             }
             let total = 4 + Int(len)
