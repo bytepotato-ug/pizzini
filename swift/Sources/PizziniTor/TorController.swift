@@ -247,7 +247,9 @@ public final class TorController: ObservableObject {
     /// completing. 4 minutes is enough for a worst-case cellular cold
     /// start with consensus fetch, well short of "user thinks the app
     /// is broken" patience.
-    nonisolated private static let bootstrapHardDeadline: TimeInterval = 4 * 60
+    // `public` so pizziniTests/DialBudgetTests can pin the
+    // dial-budget invariant against the additive per-phase sum.
+    nonisolated public static let bootstrapHardDeadline: TimeInterval = 4 * 60
 
     /// How long we wait for tor to create its `control_auth_cookie`
     /// and `controlport` files in the data directory after
@@ -381,7 +383,9 @@ public final class TorController: ObservableObject {
     /// observed worst case so the first attempt actually catches
     /// the event instead of timing out 5 s short. UI stays at
     /// `.connecting` during the wait, no `.failed` flash.
-    nonisolated private static let hsFetchDeadline: TimeInterval = 90
+    // `public` so pizziniTests/DialBudgetTests can pin the
+    // dial-budget invariant against the additive per-phase sum.
+    nonisolated public static let hsFetchDeadline: TimeInterval = 90
 
     private init() {}
 
@@ -520,13 +524,19 @@ public final class TorController: ObservableObject {
         }
     }
 
-    /// Single-fire atomic claim, used by `probeBootstrapPhase` to keep
-    /// the GETINFO completion + timeout task from both resuming the
-    /// same continuation. The first `claim()` returns true; everyone
-    /// else returns false.
-    final class SingleFire: @unchecked Sendable {
+    /// Single-fire atomic claim, used by `probeBootstrapPhase` and
+    /// `sendNewnymSignalAndWait` to keep the control-port completion
+    /// callback + the deadline/grace task from both resuming the same
+    /// continuation. The first `claim()` returns true; everyone else
+    /// returns false.
+    ///
+    /// `public` so pizziniTests/SingleFireTests can pin the
+    /// "exactly one winner" semantic that backs F-tor-02's
+    /// ack-or-grace race.
+    public final class SingleFire: @unchecked Sendable {
         private let lock = OSAllocatedUnfairLock<Bool>(initialState: false)
-        func claim() -> Bool {
+        public init() {}
+        public func claim() -> Bool {
             lock.withLock { fired in
                 if fired { return false }
                 fired = true

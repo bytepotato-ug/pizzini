@@ -388,8 +388,12 @@ public final class RelayClient: @unchecked Sendable {
     /// the user doesn't see a spurious "Connection refused" on
     /// first launch. Reset to 0 on every new `connect()` call.
     private var socksRetries: Int = 0
-    private static let maxSocksRetries: Int = 4
-    private static let socksRetryDelay: TimeInterval = 5
+    // `public` so pizziniTests/DialBudgetTests can pin the
+    // dial-budget invariant. These are config knobs, not API
+    // contract — the published value matters only as a backstop
+    // relationship to `dialBudget` below.
+    public static let maxSocksRetries: Int = 4
+    public static let socksRetryDelay: TimeInterval = 5
 
     /// End-to-end wall-clock budget for a single `connect(to:)` →
     /// `.connected` transition on the .onion path. The per-phase
@@ -406,7 +410,9 @@ public final class RelayClient: @unchecked Sendable {
     /// trips on a genuinely stuck dial — never on an honest-but-slow
     /// cold start — while still staying inside "the user thinks the
     /// app is broken".
-    private static let dialBudget: TimeInterval = 7 * 60
+    // `public` so pizziniTests/DialBudgetTests can pin the
+    // dial-budget invariant.
+    public static let dialBudget: TimeInterval = 7 * 60
     /// Watchdog enforcing `dialBudget`. Armed on the .onion path in
     /// `connect(to:)`, fires once if the dial hasn't reached
     /// `.connected` by the deadline, and is torn down on every
