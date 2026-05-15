@@ -101,11 +101,15 @@ let package = Package(
             dependencies: ["PizziniSQLCipher"],
             path: "swift/Sources/PizziniDB"
         ),
-        // Embedded Tor: prebuilt static library (C-tor + libevent + OpenSSL
-        // + lzma) repackaged into a static-library xcframework by
-        // `scripts/build-tor-xcframework.sh`. The artifact is pinned by
-        // SHA-256 against an iCepa Tor.framework release tag — see that
-        // script for the bump procedure.
+        // Embedded Tor: C-tor + libevent + OpenSSL + lzma built from
+        // source via iCepa's build-xcframework.sh (driven from
+        // `scripts/build-tor-xcframework.sh`) and repackaged into a
+        // static-library xcframework. The iCepa pin lives in that
+        // script. We build from source — not the iCepa release zip —
+        // so libtor.a contains the Equi-X PoW client solver
+        // (`--enable-gpl --enable-module-pow`); the prebuilt zip
+        // omits it and the client cannot ride out a DoS once the
+        // operator flips HiddenServicePoWDefensesEnabled.
         //
         // The xcframework is intentionally a STATIC-LIB-ONLY shape
         // (`libtor.a` per slice, no Headers/, no module map). Shipping
