@@ -318,6 +318,24 @@ func rowStatus(inputs: ChatRowStatusInputs) -> ChatRowStatus {
     return .pending(retryable: false)
 }
 
+/// Send progress (0.0 → 1.0) for a chunked attachment. Total of
+/// zero collapses to zero — the divide-by-zero / empty-chunks-array
+/// edge is the only branch the caller can't structurally rule out
+/// (the UI gates on `total > 0` before showing the bar, but the
+/// pure function defends in depth).
+///
+/// `chunksAcked` here means "chunks whose bytes left ≥1 socket"
+/// — i.e. chunks at `.relayed` or further. The progress bar
+/// tracks bytes-leaving-the-device, not peer ACKs, because the
+/// user is staring at the UI during upload and the relay-handoff
+/// tier is the latency-sensitive one (peer ACKs depend on the
+/// recipient being online, which is out of the sender's hands).
+func attachmentProgressPercent(chunksAcked: Int, totalChunks: Int) -> Double {
+    guard totalChunks > 0 else { return 0 }
+    let clampedAcked = max(0, min(chunksAcked, totalChunks))
+    return Double(clampedAcked) / Double(totalChunks)
+}
+
 extension ChatRowStatusInputs {
     /// Build the inputs row from a concrete `OutboxEntry` + the
     /// current wall clock + an optional peer-read flag.
@@ -365,6 +383,35 @@ struct OutboxStore: Codable, Sendable {
         entries.values
             .filter { $0.shouldRetry(now: now) }
             .sorted { $0.sentAt < $1.sentAt }
+    }
+
+    /// Per-attachment chunk counters used by the UI progress bar
+    /// (U4). All four counts move over the lifetime of a send:
+    ///   - `total`     == chunks.count on the originating SEND
+    ///   - `relayed`   == chunks whose bytes left ≥1 socket
+    ///   - `delivered` == chunks the peer ACKed
+    ///   - `pending`   == chunks where neither has happened yet
+    /// `failed` chunks count toward `total` but neither `relayed`
+    /// nor `delivered` — they collapse the progress bar to red
+    /// via the `.failed` branch of `rowStatus`.
+    func attachmentChunkCounts(forId attachmentId: Data) -> (
+        total: Int, pending: Int, relayed: Int, delivered: Int, failed: Int
+    ) {
+        let chunks = entries.values.filter { $0.attachmentId == attachmentId }
+        var pending = 0, relayed = 0, delivered = 0, failed = 0
+        for c in chunks {
+            if c.deliveredAt != nil { delivered += 1 }
+            else if c.failedAt != nil { failed += 1 }
+            else if c.relayedAt != nil { relayed += 1 }
+            else { pending += 1 }
+        }
+        // `chunkCount` on any chunk is authoritative for total — it
+        // captures the originating SEND's planned chunk count even
+        // after GC has removed some entries. Fall back to the
+        // observed count when no chunk reports it (legacy entries).
+        let claimed = chunks.first?.chunkCount.map { Int($0) } ?? chunks.count
+        return (total: claimed, pending: pending, relayed: relayed,
+                delivered: delivered, failed: failed)
     }
 
     /// Roll up `ChatRowStatusInputs` across every chunk of a chunked

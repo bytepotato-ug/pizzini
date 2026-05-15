@@ -624,6 +624,7 @@ struct ChatView: View {
                         entry: entry,
                         status: rowStatus(forEntry: entry),
                         fullStatus: full,
+                        attachmentProgress: attachmentSendProgress(forEntry: entry, status: full),
                         onRetry: rowRetryAction(forEntry: entry, status: full),
                         onTryAgain: rowTryAgainAction(forEntry: entry, status: full),
                         resolveURL: { info in store.attachmentURL(for: info) },
@@ -939,6 +940,30 @@ struct ChatView: View {
         return pizzini.rowStatus(inputs: inputs)
     }
 
+    /// Send progress (0.0 → 1.0) for an outbound attachment row, or
+    /// nil for plain-text rows and inbound rows (U4). Suppressed
+    /// once the attachment is delivered so the progress bar
+    /// disappears and the row falls back to the standard ✓ glyph.
+    private func attachmentSendProgress(
+        forEntry entry: PersistedMessage,
+        status: ChatRowStatus?,
+    ) -> Double? {
+        guard entry.kind == .attachment,
+              entry.side == .me,
+              let aid = entry.attachment?.attachmentId
+        else { return nil }
+        let counts = store.outbox.attachmentChunkCounts(forId: aid)
+        guard counts.total > 0 else { return nil }
+        switch status {
+        case .delivered, .read: return nil
+        default:
+            return attachmentProgressPercent(
+                chunksAcked: counts.relayed + counts.delivered,
+                totalChunks: counts.total,
+            )
+        }
+    }
+
     /// Build a Retry closure for a stuck pending row. Returns nil
     /// for any other state so the button doesn't render.
     /// Attachments route through `userRetryAttachment(attachmentId:)`
@@ -1163,6 +1188,11 @@ struct ChatRow: View {
     /// attachment). Nil for inbound rows, system rows, and `.me`
     /// rows whose outbox entry has been GC'd post-delivery.
     let fullStatus: ChatRowStatus?
+    /// Send progress for an in-flight chunked attachment: 0.0 → 1.0.
+    /// Drives the thin progress bar at the bottom of the bubble
+    /// (U4). Nil for plain-text rows, inbound rows, completed
+    /// attachments.
+    let attachmentProgress: Double?
     /// User taps "Retry" on a stuck-pending row.
     let onRetry: (() -> Void)?
     /// User taps "Try Again" on a TTL-expired row (S5).
@@ -1202,6 +1232,7 @@ struct ChatRow: View {
         entry: PersistedMessage,
         status: OutboxEntry.Status? = nil,
         fullStatus: ChatRowStatus? = nil,
+        attachmentProgress: Double? = nil,
         onRetry: (() -> Void)? = nil,
         onTryAgain: (() -> Void)? = nil,
         resolveURL: @escaping (AttachmentInfo) -> URL? = { _ in nil },
@@ -1214,6 +1245,7 @@ struct ChatRow: View {
         self.entry = entry
         self.status = status
         self.fullStatus = fullStatus
+        self.attachmentProgress = attachmentProgress
         self.onRetry = onRetry
         self.onTryAgain = onTryAgain
         self.resolveURL = resolveURL
@@ -1241,6 +1273,8 @@ struct ChatRow: View {
                         captionText: entry.text,
                         previewMode: previewMode,
                         onInfoTap: onInfoTap,
+                        sendProgress: attachmentProgress,
+                        progressTint: fullStatus == .failed ? .red : .accentColor,
                     )
                     .overlay(focusedMatchRing)
                 } else {
@@ -1483,6 +1517,13 @@ struct AttachmentRowCard: View {
     /// "no info button" (e.g. a row in a context where deep-linking
     /// to FAQ doesn't make sense).
     let onInfoTap: ((FAQSection) -> Void)?
+    /// Send progress 0.0…1.0 for an in-flight chunked attachment
+    /// (U4). Nil hides the progress bar entirely (plain rows,
+    /// completed attachments, inbound rows).
+    let sendProgress: Double?
+    /// Tint for the progress bar — accent while sending, red on
+    /// failure. The parent ChatRow computes this off `fullStatus`.
+    let progressTint: Color
 
     @State private var presentingShare = false
     @State private var presentingPreview = false
@@ -1494,7 +1535,9 @@ struct AttachmentRowCard: View {
         resolveURL: @escaping (AttachmentInfo) -> URL?,
         captionText: String,
         previewMode: AttachmentPreviewMode = .off,
-        onInfoTap: ((FAQSection) -> Void)? = nil
+        onInfoTap: ((FAQSection) -> Void)? = nil,
+        sendProgress: Double? = nil,
+        progressTint: Color = .accentColor
     ) {
         self.info = info
         self.side = side
@@ -1503,6 +1546,8 @@ struct AttachmentRowCard: View {
         self.captionText = captionText
         self.previewMode = previewMode
         self.onInfoTap = onInfoTap
+        self.sendProgress = sendProgress
+        self.progressTint = progressTint
     }
 
     var body: some View {
@@ -1562,6 +1607,21 @@ struct AttachmentRowCard: View {
                         previewButton
                     }
                 }
+            }
+            // Thin chunk-by-chunk progress bar at the bottom of
+            // the bubble while the attachment is sending (U4).
+            // Disappears the instant `sendProgress` clears — the
+            // caller suppresses it once the attachment is
+            // delivered. On failure the parent ChatRow flips
+            // `progressTint` red so the user sees WHY the row
+            // didn't progress to ✓.
+            if let p = sendProgress {
+                ProgressView(value: p)
+                    .progressViewStyle(.linear)
+                    .tint(progressTint)
+                    .accessibilityValue(
+                        Text("\(Int(p * 100)) percent sent")
+                    )
             }
         }
         .padding(.horizontal, 12)
