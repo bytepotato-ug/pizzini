@@ -72,12 +72,7 @@ struct GroupChatView: View {
     @State private var isAtBottom = true
     @State private var unreadWhileScrolledUp = 0
     @State private var lastSeenLogCount = 0
-    /// Stable identifier for the 1pt invisible sentinel row at
-    /// the very end of the group log. See `ChatView` for the
-    /// rationale — visibility of a real view sidesteps the
-    /// `ScrollGeometry` quirks introduced by `safeAreaInset`
-    /// and `.defaultScrollAnchor`.
-    private static let bottomSentinelID = "pizzini.group.bottomSentinel"
+    private static let atBottomThreshold: CGFloat = 24
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -353,19 +348,6 @@ struct GroupChatView: View {
                         )
                         .id(row.id)
                     }
-                    // Bottom sentinel — see `ChatView` for the
-                    // rationale. Visibility-of-a-real-view is a
-                    // more reliable "are we at the bottom" signal
-                    // than ScrollGeometry math.
-                    Color.clear
-                        .frame(height: 1)
-                        .id(Self.bottomSentinelID)
-                        .onScrollVisibilityChange(threshold: 0.01) { visible in
-                            isAtBottom = visible
-                            if visible {
-                                unreadWhileScrolledUp = 0
-                            }
-                        }
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
@@ -395,8 +377,23 @@ struct GroupChatView: View {
             .defaultScrollAnchor(.bottom, for: .sizeChanges)
             .scrollPosition($scrollPosition)
             .scrollDismissesKeyboard(.interactively)
-            // Floating jump-to-bottom pill — visibility of the
-            // sentinel above drives `isAtBottom`.
+            // At-bottom tracker driving the jump-to-bottom pill.
+            // `visibleRect.maxY` is the bottom edge of the
+            // visible region in content coordinates, computed by
+            // SwiftUI after applying `contentInsets` (composer's
+            // `.safeAreaInset(.bottom)`, keyboard, etc.) — so
+            // comparing it against `contentSize.height` answers
+            // "is the bottom of content currently on screen?"
+            // without the inset accounting that broke the earlier
+            // `contentOffset`-based formula.
+            .onScrollGeometryChange(for: Bool.self) { geom in
+                geom.visibleRect.maxY >= geom.contentSize.height - Self.atBottomThreshold
+            } action: { _, atBottom in
+                isAtBottom = atBottom
+                if atBottom {
+                    unreadWhileScrolledUp = 0
+                }
+            }
             .overlay(alignment: .bottomTrailing) {
                 jumpToBottomPill
                     .padding(.trailing, 16)
