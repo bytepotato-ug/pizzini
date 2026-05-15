@@ -35,7 +35,7 @@ struct GroupCipherTests {
         #expect(carolDist == dist)
 
         // Alice encrypts once; both recipients decrypt the same bytes.
-        let plaintext = Data("activist briefing for the field team".utf8)
+        let plaintext = Data("briefing for the field team".utf8)
         let ct = try alice.groupEncrypt(distributionId: dist, plaintext: plaintext)
         #expect(try bob.groupDecrypt(senderIdentity: aliceId, ciphertext: ct) == plaintext)
         #expect(try carol.groupDecrypt(senderIdentity: aliceId, ciphertext: ct) == plaintext)

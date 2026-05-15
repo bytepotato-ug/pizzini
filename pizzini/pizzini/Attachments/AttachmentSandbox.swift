@@ -35,8 +35,8 @@ enum AttachmentSandbox {
     private static let outboundName = "outgoing"
 
     /// Root `attachments/` directory. Created on first call; idempotent.
-    /// Excluded from iCloud backup so a journalist's iCloud-backed
-    /// account can't leak attachment bytes off the device. Both the
+    /// Excluded from iCloud backup so a user's iCloud-backed account
+    /// can't leak attachment bytes off the device. Both the
     /// protection class and the backup-exclusion flag are RE-ASSERTED
     /// on every call — a refactor that ever creates the directory
     /// out-of-band can't silently re-enable backup or downgrade the

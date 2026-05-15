@@ -18,7 +18,7 @@ import Foundation
 /// themselves live in a Keychain-sealed envelope, but a separate
 /// search index either has to ride the same envelope (re-encrypted on
 /// every write, defeating the point of incremental indexing) or sit
-/// in the clear (unacceptable for an activist tool). On-demand linear
+/// in the clear (unacceptable for this threat model). On-demand linear
 /// scan over the in-RAM logs is sub-millisecond at expected log
 /// volumes and a hard floor on the persistence-side attack surface.
 ///

@@ -196,8 +196,8 @@ struct ChatGroup: Codable, Identifiable, Sendable {
     // ─── Constants ─────────────────────────────────────────────────────
 
     /// Hard cap on group size. Larger groups churn rotation traffic
-    /// without bringing meaningful new utility for the activist threat
-    /// model. Mirrors Signal's classic group-v2 cap.
+    /// without bringing meaningful new utility for our threat model.
+    /// Mirrors Signal's classic group-v2 cap.
     static let maxMembers: Int = 50
 
     /// Periodic sender-key rotation: time bound. After this much

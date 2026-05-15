@@ -524,7 +524,7 @@ extension ChatStore {
 
     /// Panic-mode counterpart to 1:1 `deleteChat(_:)`: wipe the
     /// group's local log but keep the user's membership and chain
-    /// state intact. Mirrors the activist threat model — instant
+    /// state intact. Mirrors the panic-mode threat model — instant
     /// cleanup of visible content without changing what the rest
     /// of the group sees about us. To actually leave the group the
     /// user goes through `leaveGroup(_:)` (which rotates the chain

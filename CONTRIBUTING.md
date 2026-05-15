@@ -1,8 +1,7 @@
 # Contributing to Pizzini
 
-Pizzini is a secure messenger that journalists and activists trust
-with real risk. Code quality here is a safety issue, not a style
-preference.
+Pizzini is a secure messenger people use under real risk. Code
+quality here is a safety issue, not a style preference.
 
 ## Before you tag a release
 

@@ -231,9 +231,9 @@ final class ChatStore: NSObject {
         // *their* routing and is allowed to be anything (dev
         // 127.0.0.1, community-run onions). Encoding it into a card
         // a stranger then scans pins them to the same relay — for a
-        // journalist on a community relay pairing with a source,
-        // that narrows the source's anonymity set to "uses the same
-        // relay as this journalist." Always emit the bundled-fleet
+        // user on a community relay pairing with a stranger, that
+        // narrows the stranger's anonymity set to "uses the same
+        // relay as this user." Always emit the bundled-fleet
         // sentinel (empty host) instead; the peer's app will use its
         // own fleet picker (`RelayRegistry.trusted`). The
         // *informational* host comment at addContact (line 818) is
@@ -3336,9 +3336,8 @@ final class ChatStore: NSObject {
 
     /// Toggle the contacts-list ordering: contacts above groups vs.
     /// groups above contacts. Default true (contacts above) because
-    /// 1:1 chats are the more frequently-opened surface for the
-    /// activist threat model and a long groups section pushed them
-    /// off the first viewport.
+    /// 1:1 chats are the more frequently-opened surface and a long
+    /// groups section pushed them off the first viewport.
     func setContactsBeforeGroups(_ enabled: Bool) {
         guard state.contactsBeforeGroups != enabled else { return }
         state.contactsBeforeGroups = enabled

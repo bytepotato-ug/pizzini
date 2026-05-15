@@ -19,9 +19,9 @@ import UniformTypeIdentifiers
 ///   case, 2017: TheIntercept's leaked PDF carried printer-tracking dots.)
 /// - **codeOnTap** — files that *execute on tap* on iOS (`.mobileconfig`,
 ///   `.shortcut`, `.svg` via Quick Look's WebKit path). Block at the
-///   picker so a journalist cannot accidentally ship one. Desktop-execute
+///   picker so a user cannot accidentally ship one. Desktop-execute
 ///   types (`.exe`, `.dll`, `.bat`, `.command`, `.applescript`) get a
-///   red banner on receive — they won't run on iOS, but a journalist
+///   red banner on receive — they won't run on iOS, but a user
 ///   forwarding to a desktop colleague matters.
 enum AttachmentTier: String, Codable, Sendable {
     case textFamily

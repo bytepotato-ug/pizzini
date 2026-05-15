@@ -1,6 +1,6 @@
 # Pizzini
 
-A post-quantum, end-to-end encrypted iOS messenger. No phone numbers, no central directory, no metadata. Built for journalists, activists, and anyone who needs Signal-grade privacy without Signal's compromises.
+A post-quantum, end-to-end encrypted iOS messenger. No phone numbers, no central directory, no metadata. Signal-grade privacy without Signal's compromises.
 
 [pizzini.app](https://pizzini.app)
 

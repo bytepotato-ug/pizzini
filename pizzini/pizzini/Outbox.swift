@@ -8,7 +8,7 @@ import Foundation
 /// crash / kill / reboot; not duress (clears with `Storage.resetEverything`).
 /// SQLCipher migration is the obvious follow-up — outbox JSON in Keychain
 /// hits the slot's size ceiling around the low thousands of unacked
-/// entries, which is fine for a journalist's day but not multi-week
+/// entries, which is fine for a typical day but not multi-week
 /// offline.
 struct OutboxEntry: Codable, Sendable {
     let messageId: Data         // 16 bytes

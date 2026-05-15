@@ -197,7 +197,7 @@ struct OnboardingView: View {
                 bullet("End-to-end encrypted by libsignal — same protocol Signal uses, with the same post-quantum upgrades.")
                 bullet("No phone numbers. Pair with QR codes in person.")
                 bullet("No telemetry, no analytics, no third-party SDKs.")
-                bullet("Designed for journalists and activists. Lockdown Mode-friendly.")
+                bullet("Designed for high-risk use. Lockdown Mode-friendly.")
             }
             .font(.body)
             .padding(.top, 8)

@@ -7,9 +7,9 @@ import SwiftUI
 ///   - `com.bytepotato.pizzini.support.monthly` — auto-renewing $0.99/mo
 ///   - `com.bytepotato.pizzini.support.lifetime` — non-consumable $199
 ///
-/// The audience is journalists and activists. Gating safety features
-/// behind a paywall is unacceptable; these purchases unlock NOTHING in
-/// the app beyond a small "Support Pizzini" badge in Settings. They are
+/// Gating safety features behind a paywall is unacceptable; these
+/// purchases unlock NOTHING in the app beyond a small "Support
+/// Pizzini" badge in Settings. They are
 /// pure thank-yous. The threat-model rule that we never validate
 /// receipts against our own server holds here too: every entitlement
 /// decision is taken from a locally-verified StoreKit 2 transaction.
