@@ -910,35 +910,47 @@ struct ChatView: View {
         return entry.messageId.flatMap { store.outboxEntry(forMessageId: $0)?.status }
     }
 
-    /// Full `ChatRowStatus` for a plain-text row: drives the glyph
-    /// plus the Retry affordance. Pure mapping lives in
-    /// `Outbox.rowStatus(inputs:)`. Returns nil for inbound rows,
-    /// system rows, attachments (covered in S2), and `.me` rows
-    /// whose outbox entry has been GC'd.
+    /// Full `ChatRowStatus` for a row: drives the glyph plus the
+    /// Retry affordance. Pure mapping lives in
+    /// `Outbox.rowStatus(inputs:)`; this is the wiring that
+    /// derives the inputs from the persisted entry or — for
+    /// chunked attachments — the per-chunk rollup
+    /// (`attachmentInputs(forId:...)`). Returns nil for inbound
+    /// rows, system rows, and `.me` rows whose outbox entry has
+    /// been GC'd.
     private func rowFullStatus(
         forEntry entry: PersistedMessage,
         peerHasRead: Bool,
     ) -> ChatRowStatus? {
-        guard entry.kind != .attachment,
-              let mid = entry.messageId,
+        let now = Date()
+        if entry.kind == .attachment, let aid = entry.attachment?.attachmentId {
+            guard let inputs = store.outbox.attachmentInputs(
+                forId: aid, now: now, peerHasRead: peerHasRead,
+            ) else { return nil }
+            return pizzini.rowStatus(inputs: inputs)
+        }
+        guard let mid = entry.messageId,
               let outboxEntry = store.outboxEntry(forMessageId: mid)
         else { return nil }
         let inputs = ChatRowStatusInputs.from(
-            entry: outboxEntry, now: Date(), peerHasRead: peerHasRead,
+            entry: outboxEntry, now: now, peerHasRead: peerHasRead,
         )
         return pizzini.rowStatus(inputs: inputs)
     }
 
     /// Build a Retry closure for a stuck pending row. Returns nil
-    /// for any other state so the button doesn't render. Plain
-    /// text rows only in S1 — attachments wire up under S2 via
-    /// `userRetryAttachment(attachmentId:)`.
+    /// for any other state so the button doesn't render.
+    /// Attachments route through `userRetryAttachment(attachmentId:)`
+    /// which re-emits only the chunks that never reached a relay.
     private func rowRetryAction(
         forEntry entry: PersistedMessage,
         status: ChatRowStatus?,
     ) -> (() -> Void)? {
         guard case .pending(let retryable) = status, retryable else { return nil }
-        if let mid = entry.messageId, entry.kind != .attachment {
+        if entry.kind == .attachment, let aid = entry.attachment?.attachmentId {
+            return { [weak store] in store?.userRetryAttachment(attachmentId: aid) }
+        }
+        if let mid = entry.messageId {
             return { [weak store] in store?.userRetry(messageId: mid) }
         }
         return nil

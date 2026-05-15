@@ -367,6 +367,51 @@ struct OutboxStore: Codable, Sendable {
             .sorted { $0.sentAt < $1.sentAt }
     }
 
+    /// Roll up `ChatRowStatusInputs` across every chunk of a chunked
+    /// attachment. Mirrors the worst-wins precedence of
+    /// `attachmentStatus(forId:)` but emits the structured inputs
+    /// the UI's `rowStatus` consumes — so a single hung chunk
+    /// surfaces as a retryable pending row even when its 7 siblings
+    /// already relayed (S2 — per-chunk granularity).
+    ///
+    /// `pendingFor` returned in the rollup is the OLDEST pending
+    /// chunk's wait time: a 50MB attachment with one stuck chunk
+    /// should expose Retry the same instant a 1MB plain message
+    /// would. Any chunk with `failedAt` set short-circuits to
+    /// `.failed`. A chunk with `deliveredAt == nil` and `relayedAt
+    /// != nil` rolls up as `.relayed`. All chunks delivered =>
+    /// `.delivered`.
+    func attachmentInputs(
+        forId attachmentId: Data,
+        now: Date,
+        peerHasRead: Bool,
+    ) -> ChatRowStatusInputs? {
+        let chunks = entries.values.filter { $0.attachmentId == attachmentId }
+        guard !chunks.isEmpty else { return nil }
+        if chunks.contains(where: { $0.failedAt != nil }) {
+            return ChatRowStatusInputs(outbox: .failed, ack: .unread, ttl: .active)
+        }
+        if let oldestPending = chunks
+            .filter({ $0.deliveredAt == nil && $0.relayedAt == nil && $0.failedAt == nil })
+            .min(by: { $0.sentAt < $1.sentAt }) {
+            let pendingFor = now.timeIntervalSince(oldestPending.sentAt)
+            let retriesExhausted = oldestPending.retries >= OutboxEntry.maxRetries
+            let ttl: ChatRowStatusInputs.Ttl =
+                oldestPending.hasExpired(now: now) ? .expired : .active
+            return ChatRowStatusInputs(
+                outbox: .pending(pendingFor: pendingFor, retriesExhausted: retriesExhausted),
+                ack: .unread,
+                ttl: ttl,
+            )
+        }
+        if chunks.contains(where: { $0.deliveredAt == nil }) {
+            // At least one chunk left the socket but no peer ACK yet.
+            return ChatRowStatusInputs(outbox: .relayed, ack: .unread, ttl: .active)
+        }
+        let ack: ChatRowStatusInputs.Ack = peerHasRead ? .read : .unread
+        return ChatRowStatusInputs(outbox: .delivered, ack: ack, ttl: .active)
+    }
+
     /// Roll up status across every chunk that belongs to a chunked
     /// attachment. Used by the chat row to drive ⏳/✓/✓✓/✗ for the
     /// attachment as a whole rather than its individual chunks (the

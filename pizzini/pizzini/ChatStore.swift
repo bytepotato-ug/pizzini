@@ -864,6 +864,33 @@ final class ChatStore: NSObject {
         Storage.upsertOutboxEntry(e)
     }
 
+    /// User-initiated per-chunk retry for a stuck attachment. Each
+    /// chunk of a chunked attachment is already its own
+    /// `OutboxEntry` — the auto-retry walker covers them
+    /// individually via `shouldRetry`. This entry-point exists for
+    /// the user-initiated kick that bypasses the
+    /// `max(30, retries*60)` baseline.
+    ///
+    /// Crucially: re-emits ONLY chunks where `relayedAt` is still
+    /// nil — chunks that already left the socket sit in the relay's
+    /// offline queue under the existing ratchet step and re-sending
+    /// them would duplicate frames at the receiver + burn extra
+    /// chain tokens (audit S2: per-chunk granularity, not
+    /// per-message restart).
+    @MainActor
+    func userRetryAttachment(attachmentId: Data) {
+        guard relayState == .connected else { return }
+        let stuck = outbox.entries.values.filter {
+            $0.attachmentId == attachmentId
+                && $0.deliveredAt == nil
+                && $0.failedAt == nil
+                && $0.relayedAt == nil
+        }
+        for entry in stuck {
+            userRetry(messageId: entry.messageId)
+        }
+    }
+
     /// Forwards the APNs device token to the relay so it can wake us
     /// when a SEND lands while we're disconnected. Called by
     /// `AppDelegate` once iOS has issued a token. With multi-relay
