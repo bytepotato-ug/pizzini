@@ -1397,6 +1397,109 @@ public final class RelayClient: @unchecked Sendable {
     }
 }
 
+// MARK: - Per-relay fanout verdict (D3)
+
+/// Outcome of one SEND attempt against one relay in the fanout. D3's
+/// app-side fanout broadcasts every frame to every ready
+/// `RelayClient`; each broadcast resolves to one of these. The
+/// recipient ACK is end-to-end (sealed envelope back from peer) and
+/// lives at a higher tier — these outcomes are strictly relay-layer:
+/// "did this relay accept the bytes on the wire?".
+public enum RelayOutcome: Sendable, Equatable {
+    /// The relay accepted the SEND. With three independent onions,
+    /// a single `.ack` is sufficient — the recipient's libsignal
+    /// dedupe (`SealedSenderResult.isDuplicate`) drops the redundant
+    /// copies on receive (D3, `docs/relay-architecture.md`).
+    case ack
+    /// The relay refused the SEND with an in-band reason (e.g.
+    /// delivery-token replay, malformed frame). The string is
+    /// diagnostic only; the verdict logic treats it as a per-relay
+    /// failure that can still be redundantly covered by a sibling.
+    case nack(reason: String)
+    /// The send was written but no acknowledgement arrived inside
+    /// the per-relay timeout. Treated identically to `.nack` for
+    /// verdict purposes — one relay's silence does not condemn the
+    /// fanout.
+    case timeout
+    /// The underlying socket failed before the SEND could complete
+    /// (NWConnection error / SOCKS reset / FIN mid-write). Same
+    /// failure semantics as `.nack` for verdict purposes.
+    case networkError(String)
+    /// This relay was not in a `.connected` state at submission
+    /// time, so the SEND was never attempted on it. Distinguished
+    /// from `.networkError` so the diagnostic output reflects what
+    /// actually happened on the wire vs. what was skipped.
+    case notAttempted
+}
+
+/// Aggregate sender-side verdict over a fanout of `RelayOutcome`s.
+/// Computed by `relayFanoutVerdict(_:)`; consumed by the host to
+/// decide whether to mark the outbox entry `relayed`, hold it
+/// `pending` for retry, or stamp it `failed`.
+public enum SendVerdict: Sendable, Equatable {
+    /// At least one relay in the fanout accepted the bytes. With
+    /// stateless multi-onion routing, ONE acceptance is sufficient
+    /// for end-to-end delivery — the duplicate copies on the other
+    /// relays are dropped by libsignal's receive-side dedupe. The
+    /// outbox entry transitions to ✓ (single tick).
+    case delivered
+    /// No relay accepted yet, but retry is meaningful: at least one
+    /// outcome is `.timeout` / `.networkError` / `.notAttempted`,
+    /// which can resolve on a subsequent attempt. `retryAfter` is a
+    /// hint for the host's retry scheduler; the host's own backoff
+    /// timer is the authoritative cadence.
+    case pending(retryAfter: TimeInterval)
+    /// Every relay in the fanout produced a hard refusal (`.nack`)
+    /// and there is no transient outcome left to retry against.
+    /// The outbox entry transitions to ✗.
+    case failed(reason: String)
+}
+
+/// Pure aggregator over a per-relay outcome list. Matches the truth
+/// table for D3 fanout:
+///
+///   | ACK results              | Verdict                |
+///   |--------------------------|------------------------|
+///   | ≥1 of N `.ack`           | `.delivered`           |
+///   | 0 `.ack`, ≥1 retryable   | `.pending(retryAfter)` |
+///   | 0 `.ack`, all `.nack`    | `.failed(reason)`      |
+///   | empty input              | `.failed("empty …")`   |
+///
+/// "Retryable" = `.timeout` ∪ `.networkError` ∪ `.notAttempted`.
+/// "Hard refusal" = `.nack` only — `.nack` reasons are token replay,
+/// chain mismatch, or malformed frames; those won't fix themselves
+/// by retrying against the same relay.
+public func relayFanoutVerdict(_ outcomes: [RelayOutcome]) -> SendVerdict {
+    if outcomes.isEmpty {
+        return .failed(reason: "empty fanout (no relays attempted)")
+    }
+    if outcomes.contains(.ack) {
+        return .delivered
+    }
+    // No ACK anywhere. If any outcome is potentially-transient,
+    // surface as pending; the host's retry timer will pick it up.
+    let hasRetryable = outcomes.contains { outcome in
+        switch outcome {
+        case .timeout, .networkError, .notAttempted:
+            return true
+        case .ack, .nack:
+            return false
+        }
+    }
+    if hasRetryable {
+        return .pending(retryAfter: 30)
+    }
+    // Every outcome is `.nack`. Concatenate reasons for the
+    // diagnostic; the host displays a single ✗ either way, but the
+    // reason string lands in the qa log for forensics.
+    let reasons = outcomes.compactMap { outcome -> String? in
+        if case let .nack(reason) = outcome { return reason }
+        return nil
+    }
+    let joined = reasons.isEmpty ? "all relays refused" : reasons.joined(separator: "; ")
+    return .failed(reason: joined)
+}
+
 private struct Cursor {
     var buf: Data
     init(_ buf: Data) { self.buf = buf }
