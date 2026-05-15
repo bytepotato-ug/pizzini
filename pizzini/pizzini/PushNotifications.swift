@@ -98,6 +98,16 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         // granted; we gate on the cached `getNotificationSettings`
         // status so we only call it for users who said yes.
         rerequestPushTokenIfAuthorized()
+        // Secondary wake-up path: register the BGAppRefreshTask
+        // handler before `application:didFinishLaunchingWithOptions`
+        // returns. iOS requires the call here — registering later
+        // raises a fault and disables the task. The actual
+        // SUBMIT is driven from `disconnectForBackground`'s caller
+        // (`UIScene.didEnterBackgroundNotification` in
+        // `ContentView`), so this line just wires the handler.
+        BackgroundRefresh.register { task in
+            BackgroundRefresh.handle(task: task)
+        }
         return true
     }
 

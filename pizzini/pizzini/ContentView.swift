@@ -120,6 +120,15 @@ struct ContentView: View {
             // red→green→red flap. Closing here, reconnecting on
             // foreground, eliminates the race.
             store.disconnectForBackground()
+            // Secondary wake-up: ask iOS to fire BGAppRefreshTask
+            // some time in the next hour-or-so. APNs is the primary
+            // path; this catches the cases where push is throttled,
+            // silenced (low-power mode), or never delivered (force-
+            // quit). The submit is unconditional — iOS rate-limits
+            // for us, and a second submit while one is in flight is
+            // gated inside `BackgroundRefresh.submit` via the
+            // scheduler's own dedup.
+            BackgroundRefresh.submit()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIScene.willEnterForegroundNotification)) { _ in
             lockManager.handleWillEnterForeground()
