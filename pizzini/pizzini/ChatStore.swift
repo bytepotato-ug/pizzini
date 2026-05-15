@@ -3256,6 +3256,13 @@ extension ChatStore: RelayClientDelegate {
             self.perRelayState[self.relayDescriptors[idx].host] = state
             let prevAggregate = self.relayState
             self.relayState = self.aggregateRelayState()
+            // Parseable marker so `scripts/tor-foreground-stress.sh`
+            // can tail QALog and count reconnect cycles without
+            // having to scrape free-form prose. DEBUG-only via
+            // pzLog; release builds compile this out.
+            if prevAggregate != self.relayState {
+                pzLog("[reconnect-cycle] state=\(self.relayState)")
+            }
             self.electPushPrimary()
             // Self-healing reconnect: when the aggregate state
             // transitions to `.failed` we schedule an automatic
