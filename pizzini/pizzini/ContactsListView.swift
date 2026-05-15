@@ -465,24 +465,18 @@ struct ContactsListView: View {
     //                              `forceReconnectRelays`. The colour
     //                              is the only signal that this is a
     //                              non-self-resolving state.
-    /// Short label for the toolbar connecting-pill. Always non-empty
-    /// — the prior implementation hid this when `torBootstrapPhase`
-    /// was empty or "Connected" (latter is misleading anyway:
-    /// "Connected" describes Tor's state, not the relay socket's),
-    /// leaving the user with a bare spinner and no context. Each
-    /// connecting sub-state now has a one-or-two-word label that
-    /// fits in the toolbar without truncation.
+    /// Short label for the toolbar connecting-pill. The label-from-
+    /// state mapping lives in `ChatStore.connectionPillLabel` so
+    /// it can be unit-pinned without spinning up the view (the pill
+    /// is the user's continuous signal of network health — a copy
+    /// regression here is exactly the bug RELEASE-CHECKLIST catches
+    /// and we'd still rather catch in CI).
     private var connectingShortLabel: String {
-        switch store.relayState {
-        case .connectingToTor(let progress):
-            return progress > 0 ? "Tor \(progress)%" : "Tor…"
-        case .connecting:
-            return "Connecting"
-        case .idle:
-            return "Starting"
-        case .connected, .failed:
-            return ""
-        }
+        ChatStore.connectionPillLabel(
+            for: store.relayState,
+            connectedRelays: store.readyRelays.count,
+            totalRelays: store.relays.count,
+        ) ?? ""
     }
 
     /// Sentence-long explainer shown as the top item of the menu the

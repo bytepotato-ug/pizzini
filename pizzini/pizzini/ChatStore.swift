@@ -969,6 +969,55 @@ final class ChatStore: NSObject {
         return "\(head)…"
     }
 
+    /// Pure mapping from the connection state machine to the short
+    /// label shown in the toolbar pill. The relay-state alone is not
+    /// enough — once Tor is bootstrapped, the user wants to see how
+    /// far along the relay fanout is ("Connecting 1 of 3"), and that
+    /// requires the per-relay readiness count alongside the aggregate
+    /// state.
+    ///
+    /// Returns `nil` when the pill should be hidden (i.e. `.connected`
+    /// with at least one healthy relay — the user has working send/
+    /// receive and chrome would only get in the way). Caller handles
+    /// `.failed` separately (the red badge with its own tap target);
+    /// this function returns `nil` for `.failed` too so the only
+    /// non-nil returns are the spinner-bearing transient states.
+    ///
+    /// `public nonisolated` so the iOS app's test target can pin
+    /// every branch — the pill is the user's sole continuous signal
+    /// of whether the network is healthy, and a copy regression here
+    /// is the kind of bug `RELEASE-CHECKLIST.md` was written to
+    /// catch and we'd still rather catch in CI.
+    public nonisolated static func connectionPillLabel(
+        for state: RelayClient.State,
+        connectedRelays: Int,
+        totalRelays: Int,
+    ) -> String? {
+        switch state {
+        case .connectingToTor(let progress):
+            // Tor's STATUS_CLIENT BOOTSTRAP events drive `progress`
+            // (0-100). The full label spells out "Tor" so a user
+            // who doesn't know what "Tor" is in isolation still
+            // sees the sentence "Connecting Tor… N%" and can map
+            // it to the onboarding explainer.
+            return progress > 0 ? "Connecting Tor… \(progress)%" : "Connecting Tor…"
+        case .connecting:
+            // Tor is up; SOCKS handshakes to the .onion fleet are
+            // in flight. `connectedRelays` is 0 here (otherwise the
+            // aggregate would be `.connected`); the count gives the
+            // user a sense of progress through the fleet rather
+            // than a bare "Connecting…" spinner.
+            if totalRelays > 0 {
+                return "Connecting \(connectedRelays) of \(totalRelays)"
+            }
+            return "Connecting"
+        case .idle:
+            return "Starting"
+        case .connected, .failed:
+            return nil
+        }
+    }
+
     /// **D3 broadcaster.** Invoke `body` on every currently-ready
     /// relay. Returns the count for callers that want to know whether
     /// at least one delivery path succeeded.
