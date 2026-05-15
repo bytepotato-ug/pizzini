@@ -698,7 +698,7 @@ final class ChatStore: NSObject {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 guard let self else { return }
                 if Task.isCancelled { return }
-                let pct = await TorController.shared.bootstrapProgress
+                let pct = TorController.shared.bootstrapProgress
                 // Mirror the live progress onto the observable
                 // `torBootstrapProgress` so the multi-state pill in
                 // ContactsListView redraws as bootstrap climbs. The
@@ -1211,7 +1211,7 @@ final class ChatStore: NSObject {
     /// Coarse health snapshot of a single relay, as seen by the
     /// pill state machine. Strips the failure-string detail so the
     /// pill function stays pure-data and Equatable for tests.
-    public enum RelayHealth: Equatable, Sendable {
+    public nonisolated enum RelayHealth: Equatable, Sendable {
         case bootstrapping(progress: Int)
         case connecting
         case connected
