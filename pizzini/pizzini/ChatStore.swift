@@ -361,6 +361,47 @@ final class ChatStore: NSObject {
     /// every intermediate state transition. A flaky relay that
     /// bounces us back to `.failed` shouldn't drain the budget.
     private var autoReconnectFailureStreak: Int = 0
+
+    /// Per-relay exponential-backoff floor and ceiling. Drives the
+    /// silent background retry of a single `.failed` relay while the
+    /// aggregate fleet stays `.connected` (D3 fanout means N-1 of N
+    /// healthy is still a usable send/receive path — the user must
+    /// not see a banner blip for one degraded route, but the dead
+    /// route must rejoin on its own so the fleet doesn't quietly
+    /// erode to a single point of failure). Values are deliberately
+    /// tighter than the aggregate-`failed` backoff: a single-relay
+    /// blip on a healthy network usually clears in seconds (one Tor
+    /// circuit reselect), so the floor is 2 s.
+    nonisolated static let perRelayBackoffFloor: TimeInterval = 2
+    nonisolated static let perRelayBackoffCeiling: TimeInterval = 60
+
+    /// Pure decision for the per-relay retry. Given the current
+    /// backoff for one relay, returns the delay to wait before the
+    /// next attempt and the backoff to remember for the FOLLOWING
+    /// failure. Doubles on each call, capped at the ceiling. There
+    /// is no streak cap — the per-relay retry is silent and the
+    /// fleet keeps serving traffic via the other N-1 routes for as
+    /// long as it takes the dead relay to recover.
+    public struct PerRelayRetryDecision: Equatable, Sendable {
+        public let delaySeconds: TimeInterval
+        public let nextBackoff: TimeInterval
+    }
+    public nonisolated static func computePerRelayRetryDecision(
+        currentBackoff: TimeInterval,
+    ) -> PerRelayRetryDecision {
+        let delay = max(perRelayBackoffFloor, min(currentBackoff, perRelayBackoffCeiling))
+        let next = min(delay * 2, perRelayBackoffCeiling)
+        return PerRelayRetryDecision(delaySeconds: delay, nextBackoff: next)
+    }
+
+    /// Per-relay backoff state, keyed by `RelayDescriptor.host`.
+    /// Cleared when the relay (re)connects; cleared in bulk by
+    /// `teardownRelay` so a fresh fleet always starts at the floor.
+    private var perRelayBackoff: [String: TimeInterval] = [:]
+    /// Per-relay retry tasks. One pending Task per host while that
+    /// host is in `.failed`; cancelled on connect / teardown / new
+    /// scheduling. Keyed by host the same way as `perRelayBackoff`.
+    private var perRelayRetryTasks: [String: Task<Void, Never>] = [:]
     /// True once `autoReconnectFailureStreak` has hit the cap and we
     /// stopped scheduling new auto-reconnect tasks. The UI surfaces
     /// a tappable "Reconnect" button (forceReconnectRelays clears
@@ -799,27 +840,42 @@ final class ChatStore: NSObject {
     ///
     /// "Any ready wins" is the contract D3 hangs on — the user only
     /// cares that we can send + receive, not how many redundant routes
-    /// are alive.
+    /// are alive. The actual aggregation lives in
+    /// `Self.aggregateRelayState(states:)` so tests can pin the
+    /// "N-1 of N healthy stays .connected" invariant without spinning
+    /// up a ChatStore + RelayClient fleet.
     private func aggregateRelayState() -> RelayClient.State {
-        guard !relays.isEmpty else { return .idle }
-        if relays.contains(where: { $0.state == .connected }) {
+        Self.aggregateRelayState(states: relays.map { $0.state })
+    }
+
+    /// Pure aggregation: same rules as `aggregateRelayState()` but
+    /// operates on a plain `[RelayClient.State]` snapshot so it can
+    /// be exercised in unit tests. `public nonisolated` so the iOS
+    /// app's test target can pin the N-1-of-N invariant — this is
+    /// the only load-bearing behaviour of multi-relay fanout from
+    /// the user's perspective.
+    public nonisolated static func aggregateRelayState(
+        states: [RelayClient.State],
+    ) -> RelayClient.State {
+        guard !states.isEmpty else { return .idle }
+        if states.contains(where: { $0 == .connected }) {
             return .connected
         }
-        let torProgresses: [Int] = relays.compactMap { client in
-            if case let .connectingToTor(p) = client.state { return p }
+        let torProgresses: [Int] = states.compactMap { s in
+            if case let .connectingToTor(p) = s { return p }
             return nil
         }
         if let p = torProgresses.max() {
             return .connectingToTor(progress: p)
         }
-        if relays.contains(where: { $0.state == .connecting }) {
+        if states.contains(where: { $0 == .connecting }) {
             return .connecting
         }
-        let failures: [String] = relays.compactMap { client in
-            if case let .failed(msg) = client.state { return msg }
+        let failures: [String] = states.compactMap { s in
+            if case let .failed(msg) = s { return msg }
             return nil
         }
-        if failures.count == relays.count, let first = failures.first {
+        if failures.count == states.count, let first = failures.first {
             // De-dup identical messages (e.g. "Tor bootstrap failed:
             // …" reported by N clients sharing one TorController),
             // preserving the FLEET order so the rendered string is
@@ -851,10 +907,63 @@ final class ChatStore: NSObject {
         return .idle
     }
 
+    /// Schedule the next silent retry of a single failed relay.
+    /// Called from the per-relay state-change handler when a relay
+    /// hits `.failed` and the aggregate fleet is still serving
+    /// traffic. The task re-dials the same descriptor after the
+    /// computed backoff; on success the relay's `.connected` event
+    /// clears the per-relay backoff and the dead route is silently
+    /// back in the fanout set. Aggregate-`.failed` retries are
+    /// handled separately by `handleAggregateRelayStateTransition`
+    /// and use the louder, user-visible reconnect-or-give-up loop.
+    private func scheduleSilentPerRelayRetry(host: String) {
+        // Cancel any in-flight retry task for this host — a new
+        // `.failed` event supersedes the previous one's pending tick.
+        perRelayRetryTasks[host]?.cancel()
+        let current = perRelayBackoff[host] ?? Self.perRelayBackoffFloor
+        let decision = Self.computePerRelayRetryDecision(currentBackoff: current)
+        perRelayBackoff[host] = decision.nextBackoff
+        pzLog("[pizzini] silent per-relay retry for \(host.prefix(8))… in \(Int(decision.delaySeconds)) s (next backoff \(Int(decision.nextBackoff)) s)")
+        perRelayRetryTasks[host] = Task { @MainActor [weak self] in
+            let nanos = UInt64(decision.delaySeconds * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanos)
+            guard let self else { return }
+            if Task.isCancelled { return }
+            // Recheck — the relay or the whole fleet may have been
+            // torn down or already reconnected between schedule and
+            // fire. Look up the live RelayClient + descriptor by
+            // host so a fleet rebuild between schedule and fire
+            // doesn't hit a stale pointer.
+            guard let idx = self.relayDescriptors.firstIndex(where: { $0.host == host }),
+                  idx < self.relays.count
+            else { return }
+            let client = self.relays[idx]
+            // If this client is already connected (or actively
+            // re-dialing), don't punch it back into a fresh dial
+            // and reset its in-progress connect.
+            if case .connected = client.state { return }
+            if case .connecting = client.state { return }
+            if case .connectingToTor = client.state { return }
+            let descriptor = self.relayDescriptors[idx]
+            pzLog("[pizzini] silent retry firing for \(host.prefix(8))…")
+            client.connect(to: descriptor.host, port: descriptor.port)
+        }
+    }
+
+    /// Cancel and clear a single host's pending retry. Called when
+    /// the host crosses back into `.connected` (the dead route is
+    /// alive again — drop the backoff state so the NEXT outage starts
+    /// fresh from the floor) and from `teardownRelay`.
+    private func clearPerRelayRetry(host: String) {
+        perRelayRetryTasks[host]?.cancel()
+        perRelayRetryTasks.removeValue(forKey: host)
+        perRelayBackoff.removeValue(forKey: host)
+    }
+
     /// Hard cap on the user-visible aggregated failure string. See
     /// `aggregateRelayState`. Public-on-the-class for tests.
-    static let maxAggregatedFailureLength: Int = 240
-    static func boundedFailureString(_ s: String) -> String {
+    nonisolated static let maxAggregatedFailureLength: Int = 240
+    nonisolated static func boundedFailureString(_ s: String) -> String {
         if s.count <= maxAggregatedFailureLength { return s }
         let head = s.prefix(maxAggregatedFailureLength - 1)
         return "\(head)…"
@@ -1148,6 +1257,14 @@ final class ChatStore: NSObject {
         // fleet after the wipe.
         autoReconnectTask?.cancel()
         autoReconnectTask = nil
+        // Cancel every pending per-relay silent retry; the fresh
+        // fleet about to be built (or the identity wipe) makes
+        // their captured host references stale.
+        for task in perRelayRetryTasks.values {
+            task.cancel()
+        }
+        perRelayRetryTasks.removeAll()
+        perRelayBackoff.removeAll()
     }
 
     /// Foreground-entry handler. Three cases:
@@ -3253,9 +3370,36 @@ extension ChatStore: RelayClientDelegate {
             else {
                 return
             }
-            self.perRelayState[self.relayDescriptors[idx].host] = state
+            let host = self.relayDescriptors[idx].host
+            self.perRelayState[host] = state
             let prevAggregate = self.relayState
             self.relayState = self.aggregateRelayState()
+            // Silent per-relay retry. The contract: a single relay
+            // failing while the fleet still has at least one healthy
+            // route does NOT surface as a banner blip — the user
+            // already has working send/receive via the other routes.
+            // But the dead route is silently re-dialed on a tight
+            // exponential backoff so the fleet recovers full
+            // redundancy without manual intervention. The aggregate-
+            // `.failed` retry below handles the case where every
+            // route is down; this handles the case where one is.
+            switch state {
+            case .connected:
+                self.clearPerRelayRetry(host: host)
+            case .failed:
+                // Only run the silent retry when the AGGREGATE is
+                // still serving traffic (i.e. at least one other
+                // relay is up). When the aggregate is itself
+                // `.failed`, the louder reconnect loop in
+                // `handleAggregateRelayStateTransition` rebuilds
+                // the whole fleet — running both would double-dial
+                // the dead route.
+                if case .connected = self.relayState {
+                    self.scheduleSilentPerRelayRetry(host: host)
+                }
+            case .idle, .connecting, .connectingToTor:
+                break
+            }
             // Parseable marker so `scripts/tor-foreground-stress.sh`
             // can tail QALog and count reconnect cycles without
             // having to scrape free-form prose. DEBUG-only via
