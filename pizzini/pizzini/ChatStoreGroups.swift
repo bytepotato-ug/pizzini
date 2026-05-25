@@ -1647,6 +1647,23 @@ extension ChatStore {
         Storage.upsertGroup(group)
     }
 
+    /// F-GRP-05: a `(sender, distribution_id)` pair must map to at most
+    /// one local group. The per-group binding gate that defeats the
+    /// F-GRP-01 splice relies on each `(sender, group)` using a distinct
+    /// distribution-id — which honest clients guarantee (a fresh `UUID()`
+    /// per group/rotation). So a distribution-id already bound to
+    /// `sender` in a group OTHER than `targetGroupId` is a deliberate
+    /// cross-group reuse; refusing it keeps a reused id renderable in at
+    /// most one group, closing the splice-via-id-reuse path.
+    nonisolated static func distributionIdCollidesAcrossGroups(
+        _ groups: [ChatGroup],
+        targetGroupId: Data,
+        sender: Data,
+        dist: UUID,
+    ) -> Bool {
+        groups.contains { $0.id != targetGroupId && $0.memberDistributionIds[sender] == dist }
+    }
+
     /// Process a peer's incoming `groupKeyDistribution` (0x07) inner
     /// envelope. Audit fix CRITICAL-3: only install the chain if we
     /// have a local `ChatGroup` for the named groupId AND the sender
@@ -1697,6 +1714,21 @@ extension ChatStore {
             return
         }
         persistSession()
+        // F-GRP-05: refuse a distribution-id already bound to this sender
+        // in a different local group. Honest clients never reuse an id
+        // across groups, so this only fires on a malicious member trying
+        // to make one chain renderable in two transcripts (the F-GRP-01
+        // splice, resurfaced via id reuse).
+        if Self.distributionIdCollidesAcrossGroups(
+            state.groups, targetGroupId: groupId, sender: sender, dist: dist
+        ) {
+            pzLog(
+                "[pizzini.group] SKDM ← \(short(sender)):"
+                    + " REJECTED for \(short(groupId)) — distribution-id already"
+                    + " bound to this sender in another group (F-GRP-05)",
+            )
+            return
+        }
         state.groups[gIdx].memberDistributionIds[sender] = dist
         // Mark the sender as .active now that we can decrypt them.
         if let mIdx = state.groups[gIdx].members.firstIndex(where: {

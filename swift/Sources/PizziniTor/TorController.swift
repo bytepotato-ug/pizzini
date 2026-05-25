@@ -450,8 +450,33 @@ public final class TorController: ObservableObject {
     /// in-flight speculative tasks on bootstrap failure so a
     /// poisoned cycle doesn't bleed into the next one.
     public func primeOnions(_ hosts: [String]) {
-        let normalized = hosts.map { Self.stripOnionSuffix($0).lowercased() }
+        // Defence-in-depth: only speculatively HSFETCH well-formed v3
+        // onion hosts. The sole production caller already feeds
+        // canonical hosts, but `primeOnions` re-validates so a future
+        // caller handing raw/BYO strings can't push a malformed label
+        // into a control-port lookup (F-TOR-03). `OnionHost` lives in
+        // PizziniCryptoCore (which depends on this module), so the v3
+        // shape is re-checked locally rather than inverting the
+        // dependency. Non-conforming entries are dropped.
+        let normalized = hosts.compactMap { host -> String? in
+            guard Self.isCanonicalOnionHost(host) else { return nil }
+            return Self.stripOnionSuffix(host).lowercased()
+        }
         onionsToPrime = normalized
+    }
+
+    /// A canonical Tor v3 onion host: a `.onion` suffix preceded by
+    /// exactly 56 base32 characters `[a-z2-7]`. Mirrors the label rule
+    /// `OnionHost.canonical` enforces (kept local to avoid a
+    /// PizziniCryptoCore→PizziniTor dependency inversion). Case-folds
+    /// first, so `evil.com`, `…onion` look-alikes, and short/long labels
+    /// are all rejected.
+    public nonisolated static func isCanonicalOnionHost(_ host: String) -> Bool {
+        let lower = host.lowercased()
+        guard lower.hasSuffix(".onion") else { return false }
+        let label = lower.dropLast(6)
+        guard label.count == 56 else { return false }
+        return label.allSatisfy { ("a"..."z").contains($0) || ("2"..."7").contains($0) }
     }
 
     /// Probe tor for hung-libevent / stale-circuit state and force a
