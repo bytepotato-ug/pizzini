@@ -347,6 +347,34 @@ struct FileChunkEnvelopeTests {
             _ = try FileChunkEnvelope.decode(bytes)
         }
     }
+
+    @Test("rejects an impossible total_size at the codec boundary (F-ATT-04)")
+    func rejectsOversizedTotalSize() {
+        var bytes = Data(repeating: 0xA5, count: 16)               // attachment_id
+        var bigTotal = (FileChunkEnvelope.maxTotalSize + 1).bigEndian
+        withUnsafeBytes(of: &bigTotal) { bytes.append(contentsOf: $0) }  // total_size
+        bytes.append(contentsOf: [0, 0, 0, 0])                     // chunk_index = 0
+        var cnt = UInt32(1).bigEndian
+        withUnsafeBytes(of: &cnt) { bytes.append(contentsOf: $0) } // chunk_count = 1 (valid)
+        bytes.append(contentsOf: [0, 0])                           // mime_len = 0
+        bytes.append(contentsOf: [0, 0])                           // filename_len = 0
+        #expect(throws: FileChunkEnvelope.CodecError.oversizedTotalSize) {
+            _ = try FileChunkEnvelope.decode(bytes)
+        }
+    }
+
+    @Test("accepts total_size exactly at the 64 MiB ceiling")
+    func acceptsTotalSizeAtCeiling() throws {
+        var bytes = Data(repeating: 0xA5, count: 16)
+        var total = FileChunkEnvelope.maxTotalSize.bigEndian
+        withUnsafeBytes(of: &total) { bytes.append(contentsOf: $0) }
+        bytes.append(contentsOf: [0, 0, 0, 0])                     // chunk_index = 0
+        var cnt = UInt32(1).bigEndian
+        withUnsafeBytes(of: &cnt) { bytes.append(contentsOf: $0) } // chunk_count = 1
+        bytes.append(contentsOf: [0, 0, 0, 0])                     // mime_len + fn_len = 0
+        let decoded = try FileChunkEnvelope.decode(bytes)
+        #expect(decoded.totalSize == FileChunkEnvelope.maxTotalSize)
+    }
 }
 
 @MainActor

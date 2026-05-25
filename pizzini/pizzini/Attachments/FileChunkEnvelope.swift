@@ -54,10 +54,20 @@ struct FileChunkEnvelope: Sendable, Equatable {
     /// MIME/UTI strings are short ASCII. 256 bytes is generous.
     static let maxMimeBytes = 256
 
+    /// Per-attachment ceiling on the sender-asserted `total_size`:
+    /// `maxChunkCount × maxChunkPlaintextBytes` (= 64 MiB). The real
+    /// disk/RAM bound is the chunk-count × chunk-size product enforced
+    /// during reassembly, but rejecting an impossible `total_size` at
+    /// the codec boundary is fail-fast and stops a future caller that
+    /// pre-allocates from `total_size` being fed a `u64::MAX` claim
+    /// (F-ATT-04).
+    static let maxTotalSize: UInt64 = UInt64(maxChunkCount) * UInt64(maxChunkPlaintextBytes)
+
     enum CodecError: Error, Equatable {
         case truncated
         case attachmentIdLength
         case oversizedChunkCount
+        case oversizedTotalSize
         case oversizedFilename
         case oversizedMime
         case chunkIndexOutOfRange
@@ -102,6 +112,7 @@ struct FileChunkEnvelope: Sendable, Equatable {
         if count == 0 || count > maxChunkCount {
             throw CodecError.oversizedChunkCount
         }
+        if total > maxTotalSize { throw CodecError.oversizedTotalSize }
         if idx >= count { throw CodecError.chunkIndexOutOfRange }
         guard let mimeLen = c.u16() else { throw CodecError.truncated }
         if Int(mimeLen) > maxMimeBytes { throw CodecError.oversizedMime }

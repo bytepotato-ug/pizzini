@@ -25,7 +25,12 @@ Current repo claims include:
 - App lock, screenshot shielding, screen-capture shielding, and duress
   wipe protect the user under the stated local-device threats.
 - Notifications avoid peer identity, message preview, and server-side
-  unread-count leakage.
+  unread-count leakage. (Scope: this covers the APNs payload and the
+  relay/server. On-device, the NSE persists a bounded badge count to the
+  App Group plist — protected only at CompleteUntilFirstUserAuthentication
+  — so a post-first-unlock forensic extraction can read that count. It
+  carries no peer identity and is overwritten on next launch; accepted
+  residual, see F-PUSH-01 / NotificationService.didReceive.)
 - Relay binaries and transparency entries support release integrity
   checks.
 

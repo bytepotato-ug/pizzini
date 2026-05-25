@@ -4323,6 +4323,16 @@ extension ChatStore: RelayClientDelegate {
         // `emitReadReceiptIfEnabled` can find the highest-read-msg
         // to confirm. Without this the receipt path was a silent
         // no-op (the helper filters on `messageId != nil`).
+        //
+        // F-PAIR-03: the inbound `ackId`/`messageId` is a *sender-chosen,
+        // non-unique* ACK correlator — it is NOT a receive-side dedupe
+        // key. The only inbound replay guarantee is the Double Ratchet's
+        // (`SealedSenderResult.isDuplicate`, checked before we get here).
+        // A paired peer can legitimately reuse a messageId across two
+        // ratchet-distinct messages and produce two rows; within the
+        // threat model a paired peer can already inject arbitrary rows,
+        // so this grants no new capability. Do not treat messageId as a
+        // uniqueness guarantee on receive.
         let entry = PersistedMessage(
             side: .peer,
             text: text,

@@ -64,6 +64,19 @@ final class NotificationService: UNNotificationServiceExtension {
         let nseFloor = suite?.integer(forKey: SharedAppGroup.nseBadgeFloorKey) ?? 0
         let cap = nseFloor + SharedAppGroup.nseBadgeCap
         let next = min(current + 1, cap)
+        // F-PUSH-01 (accepted residual). This count lands in the App
+        // Group plist, protected at CompleteUntilFirstUserAuthentication
+        // (the NSE must read/write it while locked-after-first-unlock) —
+        // weaker than the SQLCipher message store. A forensic extraction
+        // after first unlock can therefore read a bounded count
+        // (0…nseFloor+nseBadgeCap) of pushes that arrived while the app
+        // was dead, plus the plist mtime. It carries no peer identity and
+        // the main app overwrites it on next launch. We accept this: the
+        // badge cannot be incremented while the app is force-quit without
+        // leaving *some* on-disk trace, and a shared-Keychain item would
+        // need a new access-group entitlement for marginal benefit. The
+        // "no unread-count leakage" claim in docs/threat-model.md is
+        // scoped to the payload/server, NOT this on-device plist.
         suite?.set(next, forKey: SharedAppGroup.unreadCountKey)
         bestAttemptContent.badge = NSNumber(value: next)
         contentHandler(bestAttemptContent)

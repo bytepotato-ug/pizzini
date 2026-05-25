@@ -43,7 +43,23 @@ cd "$OUT_DIR"
 # public key (also wrapped in PKCS#8 SubjectPublicKeyInfo). Both
 # forms round-trip cleanly through `openssl pkeyutl` for signing
 # and verification.
-openssl genpkey -algorithm ED25519 -out operator-key.pem
+#
+# F-SUP-07: the trust-root private key should not sit on disk in
+# cleartext. Set OPERATOR_KEY_ENCRYPT=1 to write a passphrase-
+# encrypted PKCS#8 (AES-256); `openssl` prompts for the passphrase
+# here and again when `sign-transparency-entry.sh` reads the key, so
+# the plaintext key never persists. Default stays unencrypted to keep
+# the existing non-interactive signing flow working unchanged — but
+# encrypted-at-rest (or a hardware token / `age`-encrypted backup) is
+# the recommended posture for the airgapped signing machine.
+# Destruction: when retiring the key, overwrite + remove it
+# (`rm -P operator-key.pem` on macOS, or `shred -u` on Linux) rather
+# than a plain `rm`.
+if [[ "${OPERATOR_KEY_ENCRYPT:-0}" == "1" ]]; then
+    openssl genpkey -algorithm ED25519 -aes256 -out operator-key.pem
+else
+    openssl genpkey -algorithm ED25519 -out operator-key.pem
+fi
 chmod 0600 operator-key.pem
 openssl pkey -in operator-key.pem -pubout -out operator-key.pub.pem
 chmod 0644 operator-key.pub.pem

@@ -81,14 +81,16 @@ final class AttachmentReassembler {
     /// damage to ~32 × 64 MiB worst-case per peer.
     static let perPeerPendingCap: Int = 32
 
-    /// Receive-side memoisation of attachmentIds whose assembled file
-    /// already exists on disk. Defends against the same-attachmentId-
-    /// replay attack where a sender re-ships chunks under the same
+    /// Receive-side memoisation of completed transfers, keyed on
+    /// `peer + attachmentId` (matching `pending`, not on attachmentId
+    /// alone — F-ATT-05) and valued by completion time so stale entries
+    /// can be reaped. Defends against the same-attachmentId-replay
+    /// attack where a sender re-ships chunks under the same
     /// `attachmentId` after the receiver removed the pending entry on
     /// completion — without this guard the second transfer would
     /// truncate-overwrite the existing assembled file, swapping the
     /// bytes behind a chat row the user already accepted.
-    private var completedAttachmentIds: Set<Data> = []
+    private var completedAttachmentIds: [Data: Date] = [:]
 
     /// Map key: `peer + attachmentId` (49 bytes for a libsignal IdentityKey).
     /// Don't key on attachmentId alone: a malicious paired peer A could
@@ -104,14 +106,23 @@ final class AttachmentReassembler {
     func feed(envelope: FileChunkEnvelope, fromPeer peer: Data) -> FeedResult {
         let key = peer + envelope.attachmentId
 
+        // Reap completed-transfer memoisation older than the partial
+        // TTL so the map can't grow unbounded over a long-lived session
+        // (F-ATT-05). Cheap: the map is small and this only runs on an
+        // inbound chunk.
+        let now = Date()
+        completedAttachmentIds = completedAttachmentIds.filter {
+            now.timeIntervalSince($0.value) < Self.partialTTL
+        }
+
         // **Replay defense.** If we've previously
-        // completed this attachmentId, reject every subsequent chunk
-        // — the sender can't legitimately re-open the same id, and
+        // completed this (peer, attachmentId), reject every subsequent
+        // chunk — the sender can't legitimately re-open the same id, and
         // accepting the chunk would truncate-overwrite the existing
         // assembled file on disk that an already-inserted chat row
         // points at. Bytes "behind" a row the user already accepted
         // would silently change.
-        if completedAttachmentIds.contains(envelope.attachmentId) {
+        if completedAttachmentIds[key] != nil {
             return .rejected(.duplicateChunk)
         }
 
@@ -199,13 +210,13 @@ final class AttachmentReassembler {
             switch finalize(entry) {
             case .success(let completion):
                 pending.removeValue(forKey: key)
-                // Mark this attachmentId as completed so a subsequent
-                // re-send under the same id is rejected.
-                // The 24h reaper clears stale entries; on a duress
-                // wipe `AttachmentSandbox.eraseEverything()` clears
-                // the on-disk files and a fresh ChatStore drops the
-                // set with the rest of in-memory state.
-                completedAttachmentIds.insert(completion.attachmentId)
+                // Mark this (peer, attachmentId) as completed so a
+                // subsequent re-send under the same id is rejected.
+                // Reaped past `partialTTL` on a later feed; on a duress
+                // wipe `AttachmentSandbox.eraseEverything()` clears the
+                // on-disk files and a fresh ChatStore drops the map with
+                // the rest of in-memory state.
+                completedAttachmentIds[key] = Date()
                 return .complete(completion)
             case .failure(let reason):
                 // Cleanup partial state on a finalisation failure so
@@ -327,9 +338,19 @@ final class AttachmentReassembler {
     private func chunkFileURL(attachmentId: Data, index: UInt32) -> URL? {
         guard let dir = try? AttachmentSandbox.inboundDirectory(forAttachmentId: attachmentId)
         else { return nil }
-        return dir.appending(
+        let url = dir.appending(
             path: String(format: "chunk-%05u.bin", index),
             directoryHint: .notDirectory,
         )
+        // Belt-and-suspenders containment, matching `writeAssembledFile`:
+        // attachmentId is validated to 16 bytes and the index is a fixed
+        // `%05u`, so neither can produce `..`/separators today — but
+        // assert the staging path can't escape the per-attachment dir
+        // before any attacker-supplied chunk bytes are written, so a
+        // future relaxation of either can't open a traversal (F-ATT-03).
+        guard (try? AttachmentSandbox.assertContained(url: url, in: dir)) != nil else {
+            return nil
+        }
+        return url
     }
 }
