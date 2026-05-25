@@ -239,9 +239,8 @@ extension ChatGroup {
         // which is constant-time enough for a 32-byte BLAKE3 digest
         // — there is no secret on either side anyway (both digests
         // are derived from public membership state).
-        let localRoot = self.memberSetRoot
-        if op.priorMemberSetRoot != localRoot {
-            return .rejectedMemberSetMismatch(local: localRoot, claimed: op.priorMemberSetRoot)
+        if let mismatch = memberSetRootMismatch(for: op) {
+            return mismatch
         }
 
         // Phase 6: domain mutation.
@@ -383,6 +382,13 @@ extension ChatGroup {
         guard isAuthorised(operatorIdentity: op.operatorIdentity, kind: op.kind) else {
             return .rejectedAuthorization
         }
+        // Queued ops must re-enter through every security gate the
+        // fresh-op path enforces. Without this check, a ghost-member
+        // op parked before its parent arrives can skip the membership
+        // witness validation when `replayPending` drains it.
+        if let mismatch = memberSetRootMismatch(for: op) {
+            return mismatch
+        }
         switch executeMutation(op: op, sideEffects: &sx) {
         case .ok:
             currentEpoch = op.epoch
@@ -412,6 +418,12 @@ extension ChatGroup {
                 $0.peerId == opId && $0.role == .admin && $0.status != .removed
             }
         }
+    }
+
+    private func memberSetRootMismatch(for op: GroupOp) -> ApplyOutcome? {
+        let localRoot = self.memberSetRoot
+        guard op.priorMemberSetRoot != localRoot else { return nil }
+        return .rejectedMemberSetMismatch(local: localRoot, claimed: op.priorMemberSetRoot)
     }
 
     private mutating func executeMutation(

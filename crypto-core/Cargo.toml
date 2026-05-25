@@ -42,6 +42,12 @@ uuid = { version = "1", default-features = false }
 # key — CryptoKit doesn't ship Argon2 and we don't want a parallel
 # Swift implementation drifting from the Rust one.
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+# F-CP-01: scrub secret-bearing buffers (serialized identity keypair, the
+# full serialized store, derived signing-key material) before their heap
+# storage is released, instead of leaving plaintext key bytes in freed
+# memory. Already in libsignal's transitive tree (1.8.x) — no supply-chain
+# delta.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [build-dependencies]
 cbindgen = "0.29"

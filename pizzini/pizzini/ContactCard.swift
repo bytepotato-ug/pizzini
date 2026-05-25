@@ -159,6 +159,15 @@ struct ContactCard: Equatable, Identifiable {
         if let first = bytes.first, bytes.allSatisfy({ $0 == first }) {
             throw ContactCardDecodeError(reason: "The contact card's identity has no entropy — likely a test or corrupted card.")
         }
+        // 7b. IdentityKey type byte (F-PAIR-02). A libsignal IdentityKey is
+        // 33 bytes: a 1-byte DJB type prefix (0x05) + a 32-byte Curve25519
+        // point. Validating the prefix here turns a wrong-type key into a
+        // clear, immediate "not a valid key" error at pair time instead of a
+        // silently-added contact that later fails every send at
+        // `IdentityKey::decode` (a permanently dead, unexplained contact row).
+        guard bytes.first == 0x05 else {
+            throw ContactCardDecodeError(reason: "The contact card's identity is not a valid key (unexpected key type).")
+        }
         // 8. Port.
         guard let port = UInt16(portStr), port > 0 else {
             throw ContactCardDecodeError(

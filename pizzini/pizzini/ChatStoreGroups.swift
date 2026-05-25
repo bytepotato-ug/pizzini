@@ -710,7 +710,12 @@ extension ChatStore {
             Task { [weak self] in
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                 guard let self else { return }
-                self.broadcastToRelays { $0.sendSealed(toPeer: leg.recipient, sealedCiphertext: leg.sealed, ttlSeconds: leg.ttl, token: leg.token) }
+                self.sendSealedToRelays(
+                    toPeer: leg.recipient,
+                    sealedCiphertext: leg.sealed,
+                    ttlSeconds: leg.ttl,
+                    baseToken: leg.token,
+                )
                 if var updated = self.outbox.entries[leg.messageId] {
                     updated.relayedAt = Date()
                     updated.token = Data() // F-505: scrub once relayed
@@ -1019,7 +1024,12 @@ extension ChatStore {
                     )
                     outbox.entries[messageId] = entry
                     Storage.upsertOutboxEntry(entry)
-                    broadcastToRelays { $0.sendSealed(toPeer: recipient, sealedCiphertext: sealed, ttlSeconds: ttl, token: token) }
+                    sendSealedToRelays(
+                        toPeer: recipient,
+                        sealedCiphertext: sealed,
+                        ttlSeconds: ttl,
+                        baseToken: token,
+                    )
                     entry.relayedAt = now
                     entry.token = Data() // F-505 scrub-on-relay
                     outbox.entries[messageId] = entry
@@ -2132,7 +2142,12 @@ extension ChatStore {
                 messageId: messageId,
                 plaintext: inner,
             )
-            broadcastToRelays { $0.sendSealed(toPeer: recipient, sealedCiphertext: sealed, ttlSeconds: state.contacts[cIdx].ttlSeconds, token: token) }
+            sendSealedToRelays(
+                toPeer: recipient,
+                sealedCiphertext: sealed,
+                ttlSeconds: state.contacts[cIdx].ttlSeconds,
+                baseToken: token,
+            )
             diagLog("group", "groupOp → \(short(recipient)): sealed=\(sealed.count) B, sent")
         } catch {
             diagLog("group", "groupOp → \(short(recipient)): seal failed — \(error)")
@@ -2170,7 +2185,12 @@ extension ChatStore {
                 messageId: messageId,
                 plaintext: inner,
             )
-            broadcastToRelays { $0.sendSealed(toPeer: recipient, sealedCiphertext: sealed, ttlSeconds: state.contacts[cIdx].ttlSeconds, token: token) }
+            sendSealedToRelays(
+                toPeer: recipient,
+                sealedCiphertext: sealed,
+                ttlSeconds: state.contacts[cIdx].ttlSeconds,
+                baseToken: token,
+            )
             // Successful seal → record so the bidirectional hook
             // doesn't re-fire for this peer until next rotation.
             state.groups[gIdx].mySkdmRecipients.insert(recipient)
@@ -2208,7 +2228,12 @@ extension ChatStore {
                 messageId: messageId,
                 plaintext: inner,
             )
-            broadcastToRelays { $0.sendSealed(toPeer: recipient, sealedCiphertext: sealed, ttlSeconds: state.contacts[cIdx].ttlSeconds, token: token) }
+            sendSealedToRelays(
+                toPeer: recipient,
+                sealedCiphertext: sealed,
+                ttlSeconds: state.contacts[cIdx].ttlSeconds,
+                baseToken: token,
+            )
             pzLog("[pizzini.group] bootstrap → \(short(recipient)): sealed=\(sealed.count) B, sent")
         } catch {
             pzLog("[pizzini.group] bootstrap → \(short(recipient)): seal failed — \(error)")

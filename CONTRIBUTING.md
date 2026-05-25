@@ -45,18 +45,15 @@ as a hard gate, not an optional reference. Specifically:
 # Rust workspace (crypto-core + relay)
 cargo test --workspace
 
-# Swift package (PizziniCryptoCore + PizziniDB + PizziniTor)
-xcodebuild test -scheme PizziniCryptoCore \
-  -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
-
-# iOS app
+# iOS app + local package consumers
 xcodebuild test -scheme pizzini \
-  -destination 'platform=iOS Simulator,id=<your-sim-id>' \
-  -only-testing:pizziniTests
+  -project pizzini/pizzini.xcodeproj \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
 ```
 
-All three must pass before commit. The iOS app suite is the largest
-and catches the most regressions; run it on every Swift change.
+Both commands must pass before commit. The iOS app suite is the
+largest and catches the most regressions; run it on every Swift
+change.
 
 ## Commits
 

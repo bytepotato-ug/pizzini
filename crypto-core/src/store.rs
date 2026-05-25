@@ -89,6 +89,25 @@ use libsignal_protocol::{
 use uuid::Uuid;
 use rand::{Rng, TryRngCore as _, rngs::OsRng};
 use sha2::Sha512;
+use zeroize::Zeroize;
+
+// Crypto-core runs inside the iOS process. Keep peer-aware diagnostics out
+// of release device logs just as Swift hot paths do through `pzLog`.
+#[cfg(debug_assertions)]
+macro_rules! crypto_diag {
+    ($($arg:tt)*) => {
+        eprintln!($($arg)*);
+    };
+}
+
+#[cfg(not(debug_assertions))]
+macro_rules! crypto_diag {
+    ($($arg:tt)*) => {
+        if false {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 // ───── Plaintext padding (message-size hiding) ──────────
 //
@@ -383,12 +402,21 @@ impl DeviceStore {
     /// signatures; the recipient publishes the public half in their bundle.
     pub fn delivery_token_keypair(&self) -> Result<KeyPair, SignalProtocolError> {
         let id_kp = self.local_identity_keypair();
-        let ikm = id_kp.serialize();
+        let mut ikm = id_kp.serialize();
         let hk = Hkdf::<Sha512>::new(None, &ikm);
+        // F-CP-01: `ikm` is the full serialized IdentityKeyPair (private
+        // half). HKDF-Extract has already consumed it into the PRK held by
+        // `hk`, so scrub the copy now rather than leave it in freed memory.
+        ikm.zeroize();
         let mut seed = [0u8; 32];
         hk.expand(DELIVERY_TOKEN_HKDF_INFO, &mut seed)
             .expect("32-byte expand never overflows HKDF-SHA512");
-        let private_key = PrivateKey::deserialize(&seed)?;
+        let private_key = PrivateKey::deserialize(&seed);
+        // F-CP-01: scrub the derived signing scalar on every path (incl. a
+        // deserialize error) before propagating; the returned KeyPair keeps
+        // its own copy.
+        seed.zeroize();
+        let private_key = private_key?;
         let public_key = private_key.public_key()?;
         Ok(KeyPair::new(public_key, private_key))
     }
@@ -924,7 +952,7 @@ impl DeviceStore {
         {
             Ok(u) => u,
             Err(e) => {
-                eprintln!("seal_receive: sealed_sender_decrypt_to_usmc failed: {e}");
+                crypto_diag!("seal_receive: sealed_sender_decrypt_to_usmc failed: {e}");
                 return Err(SealReceiveError::Internal(e));
             }
         };
@@ -939,7 +967,7 @@ impl DeviceStore {
         // sealed envelopes from arbitrary identities.
         let trusted = self.peers.iter().any(|p| p.as_slice() == claimed_bytes.as_slice());
         if !trusted {
-            eprintln!(
+            crypto_diag!(
                 "seal_receive: rejecting unknown sender {}",
                 hex_lower(&claimed_bytes)
             );
@@ -955,7 +983,7 @@ impl DeviceStore {
         let trust_root = IdentityKey::decode(&claimed_bytes)?;
         let validation_time = Timestamp::from_epoch_millis(now_millis());
         if !usmc.sender()?.validate(trust_root.public_key(), validation_time)? {
-            eprintln!(
+            crypto_diag!(
                 "seal_receive: cert validation failed for sender {}",
                 hex_lower(&claimed_bytes)
             );
@@ -977,7 +1005,7 @@ impl DeviceStore {
         // means a fuzzer probing the boundary doesn't even reach
         // `*SignalMessage::try_from`. F-104.
         if inner_bytes.len() < 18 {
-            eprintln!(
+            crypto_diag!(
                 "seal_receive: inner content too short ({} bytes) for {}",
                 inner_bytes.len(),
                 hex_lower(&claimed_bytes)
@@ -999,7 +1027,7 @@ impl DeviceStore {
         // checked rather than ambient.
         let usmc_is_prekey = matches!(usmc.msg_type()?, CiphertextMessageType::PreKey);
         if usmc_is_prekey != is_prekey {
-            eprintln!(
+            crypto_diag!(
                 "seal_receive: USMC msg_type / is_prekey byte disagreement from {} (usmc={usmc_is_prekey}, byte={is_prekey})",
                 hex_lower(&claimed_bytes)
             );
@@ -1045,7 +1073,7 @@ impl DeviceStore {
                 // re-emit a fresh ACK (the sender's first ACK might
                 // have been lost mid-flight, and they're now retrying
                 // — answering shuts the loop down).
-                eprintln!(
+                crypto_diag!(
                     "seal_receive: duplicate ratchet message from {} (timestamp={timestamp}, counter={counter})",
                     hex_lower(&claimed_bytes)
                 );
@@ -1057,7 +1085,7 @@ impl DeviceStore {
                 });
             }
             Err(e) => {
-                eprintln!(
+                crypto_diag!(
                     "seal_receive: inner message_decrypt failed for {} (is_prekey={is_prekey}, msg_id={}): {e}",
                     hex_lower(&claimed_bytes),
                     hex_lower(&message_id),
@@ -1232,12 +1260,12 @@ impl DeviceStore {
 
         let mut store = InMemSignalProtocolStore::new(id_kp, registration_id)?;
         let mut peers: Vec<Vec<u8>> = Vec::new();
-        let peer_count = r.u32()? as usize;
+        let peer_count = r.read_count()?;
         for _ in 0..peer_count {
             peers.push(r.u16_blob()?.to_vec());
         }
 
-        let pre_count = r.u32()? as usize;
+        let pre_count = r.read_count()?;
         for _ in 0..pre_count {
             let id = r.u32()?;
             let record = PreKeyRecord::deserialize(r.u32_blob()?)?;
@@ -1246,7 +1274,7 @@ impl DeviceStore {
                 .now_or_never()
                 .expect("in-mem store is sync")?;
         }
-        let spk_count = r.u32()? as usize;
+        let spk_count = r.read_count()?;
         for _ in 0..spk_count {
             let id = r.u32()?;
             let record = SignedPreKeyRecord::deserialize(r.u32_blob()?)?;
@@ -1255,7 +1283,7 @@ impl DeviceStore {
                 .now_or_never()
                 .expect("in-mem store is sync")?;
         }
-        let kpk_count = r.u32()? as usize;
+        let kpk_count = r.read_count()?;
         for _ in 0..kpk_count {
             let id = r.u32()?;
             let record = KyberPreKeyRecord::deserialize(r.u32_blob()?)?;
@@ -1264,7 +1292,7 @@ impl DeviceStore {
                 .now_or_never()
                 .expect("in-mem store is sync")?;
         }
-        let session_count = r.u32()? as usize;
+        let session_count = r.read_count()?;
         // Tolerate a single corrupted session record by
         // skipping that one peer rather than failing the entire load.
         // A flipped bit on flash would otherwise lose every contact's
@@ -1291,7 +1319,7 @@ impl DeviceStore {
             let record = match SessionRecord::deserialize(session_bytes) {
                 Ok(rec) => rec,
                 Err(e) => {
-                    eprintln!(
+                    crypto_diag!(
                         "[pizzini.crypto-core] dropping corrupted session for peer {}: {e}",
                         hex_short(peer),
                     );
@@ -1307,7 +1335,7 @@ impl DeviceStore {
                 .now_or_never()
                 .expect("in-mem store is sync")
             {
-                eprintln!(
+                crypto_diag!(
                     "[pizzini.crypto-core] failed to store session for peer {}: {e}",
                     hex_short(peer),
                 );
@@ -1320,7 +1348,7 @@ impl DeviceStore {
             let identity = match IdentityKey::decode(peer) {
                 Ok(k) => k,
                 Err(e) => {
-                    eprintln!(
+                    crypto_diag!(
                         "[pizzini.crypto-core] dropping peer-identity-decode failure for peer {}: {e}",
                         hex_short(peer),
                     );
@@ -1335,7 +1363,7 @@ impl DeviceStore {
                 .now_or_never()
                 .expect("in-mem store is sync")
             {
-                eprintln!(
+                crypto_diag!(
                     "[pizzini.crypto-core] failed to save identity for peer {}: {e}",
                     hex_short(peer),
                 );
@@ -1351,7 +1379,7 @@ impl DeviceStore {
             peers.retain(|p| !skipped_peers.contains(p));
         }
         if skipped_sessions > 0 {
-            eprintln!(
+            crypto_diag!(
                 "[pizzini.crypto-core] from_serialized: skipped {} corrupted session record(s); affected peers dropped from the trusted set and must re-pair",
                 skipped_sessions,
             );
@@ -1373,7 +1401,7 @@ impl DeviceStore {
         // they arrive over the existing 1:1 channels.
         let mut sender_key_index: Vec<(Vec<u8>, [u8; SENDER_KEY_DISTRIBUTION_ID_LEN])> = Vec::new();
         if version >= 3 && !r.is_empty() {
-            let count = r.u32()? as usize;
+            let count = r.read_count()?;
             for _ in 0..count {
                 let sender_identity = r.u16_blob()?.to_vec();
                 let dist_id_slice = r.take(SENDER_KEY_DISTRIBUTION_ID_LEN)?;
@@ -1606,6 +1634,23 @@ impl<'a> Cursor<'a> {
     fn u32_blob(&mut self) -> Result<&'a [u8], SignalProtocolError> {
         let n = self.u32()? as usize;
         self.take(n)
+    }
+    /// F-CP-02: read a u32 element-count and reject it if it exceeds the
+    /// bytes still in the buffer. Every serialized element consumes at least
+    /// one byte, so a count larger than what remains is unsatisfiable — fail
+    /// fast and explicitly here rather than relying on a later per-element
+    /// `take()` to error mid-loop, and never let a bogus count seed an
+    /// allocation. (Defense in depth: `from_serialized` reads only the
+    /// device's own at-rest snapshot, but this makes the bound intent
+    /// explicit and forecloses a future `with_capacity(count)` footgun.)
+    fn read_count(&mut self) -> Result<usize, SignalProtocolError> {
+        let n = self.u32()? as usize;
+        if n > self.buf.len() {
+            return Err(SignalProtocolError::InvalidArgument(
+                "serialized element count exceeds remaining bytes".into(),
+            ));
+        }
+        Ok(n)
     }
 }
 
@@ -2087,6 +2132,50 @@ mod tests {
         let s2 = DeviceStore::from_serialized(&blob).unwrap();
         assert_eq!(s.identity_keypair_bytes(), s2.identity_keypair_bytes());
         assert_eq!(s.registration_id(), s2.registration_id());
+    }
+
+    #[test]
+    fn from_serialized_rejects_bogus_element_count() {
+        // F-CP-02: take a valid serialized store, then overwrite the FIRST
+        // element count (the peer_count u32, which sits right after the
+        // version byte + u32-len-prefixed identity keypair + 4 u32 next-id
+        // fields) with a huge value. `read_count` must reject it as
+        // "exceeds remaining bytes" rather than entering an O(count) loop.
+        let mut s = DeviceStore::fresh().unwrap();
+        let mut blob = s.serialize().unwrap().to_vec();
+        // Layout: version(1) | u32 idkp_len | idkp | reg_id(4) | next_pre(4)
+        // | next_spk(4) | next_kpk(4) | u32 peer_count | ...
+        let idkp_len = u32::from_be_bytes(blob[1..5].try_into().unwrap()) as usize;
+        let peer_count_off = 1 + 4 + idkp_len + 4 + 4 + 4 + 4;
+        blob[peer_count_off..peer_count_off + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        let res = DeviceStore::from_serialized(&blob);
+        assert!(res.is_err(), "a count larger than the buffer must be rejected");
+        let msg = format!("{}", res.err().unwrap());
+        assert!(msg.contains("exceeds remaining bytes"), "got: {msg}");
+    }
+
+    #[test]
+    fn delivery_token_derivation_is_deterministic_after_zeroize() {
+        // F-CP-01 regression: `delivery_token_keypair` now scrubs its
+        // intermediate `ikm`/`seed` secrets. That must NOT change the
+        // derivation — the verify key stays deterministic across calls and a
+        // minted token still verifies against it. (Determinism is what lets a
+        // Keychain-restored identity reconstruct the same token chain.)
+        let store = DeviceStore::fresh().unwrap();
+        let vk1 = store.delivery_token_verify_key_bytes().unwrap();
+        let vk2 = store.delivery_token_verify_key_bytes().unwrap();
+        assert_eq!(vk1, vk2, "verify key must be stable across calls");
+        assert_eq!(vk1.len(), DELIVERY_TOKEN_VERIFY_KEY_LEN);
+
+        // A freshly minted token verifies against the derived verify key.
+        let token = store.mint_delivery_token().unwrap();
+        let vk = PublicKey::deserialize(&vk1).unwrap();
+        let payload = &token[..DELIVERY_TOKEN_NONCE_LEN + 4];
+        let sig = &token[DELIVERY_TOKEN_NONCE_LEN + 4..];
+        assert!(
+            vk.verify_signature(payload, sig),
+            "minted token must verify against the post-zeroize verify key"
+        );
     }
 
     #[test]

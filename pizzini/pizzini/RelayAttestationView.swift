@@ -139,8 +139,9 @@ struct RelayAttestationView: View {
     /// adversary who simply blocks the log fetch must not be able to
     /// present an unverifiable relay as if it were merely awaiting a
     /// first fetch. The amber state is coupled to the same
-    /// `.unverifiable` verdict that feeds the (decision-gated)
-    /// enforcement path in `ChatStore.didReceiveStatus`.
+    /// `.unverifiable` verdict that stays warning-only in
+    /// `ChatStore`; only a clear built-in relay mismatch is removed
+    /// from outbound fanout.
     @ViewBuilder
     private func statusRow(reportedSha256 sha: String) -> some View {
         switch store.relayAttestationVerdict {
@@ -207,9 +208,9 @@ struct RelayAttestationView: View {
     private func statusFooter(reportedSha256 sha: String, urlConfigured: Bool) -> Text {
         switch store.relayAttestationVerdict {
         case .verified:
-            return Text("The running binary's SHA-256 was signed by the operator into the public transparency log. The relay is running an audited build.")
+            return Text("The relay reports a binary SHA-256 the operator signed into the public transparency log. This confirms the operator signed this hash — it cannot prove a compromised relay host isn't reporting a genuine hash while running modified code (tamper-proof attestation needs hardware support, not yet shipped).")
         case .mismatch:
-            return Text("The running binary's SHA-256 does not appear in the operator's signed transparency log. Possible causes: a brand-new deploy the operator hasn't announced yet, a stale log on your device, or a tampered binary on the server. Do not send sensitive messages until the operator publishes a matching entry.")
+            return Text("The running binary's SHA-256 does not appear in the operator's signed transparency log. Pizzini blocks new outgoing traffic through a mismatched built-in relay; custom relays remain warning-only because they are not listed in the built-in operator's log.")
         case .unverifiable:
             if urlConfigured {
                 return Text("The transparency log could not be verified — the fetch failed, was blocked, or returned no signed entries. Until it loads, this relay's binary cannot be checked against any audited build. Tap Refresh log to retry.")

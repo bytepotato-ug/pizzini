@@ -22,6 +22,14 @@
 #   bash scripts/update-macbook.sh --force   # auto-stash local changes
 #   bash scripts/update-macbook.sh --no-tor  # skip the tor xcframework
 #                                            #   (it's heavy and rarely changes)
+#   bash scripts/update-macbook.sh --reset   # hard-reset local main to
+#                                            #   origin/main. Required after
+#                                            #   the remote was rebuilt with
+#                                            #   `git filter-repo` + force-push
+#                                            #   or recreated from scratch —
+#                                            #   the two histories then share
+#                                            #   no common ancestor and a
+#                                            #   fast-forward is impossible.
 
 set -euo pipefail
 
@@ -36,10 +44,12 @@ cd "$REPO_ROOT"
 
 FORCE=0
 SKIP_TOR=0
+RESET=0
 for arg in "$@"; do
     case "$arg" in
         --force)   FORCE=1 ;;
         --no-tor)  SKIP_TOR=1 ;;
+        --reset)   RESET=1; FORCE=1 ;;
         *)         err "unknown arg: $arg"; exit 1 ;;
     esac
 done
@@ -76,10 +86,39 @@ BEFORE_SHA="$(git rev-parse --short HEAD)"
 say "git pull --ff-only origin main"
 START=$(date +%s)
 git fetch origin main --quiet
-if ! git merge --ff-only origin/main; then
-    err "fast-forward merge failed — local branch has commits not on origin."
-    err "either rebase (git rebase origin/main) or hard-reset (git reset --hard origin/main)"
-    exit 1
+
+# History-divergence check. After the remote was rebuilt (filter-repo
+# + force-push, or repo-recreate-with-same-URL) the local main and
+# origin/main share no common ancestor, so --ff-only is impossible.
+# An empty merge-base is the unambiguous signal for "unrelated
+# histories". The non-empty-but-not-ancestor case is "local has real
+# diverged commits the user might care about".
+MERGE_BASE="$(git merge-base HEAD origin/main 2>/dev/null || true)"
+if [[ -z "$MERGE_BASE" ]]; then
+    if (( RESET == 1 )); then
+        warn "unrelated histories — hard-resetting local main to origin/main"
+        git reset --hard origin/main
+    else
+        err "local main and origin/main share no common ancestor."
+        err "this happens after the remote was rebuilt (filter-repo or"
+        err "repo-recreate-with-same-URL). re-run with --reset to discard"
+        err "local main and adopt origin/main verbatim."
+        exit 1
+    fi
+elif ! git merge-base --is-ancestor HEAD origin/main; then
+    if (( RESET == 1 )); then
+        warn "local has commits not on origin — hard-resetting to origin/main"
+        git log --oneline "origin/main..HEAD" | sed 's/^/  dropping: /' >&2
+        git reset --hard origin/main
+    else
+        err "fast-forward not possible — local has commits not on origin:"
+        git log --oneline "origin/main..HEAD" | sed 's/^/  /' >&2
+        err "either rebase (git rebase origin/main), or re-run with --reset"
+        err "to discard the local-only commits and adopt origin/main verbatim."
+        exit 1
+    fi
+else
+    git merge --ff-only origin/main
 fi
 AFTER_SHA="$(git rev-parse --short HEAD)"
 if [[ "$BEFORE_SHA" == "$AFTER_SHA" ]]; then

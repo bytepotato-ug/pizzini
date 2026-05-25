@@ -334,4 +334,32 @@ struct HashChainTokenTests {
         )
         #expect(!HashChainToken.validate(mixed, against: &v))
     }
+
+    @Test("relay-scoped chain IDs keep sibling bearer tokens separate")
+    func relayScopedChainIDsDoNotCross() {
+        var chain = HashChainToken.mintChain(length: 8)
+        let base = HashChainToken.nextToken(in: &chain)!
+        let relayA = Data("relay-a.onion:7777".utf8)
+        let relayB = Data("relay-b.onion:7777".utf8)
+        let tokenA = HashChainToken.relayScopedToken(base, relayNamespace: relayA)
+        let tokenB = HashChainToken.relayScopedToken(base, relayNamespace: relayB)
+
+        #expect(tokenA.chainID != tokenB.chainID)
+        #expect(tokenA.index == tokenB.index)
+        #expect(tokenA.value == tokenB.value)
+
+        var validatorA = HashChainToken.Validator(
+            chainID: tokenA.chainID,
+            root: chain.root,
+            length: chain.length,
+        )
+        var validatorB = HashChainToken.Validator(
+            chainID: tokenB.chainID,
+            root: chain.root,
+            length: chain.length,
+        )
+        #expect(HashChainToken.validate(tokenA, against: &validatorA))
+        #expect(!HashChainToken.validate(tokenA, against: &validatorB))
+        #expect(HashChainToken.validate(tokenB, against: &validatorB))
+    }
 }

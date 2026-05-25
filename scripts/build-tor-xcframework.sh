@@ -249,6 +249,31 @@ echo "==> Cloning iCepa/Tor.framework $VERSION"
 git clone --depth 1 --branch "$VERSION" --recursive --shallow-submodules \
     "$ICEPA_REPO" "$ICEPA_DIR" 2>&1 | grep -v -E '^(Cloning|remote: |Receiving|Resolving|Updating|Submodule|From )' || true
 
+# F-SUP-02: a git TAG is mutable (the upstream can force-push it, or an
+# account/TLS compromise can serve different bytes), so cloning `--branch
+# v409.8.1` is NOT a content pin. Resolve the cloned commit and, when the
+# operator has pinned one via TOR_PIN_COMMIT, REFUSE to build on any mismatch
+# — this is the transport trust anchor every client routes 100% of traffic
+# through. Without a pin we print the resolved commit (and the tor submodule
+# commit) so the operator can record it and turn on verification.
+TOR_RESOLVED_COMMIT="$(git -C "$ICEPA_DIR" rev-parse HEAD)"
+TOR_SUBMODULE_COMMIT="$(git -C "$ICEPA_DIR" submodule status 2>/dev/null | awk '/Tor\/tor/ {print $1}' | tr -d '+-' || true)"
+if [[ -n "${TOR_PIN_COMMIT:-}" ]]; then
+    if [[ "$TOR_RESOLVED_COMMIT" != "$TOR_PIN_COMMIT" ]]; then
+        echo "ERROR: iCepa Tor.framework commit mismatch." >&2
+        echo "  expected (TOR_PIN_COMMIT): $TOR_PIN_COMMIT" >&2
+        echo "  got (tag $VERSION now points at): $TOR_RESOLVED_COMMIT" >&2
+        echo "  Refusing to build the transport library from an unverified commit." >&2
+        exit 1
+    fi
+    echo "==> Verified iCepa commit matches TOR_PIN_COMMIT ($TOR_RESOLVED_COMMIT)"
+else
+    echo "==> WARNING: TOR_PIN_COMMIT is not set — building from tag $VERSION without a content pin."
+    echo "    Record this and re-run with TOR_PIN_COMMIT set to enforce it on every future build:"
+    echo "      TOR_PIN_COMMIT=$TOR_RESOLVED_COMMIT"
+    [[ -n "$TOR_SUBMODULE_COMMIT" ]] && echo "      (tor submodule commit: $TOR_SUBMODULE_COMMIT)"
+fi
+
 patch_icepa_build_script "$ICEPA_DIR/build-xcframework.sh"
 
 echo "==> Running iCepa build-xcframework.sh -c (this clones tor + builds OpenSSL/libevent/lzma/libtor for iOS + iOS-sim + macOS)"

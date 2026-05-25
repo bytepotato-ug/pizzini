@@ -27,8 +27,13 @@ struct DiagnosticsView: View {
 
     /// `.sheet(item:)` driver for the UIActivityViewController
     /// share sheet — holds the URL(s) of the log file(s) being
-    /// exported. `nil` = sheet not presented.
+    /// exported. `nil` = sheet not presented. DEBUG-only: `ExportTargets`
+    /// and the share/clear UI it drives are compiled out of release, so the
+    /// declaration must be too (otherwise release references a missing type
+    /// — this was a pre-existing release-build break).
+    #if DEBUG
     @State private var exportTargets: ExportTargets?
+    #endif
 
     /// Driver for the "are you sure you want to clear the QA log?"
     /// confirmation dialog. iOS-26 destructive button conventions

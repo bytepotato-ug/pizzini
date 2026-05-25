@@ -296,6 +296,10 @@ public final class RelayClient: @unchecked Sendable {
     /// having to cross-reference timestamps against ChatStore's
     /// "connecting to Relay X" pre-dial line.
     private var lastTargetHost: String = ""
+    /// Stable per-target bytes the app uses to scope v2 delivery-token
+    /// chain IDs to one relay. A bearer token seen by one relay must
+    /// not be usable at a sibling relay in the fanout.
+    public private(set) var deliveryTokenNamespace = Data()
     public private(set) var state: State = .idle {
         didSet {
             guard oldValue != state else { return }
@@ -434,6 +438,7 @@ public final class RelayClient: @unchecked Sendable {
     public func connect(to host: String, port: UInt16) {
         disconnect()
         lastTargetHost = host
+        deliveryTokenNamespace = Self.deliveryTokenNamespace(host: host, port: port)
         state = .connecting
         socksRetries = 0
         guard let nwPort = NWEndpoint.Port(rawValue: port) else {
@@ -466,6 +471,18 @@ public final class RelayClient: @unchecked Sendable {
         #else
         state = .failed("This relay isn't a Tor address.")
         #endif
+    }
+
+    private static func deliveryTokenNamespace(host: String, port: UInt16) -> Data {
+        var out = Data("pizzini.relay-target.v2".utf8)
+        let canonicalHost = OnionHost.canonical(host) ?? host.lowercased()
+        let hostBytes = Data(canonicalHost.utf8)
+        var hostLengthBE = UInt32(hostBytes.count).bigEndian
+        withUnsafeBytes(of: &hostLengthBE) { out.append(contentsOf: $0) }
+        out.append(hostBytes)
+        var portBE = port.bigEndian
+        withUnsafeBytes(of: &portBE) { out.append(contentsOf: $0) }
+        return out
     }
 
     private func startDirectConnection(host: String, port: NWEndpoint.Port) {

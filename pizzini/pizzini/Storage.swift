@@ -163,24 +163,31 @@ enum Storage {
     /// drained. Remove once the persistence bug is closed.
     static var qaDiag: [String] = []
 
-    /// 8-hex-char BLAKE3 prefix of a device_store blob. One-way, no
-    /// secret material — the blob is already an encrypted snapshot.
+    // F-STO-02: the QA persistence-fingerprint machinery is DEBUG-only. The
+    // fingerprint is a BLAKE3 prefix of `session.serialize()` — the PLAINTEXT
+    // device store (identity private key + ratchet state), not the encrypted
+    // at-rest blob — and it was being written to `UserDefaults.standard`,
+    // which is backup-included and only default-protected. A digest of secret
+    // key state has no business in release builds' defaults domain, so the
+    // whole read/write/compute path is compiled out of release.
+    #if DEBUG
+    /// 8-hex-char BLAKE3 prefix of a device_store blob (DEBUG diagnostic).
     private static func fpHex(_ blob: Data) -> String {
         Blake3.hash(blob).prefix(4).map { String(format: "%02x", $0) }.joined()
     }
 
     /// `UserDefaults.standard` key holding the fingerprint of the last
-    /// `persist(session:)` write. Survives a normal relaunch; read back
-    /// by `loadOrCreateSession` to prove the blob loaded at launch N+1
-    /// is the one written at the end of launch N.
+    /// `persist(session:)` write. DEBUG-only rollback diagnostic.
     private static let qaLastPersistFPKey = "qa.lastPersistFP"
+    #endif
 
     static func loadOrCreateSession() throws -> Session {
         guard let store = SQLiteStorage.shared else {
             throw StorageError.databaseWriteFailed(detail: "storage not bootstrapped")
         }
-        let priorFP = UserDefaults.standard.string(forKey: qaLastPersistFPKey)
         if let blob = try store.loadDeviceStore() {
+            #if DEBUG
+            let priorFP = UserDefaults.standard.string(forKey: qaLastPersistFPKey)
             let fp = fpHex(blob)
             let verdict: String
             if let priorFP {
@@ -193,15 +200,19 @@ enum Storage {
             let line = "loadOrCreateSession: loaded device_store len=\(blob.count) fp=\(fp) — \(verdict)"
             qaDiag.append(line)
             pzLog("[pizzini.storage] QA-DIAG \(line)")
+            #endif
             return try Session(serialized: blob)
         }
         // First-ever launch (no legacy Keychain content either —
         // that path was handled by StorageMigration). Mint a fresh
         // identity and persist its serialize() blob.
+        #if DEBUG
+        let priorFP = UserDefaults.standard.string(forKey: qaLastPersistFPKey)
         let line = "loadOrCreateSession: NO device_store row — minting a FRESH identity"
             + (priorFP.map { " (but UserDefaults still has prior fp=\($0) — DB was wiped, not the defaults)" } ?? "")
         qaDiag.append(line)
         pzLog("[pizzini.storage] QA-DIAG \(line)")
+        #endif
         let s = try Session()
         try persist(session: s)
         return s
@@ -215,12 +226,16 @@ enum Storage {
         do {
             let blob = try session.serialize()
             try store.saveDeviceStore(blob)
+            #if DEBUG
+            // F-STO-02: DEBUG-only. Record a one-way fingerprint of the last
+            // durable write so the next launch's loadOrCreateSession can
+            // detect a rollback. Compiled out of release — a digest of the
+            // plaintext device store must not land in backup-included
+            // UserDefaults.standard.
             let fp = fpHex(blob)
-            // Record the fingerprint of the most recent durable write so
-            // the NEXT launch's loadOrCreateSession can prove it loaded
-            // the same bytes (or detect the rollback).
             UserDefaults.standard.set(fp, forKey: qaLastPersistFPKey)
             pzLog("[pizzini.storage] QA-DIAG persist(session:): wrote device_store len=\(blob.count) fp=\(fp)")
+            #endif
             return true
         } catch {
             pzLog("[pizzini.storage] device_store UPSERT failed: \(error)")
@@ -598,6 +613,16 @@ enum Storage {
         } catch {
             pzLog("[pizzini.storage] eraseAndReinitialize failed: \(error)")
         }
+        #if DEBUG
+        // F-DUR-01: the DEBUG QA log (Application Support/qa-debug/qa.log)
+        // accumulates peer-id prefixes, group ids, and event lines —
+        // including this wipe's own log output. Clear it as the FINAL wipe
+        // step (after re-bootstrap, so the wipe-event lines are gone too) so
+        // a duress-wiped tester build carries no pre-wipe peer graph and stays
+        // indistinguishable from a fresh install. Compiled out of release,
+        // where the file never exists.
+        QALog.clear()
+        #endif
         return keyMaterialErased
     }
 

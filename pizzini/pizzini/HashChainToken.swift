@@ -15,9 +15,12 @@ import PizziniCryptoCore
 ///
 /// **Construction.** Recipient picks a random seed `s`. Computes the
 /// forward chain `s_0 = s`, `s_1 = H(s_0)`, …, `s_n = H(s_{n-1})`.
-/// `s_n` is the chain *root*, registered with the relay (and bound to
-/// recipient's peer_id). Recipient ships `(chainId, seed, length)`
-/// to the sender via the sealed-sender channel.
+/// `s_n` is the chain *root*. Recipient registers it with each relay
+/// under a relay-scoped derivation of the random `chainId` (and bound
+/// to recipient's peer_id). Recipient ships the base
+/// `(chainId, seed, length)` to the sender via the sealed-sender
+/// channel, so the sender derives the same relay-scoped chain ID at
+/// fanout time without storing N chains.
 ///
 /// **Token reveal order is reversed.** Token at sender-side index `i`
 /// (1-indexed) is the chain value at position `n − i`. So `token[1] =
@@ -27,12 +30,11 @@ import PizziniCryptoCore
 /// `(index, token)`: apply `H` `(index − lastIndex)` times to `token`
 /// and check it equals `lastToken`. On success, advance the state.
 ///
-/// **Privacy.** The relay only knows `(recipient, chainId)` →
+/// **Privacy.** The relay only knows `(recipient, scopedChainId)` →
 /// `(root, lastIndex, lastToken)`. Sender identity is never bound to
 /// the chain on the relay side; sealed-sender survives. The recipient
-/// MAY hold multiple chains (one per sender) and the relay tries each
-/// of recipient's chains in turn — N=50 contacts × 1 chain each = 50
-/// SHA-256 ops per validation, well under a millisecond.
+/// MAY hold multiple chains (one per sender); the presented scoped
+/// chain ID selects the relay-local validator entry.
 enum HashChainToken {
     static let hashSize = 32
     static let chainIDSize = 16
@@ -213,14 +215,51 @@ enum HashChainToken {
         )
     }
 
-    /// Sender-side primitive: produce the next token in the chain and
-    /// advance the cursor. Returns nil when the chain is exhausted.
+    /// Sender-side primitive: produce the next base token in the chain
+    /// and advance the cursor. `relayScopedToken` replaces its
+    /// `chainID` immediately before the token goes to one relay.
+    /// Returns nil when the chain is exhausted.
     static func nextToken(in chain: inout Chain) -> Token? {
         guard !chain.isExhausted else { return nil }
         let index = chain.nextIndex
         let value = applyHash(chain.seed, times: chain.length - index)
         chain.nextIndex = index + 1
         return Token(chainID: chain.chainID, index: index, value: value)
+    }
+
+    /// Relays in one fanout must not accept each other's bearer token
+    /// presentations. The chain ID is a 128-bit random selector known
+    /// to the two peers; hash it with the specific relay namespace so
+    /// relay A only sees `id_A` and cannot present the same chain value
+    /// to relay B without guessing `id_B`.
+    ///
+    /// The chain value and root stay unchanged, so the persisted chain
+    /// and seed-delivery wire shape do not grow into one chain per
+    /// relay. Registration and token presentation must both call this
+    /// helper with the same namespace.
+    static func relayScopedChainID(baseChainID: Data, relayNamespace: Data) -> Data {
+        precondition(baseChainID.count == chainIDSize, "base chain id must be \(chainIDSize) bytes")
+        precondition(!relayNamespace.isEmpty, "relay namespace must not be empty")
+        var material = Data("pizzini.delivery-token.relay-chain-id.v2".utf8)
+        var namespaceLengthBE = UInt32(relayNamespace.count).bigEndian
+        withUnsafeBytes(of: &namespaceLengthBE) { material.append(contentsOf: $0) }
+        material.append(relayNamespace)
+        material.append(baseChainID)
+        return Data(Blake3.hash(material).prefix(chainIDSize))
+    }
+
+    /// Replace the base chain selector with the selector for exactly
+    /// one relay. Its token value remains valid against the same root;
+    /// only the relay-local lookup key changes.
+    static func relayScopedToken(_ token: Token, relayNamespace: Data) -> Token {
+        Token(
+            chainID: relayScopedChainID(
+                baseChainID: token.chainID,
+                relayNamespace: relayNamespace,
+            ),
+            index: token.index,
+            value: token.value,
+        )
     }
 
     /// Stateless cold-path validator: hash the presented token forward

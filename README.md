@@ -10,10 +10,10 @@ Signal is the reference. Pizzini diverges where Signal made compromises we don't
 
 - **No phone number.** Pairwise random IDs. Pairing happens via QR or invite link, out of band.
 - **Tor-only transport.** No clearnet fallback. Sealed sender over onion routing.
-- **Stateless relays, app-side fanout across a bundled fleet.** Relays hold no per-user accounts and no plaintext message bodies. The current fleet is three Tor onion services hosted in DE / NO / US — but all three are run by a single operator on one provider, so the "multiple jurisdictions / no single seizable server" property is aspirational: it only holds once independent operators run independent infrastructure. Two routing maps persist across restarts under ChaCha20-Poly1305 with 0600 permissions: the offline-message queue (libsignal-sealed ciphertexts, sender-chosen TTL up to 7 days, per-peer cap) and the APNs push-token map (30-day TTL). Live route tables, verify-key caches, hashcash buckets, and token replay sets stay in memory only and are wiped on restart. Encryption at rest is defence-in-depth against operator mistakes, not against an attacker who has seized the machine.
+- **Stateless relays, app-side fanout across a bundled fleet.** Relays hold no per-user accounts and no plaintext message bodies. The current fleet is three Tor onion services hosted in DE / NO / US — but all three are run by a single operator on one provider, so the "multiple jurisdictions / no single seizable server" property is aspirational: it only holds once independent operators run independent infrastructure. Two routing maps persist across restarts under ChaCha20-Poly1305 with 0600 permissions: the offline-message queue (libsignal-sealed ciphertexts, sender-chosen TTL up to 7 days, per-peer cap) and the APNs push-token map (30-day TTL). The v2 delivery-token chain-validator cursors and bundle-request rate buckets persist in separate bounded encrypted stores so restart does not reset replay/rate state. Live route tables, verify-key caches, HELLO replay sets, and hashcash buckets stay in memory only and are wiped on restart. Encryption at rest is defence-in-depth against operator mistakes, not against an attacker who has seized the machine.
 - **Cryptographic erasure on duress.** Real wipe, not pretend mode.
 - **Post-quantum from day one.** PQXDH and Triple Ratchet, via libsignal.
-- **Reproducible builds, signed transparency log.** Relay binaries are reproducible under a pinned Docker toolchain (`scripts/build-relay-release.sh`); each SHA-256 is signed by the operator's Ed25519 key and committed to `transparency-log.ndjson`. iOS clients verify the running relay against the log on every reconnect. Multi-maintainer co-signing is a known gap.
+- **Reproducible builds, signed transparency log.** Relay binaries are reproducible under a pinned Docker toolchain (`scripts/build-relay-release.sh`); each SHA-256 is signed by the operator's Ed25519 key and committed to `transparency-log.ndjson`. On every reconnect iOS clients check the binary hash each relay *self-reports* against the log — this detects an unsigned/unannounced binary, but a compromised relay host can report a genuine signed hash while running modified code, so it is not tamper-proof attestation (which needs hardware support). Multi-maintainer co-signing and hardware-rooted attestation are known gaps.
 
 ## Stack
 
@@ -22,8 +22,8 @@ Signal is the reference. Pizzini diverges where Signal made compromises we don't
 | Crypto core | Rust, `libsignal` directly |
 | iOS app | Swift + SwiftUI, native only |
 | FFI | Rust to Swift via C ABI (cbindgen) |
-| Storage | SQLCipher v4.6.1 (vendored amalgamation). Key derivation: Secure-Enclave-resident P-256 → ECIES → 32-byte seed in Keychain → HKDF-SHA-512 → Argon2id (M=64 MiB, T=3, P=1) |
-| Transport | Tor via embedded Tor.framework v409.6.1 (iCepa, pinned by SHA-256) |
+| Storage | SQLCipher v4.6.1 (vendored amalgamation). Key derivation: Secure-Enclave-resident P-256 → ECIES → 32-byte seed in Keychain → Argon2id (M=64 MiB, T=3, P=1) → raw SQLCipher key |
+| Transport | Tor via embedded Tor.framework v409.8.1 (iCepa), pinned by git tag + a verified commit at build time |
 | Relay | Rust, stateless. Live fleet in DE / NO / US |
 | License | AGPL-3.0-or-later |
 
@@ -41,17 +41,17 @@ Signal is the reference. Pizzini diverges where Signal made compromises we don't
 
 - No custom crypto. libsignal does the work.
 - No phone-number-based identity, ever.
-- No clearnet transport. (One exception: the transparency-log fetch from `raw.githubusercontent.com` goes over plain HTTPS.)
+- No clearnet message transport. Documented exceptions are the transparency-log fetch from `raw.githubusercontent.com` over HTTPS and Apple's captive-portal probe when Tor bootstrap stalls.
 - No analytics, telemetry, or third-party SDKs.
 - No automatic media loading. Pegasus 2021 was an iMessage zero-click via image parsing.
-- No in-app preview of any attachment. Text, image, archive — all the same. Recipient taps "Save to Files" and the OS owns what's inside.
-- No auto-download of attachments. The chunked-attachment flow only fires once both peers are paired and the user is in the chat. No thumbnail generation, no in-app archive extraction, no in-app PDF rendering.
+- Attachment preview defaults off. Strict mode renders no received bytes in Pizzini; the user saves to Files first. QuickLook and tap-to-render inline image thumbnails are explicit opt-ins that widen the parser surface.
+- No auto-download of attachments. The chunked-attachment flow only fires once both peers are paired and the user is in the chat. No automatic thumbnail generation, no in-app archive extraction, no in-app PDF rendering.
 - Attachment bytes live only in `Application Support/attachments/` with `FileProtectionType.completeUntilFirstUserAuthentication`, excluded from iCloud backup. Never `PHPhotoLibrary`, never `Documents/`.
 - iOS Lockdown Mode must work.
 
 ## Architecture
 
-Tor-only transport; three multi-jurisdiction independent onion services with app-side fanout (rather than an OnionBalance frontend); numeric onion vanity prefixes (`pizzini2/3/4` are the live relays; the trailing digit is drawn from Tor v3 base32's `a-z` + `2-7` alphabet, so `pizzini5/6/7` are the unused slots); a bundled relay allowlist with a BYO override.
+Tor-only transport; a three-relay onion fleet across multiple jurisdictions with app-side fanout (rather than an OnionBalance frontend). The current live relays still share one operator/provider, so independent-operator resilience remains future work. Numeric onion vanity prefixes (`pizzini2/3/4` are the live relays; the trailing digit is drawn from Tor v3 base32's `a-z` + `2-7` alphabet, so `pizzini5/6/7` are the unused slots); a bundled relay allowlist with a BYO override.
 
 ## Repo layout
 
@@ -78,12 +78,13 @@ cargo run --example pqxdh_roundtrip -p pizzini-crypto-core
 scripts/build-xcframework.sh                # release
 PROFILE=debug scripts/build-xcframework.sh  # dev
 
-# Embedded Tor static library + headers, pinned by SHA-256 to iCepa
-# Tor.framework v409.6.1. Re-run with REBUILD=1 to refresh after a script bump.
+# Embedded Tor static library + headers, pinned by git tag v409.8.1 and a
+# verified commit (TOR_PIN_COMMIT) to iCepa Tor.framework. Re-run with
+# REBUILD=1 to refresh after a script bump.
 scripts/build-tor-xcframework.sh
 
-# Swift package tests on simulator
-xcodebuild test -scheme PizziniCryptoCore \
+# iOS app and package-consumer tests on simulator
+xcodebuild test -scheme pizzini -project pizzini/pizzini.xcodeproj \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
 ```
 

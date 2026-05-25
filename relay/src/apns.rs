@@ -54,6 +54,23 @@ impl ApnsEndpoint {
     }
 }
 
+/// F-PUSH-02: how long (seconds) APNs may hold an undelivered wake-up before
+/// discarding it. Sent as the `apns-expiration` header (an absolute UNIX
+/// time, `now + this`). Without it APNs stores-and-redelivers indefinitely,
+/// which (a) re-couples delivery time to the device's reconnect — partly
+/// defeating `PUSH_JITTER` — and (b) can fire a "ghost" wake-up for a message
+/// the relay's offline queue already dropped on TTL. This MUST stay well
+/// below the relay's offline-queue TTL so a push can never outlive the
+/// message it nudges for. 5 minutes covers a brief network/Tor reconnect blip
+/// while keeping the store-and-forward window small. (A real-device tradeoff
+/// — shorter favours privacy, longer favours background deliverability.)
+const PUSH_EXPIRATION_SECS: u64 = 300;
+
+/// Absolute `apns-expiration` value for a wake-up sent at `now_secs`.
+fn push_expiration_at(now_secs: u64) -> u64 {
+    now_secs.saturating_add(PUSH_EXPIRATION_SECS)
+}
+
 impl ApnsConfig {
     /// Reads APNS_AUTH_KEY_PATH / APNS_TEAM_ID / APNS_KEY_ID. Returns
     /// `Ok(None)` when none are set (push disabled), and `Err` when the
@@ -184,6 +201,10 @@ impl ApnsClient {
             .post(&url)
             .header("apns-topic", &self.cfg.bundle_id)
             .header("apns-push-type", "alert")
+            // F-PUSH-02: bound how long APNs may store-and-redeliver this
+            // wake-up so it can't outlive the queued message or re-couple
+            // delivery timing to the device's reconnect.
+            .header("apns-expiration", push_expiration_at(unix_now()).to_string())
             .header("authorization", format!("bearer {jwt}"))
             .json(&body)
             .send()
@@ -241,4 +262,24 @@ fn hex_encode(bytes: &[u8]) -> String {
         let _ = write!(&mut s, "{b:02x}");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_expiration_is_finite_and_bounded() {
+        // F-PUSH-02: the wake-up carries a finite `apns-expiration` (now + a
+        // few minutes), never "store indefinitely". It must be a small,
+        // bounded window so the push cannot outlive the relay's multi-day
+        // offline queue (no ghost wake-ups) and saturates instead of
+        // overflowing near u64::MAX.
+        let now = 1_760_000_000u64;
+        assert_eq!(push_expiration_at(now), now + PUSH_EXPIRATION_SECS);
+        // Well under a day, hence far under the offline-queue TTL.
+        assert!(PUSH_EXPIRATION_SECS < 24 * 60 * 60);
+        // No overflow at the u64 ceiling.
+        assert_eq!(push_expiration_at(u64::MAX), u64::MAX);
+    }
 }

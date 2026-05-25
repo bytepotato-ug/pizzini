@@ -1492,6 +1492,7 @@ dependencies = [
  "rand",
  "sha2",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

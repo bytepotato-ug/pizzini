@@ -48,6 +48,31 @@ pub const CHAIN_VALUE_LEN: usize = 32;
 /// realistic user's lifetime traffic to one peer.
 pub const MAX_CHAIN_LENGTH: u32 = 1 << 20;
 
+/// F-MEM-07 / F-RP-02: cap on how far a single presentation may advance
+/// the chain index in one `validate` call. The validator walks
+/// `delta = index - last_index` BLAKE3 steps under the global validator
+/// lock; without a cap a presentation claiming `index = length` forces up
+/// to `MAX_CHAIN_LENGTH` (~1M) hashes — and on a `BadChainValue` the cursor
+/// is NOT advanced, so a wrong-value flood re-pays the full walk on every
+/// frame, head-of-line-blocking all peers. Legitimate senders advance one
+/// step at a time; 64 leaves generous slack for lost-ACK / dropped-frame
+/// catch-up while bounding per-frame work to a small constant. A larger
+/// jump is rejected as out-of-range before any hashing.
+pub const MAX_VALIDATE_STEPS: u32 = 64;
+
+/// F-RP-01: per-peer cap on distinct registered chains. A peer_id is a
+/// free-to-mint HELLO identity, so without this one identity could
+/// register unbounded `(peer, chain)` entries (REGISTER_CHAIN has no rate
+/// limit) and grow the persistent store + its O(n) re-encrypt cost without
+/// bound. 32 distinct chains per peer is far above any realistic per-contact
+/// rotation rate.
+pub const MAX_CHAINS_PER_PEER: usize = 32;
+/// F-RP-01: global cap on total distinct `(peer, chain)` entries — the
+/// backstop against a Sybil flood that rotates peer_id for every chain to
+/// defeat the per-peer cap. New registrations past this are refused; the
+/// idle-TTL GC reclaims space.
+pub const MAX_TOTAL_CHAINS: usize = 100_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredEntry {
     /// Composite hex key: `{peer_id_hex}:{chain_id_hex}` for JSON
@@ -158,6 +183,21 @@ impl ChainValidatorStore {
             }
             return Ok(RegisterOutcome::Conflict);
         }
+        // F-RP-01: bound store growth before inserting a NEW key. Existing
+        // keys took the idempotent/conflict path above and are unaffected, so
+        // legitimate re-registration always succeeds even at the cap.
+        if self.map.len() >= MAX_TOTAL_CHAINS {
+            return Ok(RegisterOutcome::RejectedCap);
+        }
+        let per_peer = self
+            .map
+            .keys()
+            .filter(|(p, _)| p.as_slice() == reg.peer_id.as_slice())
+            .take(MAX_CHAINS_PER_PEER)
+            .count();
+        if per_peer >= MAX_CHAINS_PER_PEER {
+            return Ok(RegisterOutcome::RejectedCap);
+        }
         self.map.insert(
             key,
             ChainState {
@@ -192,6 +232,12 @@ impl ChainValidatorStore {
             return Ok(ValidateOutcome::OutOfRange);
         }
         let delta = index - state.last_index;
+        // F-MEM-07 / F-RP-02: bound the forward walk to a small constant so a
+        // single presentation cannot force a multi-hundred-thousand BLAKE3
+        // loop under the global lock. Reject an oversized jump before hashing.
+        if delta > MAX_VALIDATE_STEPS {
+            return Ok(ValidateOutcome::OutOfRange);
+        }
         let mut current = *value;
         for _ in 0..delta {
             // AUDIT-DECISION-NEEDED: the chain step is a bare
@@ -287,6 +333,10 @@ pub enum RegisterOutcome {
     Conflict,
     /// `length == 0` or `length > MAX_CHAIN_LENGTH`.
     BadLength,
+    /// F-RP-01: refused because the per-peer (`MAX_CHAINS_PER_PEER`) or
+    /// global (`MAX_TOTAL_CHAINS`) chain cap is already reached. Bounds
+    /// flooding of the persistent store by a free HELLO identity / Sybil.
+    RejectedCap,
 }
 
 fn purge_stale(
@@ -434,6 +484,36 @@ mod tests {
     }
 
     #[test]
+    fn register_enforces_per_peer_cap() {
+        // F-RP-01: a single peer_id may register at most MAX_CHAINS_PER_PEER
+        // distinct chains; the next is RejectedCap, but a different peer is
+        // still fine and idempotent re-registration of an existing key works.
+        let tmp = TempDir::new().unwrap();
+        let mut store = make_store(tmp.path());
+        let (root, _) = fresh_chain([0x01; 32], 8);
+        let peer = [0xAB; 33];
+        for i in 0..MAX_CHAINS_PER_PEER {
+            let mut chain_id = [0u8; 16];
+            chain_id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            let reg = ChainRegistration { peer_id: peer, chain_id, root, length: 8 };
+            assert_eq!(store.register(reg).unwrap(), RegisterOutcome::Registered, "i={i}");
+        }
+        // The (cap+1)th distinct chain for the same peer is refused.
+        let mut over = [0u8; 16];
+        over[..8].copy_from_slice(&(MAX_CHAINS_PER_PEER as u64).to_be_bytes());
+        let reg_over = ChainRegistration { peer_id: peer, chain_id: over, root, length: 8 };
+        assert_eq!(store.register(reg_over).unwrap(), RegisterOutcome::RejectedCap);
+        // Re-registering an EXISTING key for the capped peer still succeeds.
+        let mut existing = [0u8; 16];
+        existing[..8].copy_from_slice(&0u64.to_be_bytes());
+        let reg_existing = ChainRegistration { peer_id: peer, chain_id: existing, root, length: 8 };
+        assert_eq!(store.register(reg_existing).unwrap(), RegisterOutcome::AlreadyRegistered);
+        // A different peer is unaffected by another peer's cap.
+        let reg_other = ChainRegistration { peer_id: [0xCD; 33], chain_id: [0xFF; 16], root, length: 8 };
+        assert_eq!(store.register(reg_other).unwrap(), RegisterOutcome::Registered);
+    }
+
+    #[test]
     fn idempotent_re_registration() {
         let tmp = TempDir::new().unwrap();
         let mut store = make_store(tmp.path());
@@ -535,6 +615,41 @@ mod tests {
         );
         assert_eq!(
             store.validate(&reg.peer_id, &reg.chain_id, 5, &t5).unwrap(),
+            ValidateOutcome::Accepted,
+        );
+    }
+
+    #[test]
+    fn validate_caps_forward_walk_steps() {
+        // F-MEM-07 / F-RP-02: a single presentation may advance the index by
+        // at most MAX_VALIDATE_STEPS. A larger jump is rejected as OutOfRange
+        // BEFORE any BLAKE3 walk; a jump exactly at the cap still validates.
+        let tmp = TempDir::new().unwrap();
+        let mut store = make_store(tmp.path());
+        let length = 200u32; // > MAX_VALIDATE_STEPS, < MAX_CHAIN_LENGTH
+        let (root, positions) = fresh_chain([0x5A; 32], length);
+        let reg = ChainRegistration {
+            peer_id: [0x10; 33],
+            chain_id: [0x20; 16],
+            root,
+            length,
+        };
+        store.register(reg).unwrap();
+
+        // Jump of MAX_VALIDATE_STEPS + 1 from a fresh chain (last_index = 0)
+        // is rejected without walking; state stays at last_index = 0.
+        let over = MAX_VALIDATE_STEPS + 1;
+        let t_over = token_at(&positions, length, over);
+        assert_eq!(
+            store.validate(&reg.peer_id, &reg.chain_id, over, &t_over).unwrap(),
+            ValidateOutcome::OutOfRange,
+        );
+
+        // A jump of exactly MAX_VALIDATE_STEPS is within budget and validates.
+        let at_cap = MAX_VALIDATE_STEPS;
+        let t_cap = token_at(&positions, length, at_cap);
+        assert_eq!(
+            store.validate(&reg.peer_id, &reg.chain_id, at_cap, &t_cap).unwrap(),
             ValidateOutcome::Accepted,
         );
     }

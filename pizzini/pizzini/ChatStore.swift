@@ -49,11 +49,8 @@ final class ChatStore: NSObject {
     /// Verdict of comparing the running relay's reported
     /// `binarySha256` against the verified transparency log. Computed
     /// in `relayClient(_:didReceiveStatus:)` on every reconnect — NOT
-    /// merely on demand in the Settings view — so it is an
-    /// enforceable signal, not just badge state. The actual
-    /// enforcement ACTION (disconnect / block sends / signed grace
-    /// window) is decision-gated on policy; see the
-    /// `AUDIT-DECISION-NEEDED` marker in `didReceiveStatus`.
+    /// merely on demand in the Settings view — so send selection can
+    /// enforce the bundled-relay mismatch policy.
     enum RelayAttestationVerdict: Sendable, Equatable {
         /// No STATUS_RESPONSE yet, or no operator verify key is
         /// configured in this build — verification has not run.
@@ -76,11 +73,20 @@ final class ChatStore: NSObject {
         case unverifiable
     }
 
-    /// Latest per-reconnect attestation verdict. Drives both the
-    /// Settings badge and (once the enforcement policy is decided)
-    /// the interruption path. `.notEvaluated` until the first
-    /// STATUS_RESPONSE is compared against the log.
+    /// Latest per-reconnect attestation verdict. Drives the Settings
+    /// badge. `.notEvaluated` until the first STATUS_RESPONSE is
+    /// compared against the log.
     private(set) var relayAttestationVerdict: RelayAttestationVerdict = .notEvaluated
+    /// Per-relay trust labels used by outbound fanout. The
+    /// user-facing panel still shows the last status snapshot, but
+    /// one verified sibling must not re-admit a built-in relay that
+    /// reported a mismatched binary.
+    private var relayAttestationVerdictsByHost: [String: RelayAttestationVerdict] = [:]
+    /// Last self-report per host. Needed because the transparency log
+    /// can refresh after STATUS_RESPONSE; outbound policy must then
+    /// re-evaluate every ready relay, not just the last one rendered
+    /// in Settings.
+    private var relayStatusesByHost: [String: RelayStatus] = [:]
 
     /// Re-pair UX: set true after the user explicitly resets their
     /// identity via Settings → Reset everything. Drives a one-shot
@@ -268,11 +274,23 @@ final class ChatStore: NSObject {
     /// the descriptor on the RelayClient itself (which lives in a
     /// SwiftUI-free crypto-core module).
     private var relayDescriptors: [RelayDescriptor] = []
-    /// Subset of `relays` currently in `.connected`. Send-fanout
-    /// targets this set; if it's empty the call is a no-op (the
-    /// outbox retry walk picks it back up once a relay reconnects).
+    /// Subset of `relays` currently in `.connected` and allowed for
+    /// outbound traffic. Built-in relays with a confirmed mismatch
+    /// are skipped; custom relays and temporary unverifiable states
+    /// stay warn-only.
     var readyRelays: [RelayClient] {
-        relays.filter { $0.state == .connected }
+        relays.enumerated().compactMap { index, relay in
+            guard relay.state == .connected,
+                  index < relayDescriptors.count
+            else { return nil }
+            let descriptor = relayDescriptors[index]
+            let verdict = relayAttestationVerdictsByHost[descriptor.host] ?? .notEvaluated
+            guard Self.shouldUseRelayForOutbound(
+                isBundledRelay: isBundledRelay(descriptor),
+                verdict: verdict,
+            ) else { return nil }
+            return relay
+        }
     }
     /// Primary push-token holder. APNs registrations target ONE relay
     /// at a time — registering on N relays would mean N "New message"
@@ -781,10 +799,7 @@ final class ChatStore: NSObject {
                 // STATUS_RESPONSE and the log fetch race on reconnect;
                 // whichever lands second must recompute so the stored
                 // enforceable signal reflects both inputs.
-                if let status = self.relayStatus {
-                    self.relayAttestationVerdict = self.computeAttestationVerdict(for: status)
-                    pzLog("[pizzini] relay attestation verdict (post-log-refresh): \(self.relayAttestationVerdict)")
-                }
+                self.recomputeRelayAttestationVerdictsAfterLogChange()
             } catch let err as TransparencyLog.FetchError {
                 self.transparencyLogError = err
                 pzLog("[pizzini.translog] fetch failed: \(err)")
@@ -792,15 +807,11 @@ final class ChatStore: NSObject {
                 // status is cached, downgrade the verdict accordingly
                 // rather than leaving a stale `.verified` standing on
                 // a log we can no longer confirm.
-                if let status = self.relayStatus {
-                    self.relayAttestationVerdict = self.computeAttestationVerdict(for: status)
-                }
+                self.recomputeRelayAttestationVerdictsAfterLogChange()
             } catch {
                 self.transparencyLogError = .http(error.localizedDescription)
                 pzLog("[pizzini.translog] fetch failed (unexpected): \(error)")
-                if let status = self.relayStatus {
-                    self.relayAttestationVerdict = self.computeAttestationVerdict(for: status)
-                }
+                self.recomputeRelayAttestationVerdictsAfterLogChange()
             }
         }
     }
@@ -841,14 +852,12 @@ final class ChatStore: NSObject {
             return
         }
         let wire = HashChainToken.encode(v2)
-        let count = broadcastToRelays {
-            $0.sendSealed(
-                toPeer: entry.recipientPeerId,
-                sealedCiphertext: entry.sealedCiphertext,
-                ttlSeconds: UInt32(entry.ttl),
-                token: wire,
-            )
-        }
+        let count = sendSealedToRelays(
+            toPeer: entry.recipientPeerId,
+            sealedCiphertext: entry.sealedCiphertext,
+            ttlSeconds: UInt32(entry.ttl),
+            baseToken: wire,
+        )
         var e = entry
         e.retries += 1
         if count > 0 {
@@ -1403,6 +1412,102 @@ final class ChatStore: NSObject {
         return ready.count
     }
 
+    /// Conservative trust policy:
+    /// - clear mismatch on a built-in relay => do not send through it;
+    /// - not-yet-checked/unverifiable => warn but continue, so a
+    ///   temporary log lookup failure does not brick connectivity;
+    /// - custom relays => warn but continue, because they are not
+    ///   required to appear in the bundled operator's log.
+    nonisolated static func shouldUseRelayForOutbound(
+        isBundledRelay: Bool,
+        verdict: RelayAttestationVerdict
+    ) -> Bool {
+        guard isBundledRelay else { return true }
+        switch verdict {
+        case .mismatch, .notEvaluated:
+            // F-TL-01: a bundled relay must produce a STATUS_RESPONSE we can
+            // evaluate before we route sealed traffic (or register push)
+            // through it. A tampered relay that simply never answers
+            // STATUS_REQUEST previously stayed usable forever via
+            // `.notEvaluated`, silently defeating the attestation gate the
+            // bundled fleet relies on. Fail closed: until the relay attests
+            // (`.verified` / `.unverifiable` on a real response), it is not
+            // outbound-eligible. STATUS_REQUEST is sent the moment a relay
+            // reaches `.connected`, so a well-behaved relay leaves
+            // `.notEvaluated` within ~1 RTT; only a withholding relay stays
+            // blocked.
+            return false
+        case .verified, .unverifiable:
+            return true
+        }
+    }
+
+    private func isBundledRelay(_ descriptor: RelayDescriptor) -> Bool {
+        let inFleetMode = state.relayHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard inFleetMode else { return false }
+        return RelayRegistry.trusted.contains {
+            $0.host == descriptor.host && $0.port == descriptor.port
+        }
+    }
+
+    private func recomputeRelayAttestationVerdictsAfterLogChange() {
+        for (host, status) in relayStatusesByHost {
+            relayAttestationVerdictsByHost[host] = computeAttestationVerdict(for: status)
+        }
+        if let status = relayStatus {
+            relayAttestationVerdict = computeAttestationVerdict(for: status)
+            pzLog("[pizzini] relay attestation verdict (post-log-refresh): \(relayAttestationVerdict)")
+        }
+    }
+
+    /// v2 SEND/ACK fanout uses one persisted base token cursor but a
+    /// different chain selector per relay. Relay A sees only its
+    /// scoped chain ID, so replaying the bearer presentation to relay
+    /// B does not find B's registered chain state.
+    private func relayScopedV2TokenWire(_ baseTokenWire: Data, for relay: RelayClient) -> Data {
+        guard let token = HashChainToken.decode(baseTokenWire) else {
+            return baseTokenWire
+        }
+        return HashChainToken.encode(HashChainToken.relayScopedToken(
+            token,
+            relayNamespace: relay.deliveryTokenNamespace,
+        ))
+    }
+
+    @discardableResult
+    func sendSealedToRelays(
+        toPeer peer: Data,
+        sealedCiphertext: Data,
+        ttlSeconds: UInt32,
+        baseToken: Data
+    ) -> Int {
+        broadcastToRelays {
+            $0.sendSealed(
+                toPeer: peer,
+                sealedCiphertext: sealedCiphertext,
+                ttlSeconds: ttlSeconds,
+                token: relayScopedV2TokenWire(baseToken, for: $0),
+            )
+        }
+    }
+
+    @discardableResult
+    private func sendAckToRelays(
+        toPeer peer: Data,
+        sealedCiphertext: Data,
+        ttlSeconds: UInt32,
+        baseToken: Data
+    ) -> Int {
+        broadcastToRelays {
+            $0.sendAck(
+                toPeer: peer,
+                sealedCiphertext: sealedCiphertext,
+                ttlSeconds: ttlSeconds,
+                token: relayScopedV2TokenWire(baseToken, for: $0),
+            )
+        }
+    }
+
     private func scheduleRetryTimer() {
         retryTimer?.invalidate()
         // 30s matches the OutboxEntry.shouldRetry minimum baseline so
@@ -1685,6 +1790,17 @@ final class ChatStore: NSObject {
         // verdict — a banner from the previous network must not
         // outlive the reconnect.
         stopCaptivePortalStallWatcher()
+        // Drop per-host attestation state. These dicts are keyed by
+        // host, so without this a previously-`.verified` built-in relay
+        // would be re-admitted for outbound the instant it reconnects —
+        // before the fresh STATUS_REQUEST issued on `.connected` has a
+        // chance to re-evaluate it. A reconnecting host must re-attest
+        // from `.notEvaluated`, which `shouldUseRelayForOutbound` treats
+        // as fail-closed for built-in relays. (The live-socket-survives
+        // foreground path does not call teardownRelay, so a connection
+        // that never dropped keeps its verdict.)
+        relayAttestationVerdictsByHost.removeAll()
+        relayStatusesByHost.removeAll()
     }
 
     /// Foreground-entry handler. Three cases:
@@ -2226,31 +2342,15 @@ final class ChatStore: NSObject {
             return
         }
         let readyCount = readyRelays.count
-        // AUDIT-DECISION-NEEDED: the SAME `wireToken` (chain_id, index,
-        // value) is broadcast to every relay in the fanout. A v2
-        // delivery token is a pure bearer credential — the relay's
-        // `check_delivery_token` authenticates it against the
-        // recipient's chain state with no binding to the submitting
-        // connection. So a malicious relay in the fleet can replay an
-        // observed token to the sibling relays: the first acceptance
-        // advances `last_index`, and the sender's genuine fan-out copy
-        // then loses to `OutOfRange` on those siblings — a silent
-        // message-suppression / censorship primitive against the
-        // exact adversary the multi-relay fanout exists to neutralise.
-        // The fix is a wire-protocol change (per-relay token minting,
-        // or binding token presentation to the HELLO-authenticated
-        // connection, or a per-relay chain namespace) and needs
-        // design sign-off before it can land — `from_id` binding is
-        // not available because SEND is sealed-sender. Left as the
-        // current broadcast pending that decision.
-        broadcastToRelays {
-            $0.sendSealed(
-                toPeer: contact.identityPub,
-                sealedCiphertext: sealed,
-                ttlSeconds: ttl,
-                token: wireToken,
-            )
-        }
+        // The base token stored in the outbox is scoped to each relay
+        // inside `sendSealedToRelays`. Sibling relays therefore see
+        // different chain IDs for the same chain cursor/value.
+        sendSealedToRelays(
+            toPeer: contact.identityPub,
+            sealedCiphertext: sealed,
+            ttlSeconds: ttl,
+            baseToken: wireToken,
+        )
         diagLog(
             "send",
             "v2 SEND → \(short(contact.identityPub)) "
@@ -2563,14 +2663,12 @@ final class ChatStore: NSObject {
                     )
                     return
                 }
-                broadcastToRelays {
-                    $0.sendSealed(
-                        toPeer: contactId,
-                        sealedCiphertext: sealed,
-                        ttlSeconds: ttl,
-                        token: token,
-                    )
-                }
+                sendSealedToRelays(
+                    toPeer: contactId,
+                    sealedCiphertext: sealed,
+                    ttlSeconds: ttl,
+                    baseToken: token,
+                )
                 entry.relayedAt = now
                 entry.token = Data() // F-505: scrub once relayed
                 outbox.entries[messageId] = entry
@@ -2912,14 +3010,12 @@ final class ChatStore: NSObject {
             return false
         }
         let wireToken = HashChainToken.encode(v2Token)
-        broadcastToRelays {
-            $0.sendSealed(
-                toPeer: peer,
-                sealedCiphertext: sealed,
-                ttlSeconds: UInt32(Contact.chainRefreshCooldown),
-                token: wireToken,
-            )
-        }
+        sendSealedToRelays(
+            toPeer: peer,
+            sealedCiphertext: sealed,
+            ttlSeconds: UInt32(Contact.chainRefreshCooldown),
+            baseToken: wireToken,
+        )
         _ = client
         return true
     }
@@ -2931,7 +3027,10 @@ final class ChatStore: NSObject {
         //    SENDs from this peer can validate.
         broadcastToRelays {
             $0.sendRegisterChain(
-                chainID: chain.chainID,
+                chainID: HashChainToken.relayScopedChainID(
+                    baseChainID: chain.chainID,
+                    relayNamespace: $0.deliveryTokenNamespace,
+                ),
                 root: chain.root,
                 length: UInt32(chain.length),
             )
@@ -3267,14 +3366,12 @@ final class ChatStore: NSObject {
                 pzLog("[pizzini] read-receipt ABORTED — session persist failed; no ciphertext on wire")
                 return
             }
-            broadcastToRelays {
-                $0.sendSealed(
-                    toPeer: contact.identityPub,
-                    sealedCiphertext: sealed,
-                    ttlSeconds: contact.ttlSeconds,
-                    token: token,
-                )
-            }
+            sendSealedToRelays(
+                toPeer: contact.identityPub,
+                sealedCiphertext: sealed,
+                ttlSeconds: contact.ttlSeconds,
+                baseToken: token,
+            )
         } catch {
             pzLog("[pizzini] read-receipt encrypt failed: \(error)")
         }
@@ -4027,7 +4124,12 @@ extension ChatStore: RelayClientDelegate {
         // SHA must match `binarySha256` for the running relay
         // to be considered the audited build.
         Task { @MainActor in
+            guard let relayIndex = self.relays.firstIndex(where: { $0 === client }),
+                  relayIndex < self.relayDescriptors.count
+            else { return }
+            let descriptor = self.relayDescriptors[relayIndex]
             self.relayStatus = status
+            self.relayStatusesByHost[descriptor.host] = status
             pzLog(
                 "[pizzini] relay attest: v\(status.crateVersion) commit=\(status.gitSha)"
                     + " dirty=\(status.gitDirty) sha256=\(self.hex(status.binarySha256))",
@@ -4042,30 +4144,18 @@ extension ChatStore: RelayClientDelegate {
             // gap: the verdict now exists at the connection layer.
             let verdict = self.computeAttestationVerdict(for: status)
             self.relayAttestationVerdict = verdict
+            self.relayAttestationVerdictsByHost[descriptor.host] = verdict
             pzLog("[pizzini] relay attestation verdict: \(verdict)")
 
-            // AUDIT-DECISION-NEEDED: enforcement action on a non-clean
-            // verdict. The verdict above is now computed and stored,
-            // but the protective ACTION is gated on a policy decision
-            // that is not ours to make unilaterally:
-            //   - `.mismatch`  — hard-disconnect this relay? block
-            //     only sends (let receives drain)? or allow a signed,
-            //     time-bounded grace window so a legitimately-new
-            //     deploy that is not yet in the log isn't a
-            //     bootstrapping deadlock?
-            //   - `.unverifiable` — should an un-checkable relay feed
-            //     the SAME interruption path as a mismatched one
-            //     (fail-closed), or only a louder warning?
-            // Both options change user-visible behaviour and the BYO /
-            // new-deploy story, so the enforcement is left as this
-            // marked stub. When the policy lands, the action hooks in
-            // here, keyed off `verdict`; `RelayAttestationView` and
-            // `FAQView` copy must be reconciled with whatever is
-            // chosen (the FAQ currently claims the app "refuses to
-            // talk to" an unattested relay, which is not yet true).
             switch verdict {
-            case .mismatch, .unverifiable:
-                pzLog("[pizzini] relay attestation \(verdict) — enforcement policy pending (AUDIT-DECISION-NEEDED)")
+            case .mismatch:
+                if self.isBundledRelay(descriptor) {
+                    pzLog("[pizzini] relay attestation mismatch for bundled relay — blocking new outbound traffic on this relay")
+                } else {
+                    pzLog("[pizzini] relay attestation mismatch for custom relay — warning only")
+                }
+            case .unverifiable:
+                pzLog("[pizzini] relay attestation unverifiable — warning only until the log can be checked")
             case .verified, .notEvaluated:
                 break
             }
@@ -4439,9 +4529,28 @@ extension ChatStore: RelayClientDelegate {
             pzLog("[pizzini] ACK for unknown messageId \(messageId.map { String(format: "%02x", $0) }.joined())")
             return
         }
+        // F-PAIR-01: an ACK from contact X may only confirm delivery of an
+        // outbox entry addressed TO X. Without this scope check a paired peer
+        // who learned a messageId could forge a delivery confirmation (✓✓) on
+        // a message you sent to a *different* contact. The read-receipt
+        // handler already scopes this way; the ACK path was the outlier.
+        guard Self.ackMayMarkEntry(
+            entryRecipient: entry.recipientPeerId,
+            ackSender: state.contacts[idx].identityPub
+        ) else {
+            pzLog("[pizzini] ACK recipient mismatch for messageId; ignoring")
+            return
+        }
         entry.deliveredAt = Date()
         outbox.entries[messageId] = entry
         Storage.upsertOutboxEntry(entry)
+    }
+
+    /// F-PAIR-01: an inbound ACK from `ackSender` may only mark an outbox
+    /// entry whose recipient is `ackSender`. Pure predicate so the
+    /// authorisation rule is unit-testable independent of `ChatStore` state.
+    nonisolated static func ackMayMarkEntry(entryRecipient: Data, ackSender: Data) -> Bool {
+        entryRecipient == ackSender
     }
 
     /// Periodic walk: re-send unacked entries that satisfy
@@ -4473,14 +4582,12 @@ extension ChatStore: RelayClientDelegate {
                     continue
                 }
                 let wire = HashChainToken.encode(v2)
-                broadcastToRelays {
-                    $0.sendSealed(
-                        toPeer: entry.recipientPeerId,
-                        sealedCiphertext: entry.sealedCiphertext,
-                        ttlSeconds: UInt32(entry.ttl),
-                        token: wire,
-                    )
-                }
+                sendSealedToRelays(
+                    toPeer: entry.recipientPeerId,
+                    sealedCiphertext: entry.sealedCiphertext,
+                    ttlSeconds: UInt32(entry.ttl),
+                    baseToken: wire,
+                )
                 var e = entry
                 e.retries += 1
                 // `relayedAt` records the FIRST time bytes left our
@@ -4589,14 +4696,12 @@ extension ChatStore: RelayClientDelegate {
             // connected to any subset of the fleet. Fan the ACK out
             // so they get ✓✓ via whichever relay's queue holds their
             // session.
-            broadcastToRelays {
-                $0.sendAck(
-                    toPeer: toPeer,
-                    sealedCiphertext: sealed,
-                    ttlSeconds: Self.defaultTTLSeconds,
-                    token: token,
-                )
-            }
+            sendAckToRelays(
+                toPeer: toPeer,
+                sealedCiphertext: sealed,
+                ttlSeconds: Self.defaultTTLSeconds,
+                baseToken: token,
+            )
         } catch {
             pzLog("[pizzini] failed to emit ACK to \(self.short(toPeer)): \(error)")
         }

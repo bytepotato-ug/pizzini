@@ -14,8 +14,9 @@ struct OutboxEntry: Codable, Sendable {
     let messageId: Data         // 16 bytes
     let recipientPeerId: Data
     let sealedCiphertext: Data
-    /// The 52-byte v2 hash-chain delivery token attached to the
-    /// original SEND. **F-505**: scrubbed to empty once
+    /// The 52-byte v2 hash-chain base token minted for the original
+    /// SEND. Fanout replaces its chain ID with a relay-scoped chain ID
+    /// immediately before write. **F-505**: scrubbed to empty once
     /// `relayedAt != nil` — the relay has accepted the bytes, and
     /// storing the token onward only widens the post-extraction
     /// replay surface against the per-(recipient, chain_id) state.

@@ -248,7 +248,7 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
         case .relayVisibility:   return "What the relay can see"
         case .runYourOwnRelay:   return "Running your own relay"
         case .transparencyLog:   return "The transparency log"
-        case .noPreview:         return "Why Pizzini doesn't preview files inline"
+        case .noPreview:         return "Why attachment preview defaults off"
         case .mediaStripping:    return "What's stripped from images and videos"
         case .prnu:              return "The sensor-fingerprint warning"
         case .documentMetadata:  return "Why documents can still identify you"
@@ -420,14 +420,22 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             return """
             Pizzini publishes a signed log of every relay binary the \
             operator deploys, signed with the operator's Ed25519 key. \
-            Your phone checks each relay's running binary against the \
-            log on reconnect.
+            On reconnect your phone checks the binary hash each relay \
+            REPORTS about itself against that log. This detects a relay \
+            running an unsigned or unannounced build — it does NOT prove \
+            a relay host hasn't been compromised, because a tampered host \
+            can report a genuine signed hash while running modified code. \
+            True tamper-proof attestation needs hardware support and is \
+            not yet shipped.
 
-            If a relay is running an unannounced build, Settings → \
-            Relay attestation flags it as "mismatch". Today this is \
-            detection only — the app surfaces the warning but doesn't \
-            yet refuse to talk to a mismatched relay. Enforcement is \
-            pending a policy decision.
+            If a built-in relay reports a hash that isn't in the log, \
+            Settings → Relay attestation flags it as "mismatch" and \
+            Pizzini stops sending new traffic through that relay. A \
+            built-in relay that won't report a hash at all is also held \
+            back from new traffic until it does. It keeps temporary \
+            "could not check" cases warn-only so a blocked log fetch does \
+            not stop messaging. Custom relays stay warning-only because \
+            they are not listed in the built-in operator's log.
 
             The log itself is fetched over plain HTTPS, NOT through \
             Tor. This is one of two documented clearnet exceptions in \
@@ -437,18 +445,23 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
 
         case .noPreview:
             return """
-            Pizzini never renders a received file inside the app. You \
-            see the filename, the size, and a Save button.
+            Attachment preview defaults off. In that strict mode \
+            Pizzini renders no received file bytes inside the app — \
+            you see the filename, the size, and a Save button.
 
             This rule exists because of attacks like Pegasus (2021), \
             where a maliciously-crafted image could take over an \
             iPhone the moment iMessage previewed it — the victim \
             never tapped anything. Any code that parses incoming \
-            bytes is a potential exploit surface, so we run zero of it.
+            bytes is a potential exploit surface.
 
             When you tap "Save to Files", the bytes are handed off to \
             iOS. Apple's own services then decode them in sandboxed \
-            processes.
+            processes. Settings also offers explicit preview opt-ins: \
+            QuickLook hands a file to Apple's preview service, and \
+            inline thumbnails render supported images in Pizzini only \
+            after a tap. Those modes trade parser hardening for \
+            convenience.
             """
 
         case .mediaStripping:
@@ -738,14 +751,16 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
         case .relayVisibility:
             return """
             Most relay state is in memory only and is wiped on \
-            restart: live route table, verify-key cache, hashcash \
-            buckets, token replay set. Two pieces persist across \
+            restart: live route table, verify-key cache, HELLO replay \
+            set, hashcash buckets. Other bounded state persists across \
             restarts under ChaCha20-Poly1305 with 0600 permissions:
 
             • The offline-message queue (sealed ciphertexts waiting \
               for the recipient to come online — per-peer cap, TTL \
               up to 7 days).
             • The APNs push-token map (30 days).
+            • V2 chain-validator cursors and bundle-request rate \
+              buckets, so restart does not reset replay or rate state.
 
             Without that persistence, a relay reboot would silently \
             drop messages and break push for paired devices.
@@ -942,8 +957,9 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             return """
             After pairing, you mint a 32-byte chain seed for each \
             contact and register the root with each relay in the \
-            fleet. Every outgoing message derives one delivery token \
-            by hashing one step along the chain (BLAKE3).
+            fleet under a relay-specific chain ID. Every outgoing \
+            message derives one delivery token by hashing one step \
+            along the chain (BLAKE3).
 
             The relay verifies that the token hash-chains back to \
             your registered root. A hostile peer cannot forge a \

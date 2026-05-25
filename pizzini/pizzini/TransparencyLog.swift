@@ -516,13 +516,12 @@ extension TransparencyLog {
         return entries
     }
 
-    /// Build a `URLSession` that routes every request through Tor's
-    /// local SOCKS5 port. The Tor daemon must be bootstrapped — this
-    /// throws otherwise. Audit notes that the transparency-log fetch
-    /// was the only non-Tor egress in the app; the fix routes it
-    /// through the same anonymising plane the relay traffic already
-    /// uses, so a Cloudflare/GitHub observer learns nothing more
-    /// about the user than "a Tor exit fetched the log."
+    /// Build a `URLSession` that routes an onion-hosted transparency
+    /// log request through Tor's local SOCKS5 port. The Tor daemon
+    /// must be bootstrapped — this throws otherwise. The default
+    /// GitHub-hosted log is clearnet and deliberately uses
+    /// `URLSession.shared` above; an operator-provided onion mirror
+    /// reaches this helper instead.
     ///
     /// The session is constructed on every fetch (rather than
     /// cached) so a Tor restart with a new SOCKS port — rare, but

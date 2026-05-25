@@ -13,6 +13,7 @@ use core::ffi::c_char;
 use libsignal_protocol::{IdentityKeyPair, PublicKey};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
+use zeroize::Zeroize;
 
 mod hashcash;
 mod store;
@@ -385,9 +386,15 @@ unsafe fn write_blob<F: FnOnce(&DeviceStore) -> Vec<u8>>(
     }
     // SAFETY: caller asserted store is live.
     let s = unsafe { &*store };
-    let bytes = accessor(s);
+    let mut bytes = accessor(s);
     // SAFETY: out_buf/out_len asserted valid.
-    unsafe { copy_or_size_out(&bytes, out_buf, out_buf_cap, out_len) }
+    let rc = unsafe { copy_or_size_out(&bytes, out_buf, out_buf_cap, out_len) };
+    // F-CP-01: this path returns the serialized IdentityKeyPair (private
+    // half) for `pizzini_store_identity_keypair`. Scrub the Rust-side copy
+    // before its heap is freed so a plaintext private key does not linger in
+    // freed memory. Harmless (just zeroes) for the public-bytes accessors.
+    bytes.zeroize();
+    rc
 }
 
 /// Snapshot the entire store (identity + prekeys + sessions) to a versioned
@@ -411,12 +418,18 @@ pub unsafe extern "C" fn pizzini_store_serialize(
     // since v3 — `InMemSenderKeyStore.load_sender_key` is declared with
     // `&mut self` on the trait, even though it only clones internally.
     let s = unsafe { &mut *store };
-    let bytes = match s.serialize() {
+    let mut bytes = match s.serialize() {
         Ok(b) => b,
         Err(_) => return PIZZINI_ERR_INTERNAL,
     };
     // SAFETY: out_buf/out_len asserted valid.
-    unsafe { copy_or_size_out(&bytes, out_buf, out_buf_cap, out_len) }
+    let rc = unsafe { copy_or_size_out(&bytes, out_buf, out_buf_cap, out_len) };
+    // F-CP-01: the full serialized store holds the identity private key, all
+    // prekey private records, and every Double-Ratchet session. Scrub the
+    // Rust-side copy after handing the bytes to the caller so the complete
+    // secret state is not left in freed heap.
+    bytes.zeroize();
+    rc
 }
 
 /// Idempotently track an identity_pub. Called by the host right after

@@ -1,16 +1,17 @@
-//! Pizzini relay — development build (LAN TCP).
+//! Pizzini relay — Tor onion-service backend.
 //!
-//! Hard rules (production):
-//! - No persistent state about clients or messages.
-//! - No clearnet bind. Listens on a Tor onion address only.
-//! - No logging that survives a process restart.
+//! Production posture:
+//! - Bind loopback by default; system Tor's `HiddenServicePort` owns the
+//!   public `.onion` surface and forwards to this listener.
+//! - No client accounts and no plaintext message bodies.
+//! - Persist only encrypted restart-survival state needed for offline
+//!   delivery, APNs wakeups, and delivery-token/rate-limit continuity.
+//! - Keep peer-id-aware diagnostics behind `debug_assertions` so a release
+//!   relay does not write routing metadata to stdout/stderr.
 //!
-//! THIS BUILD VIOLATES THE FIRST TWO. It is a *dev relay* meant only for
-//! sim ↔ phone testing on a trusted LAN. Bytes traveling over the wire are
-//! libsignal-encrypted, so the relay sees only ciphertext + routing
-//! identifiers — but routing identifiers are still observable. The
-//! production relay needs a separate task: bind via `arti-client` /
-//! `tor-hsservice` to an ephemeral onion service, drop the clearnet listener.
+//! Dev workflows can override `PIZZINI_RELAY_BIND` for simulator/LAN
+//! testing. That exposes routing identifiers to the chosen network even
+//! though message bodies remain libsignal ciphertext.
 //!
 //! ## Wire protocol v2 (length-prefixed framing, big-endian)
 //!
@@ -90,18 +91,12 @@
 //! For our stateless relay, both peers must be online for first contact.
 //! ```
 //!
-//! Stateless-ish: if the recipient is not currently connected, the SEND
-//! frame is held in an *ephemeral, in-memory* per-peer queue (capped
-//! size, capped age — no disk persistence, process restart wipes
-//! everything). When the recipient HELLOs, the queue drains in order.
-//! Bundle frames are NOT queued — bundle exchange is a first-contact
-//! handshake and both peers must be online for it.
-//!
-//! The queue is consistent with the "stateless server" hard rule: there
-//! are no per-user accounts, no long-term state, no on-disk records that
-//! survive a process restart. The queue only buffers in-flight encrypted
-//! routing frames the relay was already going to forward — same
-//! threat-profile as the live route table itself.
+//! If the recipient is not currently connected, the SEND frame is held in
+//! a capped per-peer queue. Queue bytes persist across relay restarts in an
+//! encrypted state file so an offline delivery does not vanish on deploy;
+//! per-frame TTL and global queue caps bound that state. Bundle frames are
+//! NOT queued — bundle exchange is a first-contact handshake and both
+//! peers must be online for it.
 //!
 //! Push remains a wake-up: if APNs is configured and the recipient has
 //! REGISTER_PUSH'd, we fire a payload-opaque "New message" push so iOS
@@ -1172,10 +1167,7 @@ async fn handle_connection(
     // half — typically a network attacker squatting another peer's
     // peer_id to drain queued mail or DoS token verification.
     if let Err(e) = verify_hello_possession_proof(&parsed_hello, &hello_replays).await {
-        eprintln!(
-            "[{peer_addr}] HELLO possession proof rejected for {}: {e}",
-            short_hex(&parsed_hello.peer_id),
-        );
+        eprintln!("[{peer_addr}] HELLO possession proof rejected: {e}");
         return Err(invalid(&format!("HELLO possession proof failed: {e}")));
     }
     let peer_id = parsed_hello.peer_id;
@@ -1394,10 +1386,7 @@ async fn read_loop(
                 let reg = match parse_register_chain(&frame[1..], self_id) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!(
-                            "malformed REGISTER_CHAIN from {}: {e}",
-                            short_hex(self_id),
-                        );
+                        eprintln!("malformed REGISTER_CHAIN: {e}");
                         continue;
                     }
                 };
@@ -1432,6 +1421,12 @@ async fn read_loop(
                         reg.length,
                         chain_validator_store::MAX_CHAIN_LENGTH,
                     ),
+                    chain_validator_store::RegisterOutcome::RejectedCap => dev_peer_elog!(
+                        "REGISTER_CHAIN from {}: chain cap reached; refused (per-peer {} / global {})",
+                        short_hex(self_id),
+                        chain_validator_store::MAX_CHAINS_PER_PEER,
+                        chain_validator_store::MAX_TOTAL_CHAINS,
+                    ),
                 }
             }
             FRAME_TYPE_DEREGISTER_PUSH => {
@@ -1443,8 +1438,7 @@ async fn read_loop(
                 // no entry just no-ops here.
                 if frame.len() != 1 {
                     eprintln!(
-                        "malformed DEREGISTER_PUSH from {}: trailing {} bytes",
-                        short_hex(self_id),
+                        "malformed DEREGISTER_PUSH: trailing {} bytes",
                         frame.len() - 1
                     );
                     continue;
@@ -1594,10 +1588,7 @@ async fn read_loop(
                             // are still bounded; only the persist
                             // failed. Don't drop the connection over
                             // an I/O hiccup.
-                            eprintln!(
-                                "[pizzini-relay] warn: bundle-req rate persist failed for {}: {e}",
-                                short_hex(&parsed.to_id),
-                            );
+                            eprintln!("[pizzini-relay] warn: bundle-req rate persist failed: {e}");
                             true
                         }
                     }
@@ -1844,10 +1835,7 @@ async fn enqueue_pending(
             // (already best-effort) continues to work; only the
             // cross-restart guarantee is at risk. Better than
             // dropping the connection over an I/O hiccup.
-            eprintln!(
-                "[pizzini-relay] warn: pending enqueue persist failed for {}: {e}",
-                short_hex(recipient),
-            );
+            eprintln!("[pizzini-relay] warn: pending enqueue persist failed: {e}");
         }
     }
 }
@@ -1880,10 +1868,7 @@ async fn drain_pending(peer_id: &[u8], pending: &Pending, routes: &Routes) {
         match store.drain(peer_id) {
             Ok(q) => q,
             Err(e) => {
-                eprintln!(
-                    "[pizzini-relay] warn: pending drain persist failed for {}: {e}",
-                    short_hex(peer_id),
-                );
+                eprintln!("[pizzini-relay] warn: pending drain persist failed: {e}");
                 // The in-memory state may still hold the queue (drain
                 // returns Err only on the post-persist path). Return
                 // empty here rather than partially forward; the
@@ -2239,10 +2224,17 @@ async fn verify_hello_possession_proof(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let delta = (h.timestamp_secs as i64) - (now_secs as i64);
-    if delta.abs() > HELLO_MAX_CLOCK_SKEW_SECS {
+    // F-MEM-05: the skew check is done entirely in u64 space.
+    // `h.timestamp_secs` is an unvalidated attacker-controlled u64 from the
+    // wire; the previous `(ts as i64) - (now as i64)` plus `i64::abs()` could
+    // overflow (subtract-overflow for ts >= 2^63, or `i64::MIN.abs()`), and
+    // with `overflow-checks = true` + `panic = "abort"` that aborted the whole
+    // relay before any signature was even checked — a remote unauthenticated
+    // DoS. `u64::abs_diff` is total and cannot overflow.
+    let skew_secs = h.timestamp_secs.abs_diff(now_secs);
+    if skew_secs > HELLO_MAX_CLOCK_SKEW_SECS as u64 {
         return Err(format!(
-            "timestamp out of range (Δ={delta}s, |max|={HELLO_MAX_CLOCK_SKEW_SECS}s)"
+            "timestamp out of range (|Δ|={skew_secs}s, |max|={HELLO_MAX_CLOCK_SKEW_SECS}s)"
         ));
     }
     // peer_id IS the libsignal IdentityKey wire form (1-byte type
@@ -2798,6 +2790,57 @@ mod tests {
         assert!(parse_hello(&body).is_err());
     }
 
+    /// F-MEM-05 regression: an attacker-controlled HELLO `timestamp_secs`
+    /// must never reach signed-i64 arithmetic that can overflow. The skew
+    /// check is done in u64 (`abs_diff`), so even the worst-case values
+    /// (2^63 → subtract-underflow; the value that makes the old delta equal
+    /// i64::MIN → `abs()` overflow; u64::MAX) are rejected cleanly instead of
+    /// aborting the whole relay under `overflow-checks` + `panic = "abort"`.
+    /// Reached before any signature check, so a dummy peer_id/sig is fine.
+    #[tokio::test]
+    async fn hello_extreme_timestamp_is_rejected_not_panic() {
+        fn hello_body_with_timestamp(ts: u64) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.push(PROTOCOL_VERSION);
+            body.extend_from_slice(&(33u16.to_be_bytes()));
+            body.extend_from_slice(&[1u8; 33]); // peer_id: ts check precedes decode
+            body.extend_from_slice(&(VERIFY_KEY_LEN as u16).to_be_bytes());
+            body.extend_from_slice(&[2u8; VERIFY_KEY_LEN]);
+            body.extend_from_slice(&ts.to_be_bytes());
+            body.extend_from_slice(&(HELLO_NONCE_LEN as u16).to_be_bytes());
+            body.extend_from_slice(&[0u8; HELLO_NONCE_LEN]);
+            body.extend_from_slice(&64u16.to_be_bytes());
+            body.extend_from_slice(&[0u8; 64]);
+            body
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
+        for ts in [
+            0x8000_0000_0000_0000u64,            // (ts as i64) - now underflows i64
+            (i64::MIN as u64).wrapping_add(now),  // old delta == i64::MIN => abs() overflows
+            u64::MAX,
+        ] {
+            let parsed = parse_hello(&hello_body_with_timestamp(ts)).expect("parses structurally");
+            let err = verify_hello_possession_proof(&parsed, &replays)
+                .await
+                .expect_err("extreme timestamp must be rejected, not panic");
+            assert!(err.contains("timestamp out of range"), "got: {err}");
+        }
+        // A within-window timestamp passes the skew gate and fails later at
+        // the all-ones peer_id decode — NOT at the timestamp check.
+        let parsed = parse_hello(&hello_body_with_timestamp(now)).expect("parses");
+        let err = verify_hello_possession_proof(&parsed, &replays)
+            .await
+            .expect_err("dummy peer_id still fails downstream");
+        assert!(
+            !err.contains("timestamp out of range"),
+            "in-window timestamp wrongly rejected: {err}"
+        );
+    }
+
     #[test]
     fn hashcash_accepts_within_clock_skew_window() {
         // Compute a proof that targets the CURRENT hour, then verify
@@ -2973,6 +3016,112 @@ mod tests {
             .await
             .expect_err("tampered value must fail");
         assert!(err.contains("chain"));
+    }
+
+    /// Each relay in the fleet owns an independent replay cursor. The
+    /// app registers a distinct chain ID per relay for one base chain,
+    /// so a bearer presentation copied from one relay does not find a
+    /// sibling relay's chain even though the index, root, and chain
+    /// value are otherwise the same.
+    #[tokio::test]
+    async fn v2_relay_scoped_chain_id_blocks_sibling_token_preemption() {
+        use chain_validator_store::*;
+
+        fn fresh_validator_dir(label: &str) -> std::path::PathBuf {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!("pizzini-relay-{label}-{nanos}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        let observer_relay: ChainValidators = Arc::new(Mutex::new(
+            ChainValidatorStore::load_or_create(
+                &fresh_validator_dir("token-observer"),
+                CHAIN_VALIDATOR_IDLE_TTL,
+            )
+            .unwrap(),
+        ));
+        let sibling_relay: ChainValidators = Arc::new(Mutex::new(
+            ChainValidatorStore::load_or_create(
+                &fresh_validator_dir("token-sibling"),
+                CHAIN_VALIDATOR_IDLE_TTL,
+            )
+            .unwrap(),
+        ));
+
+        let seed = [0x19u8; 32];
+        let length: u32 = 4;
+        let mut positions: Vec<[u8; 32]> = Vec::with_capacity(length as usize + 1);
+        positions.push(seed);
+        let mut cur = seed;
+        for _ in 0..length {
+            let out = blake3::hash(&cur);
+            let mut next = [0u8; 32];
+            next.copy_from_slice(out.as_bytes());
+            positions.push(next);
+            cur = next;
+        }
+        let root = positions[length as usize];
+        let to_id = vec![0xA5; 33];
+        let observer_chain_id = [0xB6; 16];
+        let sibling_chain_id = [0xC7; 16];
+        observer_relay
+            .lock()
+            .await
+            .register(ChainRegistration {
+                peer_id: to_id.as_slice().try_into().unwrap(),
+                chain_id: observer_chain_id,
+                root,
+                length,
+            })
+            .unwrap();
+        sibling_relay
+            .lock()
+            .await
+            .register(ChainRegistration {
+                peer_id: to_id.as_slice().try_into().unwrap(),
+                chain_id: sibling_chain_id,
+                root,
+                length,
+            })
+            .unwrap();
+
+        let mut observer_token_wire = Vec::with_capacity(TOKEN_V2_LEN);
+        observer_token_wire.extend_from_slice(&observer_chain_id);
+        observer_token_wire.extend_from_slice(&1u32.to_be_bytes());
+        observer_token_wire.extend_from_slice(&positions[(length - 1) as usize]);
+        let observer_parsed = ParsedSealed {
+            to_id: to_id.clone(),
+            ttl_seconds: 3600,
+            token: observer_token_wire,
+            sealed_offset: 0,
+        };
+
+        check_delivery_token(&observer_parsed, &observer_relay)
+            .await
+            .expect("the observing relay accepts its scoped bearer token");
+        let err = check_delivery_token(&observer_parsed, &sibling_relay)
+            .await
+            .expect_err("a sibling relay must not know the observer chain ID");
+        assert!(err.contains("unknown chain"));
+
+        let mut sibling_token_wire = Vec::with_capacity(TOKEN_V2_LEN);
+        sibling_token_wire.extend_from_slice(&sibling_chain_id);
+        sibling_token_wire.extend_from_slice(&1u32.to_be_bytes());
+        sibling_token_wire.extend_from_slice(&positions[(length - 1) as usize]);
+        let sibling_parsed = ParsedSealed {
+            to_id,
+            ttl_seconds: 3600,
+            token: sibling_token_wire,
+            sealed_offset: 0,
+        };
+
+        check_delivery_token(&sibling_parsed, &sibling_relay)
+            .await
+            .expect("the sender's genuine sibling-scoped token still validates");
     }
 
     // ─── F-203 fix-review attack vectors ──────────────────────────────────

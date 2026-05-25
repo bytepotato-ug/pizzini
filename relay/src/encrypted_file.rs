@@ -158,14 +158,7 @@ pub fn decrypt_with_aad(
 /// prior canonical file intact; the rename itself is atomic on POSIX
 /// (and on macOS APFS / Linux ext4 / btrfs / xfs).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension(
-        format!(
-            "{}.tmp",
-            path.extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("tmp"),
-        ),
-    );
+    let tmp = unique_tmp_path(path);
     {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(bytes)?;
@@ -173,7 +166,37 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
     restrict_permissions(&tmp, 0o600);
     fs::rename(&tmp, path)?;
+    // F-RP-04: fsync the parent directory so the rename (the directory entry
+    // now pointing at the new inode) is durable. Without this, a crash after
+    // the rename but before the directory metadata is flushed can roll the
+    // file back to its prior contents on some filesystems — silently losing a
+    // committed replay-cursor / offline-queue / rate-bucket update. Best
+    // effort: not every platform lets you fsync a directory handle.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+    }
     Ok(())
+}
+
+/// F-RP-05: build a per-process, per-call-unique temp path for `write_atomic`.
+/// The previous fixed `<path>.tmp` meant two relay processes (or concurrent
+/// writers) sharing one state dir would write the SAME temp file and could
+/// rename a half-written temp over a committed snapshot, corrupting it. The
+/// pid + monotonic counter make the temp name unique so each in-flight write
+/// is private until its atomic rename.
+fn unique_tmp_path(path: &Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let base_ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("dat");
+    path.with_extension(format!("{base_ext}.{}.{}.tmp", std::process::id(), seq))
 }
 
 /// chmod helper. POSIX-only — on Windows / other non-Unix this is a
@@ -299,5 +322,38 @@ mod tests {
         }
         assert_eq!(hex_decode("abc"), None);
         assert_eq!(hex_decode("zz"), None);
+    }
+
+    #[test]
+    fn unique_tmp_path_differs_per_call() {
+        // F-RP-05: successive temp paths for the same target must differ so
+        // two writers can't share (and clobber) one in-flight temp file.
+        let p = Path::new("/tmp/pizzini-state/foo.bin");
+        let a = unique_tmp_path(p);
+        let b = unique_tmp_path(p);
+        assert_ne!(a, b, "temp paths must be unique per call");
+        assert!(a.to_string_lossy().ends_with(".tmp"));
+        assert!(b.to_string_lossy().ends_with(".tmp"));
+        assert_ne!(a, p.to_path_buf());
+    }
+
+    #[test]
+    fn write_atomic_round_trips_and_leaves_no_temp() {
+        // F-RP-04/05: write_atomic commits the bytes, an overwrite replaces
+        // them, and the rename consumes the unique temp so no stray *.tmp is
+        // left behind in the state dir.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("state.bin");
+        write_atomic(&path, b"first").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        write_atomic(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .map(|e| e.file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files left behind: {leftovers:?}");
     }
 }

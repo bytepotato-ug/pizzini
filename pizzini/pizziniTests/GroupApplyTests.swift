@@ -411,6 +411,38 @@ struct ChatGroupApplyQueueTests {
         #expect(env.group.displayName == "stage-1")
     }
 
+    @Test("queued op rechecks the member-set witness when the missing parent arrives")
+    func queuedOpRechecksMemberSetRoot() throws {
+        var env = try Env.bootstrap()
+        let op1 = try env.adminSign(kind: .rename(newName: "honest-parent"))
+        let ghostId = Data(repeating: 0xEE, count: GroupOp.identityKeySize)
+        var ghostedMembers = env.group.members
+        ghostedMembers.append(GroupMember(
+            peerId: ghostId,
+            displayName: "ghost",
+            role: .member,
+            joinedAtEpoch: 0,
+            status: .active,
+            addedBy: env.aliceId,
+        ))
+        let ghostRoot = ChatGroup.memberSetRoot(of: ghostedMembers)
+        let op2 = try realSignedOp(
+            by: env.alice,
+            groupId: env.group.id,
+            epoch: 2,
+            parent: op1.digest(),
+            kind: .rename(newName: "ghost-child"),
+            priorMemberSetRoot: ghostRoot,
+        )
+
+        env.expectQueued(env.group.apply(op2), atEpoch: 2)
+        env.expectApplied(env.group.apply(op1), atEpoch: 1)
+
+        #expect(env.group.currentEpoch == 1)
+        #expect(env.group.displayName == "honest-parent")
+        #expect(env.group.pendingOps.isEmpty)
+    }
+
     @Test("the queue is bounded — a flood of future-epoch ops doesn't grow unboundedly")
     func boundedQueue() throws {
         var env = try Env.bootstrap()
