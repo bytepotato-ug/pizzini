@@ -98,6 +98,45 @@ struct AttachmentThumbnailGuardsTests {
         ))
     }
 
+    // MARK: - Decompression-bomb pixel budget (F-ATT-02)
+
+    @Test("A normal phone photo is within the pixel budget")
+    func normalPhotoWithinBudget() {
+        // 12 MP (4032×3024) and a 50 MP shot both pass.
+        #expect(AttachmentThumbnail.isWithinPixelBudget(width: 4032, height: 3024))
+        #expect(AttachmentThumbnail.isWithinPixelBudget(width: 8160, height: 6120))
+    }
+
+    @Test("A decompression-bomb dimension is rejected")
+    func bombDimensionsRejected() {
+        // 30000×30000 ≈ 900 MP → ~3.6 GB decoded. Must fail before decode.
+        #expect(!AttachmentThumbnail.isWithinPixelBudget(width: 30000, height: 30000))
+        // Just over the budget on one axis.
+        #expect(!AttachmentThumbnail.isWithinPixelBudget(
+            width: Int(AttachmentThumbnail.maxSourcePixels) + 1, height: 1,
+        ))
+    }
+
+    @Test("Exactly at the pixel budget is accepted; one over is rejected")
+    func pixelBudgetBoundary() {
+        let max = Int(AttachmentThumbnail.maxSourcePixels)
+        #expect(AttachmentThumbnail.isWithinPixelBudget(width: max, height: 1))
+        #expect(!AttachmentThumbnail.isWithinPixelBudget(width: max / 2 + 1, height: 2))
+    }
+
+    @Test("Non-positive dimensions are rejected")
+    func nonPositiveDimensionsRejected() {
+        #expect(!AttachmentThumbnail.isWithinPixelBudget(width: 0, height: 100))
+        #expect(!AttachmentThumbnail.isWithinPixelBudget(width: 100, height: 0))
+        #expect(!AttachmentThumbnail.isWithinPixelBudget(width: -1, height: -1))
+    }
+
+    @Test("Downsample target is bounded to a sane long edge")
+    func thumbnailMaxPixelSizeBounded() {
+        #expect(AttachmentThumbnail.thumbnailMaxPixelSize > 0)
+        #expect(AttachmentThumbnail.thumbnailMaxPixelSize <= 4096)
+    }
+
     // MARK: - Whitelist
 
     @Test("Whitelisted extensions are accepted")

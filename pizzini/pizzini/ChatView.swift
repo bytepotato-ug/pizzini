@@ -1735,6 +1735,7 @@ struct AttachmentRowCard: View {
             DocumentInteractionPresenter(
                 isPresented: $presentingShare,
                 url: resolveURL(info),
+                allowPreviewFallback: previewMode.allowsInAppRender,
             )
         )
     }
@@ -1815,6 +1816,10 @@ private struct QLPreviewWrapper: UIViewControllerRepresentable {
 struct DocumentInteractionPresenter: UIViewControllerRepresentable {
     @Binding var isPresented: Bool
     let url: URL?
+    /// When false (preview mode `.off`), the QuickLook `presentPreview`
+    /// fallback is suppressed so a "Save to Files" tap can never render
+    /// received bytes (F-ATT-01).
+    var allowPreviewFallback: Bool = false
 
     func makeUIViewController(context: Context) -> UIViewController {
         UIViewController()
@@ -1830,10 +1835,12 @@ struct DocumentInteractionPresenter: UIViewControllerRepresentable {
             in: uiViewController.view,
             animated: true,
         )
-        // If iOS refused the menu (no apps registered for this UTI),
-        // fall back to the standard preview-options sheet so the user
-        // can still pick "Save to Files".
-        if !presented {
+        // If iOS refused the menu (no apps registered for this UTI), fall
+        // back to the preview sheet only when the user has opted into
+        // rendering. Under `.off`, `presentPreview` would render the bytes
+        // via QuickLook — exactly what the strict posture forbids — so we
+        // suppress it (F-ATT-01).
+        if !presented, allowPreviewFallback {
             _ = controller.presentPreview(animated: true)
         }
         DispatchQueue.main.async {

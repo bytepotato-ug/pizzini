@@ -544,6 +544,14 @@ enum AttachmentPreviewMode: String, Codable, Sendable, CaseIterable {
         case .inlineThumbnail: return 2
         }
     }
+
+    /// Whether a Pizzini-initiated path may render received attachment
+    /// bytes (in-process or via QuickLook XPC). `.off` must never render —
+    /// that is the whole promise of the strict default. Gates both the
+    /// QuickLook preview button and the Save-to-Files `presentPreview`
+    /// fallback (F-ATT-01), so a user who left preview off can't be routed
+    /// into a QuickLook render by tapping "Save to Files".
+    var allowsInAppRender: Bool { self != .off }
 }
 
 /// Everything the UI needs that lives outside the libsignal store. Encoded

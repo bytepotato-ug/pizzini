@@ -132,6 +132,43 @@ struct TransparencyLogTests {
         }
     }
 
+    @Test("parseSignedAt accepts both whole-second and fractional-second UTC")
+    func parseSignedAtBothForms() {
+        // Current signer emits whole-second; a future one may emit
+        // fractional. Both must parse, else maxSignedAt goes nil and
+        // refresh bricks fail-closed (F-TL-07).
+        #expect(TransparencyLog.parseSignedAt("2026-05-13T09:56:16Z") != nil)
+        #expect(TransparencyLog.parseSignedAt("2026-05-13T09:56:16.123Z") != nil)
+        #expect(TransparencyLog.parseSignedAt("not-a-timestamp") == nil)
+    }
+
+    @Test("rollback watermark persists in a durable (non-evictable) store")
+    func watermarkDurableRoundTrip() throws {
+        // F-TL-03: the watermark lives in UserDefaults, not Caches, so
+        // disk-pressure eviction can't reset the rollback floor. Use a
+        // throwaway suite so the test never touches the real defaults.
+        let suite = "test-watermark-\(UUID().uuidString)"
+        let d = try #require(UserDefaults(suiteName: suite))
+        defer { d.removePersistentDomain(forName: suite) }
+
+        let t1 = Date(timeIntervalSince1970: 1_700_000_000)
+        TransparencyLog.storeWatermark(t1, defaults: d)
+        let loaded = try #require(TransparencyLog.loadWatermark(defaults: d))
+        #expect(abs(loaded.timeIntervalSince1970 - t1.timeIntervalSince1970) < 0.001)
+
+        // Survives a fresh handle on the same suite (≈ process restart):
+        // proves the value is persisted, not held only in memory.
+        let d2 = try #require(UserDefaults(suiteName: suite))
+        let reloaded = try #require(TransparencyLog.loadWatermark(defaults: d2))
+        #expect(abs(reloaded.timeIntervalSince1970 - t1.timeIntervalSince1970) < 0.001)
+
+        // A newer watermark overwrites the floor.
+        let t2 = Date(timeIntervalSince1970: 1_800_000_000)
+        TransparencyLog.storeWatermark(t2, defaults: d)
+        let bumped = try #require(TransparencyLog.loadWatermark(defaults: d))
+        #expect(abs(bumped.timeIntervalSince1970 - t2.timeIntervalSince1970) < 0.001)
+    }
+
     @Test("contains(binarySha256Hex:) is case-insensitive on the hex compare")
     func containsCaseInsensitive() {
         let entry = TransparencyLog.SignedEntry(

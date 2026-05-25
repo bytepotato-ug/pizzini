@@ -447,16 +447,11 @@ public final class RelayClient: @unchecked Sendable {
         }
         // **D1 Tor-only enforcement.** The single chokepoint for the
         // production posture: any host that isn't a strictly-validated
-        // v3 onion routes through `startTorConnection` below; everything
-        // else takes the direct path. A naive `.hasSuffix(".onion")`
-        // gate is bypassable (Unicode look-alikes, trailing whitespace,
-        // mixed case, `evil.com.onion`), so we use the OnionHost
-        // canonicaliser instead. The direct path is gated behind a
-        // compile-time `RELAY_ALLOW_DIRECT_TCP` flag so production
-        // builds physically cannot reach `startDirectConnection`. Dev
-        // builds (Xcode "Debug" config or `swift test`) flip the flag
-        // on for the LAN-loopback test harness in
-        // `RelayClientLanTests`.
+        // v3 onion routes through `startTorConnection` below. A naive
+        // `.hasSuffix(".onion")` gate is bypassable (Unicode look-alikes,
+        // trailing whitespace, mixed case, `evil.com.onion`), so we use the
+        // OnionHost canonicaliser: anything that isn't a canonical v3 onion
+        // is rejected. There is no clearnet/direct-TCP path (F-TOR-01).
         if let canonical = OnionHost.canonical(host) {
             // Arm the single end-to-end dial budget before the
             // multi-phase onion setup begins. Disarmed on the next
@@ -466,11 +461,9 @@ public final class RelayClient: @unchecked Sendable {
             startTorConnection(host: canonical, port: nwPort)
             return
         }
-        #if RELAY_ALLOW_DIRECT_TCP
-        startDirectConnection(host: host, port: nwPort)
-        #else
+        // F-TOR-01: transport is Tor-only. A non-canonical (non-onion) host
+        // is rejected outright — there is no clearnet/direct-TCP fallback.
         state = .failed("This relay isn't a Tor address.")
-        #endif
     }
 
     private static func deliveryTokenNamespace(host: String, port: UInt16) -> Data {
@@ -483,40 +476,6 @@ public final class RelayClient: @unchecked Sendable {
         var portBE = port.bigEndian
         withUnsafeBytes(of: &portBE) { out.append(contentsOf: $0) }
         return out
-    }
-
-    private func startDirectConnection(host: String, port: NWEndpoint.Port) {
-        let endpoint = NWEndpoint.Host(host)
-        let conn = NWConnection(host: endpoint, port: port, using: .tcp)
-        self.connection = conn
-
-        conn.stateUpdateHandler = { [weak self] s in
-            guard let self else { return }
-            switch s {
-            case .ready:
-                self.sendHello()
-                if let token = self.pushToken {
-                    self.sendRegisterPush(token: token)
-                }
-                self.state = .connected
-                self.scheduleRead()
-            case .waiting:
-                // Transient (route flap, brief unreachable). NWConnection
-                // will resolve back to `.ready` on its own; until then,
-                // bytes won't flow, so don't lie to the UI by leaving
-                // state at `.connected`. Surface as `.connecting`, not
-                // `.failed` — `.failed` would imply the user should
-                // intervene, which is wrong for a recoverable hiccup.
-                self.state = .connecting
-            case .failed(let err):
-                self.state = .failed("\(err)")
-            case .cancelled:
-                self.state = .idle
-            default:
-                break
-            }
-        }
-        conn.start(queue: queue)
     }
 
     /// .onion target. Multi-step setup:

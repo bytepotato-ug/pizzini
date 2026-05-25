@@ -426,7 +426,10 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             a relay host hasn't been compromised, because a tampered host \
             can report a genuine signed hash while running modified code. \
             True tamper-proof attestation needs hardware support and is \
-            not yet shipped.
+            not yet shipped. The log is also append-only with no \
+            revocation, so a match means the hash was signed at some \
+            point — not that it is the newest build; an older, \
+            since-superseded build still shows as verified.
 
             If a built-in relay reports a hash that isn't in the log, \
             Settings → Relay attestation flags it as "mismatch" and \
@@ -808,7 +811,8 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             attestation:
 
             • Verified — the relay's running binary SHA-256 matches a \
-              signed log entry.
+              signed log entry. The log has no revocation, so this \
+              means "signed at some point", not "the newest build".
             • Mismatch — the binary is in no signed entry (possibly \
               a tampered build).
             • Could not verify — the log fetch failed or was blocked. \

@@ -91,19 +91,29 @@ use rand::{Rng, TryRngCore as _, rngs::OsRng};
 use sha2::Sha512;
 use zeroize::Zeroize;
 
-// Crypto-core runs inside the iOS process. Keep peer-aware diagnostics out
-// of release device logs just as Swift hot paths do through `pzLog`.
-#[cfg(debug_assertions)]
-macro_rules! crypto_diag {
-    ($($arg:tt)*) => {
-        eprintln!($($arg)*);
-    };
+// Crypto-core runs inside the iOS process. Peer-aware diagnostics
+// (which print peer identity_pubs) are gated on an explicit RUNTIME
+// opt-in — `PIZZINI_CRYPTO_DIAG=1` — NOT the build profile. A
+// debug-profile XCFramework can reach testers/servers (operator-
+// confirmed), so a `debug_assertions` gate would leak the peer social
+// graph to those devices' unified logs. An env opt-in means the
+// diagnostics are silent on every shipped build (debug or release)
+// unless an operator turns them on deliberately. (F-CF-02)
+fn crypto_diag_value_enables(value: Option<&str>) -> bool {
+    matches!(value, Some("1") | Some("true"))
 }
 
-#[cfg(not(debug_assertions))]
+fn crypto_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crypto_diag_value_enables(std::env::var("PIZZINI_CRYPTO_DIAG").ok().as_deref())
+    })
+}
+
 macro_rules! crypto_diag {
     ($($arg:tt)*) => {
-        if false {
+        if crypto_diag_enabled() {
             eprintln!($($arg)*);
         }
     };
@@ -272,11 +282,6 @@ pub struct DeviceStore {
     /// performs on every `group_encrypt` / `group_decrypt`. Used at
     /// `serialize` time to enumerate persisted records.
     sender_key_index: Vec<(Vec<u8>, [u8; SENDER_KEY_DISTRIBUTION_ID_LEN])>,
-}
-
-pub struct EncryptResult {
-    pub ciphertext: Vec<u8>,
-    pub is_prekey: bool,
 }
 
 /// Result of `seal_receive`: the claimed sender's identity_pub (verified
@@ -713,63 +718,6 @@ impl DeviceStore {
             self.sender_key_index
                 .push((sender_identity.to_vec(), distribution_id));
         }
-    }
-
-    pub fn encrypt(
-        &mut self,
-        peer_identity: &[u8],
-        plaintext: &[u8],
-    ) -> Result<EncryptResult, SignalProtocolError> {
-        let mut rng = OsRng.unwrap_err();
-        let peer_addr = address_for(peer_identity);
-        let local_addr = address_for(&self.identity_public_bytes());
-        let outgoing = message_encrypt(
-            plaintext,
-            &peer_addr,
-            &local_addr,
-            &mut self.inner.session_store,
-            &mut self.inner.identity_store,
-            SystemTime::now(),
-            &mut rng,
-        )
-        .now_or_never()
-        .expect("in-mem store is sync")?;
-        let is_prekey = outgoing.message_type() == CiphertextMessageType::PreKey;
-        Ok(EncryptResult {
-            ciphertext: outgoing.serialize().to_vec(),
-            is_prekey,
-        })
-    }
-
-    pub fn decrypt(
-        &mut self,
-        peer_identity: &[u8],
-        ciphertext: &[u8],
-        is_prekey: bool,
-    ) -> Result<Vec<u8>, SignalProtocolError> {
-        let mut rng = OsRng.unwrap_err();
-        let peer_addr = address_for(peer_identity);
-        let local_addr = address_for(&self.identity_public_bytes());
-        let parsed = if is_prekey {
-            CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::try_from(ciphertext)?)
-        } else {
-            CiphertextMessage::SignalMessage(SignalMessage::try_from(ciphertext)?)
-        };
-        let pt = message_decrypt(
-            &parsed,
-            &peer_addr,
-            &local_addr,
-            &mut self.inner.session_store,
-            &mut self.inner.identity_store,
-            &mut self.inner.pre_key_store,
-            &self.inner.signed_pre_key_store,
-            &mut self.inner.kyber_pre_key_store,
-            &mut rng,
-        )
-        .now_or_never()
-        .expect("in-mem store is sync")?;
-        self.register_peer(peer_identity);
-        Ok(pt)
     }
 
     /// Mint a fresh self-signed SenderCertificate if the cached one is
@@ -1659,40 +1607,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn two_devices_round_trip() {
-        let mut alice = DeviceStore::fresh().unwrap();
-        let mut bob = DeviceStore::fresh().unwrap();
-
-        let bob_bundle = bob.publish_bundle().unwrap();
-        alice
-            .initiate_session(&bob.identity_public_bytes(), &bob_bundle)
-            .unwrap();
-
-        let m1 = alice.encrypt(&bob.identity_public_bytes(), b"hi bob").unwrap();
-        assert!(m1.is_prekey);
-
-        let pt1 = bob
-            .decrypt(&alice.identity_public_bytes(), &m1.ciphertext, true)
-            .unwrap();
-        assert_eq!(pt1, b"hi bob");
-
-        let m2 = bob.encrypt(&alice.identity_public_bytes(), b"hi alice").unwrap();
-        assert!(!m2.is_prekey, "bob's reply must be Whisper, session is set up");
-
-        let pt2 = alice
-            .decrypt(&bob.identity_public_bytes(), &m2.ciphertext, false)
-            .unwrap();
-        assert_eq!(pt2, b"hi alice");
-
-        let m3 = alice.encrypt(&bob.identity_public_bytes(), b"again").unwrap();
-        assert!(!m3.is_prekey, "alice's next message must be Whisper too");
-        let pt3 = bob
-            .decrypt(&alice.identity_public_bytes(), &m3.ciphertext, false)
-            .unwrap();
-        assert_eq!(pt3, b"again");
-    }
-
-    #[test]
     fn rehydrate_keeps_identity() {
         let store = DeviceStore::fresh().unwrap();
         let id_bytes = store.identity_keypair_bytes();
@@ -2098,34 +2012,6 @@ mod tests {
     }
 
     #[test]
-    fn serialize_round_trips_full_session() {
-        // Establish Alice ↔ Bob, send a couple of messages, snapshot Alice's
-        // store, rehydrate, and prove the ratchet picks up where it left off.
-        let mut alice = DeviceStore::fresh().unwrap();
-        let mut bob = DeviceStore::fresh().unwrap();
-        let bob_id = bob.identity_public_bytes();
-        let alice_id = alice.identity_public_bytes();
-
-        let bundle = bob.publish_bundle().unwrap();
-        alice.initiate_session(&bob_id, &bundle).unwrap();
-
-        let m1 = alice.encrypt(&bob_id, b"hello").unwrap();
-        let _ = bob.decrypt(&alice_id, &m1.ciphertext, true).unwrap();
-        let m2 = bob.encrypt(&alice_id, b"hi back").unwrap();
-        let _ = alice.decrypt(&bob_id, &m2.ciphertext, false).unwrap();
-
-        let snapshot = alice.serialize().unwrap();
-        let mut alice2 = DeviceStore::from_serialized(&snapshot).unwrap();
-        assert_eq!(alice2.identity_public_bytes(), alice_id);
-
-        // Continue the conversation across the rehydrate boundary.
-        let m3 = alice2.encrypt(&bob_id, b"and again").unwrap();
-        assert!(!m3.is_prekey, "session continued — must be Whisper");
-        let pt3 = bob.decrypt(&alice_id, &m3.ciphertext, false).unwrap();
-        assert_eq!(pt3, b"and again");
-    }
-
-    #[test]
     fn fresh_store_serializes_to_a_minimal_blob() {
         let mut s = DeviceStore::fresh().unwrap();
         let blob = s.serialize().unwrap();
@@ -2199,13 +2085,28 @@ mod tests {
         let bob_id = bob.identity_public_bytes();
         let bundle = bob.publish_bundle().unwrap();
         alice.initiate_session(&bob_id, &bundle).unwrap();
-        let _ = alice.encrypt(&bob_id, b"hi").unwrap();
+        let _ = alice.seal_send(&bob_id, &[0u8; 16], b"hi").unwrap();
         alice.forget_peer(&bob_id);
-        // Encrypting again must now fail — session was dropped.
-        match alice.encrypt(&bob_id, b"again") {
+        // Sending again must now fail — session was dropped.
+        match alice.seal_send(&bob_id, &[1u8; 16], b"again") {
             Err(SignalProtocolError::SessionNotFound(_)) => {}
-            Ok(_) => panic!("expected SessionNotFound; encrypt succeeded"),
+            Ok(_) => panic!("expected SessionNotFound; seal_send succeeded"),
             Err(e) => panic!("expected SessionNotFound, got {e:?}"),
         }
+    }
+
+    #[test]
+    fn crypto_diag_requires_explicit_env_optin() {
+        // F-CF-02: peer-aware diagnostics must stay silent on every
+        // shipped build unless the operator explicitly opts in. Only
+        // "1"/"true" enable; absence and every other value (including a
+        // debug-profile build, which no longer matters) keep it off.
+        assert!(!crypto_diag_value_enables(None));
+        assert!(crypto_diag_value_enables(Some("1")));
+        assert!(crypto_diag_value_enables(Some("true")));
+        assert!(!crypto_diag_value_enables(Some("0")));
+        assert!(!crypto_diag_value_enables(Some("")));
+        assert!(!crypto_diag_value_enables(Some("yes")));
+        assert!(!crypto_diag_value_enables(Some("TRUE")));
     }
 }

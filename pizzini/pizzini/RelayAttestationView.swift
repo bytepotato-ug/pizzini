@@ -208,7 +208,7 @@ struct RelayAttestationView: View {
     private func statusFooter(reportedSha256 sha: String, urlConfigured: Bool) -> Text {
         switch store.relayAttestationVerdict {
         case .verified:
-            return Text("The relay reports a binary SHA-256 the operator signed into the public transparency log. This confirms the operator signed this hash — it cannot prove a compromised relay host isn't reporting a genuine hash while running modified code (tamper-proof attestation needs hardware support, not yet shipped).")
+            return Text("The relay reports a binary SHA-256 the operator signed into the public transparency log. This confirms the operator signed this hash — it cannot prove a compromised relay host isn't reporting a genuine hash while running modified code (tamper-proof attestation needs hardware support, not yet shipped). It also means only that this hash was signed at some point: the log is append-only with no revocation, so an older, since-superseded build still shows as signed.")
         case .mismatch:
             return Text("The running binary's SHA-256 does not appear in the operator's signed transparency log. Pizzini blocks new outgoing traffic through a mismatched built-in relay; custom relays remain warning-only because they are not listed in the built-in operator's log.")
         case .unverifiable:

@@ -19,7 +19,7 @@ mod hashcash;
 mod store;
 pub use hashcash::{hashcash_compute, hashcash_verify, HASHCASH_DEFAULT_BITS};
 pub use store::{
-    extract_bundle_verify_key, DeviceStore, EncryptResult, SealReceiveError, SealReceived,
+    extract_bundle_verify_key, DeviceStore, SealReceiveError, SealReceived,
     DELIVERY_TOKEN_LEN, DELIVERY_TOKEN_NONCE_LEN, DELIVERY_TOKEN_SIG_LEN, DELIVERY_TOKEN_TTL_SECS,
     DELIVERY_TOKEN_VERIFY_KEY_LEN,
 };
@@ -38,11 +38,6 @@ pub const PIZZINI_ERR_INTERNAL: i32 = -3;
 /// caller can attribute the failure to "untrustworthy bytes" rather than
 /// "library misbehaved".
 pub const PIZZINI_ERR_BAD_SIGNATURE: i32 = -4;
-
-// ───── Message type tags exposed across FFI ────────────────────────────
-
-pub const PIZZINI_MSG_TYPE_PREKEY: u32 = 0;
-pub const PIZZINI_MSG_TYPE_WHISPER: u32 = 1;
 
 // ───── Version ─────────────────────────────────────────────────────────
 
@@ -257,92 +252,6 @@ pub unsafe extern "C" fn pizzini_store_initiate_session(
         Ok(()) => PIZZINI_OK,
         Err(_) => PIZZINI_ERR_INTERNAL,
     }
-}
-
-/// Encrypts `plaintext` for `peer_identity`. Writes the wire ciphertext to
-/// `out_ciphertext` and the message type tag to `out_message_type`.
-///
-/// # Safety
-/// All pointers must be non-null and point to memory of the declared sizes.
-#[allow(clippy::too_many_arguments)]
-#[no_mangle]
-pub unsafe extern "C" fn pizzini_store_encrypt(
-    store: *mut DeviceStore,
-    peer_identity: *const u8,
-    peer_identity_len: usize,
-    plaintext: *const u8,
-    plaintext_len: usize,
-    out_ciphertext: *mut u8,
-    out_ciphertext_cap: usize,
-    out_ciphertext_len: *mut usize,
-    out_message_type: *mut u32,
-) -> i32 {
-    if store.is_null()
-        || peer_identity.is_null()
-        || plaintext.is_null()
-        || out_ciphertext.is_null()
-        || out_ciphertext_len.is_null()
-        || out_message_type.is_null()
-    {
-        return PIZZINI_ERR_INVALID_ARG;
-    }
-    // SAFETY: caller asserted preconditions above.
-    let s = unsafe { &mut *store };
-    let peer = unsafe { std::slice::from_raw_parts(peer_identity, peer_identity_len) };
-    let pt = unsafe { std::slice::from_raw_parts(plaintext, plaintext_len) };
-    let r = match s.encrypt(peer, pt) {
-        Ok(r) => r,
-        Err(_) => return PIZZINI_ERR_INTERNAL,
-    };
-    // SAFETY: caller asserted out_message_type is valid.
-    unsafe {
-        *out_message_type = if r.is_prekey {
-            PIZZINI_MSG_TYPE_PREKEY
-        } else {
-            PIZZINI_MSG_TYPE_WHISPER
-        };
-    }
-    // SAFETY: caller asserted out_ciphertext / out_ciphertext_len are valid.
-    unsafe { copy_or_size_out(&r.ciphertext, out_ciphertext, out_ciphertext_cap, out_ciphertext_len) }
-}
-
-/// Decrypts a wire ciphertext from `peer_identity`. `is_prekey` selects
-/// PreKey vs Whisper parsing — the caller must communicate this out-of-band
-/// (we ship it as a wire-protocol tag, not embedded in the ciphertext).
-///
-/// # Safety
-/// All pointers must be non-null and point to memory of the declared sizes.
-#[allow(clippy::too_many_arguments)]
-#[no_mangle]
-pub unsafe extern "C" fn pizzini_store_decrypt(
-    store: *mut DeviceStore,
-    peer_identity: *const u8,
-    peer_identity_len: usize,
-    ciphertext: *const u8,
-    ciphertext_len: usize,
-    is_prekey: u32,
-    out_plaintext: *mut u8,
-    out_plaintext_cap: usize,
-    out_plaintext_len: *mut usize,
-) -> i32 {
-    if store.is_null()
-        || peer_identity.is_null()
-        || ciphertext.is_null()
-        || out_plaintext.is_null()
-        || out_plaintext_len.is_null()
-    {
-        return PIZZINI_ERR_INVALID_ARG;
-    }
-    // SAFETY: caller asserted preconditions.
-    let s = unsafe { &mut *store };
-    let peer = unsafe { std::slice::from_raw_parts(peer_identity, peer_identity_len) };
-    let ct = unsafe { std::slice::from_raw_parts(ciphertext, ciphertext_len) };
-    let pt = match s.decrypt(peer, ct, is_prekey != 0) {
-        Ok(pt) => pt,
-        Err(_) => return PIZZINI_ERR_INTERNAL,
-    };
-    // SAFETY: caller asserted out_plaintext/out_plaintext_len validity.
-    unsafe { copy_or_size_out(&pt, out_plaintext, out_plaintext_cap, out_plaintext_len) }
 }
 
 /// Shared "copy bytes into caller buffer or report required size" tail.
@@ -1643,80 +1552,6 @@ mod tests {
     }
 
     #[test]
-    fn store_ffi_two_devices_round_trip() {
-        // Mirror two_devices_round_trip from store.rs but exercising every
-        // exposed C ABI symbol — these are what Swift actually calls.
-        let alice = unsafe { pizzini_store_new(std::ptr::null(), 0) };
-        let bob = unsafe { pizzini_store_new(std::ptr::null(), 0) };
-        assert!(!alice.is_null() && !bob.is_null());
-
-        let mut buf = vec![0u8; 64];
-        let mut len = 0usize;
-        let rc = unsafe {
-            pizzini_store_identity_public(bob, buf.as_mut_ptr(), buf.len(), &mut len)
-        };
-        assert_eq!(rc, PIZZINI_OK);
-        let bob_id = buf[..len].to_vec();
-
-        let mut alice_id = vec![0u8; 64];
-        let mut alen = 0usize;
-        unsafe {
-            pizzini_store_identity_public(alice, alice_id.as_mut_ptr(), alice_id.len(), &mut alen)
-        };
-        let alice_id = alice_id[..alen].to_vec();
-
-        let mut bundle = vec![0u8; 4096];
-        let mut blen = 0usize;
-        let rc = unsafe {
-            pizzini_store_publish_bundle(bob, bundle.as_mut_ptr(), bundle.len(), &mut blen)
-        };
-        assert_eq!(rc, PIZZINI_OK);
-        let bundle = &bundle[..blen];
-
-        let rc = unsafe {
-            pizzini_store_initiate_session(
-                alice,
-                bob_id.as_ptr(), bob_id.len(),
-                bundle.as_ptr(), bundle.len(),
-            )
-        };
-        assert_eq!(rc, PIZZINI_OK);
-
-        let plain = b"hello via store FFI";
-        let mut ct = vec![0u8; 4096];
-        let mut ctlen = 0usize;
-        let mut mtype: u32 = 999;
-        let rc = unsafe {
-            pizzini_store_encrypt(
-                alice,
-                bob_id.as_ptr(), bob_id.len(),
-                plain.as_ptr(), plain.len(),
-                ct.as_mut_ptr(), ct.len(), &mut ctlen,
-                &mut mtype,
-            )
-        };
-        assert_eq!(rc, PIZZINI_OK);
-        assert_eq!(mtype, PIZZINI_MSG_TYPE_PREKEY);
-
-        let mut pt = vec![0u8; 256];
-        let mut ptlen = 0usize;
-        let rc = unsafe {
-            pizzini_store_decrypt(
-                bob,
-                alice_id.as_ptr(), alice_id.len(),
-                ct.as_ptr(), ctlen,
-                1,
-                pt.as_mut_ptr(), pt.len(), &mut ptlen,
-            )
-        };
-        assert_eq!(rc, PIZZINI_OK);
-        assert_eq!(&pt[..ptlen], plain);
-
-        unsafe { pizzini_store_free(alice) };
-        unsafe { pizzini_store_free(bob) };
-    }
-
-    #[test]
     fn store_ffi_rehydrate_from_seed() {
         let s = unsafe { pizzini_store_new(std::ptr::null(), 0) };
         let mut seed = vec![0u8; 256];
@@ -1746,9 +1581,10 @@ mod tests {
 
     #[test]
     fn store_ffi_serialize_round_trips() {
-        // Build Alice + Bob, talk a bit, snapshot Alice via FFI, rehydrate
-        // via FFI, keep talking. Mirrors the lib-level test but proves the
-        // serialize/from_serialized/forget_peer C ABI symbols work.
+        // Build Alice + Bob, talk over the sealed FFI, snapshot Alice via FFI,
+        // rehydrate via FFI, keep talking on the SAME sending chain, then
+        // forget the peer. Proves the serialize/from_serialized/forget_peer C
+        // ABI symbols survive a rehydrate boundary.
         let alice = unsafe { pizzini_store_new(std::ptr::null(), 0) };
         let bob = unsafe { pizzini_store_new(std::ptr::null(), 0) };
 
@@ -1782,48 +1618,43 @@ mod tests {
                 bundle.as_ptr(), blen,
             )
         };
+        // Bob must trust Alice for the seal_receive contact gate to accept her.
+        unsafe { pizzini_store_register_peer(bob, alice_id.as_ptr(), alice_id.len()) };
 
-        let mut ct = vec![0u8; 4096];
-        let mut ctlen = 0usize;
-        let mut mt: u32 = 0;
-        unsafe {
-            pizzini_store_encrypt(
+        // Reusable receive buffers.
+        let mut sender = vec![0u8; 64];
+        let mut sender_len = 0usize;
+        let mut got_id = [0u8; 16];
+
+        // Alice → Bob (PreKey), a live send before the snapshot.
+        let msg_id0 = [0x01u8; 16];
+        let mut sealed = vec![0u8; 4096];
+        let mut sealed_len = 0usize;
+        let rc = unsafe {
+            pizzini_store_seal_send(
                 alice,
                 bob_id.as_ptr(), bob_id.len(),
+                msg_id0.as_ptr(), msg_id0.len(),
                 b"hi".as_ptr(), 2,
-                ct.as_mut_ptr(), ct.len(), &mut ctlen, &mut mt,
+                sealed.as_mut_ptr(), sealed.len(), &mut sealed_len,
             )
         };
-        let mut pt = vec![0u8; 256];
+        assert_eq!(rc, PIZZINI_OK);
+        let mut pt = vec![0u8; 4096];
         let mut ptlen = 0usize;
-        unsafe {
-            pizzini_store_decrypt(
+        let mut is_dup: u8 = 0;
+        let rc = unsafe {
+            pizzini_store_seal_receive(
                 bob,
-                alice_id.as_ptr(), alice_id.len(),
-                ct.as_ptr(), ctlen, 1,
+                sealed.as_ptr(), sealed_len,
+                sender.as_mut_ptr(), sender.len(), &mut sender_len,
+                got_id.as_mut_ptr(),
                 pt.as_mut_ptr(), pt.len(), &mut ptlen,
+                &mut is_dup,
             )
         };
-        let mut bob_ct = vec![0u8; 4096];
-        let mut bob_ctlen = 0usize;
-        unsafe {
-            pizzini_store_encrypt(
-                bob,
-                alice_id.as_ptr(), alice_id.len(),
-                b"yo".as_ptr(), 2,
-                bob_ct.as_mut_ptr(), bob_ct.len(), &mut bob_ctlen, &mut mt,
-            )
-        };
-        let mut bob_pt = vec![0u8; 256];
-        let mut bob_ptlen = 0usize;
-        unsafe {
-            pizzini_store_decrypt(
-                alice,
-                bob_id.as_ptr(), bob_id.len(),
-                bob_ct.as_ptr(), bob_ctlen, 0,
-                bob_pt.as_mut_ptr(), bob_pt.len(), &mut bob_ptlen,
-            )
-        };
+        assert_eq!(rc, PIZZINI_OK);
+        assert_eq!(&pt[..ptlen], b"hi");
 
         // Snapshot Alice via FFI.
         let mut snap = vec![0u8; 16384];
@@ -1839,47 +1670,57 @@ mod tests {
         let alice2 = unsafe { pizzini_store_new_from_serialized(snap.as_ptr(), snaplen) };
         assert!(!alice2.is_null());
 
-        // Continue the chat — Whisper, since the session survived.
-        let mut ct3 = vec![0u8; 4096];
-        let mut ct3len = 0usize;
-        unsafe {
-            pizzini_store_encrypt(
+        // Continue the chat on the SAME sending chain — Bob has not replied, so
+        // no DH ratchet step. Must NOT be a duplicate: proves the sending-chain
+        // counter survived serialize/from_serialized.
+        let msg_id1 = [0x02u8; 16];
+        let mut sealed2 = vec![0u8; 4096];
+        let mut sealed2_len = 0usize;
+        let rc = unsafe {
+            pizzini_store_seal_send(
                 alice2,
                 bob_id.as_ptr(), bob_id.len(),
+                msg_id1.as_ptr(), msg_id1.len(),
                 b"still here".as_ptr(), 10,
-                ct3.as_mut_ptr(), ct3.len(), &mut ct3len, &mut mt,
-            )
-        };
-        assert_eq!(mt, PIZZINI_MSG_TYPE_WHISPER);
-        let mut pt3 = vec![0u8; 256];
-        let mut pt3len = 0usize;
-        let rc = unsafe {
-            pizzini_store_decrypt(
-                bob,
-                alice_id.as_ptr(), alice_id.len(),
-                ct3.as_ptr(), ct3len, 0,
-                pt3.as_mut_ptr(), pt3.len(), &mut pt3len,
+                sealed2.as_mut_ptr(), sealed2.len(), &mut sealed2_len,
             )
         };
         assert_eq!(rc, PIZZINI_OK);
+        let mut pt3 = vec![0u8; 4096];
+        let mut pt3len = 0usize;
+        let mut is_dup3: u8 = 0;
+        let rc = unsafe {
+            pizzini_store_seal_receive(
+                bob,
+                sealed2.as_ptr(), sealed2_len,
+                sender.as_mut_ptr(), sender.len(), &mut sender_len,
+                got_id.as_mut_ptr(),
+                pt3.as_mut_ptr(), pt3.len(), &mut pt3len,
+                &mut is_dup3,
+            )
+        };
+        assert_eq!(rc, PIZZINI_OK);
+        assert_eq!(is_dup3, 0, "post-rehydrate send must not be a duplicate");
         assert_eq!(&pt3[..pt3len], b"still here");
 
-        // Forget the peer — encrypting to them must now fail.
+        // Forget the peer — sending to them must now fail (session dropped).
         let rc = unsafe {
             pizzini_store_forget_peer(alice2, bob_id.as_ptr(), bob_id.len())
         };
         assert_eq!(rc, PIZZINI_OK);
-        let mut ct4 = vec![0u8; 4096];
-        let mut ct4len = 0usize;
+        let msg_id2 = [0x03u8; 16];
+        let mut ghost = vec![0u8; 4096];
+        let mut ghost_len = 0usize;
         let rc = unsafe {
-            pizzini_store_encrypt(
+            pizzini_store_seal_send(
                 alice2,
                 bob_id.as_ptr(), bob_id.len(),
+                msg_id2.as_ptr(), msg_id2.len(),
                 b"ghost".as_ptr(), 5,
-                ct4.as_mut_ptr(), ct4.len(), &mut ct4len, &mut mt,
+                ghost.as_mut_ptr(), ghost.len(), &mut ghost_len,
             )
         };
-        assert_eq!(rc, PIZZINI_ERR_INTERNAL);
+        assert_eq!(rc, PIZZINI_ERR_INTERNAL, "seal_send after forget_peer must fail");
 
         unsafe { pizzini_store_free(alice2) };
         unsafe { pizzini_store_free(bob) };

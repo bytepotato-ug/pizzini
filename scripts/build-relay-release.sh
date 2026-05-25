@@ -31,10 +31,11 @@
 #                                 closing the `--frozen` git-deps
 #                                 refresh hole
 #
-# Operators on a Linux host with all the above already installed
-# can opt out of the docker wrapper with `PIZZINI_RELEASE_NO_DOCKER=1`,
-# but the canonical path is `Docker required` — the hash published
-# to the transparency log is the docker-built one.
+# Docker is required: there is no host opt-out (F-SUP-06), so every
+# operator's build runs in the identical pinned environment and the
+# hash published to the transparency log is always the docker-built
+# one. (`INSIDE_DOCKER=1` is set only by this script's own re-exec
+# into the container — it is not an operator-facing escape hatch.)
 
 set -euo pipefail
 
@@ -70,21 +71,19 @@ SHORT_SHA="$(git rev-parse --short HEAD)"
 SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct HEAD)"
 export SOURCE_DATE_EPOCH
 
-if [[ -z "${PIZZINI_RELEASE_NO_DOCKER:-}" ]]; then
+if [[ -z "${INSIDE_DOCKER:-}" ]]; then
     # Outer invocation: re-exec ourselves inside the pinned
     # `rust:1.95.0-bookworm` image with the repo bind-mounted
-    # at /work. The inner invocation sets PIZZINI_RELEASE_NO_DOCKER
-    # so we don't recurse, and INSIDE_DOCKER so it knows to use
-    # the in-container paths for the path-remap.
+    # at /work. The inner invocation sets INSIDE_DOCKER so we
+    # don't recurse and so it uses the in-container paths for
+    # the path-remap.
     #
     # If docker isn't available, fail fast with a clear message:
     # building outside the pinned image silently produces a
     # different hash and breaks the reproducibility promise.
     if ! command -v docker >/dev/null 2>&1; then
         echo "error: docker not found. Reproducible relay builds run inside a pinned image." >&2
-        echo "       Install docker, or set PIZZINI_RELEASE_NO_DOCKER=1 to opt out (you" >&2
-        echo "       MUST then be on x86_64-linux with the same rustc + protoc as the" >&2
-        echo "       canonical builder, or the published hash will not match)." >&2
+        echo "       Install docker and re-run; there is no non-docker build path." >&2
         exit 1
     fi
     echo "==> Reproducible relay build (inside docker)"
@@ -111,7 +110,6 @@ if [[ -z "${PIZZINI_RELEASE_NO_DOCKER:-}" ]]; then
     HOST_UID="$(id -u)"
     HOST_GID="$(id -g)"
     docker run --rm \
-        -e PIZZINI_RELEASE_NO_DOCKER=1 \
         -e INSIDE_DOCKER=1 \
         -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
         -e CARGO_HOME=/work/.cargo \
@@ -152,7 +150,6 @@ if [[ -z "${PIZZINI_RELEASE_NO_DOCKER:-}" ]]; then
             exit "$rc"
         '
     BIN_PATH="$REPO_ROOT/target/x86_64-unknown-linux-gnu/release/pizzini-relay"
-    BIN_PATH="${BIN_PATH:-$REPO_ROOT/target/release/pizzini-relay}"
     if [[ ! -f "$BIN_PATH" ]]; then
         BIN_PATH="$REPO_ROOT/target/release/pizzini-relay"
     fi
@@ -174,10 +171,10 @@ if [[ -z "${PIZZINI_RELEASE_NO_DOCKER:-}" ]]; then
     exit 0
 fi
 
-# Inner invocation (or `PIZZINI_RELEASE_NO_DOCKER=1` opt-out path).
-# `INSIDE_DOCKER=1` flips path-remap to the container-internal
-# values; opt-out path uses the host's $REPO_ROOT and $HOME, which
-# is only correct on the canonical x86_64-linux builder image.
+# Inner invocation: only ever reached inside the pinned Docker image
+# (the wrapper re-execs us with INSIDE_DOCKER=1). There is no host
+# opt-out path (F-SUP-06), so the path-remap always uses the fixed
+# container-internal sentinels.
 echo "==> Reproducible relay build"
 echo "    repo  : $REPO_ROOT"
 echo "    commit: $GIT_SHA"
@@ -186,26 +183,15 @@ echo "    rustc : $(command -v rustc)"
 echo "    target: x86_64-unknown-linux-gnu"
 
 # 2. Build flags. The remap-path-prefix invocations replace the
-#    builder-specific absolute paths embedded in DWARF debug info
-#    (which would otherwise differ between $HOME=/Users/alice
-#    and $HOME=/home/bob and silently make the binaries diverge).
-#    Both build modes must remap onto the SAME fixed `/build` +
-#    `/build-home` sentinels, or the opt-out binary is not
-#    digest-identical to the docker one and host paths leak into
-#    the DWARF section. Inside docker the live paths already ARE
-#    `/work` + `/build-home`; on the opt-out path the live
-#    `$REPO_ROOT` / `$HOME` are the remap *sources* and `/build` /
-#    `/build-home` the *targets* — so the embedded paths come out
-#    identical regardless of where the operator's repo and home
-#    actually live. `CARGO_HOME` is pinned under `$HOME` (its
-#    default) so the vendored-crate source paths fall under the
-#    `$HOME=/build-home` remap rather than leaking a host path.
-if [[ -n "${INSIDE_DOCKER:-}" ]]; then
-    export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=/work=/build --remap-path-prefix=/build-home=/build-home"
-else
-    export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
-    export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$REPO_ROOT=/build --remap-path-prefix=$HOME=/build-home"
-fi
+#    container's `/work` + `/build-home` paths embedded in DWARF
+#    debug info with fixed sentinels, so no builder-specific path
+#    reaches the binary and two operators get a byte-identical
+#    digest. This build only ever runs inside the pinned image, so
+#    the container paths are the only remap sources — there is no
+#    host opt-out that could leak `$HOME`/`$REPO_ROOT` (F-SUP-06).
+#    `CARGO_HOME` is supplied by the docker wrapper (`/work/.cargo`)
+#    so vendored-crate source paths fall under the `/work` remap.
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=/work=/build --remap-path-prefix=/build-home=/build-home"
 # Cargo refuses to update the lockfile. `--offline` (set via
 # CARGO_NET_OFFLINE in the docker wrapper) closes the network
 # entirely; `--locked --frozen` keeps the lockfile + vendored

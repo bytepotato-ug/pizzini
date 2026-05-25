@@ -48,18 +48,9 @@ public struct IdentityKeyPair: Sendable {
 
 /// Owns one libsignal `InMemSignalProtocolStore` on the Rust side. Use this
 /// for real two-device messaging: each device has one Session, peers exchange
-/// PreKey bundles out-of-band, then encrypt / decrypt via wire bytes.
+/// PreKey bundles out-of-band, then send / receive via the sealed-sender wire
+/// bytes (`sealSend` / `sealReceive`).
 public final class Session: @unchecked Sendable {
-    public enum MessageType: Sendable {
-        case preKey
-        case whisper
-    }
-
-    public struct EncryptResult: Sendable {
-        public let ciphertext: Data
-        public let messageType: MessageType
-    }
-
     private var handle: OpaquePointer?
 
     /// Create a session for a brand-new identity (fresh keypair, fresh
@@ -174,50 +165,6 @@ public final class Session: @unchecked Sendable {
             }
         }
         try mapRC(rc)
-    }
-
-    public func encrypt(peerIdentity: Data, plaintext: Data) throws -> EncryptResult {
-        guard let handle else { throw CryptoCoreError.invalidArgument }
-        var ct = [UInt8](repeating: 0, count: max(plaintext.count + 256, 4096))
-        var ctLen: UInt = 0
-        var msgType: UInt32 = 0
-        let rc = peerIdentity.withUnsafeBytes { peerPtr -> Int32 in
-            plaintext.withUnsafeBytes { plainPtr -> Int32 in
-                ct.withUnsafeMutableBufferPointer { ctPtr in
-                    pizzini_store_encrypt(
-                        handle,
-                        peerPtr.bindMemory(to: UInt8.self).baseAddress, UInt(peerIdentity.count),
-                        plainPtr.bindMemory(to: UInt8.self).baseAddress, UInt(plaintext.count),
-                        ctPtr.baseAddress, UInt(ctPtr.count), &ctLen,
-                        &msgType
-                    )
-                }
-            }
-        }
-        try mapRC(rc)
-        let mt: MessageType = (msgType == UInt32(PIZZINI_MSG_TYPE_PREKEY)) ? .preKey : .whisper
-        return EncryptResult(ciphertext: Data(ct.prefix(Int(ctLen))), messageType: mt)
-    }
-
-    public func decrypt(peerIdentity: Data, ciphertext: Data, isPreKey: Bool) throws -> Data {
-        guard let handle else { throw CryptoCoreError.invalidArgument }
-        var pt = [UInt8](repeating: 0, count: max(ciphertext.count + 256, 1024))
-        var ptLen: UInt = 0
-        let rc = peerIdentity.withUnsafeBytes { peerPtr -> Int32 in
-            ciphertext.withUnsafeBytes { ctPtr -> Int32 in
-                pt.withUnsafeMutableBufferPointer { ptPtr in
-                    pizzini_store_decrypt(
-                        handle,
-                        peerPtr.bindMemory(to: UInt8.self).baseAddress, UInt(peerIdentity.count),
-                        ctPtr.bindMemory(to: UInt8.self).baseAddress, UInt(ciphertext.count),
-                        isPreKey ? 1 : 0,
-                        ptPtr.baseAddress, UInt(ptPtr.count), &ptLen
-                    )
-                }
-            }
-        }
-        try mapRC(rc)
-        return Data(pt.prefix(Int(ptLen)))
     }
 
     /// Recipient's published delivery-token verify key (33 bytes —

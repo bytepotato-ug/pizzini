@@ -23,10 +23,6 @@
  */
 #define PIZZINI_ERR_BAD_SIGNATURE -4
 
-#define PIZZINI_MSG_TYPE_PREKEY 0
-
-#define PIZZINI_MSG_TYPE_WHISPER 1
-
 /**
  * Wire size of a `message_id`: a 16-byte opaque identifier the host
  * mints per message and the relay never sees (it rides inside the
@@ -264,41 +260,6 @@ int32_t pizzini_store_initiate_session(struct DeviceStore *store,
                                        uintptr_t peer_identity_len,
                                        const uint8_t *bundle,
                                        uintptr_t bundle_len);
-
-/**
- * Encrypts `plaintext` for `peer_identity`. Writes the wire ciphertext to
- * `out_ciphertext` and the message type tag to `out_message_type`.
- *
- * # Safety
- * All pointers must be non-null and point to memory of the declared sizes.
- */
-int32_t pizzini_store_encrypt(struct DeviceStore *store,
-                              const uint8_t *peer_identity,
-                              uintptr_t peer_identity_len,
-                              const uint8_t *plaintext,
-                              uintptr_t plaintext_len,
-                              uint8_t *out_ciphertext,
-                              uintptr_t out_ciphertext_cap,
-                              uintptr_t *out_ciphertext_len,
-                              uint32_t *out_message_type);
-
-/**
- * Decrypts a wire ciphertext from `peer_identity`. `is_prekey` selects
- * PreKey vs Whisper parsing — the caller must communicate this out-of-band
- * (we ship it as a wire-protocol tag, not embedded in the ciphertext).
- *
- * # Safety
- * All pointers must be non-null and point to memory of the declared sizes.
- */
-int32_t pizzini_store_decrypt(struct DeviceStore *store,
-                              const uint8_t *peer_identity,
-                              uintptr_t peer_identity_len,
-                              const uint8_t *ciphertext,
-                              uintptr_t ciphertext_len,
-                              uint32_t is_prekey,
-                              uint8_t *out_plaintext,
-                              uintptr_t out_plaintext_cap,
-                              uintptr_t *out_plaintext_len);
 
 /**
  * Snapshot the entire store (identity + prekeys + sessions) to a versioned

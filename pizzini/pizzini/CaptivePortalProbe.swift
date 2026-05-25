@@ -45,10 +45,11 @@ public func captivePortalVerdict(
 /// is the only documented clearnet exception added by this code; see
 /// `docs/threat-model.md` for the policy.
 ///
-/// `URLSession.shared` honours the same Tor-bypass posture as the
-/// transparency-log fetch — both are explicit clearnet calls because
-/// neither can ride Tor by definition (the portal probe IS the test
-/// for whether the network is intercepting clearnet; if it could
+/// Uses an isolated, cookie-less `ClearnetSession` rather than
+/// `URLSession.shared` so a portal-set cookie can't ride to the
+/// transparency-log fetch (F-TOR-02). Both are explicit clearnet calls
+/// because neither can ride Tor by definition (the portal probe IS the
+/// test for whether the network is intercepting clearnet; if it could
 /// ride Tor we wouldn't be probing).
 enum CaptivePortalProbe {
     /// Apple's HTTP captive-portal detection endpoint. Stable since
@@ -66,7 +67,8 @@ enum CaptivePortalProbe {
         request.timeoutInterval = timeout
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let session = ClearnetSession.make(timeout: timeout)
+            let (data, response) = try await session.data(for: request)
             return captivePortalVerdict(
                 response: response as? HTTPURLResponse,
                 body: data,

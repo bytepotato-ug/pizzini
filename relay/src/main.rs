@@ -642,6 +642,18 @@ const CHAIN_SEED_DELIVERY_MAX_DISTINCT_TO_IDS: usize = 256;
 /// `(from_id, to_id)`; value is a deque of timestamps of recently
 /// accepted frames within the rate window. Entries with empty
 /// deques are pruned by `spawn_chain_seed_rate_gc`.
+///
+/// Durability (F-ST-03): this table is intentionally **in-memory
+/// only** — a relay bounce resets the per-pair window and the
+/// connection-local distinct-`to_id` set, so it is a *soft,
+/// per-process* anti-flood ceiling, not a hard cross-restart
+/// guarantee. The durable backstop is the persistent `PendingStore`:
+/// its distinct-peer cap is partitioned so unauthenticated seeds can
+/// occupy at most `seed_distinct_peers_cap` of it (F-RP-03), which
+/// bounds absolute disk/RAM growth regardless of restarts. Persisting
+/// this rate table (like `bundle_req_rate_store`) would only harden
+/// the soft window; the store-growth guarantee already holds without
+/// it.
 type ChainSeedRate = Arc<Mutex<HashMap<(PeerId, PeerId), VecDeque<Instant>>>>;
 /// GC cadence for the chain-seed-delivery rate-limit map.
 const CHAIN_SEED_RATE_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -1531,7 +1543,14 @@ async fn read_loop(
                     );
                 } else {
                     drop(map);
-                    enqueue_pending(&parsed.to_id, frame, parsed.ttl_seconds, pending).await;
+                    enqueue_pending(
+                        &parsed.to_id,
+                        frame,
+                        parsed.ttl_seconds,
+                        pending,
+                        PendingClass::Authorized,
+                    )
+                    .await;
                     dev_peer_log!(
                         "queued type={frame_type} → {}: recipient offline (ttl={}s)",
                         short_hex(&parsed.to_id),
@@ -1784,6 +1803,7 @@ async fn read_loop(
                         frame,
                         MAX_PENDING_TTL.as_secs() as u32,
                         pending,
+                        PendingClass::Seed,
                     )
                     .await;
                     dev_peer_log!(
@@ -1798,11 +1818,23 @@ async fn read_loop(
     }
 }
 
+/// Which queue-admission class a pending enqueue belongs to. Token-
+/// authorised SEND/ACK frames (`Authorized`) may use the full
+/// distinct-peer cap; unauthenticated CHAIN_SEED_DELIVERY frames
+/// (`Seed`) are bounded below it so they can't exhaust the slots
+/// authorised offline recipients depend on (F-RP-03).
+#[derive(Clone, Copy)]
+enum PendingClass {
+    Authorized,
+    Seed,
+}
+
 async fn enqueue_pending(
     recipient: &[u8],
     frame: Vec<u8>,
     ttl_seconds: u32,
     pending: &Pending,
+    class: PendingClass,
 ) {
     // Per-peer cap + arrival-order eviction live in `PendingStore`.
     // `enqueue` also atomically persists the new queue state, so a
@@ -1814,7 +1846,11 @@ async fn enqueue_pending(
     let expires_at_unix = encrypted_file::unix_now() + ttl.as_secs();
     let entry = PendingFrame::new(frame, expires_at_unix);
     let mut store = pending.lock().await;
-    match store.enqueue(recipient.to_vec(), entry) {
+    let outcome = match class {
+        PendingClass::Authorized => store.enqueue(recipient.to_vec(), entry),
+        PendingClass::Seed => store.enqueue_seed(recipient.to_vec(), entry),
+    };
+    match outcome {
         Ok(pending_store::EnqueueOutcome::Stored) => {}
         Ok(pending_store::EnqueueOutcome::RejectedGlobalCap) => {
             // The offline-queue store hit a global ceiling (distinct

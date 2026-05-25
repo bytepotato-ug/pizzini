@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import SwiftUI
 import UIKit
 
@@ -33,6 +34,32 @@ enum AttachmentThumbnail {
     /// 1.5 and 4 MB; 5 MB covers the common case while keeping a
     /// hard ceiling on memory pressure for a single decode.
     nonisolated static let maxByteSize: UInt64 = 5 * 1024 * 1024
+
+    /// Hard ceiling on a source image's *declared* pixel count, read from
+    /// the header before any bitmap is allocated. The 5 MiB byte cap
+    /// bounds *encoded* size, not *decoded* size: a few-KiB PNG can
+    /// declare 30000×30000 and expand to width×height×4 ≈ 3.6 GB when
+    /// fully decoded (a decompression bomb). 100 MP ≈ 400 MiB at 4 B/px
+    /// is already well past any legitimate phone photo (~50 MP), so we
+    /// refuse anything larger up front (F-ATT-02).
+    nonisolated static let maxSourcePixels: UInt64 = 100_000_000
+
+    /// Long-edge ceiling for the downsampled decode. `CGImageSourceCreateThumbnailAtIndex`
+    /// produces at most this dimension, so the decoded bitmap is bounded
+    /// at ~`thumbnailMaxPixelSize`² × 4 B regardless of the source's
+    /// declared size — the "hard ceiling on memory pressure for a single
+    /// decode" the byte cap alone never enforced. Large enough that both
+    /// the inline 220 pt thumbnail and the full-screen zoom stay crisp.
+    nonisolated static let thumbnailMaxPixelSize: Int = 2048
+
+    /// Whether an image whose header declares `width`×`height` may be
+    /// decoded in-process. Rejects non-positive dimensions and anything
+    /// above `maxSourcePixels`. Pure so it can be unit-tested without
+    /// invoking ImageIO.
+    nonisolated static func isWithinPixelBudget(width: Int, height: Int) -> Bool {
+        guard width > 0, height > 0 else { return false }
+        return UInt64(width) * UInt64(height) <= maxSourcePixels
+    }
 
     /// Whitelist of file extensions eligible for in-process decode.
     /// Deliberately narrower than `AttachmentTierClassifier.mediaExtensions`
@@ -98,7 +125,7 @@ enum AttachmentThumbnail {
     /// the timeout and process-isolation layer.
     nonisolated static func decode(_ data: Data) async -> UIImage? {
         let task = Task.detached(priority: .utility) { () -> UIImage? in
-            UIImage(data: data)
+            downsample(data)
         }
         let timeout = Task.detached(priority: .utility) { () -> UIImage? in
             try? await Task.sleep(nanoseconds: 5 * 1_000_000_000)
@@ -114,6 +141,39 @@ enum AttachmentThumbnail {
         task.cancel()
         timeout.cancel()
         return result
+    }
+
+    /// Decode `data` to a downsampled `UIImage` via ImageIO. Unlike
+    /// `UIImage(data:)`, this (1) reads the declared pixel dimensions from
+    /// the header and refuses anything over `maxSourcePixels` before a
+    /// bitmap is allocated, and (2) asks ImageIO for a thumbnail capped at
+    /// `thumbnailMaxPixelSize` on the long edge — so the decoded buffer is
+    /// bounded regardless of the source's declared dimensions (F-ATT-02).
+    nonisolated private static func downsample(_ data: Data) -> UIImage? {
+        let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions as CFDictionary) else {
+            return nil
+        }
+        // Reject decompression bombs by declared dimensions BEFORE
+        // decoding any pixels. A header with no usable dimensions is not
+        // trusted — fail closed.
+        guard let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = props[kCGImagePropertyPixelWidth] as? Int,
+              let height = props[kCGImagePropertyPixelHeight] as? Int,
+              isWithinPixelBudget(width: width, height: height)
+        else {
+            return nil
+        }
+        let thumbOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: thumbnailMaxPixelSize,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOptions as CFDictionary) else {
+            return nil
+        }
+        return UIImage(cgImage: cg)
     }
 
     /// One-shot guard: applies every pre-decode predicate (whitelist,

@@ -59,13 +59,20 @@ fi
 ok "Xcode CLT at $(xcode-select -p)."
 
 # ───── Homebrew ───────────────────────────────────────────────────────
+# This script mints the relays' onion-service private keys, so it must
+# not pull and execute an unpinned remote installer on the key machine.
+# We do NOT `curl … | bash` the Homebrew bootstrap (F-SUP-05): require
+# brew to be present (installed out-of-band, verified) and stop with
+# instructions otherwise.
 if ! command -v brew >/dev/null 2>&1; then
     if [[ -x /opt/homebrew/bin/brew ]]; then
         eval "$(/opt/homebrew/bin/brew shellenv)"
     else
-        say "Installing Homebrew (this prompts for your password)…"
-        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-        eval "$(/opt/homebrew/bin/brew shellenv)"
+        err "Homebrew is required but not installed."
+        err "Install it manually first — review https://brew.sh and run the"
+        err "installer yourself (do not pipe a remote script to bash on the"
+        err "machine that holds your onion private keys), then re-run this."
+        exit 1
     fi
 fi
 ok "Homebrew at $(command -v brew)."
@@ -82,21 +89,48 @@ fi
 ok "libsodium + autotools present."
 
 # ───── mkp224o clone + build ──────────────────────────────────────────
+# mkp224o mints the relays' onion-service SECRET keys, so it must be
+# locked to a reviewed commit — not whatever the default branch happens
+# to be at clone time, and not a mutable tag (F-SUP-05). Set
+# MKP224O_PIN_SHA to a full 40-char commit you have reviewed; the build
+# refuses to proceed on an unpinned or mismatched checkout.
+MKP224O_PIN_SHA="${MKP224O_PIN_SHA:-}"
+if [[ -z "$MKP224O_PIN_SHA" ]]; then
+    err "MKP224O_PIN_SHA is not set."
+    err "Pin mkp224o to a reviewed commit before minting onion keys:"
+    err "review https://github.com/cathugger/mkp224o, pick a commit you"
+    err "trust, then re-run with:"
+    err "  MKP224O_PIN_SHA=<full-40-char-commit> $0"
+    exit 1
+fi
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
 if [[ ! -d mkp224o/.git ]]; then
     say "Cloning mkp224o…"
-    git clone --depth=1 https://github.com/cathugger/mkp224o.git
+    # Full clone (not --depth=1 of a branch) so an arbitrary reviewed
+    # commit is fetchable regardless of how far back it is.
+    git clone https://github.com/cathugger/mkp224o.git
 fi
 cd mkp224o
-if [[ ! -x ./mkp224o ]]; then
-    say "Building mkp224o for ARM64…"
-    ./autogen.sh
-    LDFLAGS="-L$(brew --prefix libsodium)/lib" \
-    CFLAGS="-I$(brew --prefix libsodium)/include -O3" \
-        ./configure
-    make -j"$(sysctl -n hw.logicalcpu)"
+# Lock to the reviewed commit and verify the checkout actually landed on
+# it — a moved branch/tag can't smuggle in different code past this gate.
+git fetch --tags origin >/dev/null 2>&1 || true
+git -c advice.detachedHead=false checkout "$MKP224O_PIN_SHA" >/dev/null 2>&1 \
+    || { err "Cannot check out pinned commit $MKP224O_PIN_SHA (not found upstream)."; exit 1; }
+actual_sha="$(git rev-parse HEAD)"
+if [[ "$actual_sha" != "$MKP224O_PIN_SHA" ]]; then
+    err "mkp224o checkout is $actual_sha, expected pinned $MKP224O_PIN_SHA"
+    exit 1
 fi
+ok "mkp224o pinned at $MKP224O_PIN_SHA"
+# Always rebuild after the pinned checkout so the binary can't be a stale
+# build from a previously-checked-out commit.
+say "Building mkp224o (pinned) for ARM64…"
+./autogen.sh
+LDFLAGS="-L$(brew --prefix libsodium)/lib" \
+CFLAGS="-I$(brew --prefix libsodium)/include -O3" \
+    ./configure
+make -j"$(sysctl -n hw.logicalcpu)"
 [[ -x ./mkp224o ]] || { err "Build failed: ./mkp224o not found."; exit 1; }
 ok "mkp224o built at $(pwd)/mkp224o."
 

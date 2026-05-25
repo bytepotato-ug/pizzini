@@ -78,13 +78,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify pizzini_sqlcipher.c sha256 sidecar
+      - name: Verify pizzini_sqlcipher.c sha256 + commit pin
         run: |
-          if [ ! -f swift/Sources/PizziniSQLCipher/pizzini_sqlcipher.c.sha256 ]; then
-            echo "::warning::sha256 sidecar missing — regenerate via scripts/build-sqlcipher-amalgamation.sh"
-            exit 0
+          set -euo pipefail
+          dir=swift/Sources/PizziniSQLCipher
+          # Hard-fail (not warn) on a missing baseline: an absent sidecar
+          # means the committed 9 MB C blob has no integrity anchor, which
+          # is exactly the gap this gate exists to close (F-SUP-04).
+          if [ ! -f "$dir/pizzini_sqlcipher.c.sha256" ]; then
+            echo "::error::pizzini_sqlcipher.c.sha256 missing — regenerate via scripts/build-sqlcipher-amalgamation.sh and commit it"
+            exit 1
           fi
-          (cd swift/Sources/PizziniSQLCipher && sha256sum -c pizzini_sqlcipher.c.sha256)
+          if [ ! -f "$dir/COMMIT_SHA" ]; then
+            echo "::error::COMMIT_SHA missing — regenerate via scripts/build-sqlcipher-amalgamation.sh and commit it"
+            exit 1
+          fi
+          (cd "$dir" && sha256sum -c pizzini_sqlcipher.c.sha256)
+          # The committed amalgamation must come from the upstream commit
+          # the build script pins, so a same-VERSION swap from a different
+          # commit is caught even if someone regenerates the sha256.
+          expected="$(grep -E '^SQLCIPHER_PIN_SHA=' scripts/build-sqlcipher-amalgamation.sh | grep -oE '[0-9a-f]{40}' | head -1)"
+          actual="$(tr -d '[:space:]' < "$dir/COMMIT_SHA")"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::COMMIT_SHA ($actual) != pinned SQLCIPHER_PIN_SHA ($expected)"
+            exit 1
+          fi
 
   ios-build:
     name: iOS device + simulator slices build clean

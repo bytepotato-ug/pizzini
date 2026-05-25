@@ -159,6 +159,17 @@ pub enum EnqueueOutcome {
     RejectedGlobalCap,
 }
 
+/// Distinct-peer slots reserved exclusively for token-authorised
+/// SEND/ACK recipients, expressed as a fraction of `max_distinct_peers`.
+/// Unauthenticated `CHAIN_SEED_DELIVERY` enqueues to never-seen `to_id`s
+/// (via `enqueue_seed`) are bounded at the remaining slots, so a
+/// free-to-mint sender spraying fabricated `to_id`s cannot consume the
+/// queue slots legitimate offline SEND recipients depend on (F-RP-03).
+/// 1/4 reserved ⇒ seeds may occupy at most 3/4 of the distinct-peer cap.
+fn seed_distinct_peers_cap(max_distinct_peers: usize) -> usize {
+    max_distinct_peers - max_distinct_peers / 4
+}
+
 // Manual `Debug` to redact the key — same reasoning as
 // `PushTokenStore`.
 impl std::fmt::Debug for PendingStore {
@@ -269,11 +280,42 @@ impl PendingStore {
         peer_id: Vec<u8>,
         frame: PendingFrame,
     ) -> io::Result<EnqueueOutcome> {
+        // Token-authorised SEND/ACK: may use the full distinct-peer cap,
+        // including the slots reserved away from unauthenticated seeds.
+        let cap = self.max_distinct_peers;
+        self.enqueue_inner(peer_id, frame, cap)
+    }
+
+    /// Enqueue an unauthenticated `CHAIN_SEED_DELIVERY` frame. Identical
+    /// to `enqueue` except a *new*-peer queue is refused once the store
+    /// already holds `seed_distinct_peers_cap` distinct queues — below
+    /// the global `max_distinct_peers`. The difference is the F-RP-03
+    /// reserve: a free-to-mint sender spraying fabricated `to_id`s can
+    /// fill at most that lower bound, leaving the remaining slots for
+    /// token-authorised SEND recipients. (An *existing* queue still
+    /// accepts seeds up to the per-peer cap — this only gates creating
+    /// new distinct queues.)
+    pub fn enqueue_seed(
+        &mut self,
+        peer_id: Vec<u8>,
+        frame: PendingFrame,
+    ) -> io::Result<EnqueueOutcome> {
+        let cap = seed_distinct_peers_cap(self.max_distinct_peers);
+        self.enqueue_inner(peer_id, frame, cap)
+    }
+
+    fn enqueue_inner(
+        &mut self,
+        peer_id: Vec<u8>,
+        frame: PendingFrame,
+        distinct_peer_cap: usize,
+    ) -> io::Result<EnqueueOutcome> {
         let is_new_peer = !self.queues.contains_key(&peer_id);
-        // Global distinct-peer cap: a frame to a not-yet-seen `to_id`
-        // is refused once the store already holds the maximum number
-        // of distinct queues.
-        if is_new_peer && self.queues.len() >= self.max_distinct_peers {
+        // Distinct-peer cap: a frame to a not-yet-seen `to_id` is
+        // refused once the store already holds the maximum number of
+        // distinct queues this caller class is allowed (the full cap
+        // for authorised SENDs, the reduced cap for seeds — F-RP-03).
+        if is_new_peer && self.queues.len() >= distinct_peer_cap {
             return Ok(EnqueueOutcome::RejectedGlobalCap);
         }
         // Global frame-count cap. The per-peer eviction below can
@@ -712,6 +754,85 @@ mod tests {
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].bytes()[0], 2);
         assert_eq!(drained[1].bytes()[0], 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_cap_is_three_quarters_of_distinct_peers() {
+        // F-RP-03: 1/4 of the distinct-peer cap is reserved for
+        // token-authorised SENDs; seeds get the rest.
+        assert_eq!(seed_distinct_peers_cap(1024), 768);
+        assert_eq!(seed_distinct_peers_cap(8), 6);
+        assert_eq!(seed_distinct_peers_cap(4), 3);
+        assert_eq!(seed_distinct_peers_cap(0), 0);
+    }
+
+    #[test]
+    fn seeds_cannot_exhaust_slots_reserved_for_authorized_sends() {
+        // F-RP-03: with a distinct-peer cap of 8, unauthenticated seeds
+        // may occupy at most 6 distinct queues (3/4), leaving 2 reserved
+        // for token-authorised SENDs. A free-to-mint sender spraying
+        // fabricated `to_id`s via CHAIN_SEED_DELIVERY therefore cannot
+        // block first-delivery to a new offline SEND recipient.
+        let dir = fresh_state_dir("rp03-partition");
+        let mut store =
+            PendingStore::load_or_create(&dir, TEST_CAP, 8, TEST_MAX_FRAMES, TEST_MAX_BYTES)
+                .unwrap();
+
+        // Attacker fills the seed share: 6 distinct fabricated to_ids.
+        for i in 0..6u8 {
+            assert_eq!(
+                store.enqueue_seed(vec![i; 33], frame_with_ttl(i, 3600)).unwrap(),
+                EnqueueOutcome::Stored,
+                "seed {i} within the seed cap must be stored",
+            );
+        }
+        // The 7th distinct seed is refused — seeds are capped below the
+        // global distinct-peer cap.
+        assert_eq!(
+            store.enqueue_seed(vec![100; 33], frame_with_ttl(100, 3600)).unwrap(),
+            EnqueueOutcome::RejectedGlobalCap,
+            "a new seed queue past the seed cap must be refused",
+        );
+        // But a token-authorised SEND to a brand-new offline recipient
+        // still gets a slot from the reserve.
+        assert_eq!(
+            store.enqueue(vec![200; 33], frame_with_ttl(200, 3600)).unwrap(),
+            EnqueueOutcome::Stored,
+            "authorised SEND must reach a new recipient despite the seed flood",
+        );
+        assert_eq!(
+            store.enqueue(vec![201; 33], frame_with_ttl(201, 3600)).unwrap(),
+            EnqueueOutcome::Stored,
+            "the full distinct-peer cap (8) is available to authorised SENDs",
+        );
+        assert_eq!(store.peers_with_queues(), 8);
+        // Now the full cap (8) is reached — even an authorised SEND to
+        // yet another new recipient is refused.
+        assert_eq!(
+            store.enqueue(vec![202; 33], frame_with_ttl(202, 3600)).unwrap(),
+            EnqueueOutcome::RejectedGlobalCap,
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_to_existing_queue_is_not_blocked_by_the_seed_cap() {
+        // The seed cap only gates creating NEW distinct queues; an
+        // existing recipient's queue keeps accepting seeds.
+        let dir = fresh_state_dir("rp03-existing");
+        let mut store =
+            PendingStore::load_or_create(&dir, TEST_CAP, 8, TEST_MAX_FRAMES, TEST_MAX_BYTES)
+                .unwrap();
+        for i in 0..6u8 {
+            store.enqueue_seed(vec![i; 33], frame_with_ttl(i, 3600)).unwrap();
+        }
+        // A second seed to an EXISTING queue (peer 0) still stores even
+        // though we're at the seed distinct-peer cap.
+        assert_eq!(
+            store.enqueue_seed(vec![0; 33], frame_with_ttl(0xEE, 3600)).unwrap(),
+            EnqueueOutcome::Stored,
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

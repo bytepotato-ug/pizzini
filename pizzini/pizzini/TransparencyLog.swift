@@ -319,13 +319,19 @@ extension TransparencyLog {
         return parseLog(data)
     }
 
-    /// Sidecar file holding the highest `signed_at` ever observed
-    /// across every fetched log. Lives next to the log cache in
-    /// `Library/Caches/` — both share the same durability (iOS may
-    /// evict either under disk pressure, which simply restarts the
-    /// monotonicity tracking, the same way it restarts the
-    /// count-based rollback guard).
-    private static func watermarkURL() throws -> URL {
+    /// UserDefaults key holding the highest `signed_at` ever observed
+    /// across every fetched log, as a `timeIntervalSince1970` Double.
+    /// Stored in UserDefaults — NOT the evictable `Library/Caches` dir —
+    /// so iOS reclaiming disk space can't silently reset the rollback
+    /// floor (F-TL-03). The floor must be at least as durable as the
+    /// decision it gates; the log cache itself stays in Caches because
+    /// it is re-fetchable, but the rollback floor is not.
+    private static let watermarkDefaultsKey = "pizzini.transparencyLog.signedAtWatermark"
+
+    /// Legacy sidecar location for the watermark (pre-F-TL-03, in
+    /// `Library/Caches`). Read once on migration so an app upgrade
+    /// doesn't momentarily drop the floor to nil; never written.
+    private static func legacyWatermarkURL() throws -> URL {
         let cachesDir = try FileManager.default.url(
             for: .cachesDirectory,
             in: .userDomainMask,
@@ -340,9 +346,17 @@ extension TransparencyLog {
     /// unparseable value — a log whose newest entry has an
     /// unparseable timestamp cannot be monotonicity-checked, which
     /// `fetchAndCache` treats as a hard reject (fail-closed).
-    private static func parseSignedAt(_ raw: String) -> Date? {
+    static func parseSignedAt(_ raw: String) -> Date? {
+        // Whole-second UTC is what the current signer emits
+        // (sign-transparency-entry.sh). Accept fractional seconds too so
+        // a future signer that emits e.g. `…:16.123Z` doesn't make
+        // `maxSignedAt` nil and brick refresh fail-closed (F-TL-07) —
+        // `.withFractionalSeconds` parses ONLY the fractional form, so we
+        // try the plain form first and fall back.
         let fmt = ISO8601DateFormatter()
         fmt.formatOptions = [.withInternetDateTime]
+        if let date = fmt.date(from: raw) { return date }
+        fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return fmt.date(from: raw)
     }
 
@@ -356,9 +370,16 @@ extension TransparencyLog {
         }.max()
     }
 
-    /// Read the persisted high-water `signed_at`, if any.
-    private static func loadWatermark() -> Date? {
-        guard let url = try? watermarkURL(),
+    /// Read the persisted high-water `signed_at`, if any. Prefers the
+    /// durable UserDefaults value; on first run after the F-TL-03
+    /// upgrade it falls back to (migrates from) the legacy Caches
+    /// sidecar so the floor isn't momentarily lost across the update.
+    /// `defaults` is injectable for tests.
+    static func loadWatermark(defaults: UserDefaults = .standard) -> Date? {
+        if let epoch = defaults.object(forKey: watermarkDefaultsKey) as? Double {
+            return Date(timeIntervalSince1970: epoch)
+        }
+        guard let url = try? legacyWatermarkURL(),
               let data = try? Data(contentsOf: url),
               let text = String(data: data, encoding: .utf8),
               let epoch = TimeInterval(text.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -366,13 +387,10 @@ extension TransparencyLog {
         return Date(timeIntervalSince1970: epoch)
     }
 
-    /// Persist `date` as the new high-water `signed_at`. Best-effort:
-    /// a write failure just means the next fetch re-evaluates against
-    /// the prior (or absent) watermark.
-    private static func storeWatermark(_ date: Date) {
-        guard let url = try? watermarkURL() else { return }
-        let text = String(date.timeIntervalSince1970)
-        try? Data(text.utf8).write(to: url, options: [.atomic])
+    /// Persist `date` as the new high-water `signed_at` in the durable
+    /// (non-evictable) store. `defaults` is injectable for tests.
+    static func storeWatermark(_ date: Date, defaults: UserDefaults = .standard) {
+        defaults.set(date.timeIntervalSince1970, forKey: watermarkDefaultsKey)
     }
 
     /// Count entries in `log` whose signature passes against the
@@ -430,13 +448,16 @@ extension TransparencyLog {
                 throw FetchError.http("Tor not ready: \(error.localizedDescription)")
             }
         } else {
-            // Clearnet target: fall through to `URLSession.shared`.
-            // The Tor daemon's `OnionTrafficOnly` flag (see
+            // Clearnet target: use an isolated, cookie-less session
+            // rather than `URLSession.shared`. The Tor daemon's
+            // `OnionTrafficOnly` flag (see
             // PizziniTor/TorController.makeConfiguration) refuses
             // clearnet on the SOCKS port outright, so trying Tor
             // here would produce a hard error. The IP-leak is
-            // documented in the threat model.
-            session = .shared
+            // documented in the threat model; the isolated session
+            // keeps this fetch unlinkable to the captive-portal probe
+            // (no shared cookie jar — F-TOR-02).
+            session = ClearnetSession.make()
         }
         let (data, response): (Data, URLResponse)
         do {
