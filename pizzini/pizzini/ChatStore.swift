@@ -3583,9 +3583,10 @@ final class ChatStore: NSObject {
     ///      a Face-ID-on or onboarded posture would make the device
     ///      show a lock screen / skip onboarding, which a genuinely
     ///      fresh install does not, breaking the "indistinguishable
-    ///      from a clean install" goal. (The brief and README still
-    ///      describe a larger preserved set; the code here is
-    ///      authoritative — see `Storage.eraseAndReinitialize`.)
+    ///      from a clean install" goal. (F-DUR-04:
+    ///      `Storage.eraseAndReinitialize` is the single authoritative
+    ///      definition of the preserved set; keep the README/FAQ copy in
+    ///      sync with it rather than the reverse.)
     ///   2. Tear down the relay socket + retry timer so no in-
     ///      flight encrypt can reach the network with the soon-to-
     ///      be-orphaned session.

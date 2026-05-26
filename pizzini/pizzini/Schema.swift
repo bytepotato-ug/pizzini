@@ -1,9 +1,10 @@
 import Foundation
 import PizziniDB
 
-/// SQLCipher schema for Pizzini's persistent state. Eleven tables —
-/// see `docs/storage-architecture.md` and the sign-off recorded in
-/// the README's session log for the design rationale.
+/// SQLCipher schema for Pizzini's persistent state. Eleven tables; the
+/// design rationale ("why no JSON-blob columns") is inlined below
+/// (F-STO-03: removed a pointer to a `docs/storage-architecture.md` that
+/// does not exist).
 ///
 /// Migration model: `PRAGMA user_version` records the schema version
 /// that was last applied. `Migrator.run(on:)` walks every migration

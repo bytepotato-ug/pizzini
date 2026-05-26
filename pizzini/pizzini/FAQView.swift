@@ -326,6 +326,14 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             received in a system-wide database that forensic tools \
             can read. Anything in the notification text sits there in \
             plain text. Pizzini deliberately puts nothing useful in it.
+
+            What Apple still sees: push goes through Apple's servers \
+            (APNs), so Apple can link the device token to your Apple ID \
+            and learns the timing of when a wake-up was sent to you — \
+            even though the content reveals nothing. The relay also adds \
+            a random delay before sending each wake-up to blur that \
+            timing. If you want zero Apple involvement, leave \
+            notifications off and open the app to fetch.
             """
 
         case .screenCapture:

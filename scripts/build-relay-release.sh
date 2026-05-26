@@ -89,6 +89,25 @@ if [[ -z "${INSIDE_DOCKER:-}" ]]; then
     echo "==> Reproducible relay build (inside docker)"
     echo "    repo  : $REPO_ROOT"
     echo "    commit: $GIT_SHA"
+    # F-TL-05: pin the build inputs that otherwise float. A bare
+    # `rust:1.95.0-bookworm` tag is mutable, and `apt-get install
+    # protobuf-compiler pkg-config` pulls whatever Debian publishes that
+    # day — both can change the binary digest between two builds of the
+    # same commit, breaking the cross-operator reproducibility the
+    # transparency log relies on. For a bit-reproducible build set BOTH:
+    #   RELAY_BASE_IMAGE="rust:1.95.0-bookworm@sha256:<digest>"
+    #   APT_PINS="protobuf-compiler=<ver> pkg-config=<ver>"
+    # Defaults keep the script working; a WARN fires when unpinned.
+    RELAY_BASE_IMAGE="${RELAY_BASE_IMAGE:-rust:1.95.0-bookworm}"
+    APT_PINS="${APT_PINS:-protobuf-compiler pkg-config}"
+    if [[ "$RELAY_BASE_IMAGE" != *"@sha256:"* ]]; then
+        echo "    WARN: RELAY_BASE_IMAGE is a mutable tag ($RELAY_BASE_IMAGE)." >&2
+        echo "          Set it to an @sha256: digest for a reproducible build." >&2
+    fi
+    if [[ "$APT_PINS" != *"="* ]]; then
+        echo "    WARN: APT_PINS unpinned ($APT_PINS) — set name=version for reproducibility." >&2
+    fi
+    echo "    image : $RELAY_BASE_IMAGE"
     # `cargo vendor` once on the host (outside the container) so the
     # offline build inside docker has every dep on disk. Idempotent;
     # produces `vendor/` + `.cargo/config.toml`-equivalent stdout we
@@ -116,13 +135,16 @@ if [[ -z "${INSIDE_DOCKER:-}" ]]; then
         -e HOME=/build-home \
         -e HOST_UID="$HOST_UID" \
         -e HOST_GID="$HOST_GID" \
+        -e APT_PINS="$APT_PINS" \
         -v "$REPO_ROOT":/work:rw \
         -w /work \
-        rust:1.95.0-bookworm \
+        "$RELAY_BASE_IMAGE" \
         bash -c '
             set -euo pipefail
             apt-get update -qq
-            apt-get install -y --no-install-recommends protobuf-compiler pkg-config >/dev/null
+            # F-TL-05: install the pinned package specs (name=version when
+            # APT_PINS is pinned; bare names otherwise — see the WARN above).
+            apt-get install -y --no-install-recommends $APT_PINS >/dev/null
             mkdir -p /build-home
             # The bind-mounted repo is owned by HOST_UID but the
             # container runs as root, so git >= 2.35 refuses /work

@@ -913,7 +913,10 @@ impl DeviceStore {
         // PoW already forbid this in steady state, but we defend in
         // depth here too — a malicious relay could otherwise inject
         // sealed envelopes from arbitrary identities.
-        let trusted = self.peers.iter().any(|p| p.as_slice() == claimed_bytes.as_slice());
+        // F-CF-03: constant-time (no early-exit) membership so a malicious
+        // relay can't time-probe contact-list position by injecting sealed
+        // envelopes claiming various identities.
+        let trusted = ct_peer_contains(&self.peers, claimed_bytes.as_slice());
         if !trusted {
             crypto_diag!(
                 "seal_receive: rejecting unknown sender {}",
@@ -1410,6 +1413,35 @@ fn hex_lower(bytes: &[u8]) -> String {
         let _ = write!(&mut s, "{b:02x}");
     }
     s
+}
+
+/// F-CF-03: constant-time byte equality (returns 1 if equal, 0 otherwise)
+/// with no early exit. Length is public (a 33-byte IdentityKey), so the
+/// length branch is fine; the byte loop never short-circuits.
+fn ct_byte_eq(a: &[u8], b: &[u8]) -> u8 {
+    if a.len() != b.len() {
+        return 0;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    // Branchless "diff == 0 -> 1, else 0".
+    ((((diff as i32) - 1) >> 8) & 1) as u8
+}
+
+/// F-CF-03: constant-time (w.r.t. match position) contact-gate membership.
+/// Folds over EVERY peer without short-circuiting so the lookup time does
+/// not depend on which contact matched (or none) — closing the timing
+/// signal a malicious relay could otherwise probe by injecting sealed
+/// envelopes claiming various identities. The comparison is over public
+/// identity bytes, so this is defense-in-depth, not a secret-dependent path.
+fn ct_peer_contains(peers: &[Vec<u8>], needle: &[u8]) -> bool {
+    let mut found = 0u8;
+    for p in peers {
+        found |= ct_byte_eq(p.as_slice(), needle);
+    }
+    found != 0
 }
 
 /// 4-byte hex shorthand for peer-id log lines. Mirrors the iOS
@@ -2038,6 +2070,32 @@ mod tests {
         assert!(res.is_err(), "a count larger than the buffer must be rejected");
         let msg = format!("{}", res.err().unwrap());
         assert!(msg.contains("exceeds remaining bytes"), "got: {msg}");
+    }
+
+    #[test]
+    fn ct_peer_contains_is_correct_and_position_independent() {
+        // F-CF-03: the constant-time, no-early-exit contact-gate membership
+        // must still be functionally correct — match at any position, reject
+        // non-members and wrong-length inputs.
+        assert_eq!(ct_byte_eq(&[1, 2, 3], &[1, 2, 3]), 1);
+        assert_eq!(ct_byte_eq(&[1, 2, 3], &[1, 2, 4]), 0);
+        assert_eq!(ct_byte_eq(&[1, 2, 3], &[1, 2]), 0); // length mismatch
+        assert_eq!(ct_byte_eq(&[], &[]), 1);
+
+        let first = vec![5u8; 33];
+        let mut middle = vec![5u8; 33];
+        middle[10] = 9;
+        let mut last = vec![5u8; 33];
+        last[0] = 6;
+        let peers = vec![first.clone(), middle.clone(), last.clone()];
+        assert!(ct_peer_contains(&peers, &first)); // position 0
+        assert!(ct_peer_contains(&peers, &middle)); // middle
+        assert!(ct_peer_contains(&peers, &last)); // last
+        let mut absent = vec![5u8; 33];
+        absent[20] = 1;
+        assert!(!ct_peer_contains(&peers, &absent));
+        assert!(!ct_peer_contains(&peers, &[5u8; 32])); // wrong length
+        assert!(!ct_peer_contains(&[], &first)); // empty contact list
     }
 
     #[test]
