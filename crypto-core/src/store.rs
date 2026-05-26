@@ -1685,6 +1685,44 @@ mod tests {
         assert!(clock_is_sane_for_cert(now_millis()));
     }
 
+    /// PZ-M1: `extract_bundle_verify_key` parses peer-supplied bundle
+    /// bytes (a malicious relay or peer can hand us anything). It must
+    /// never panic — only `Ok`/`Err`. crypto-core is `panic = "abort"`,
+    /// so a panic aborts this binary, making the sweep a real detector.
+    /// Inputs are also tried with a leading valid BUNDLE_VERSION byte to
+    /// drive past the version gate into the deeper field/KEM parsing.
+    #[test]
+    fn decode_bundle_never_panics_on_arbitrary_input() {
+        let mut state: u64 = 0xDEAD_BEEF_0BAD_F00D;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        };
+        let mut calls = 0usize;
+        for len in 0usize..=400 {
+            let patterns: [Vec<u8>; 4] = [
+                vec![0x00u8; len],
+                vec![0xFFu8; len],
+                (0..len).map(|i| i as u8).collect(),
+                (0..len).map(|_| next()).collect(),
+            ];
+            for input in &patterns {
+                let _ = extract_bundle_verify_key(input);
+                // Prepend the real version byte so the parser advances
+                // past the version gate into registration_id / blobs /
+                // the kem public-key deserialization on garbage.
+                let mut versioned = Vec::with_capacity(input.len() + 1);
+                versioned.push(BUNDLE_VERSION);
+                versioned.extend_from_slice(input);
+                let _ = extract_bundle_verify_key(&versioned);
+                calls += 2;
+            }
+        }
+        assert!(calls > 0);
+    }
+
     #[test]
     fn rehydrate_keeps_identity() {
         let store = DeviceStore::fresh().unwrap();

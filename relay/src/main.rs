@@ -2741,6 +2741,49 @@ mod tests {
         assert!(parse_routed(&huge).is_err());
     }
 
+    /// PZ-M1: no wire-reachable panic. Every `parse_*` is built on the
+    /// bounds-checked `Cursor`, so arbitrary / truncated / oversized /
+    /// garbage frame bodies must return `Ok` or `Err`, never panic. The
+    /// dev and release profiles both set `panic = "abort"`, so a panic in
+    /// any parser would abort this test binary — making this sweep a real
+    /// detector, and a guard against a future parser that indexes or
+    /// unwraps on attacker-controlled bytes.
+    #[test]
+    fn parsers_never_panic_on_arbitrary_input() {
+        // Deterministic LCG → reproducible corpus.
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        };
+        // A valid-length HELLO-authenticated peer id for parse_register_chain
+        // (it rejects any other self_id length before touching the body).
+        let self_id_33 = [7u8; 33];
+        let mut calls = 0usize;
+        for len in 0usize..=300 {
+            let patterns: [Vec<u8>; 4] = [
+                vec![0x00u8; len],
+                vec![0xFFu8; len], // u16/u32 length prefixes claim far more than present
+                (0..len).map(|i| i as u8).collect(),
+                (0..len).map(|_| next()).collect(),
+            ];
+            for input in &patterns {
+                // Each call must return without aborting the process.
+                let _ = parse_hello(input);
+                let _ = parse_routed(input);
+                let _ = parse_bundle_request(input);
+                let _ = parse_sealed(input);
+                let _ = parse_register_push(input);
+                let _ = parse_register_chain(input, &self_id_33);
+                calls += 6;
+            }
+        }
+        // Reaching this line means no parser panicked across the corpus.
+        assert!(calls > 0);
+    }
+
     // ───── STATUS_RESPONSE encoding ─────────────────────────
 
     fn make_status(crate_version: &str, git_sha: &str, dirty: u8, hash: [u8; 32]) -> RelayStatus {
