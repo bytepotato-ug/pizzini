@@ -14,7 +14,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 # Pinned by tag; Cargo.lock records the resolved commit.
-libsignal-protocol = { git = "https://github.com/signalapp/libsignal.git", tag = "v0.93.2" }
+# `mlkem1024` enables libsignal's FIPS-203 ML-KEM-1024 KEM variant
+# (KeyType::MLKEM1024). We select it over the always-on draft `Kyber1024`
+# so the PQXDH post-quantum half is the final NIST standard, not a
+# round-3 draft (PZ-H1). FIPS-203 ML-KEM-768 is not exposed by this
+# libsignal version and would require a library upgrade; 1024 is the
+# reachable FIPS-203 parameter set and carries a higher security margin.
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal.git", tag = "v0.93.2", features = ["mlkem1024"] }
 rand = "0.9"
 # now_or_never() — the in-mem libsignal stores resolve futures synchronously,
 # so we don't need a real runtime. Promoted from dev-dep when LoopbackState

@@ -124,7 +124,8 @@ final class ScannerViewController: UIViewController, AVCaptureMetadataOutputObje
     }
 
     /// Renders an in-sheet explanation with an "Open Settings" deep
-    /// link and a note that invite-link pairing is an alternative.
+    /// link and a note that a contact can still be added without the
+    /// camera (they scan your QR, or you paste their contact card).
     /// Replaces the silent black rectangle for every camera-
     /// unavailable state.
     private func showCameraUnavailable(_ reason: CameraUnavailableReason) {
@@ -139,10 +140,12 @@ final class ScannerViewController: UIViewController, AVCaptureMetadataOutputObje
         switch reason {
         case .denied:
             detail.text = "Pizzini needs camera access to scan a contact's QR code. "
-                + "Enable it in Settings, or pair using an invite link instead."
+                + "Enable it in Settings, or add a contact without scanning: have them "
+                + "scan your QR code, or paste their contact card into Add Contact."
         case .noDevice:
             detail.text = "No usable camera was found on this device. "
-                + "You can still pair using an invite link instead."
+                + "You can still add a contact without scanning: have them scan your "
+                + "QR code, or paste their contact card into Add Contact."
         }
         detail.font = .preferredFont(forTextStyle: .body)
         detail.textColor = .white

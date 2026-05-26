@@ -243,7 +243,7 @@ struct Contact: Codable, Identifiable, Sendable {
     var peerVerifyKey: Data?
     /// Last time we *served* a BUNDLE_RESPONSE to this peer. F-404: a
     /// paired peer can otherwise loop BUNDLE_REQUEST and burn one
-    /// kyber1024 + one one-time prekey per request; we cap at one fresh
+    /// ML-KEM-1024 + one one-time prekey per request; we cap at one fresh
     /// publish per `Contact.chainServeCooldown`.
     var lastBundleServedAt: Date?
     /// How this contact's identity entered the device. The verification
@@ -332,7 +332,7 @@ struct Contact: Codable, Identifiable, Sendable {
     /// Minimum time between chain mint+ship operations to one peer.
     /// Used to rate-limit how often we re-issue a chain in response
     /// to a peer-initiated BUNDLE_REQUEST. 6 h matches the cost
-    /// profile of the bundle-coupled path (kyber1024 keygen + one-
+    /// profile of the bundle-coupled path (ML-KEM-1024 keygen + one-
     /// time prekey burn).
     ///
     /// `nonisolated` because Swift 6's module-default `@MainActor`
@@ -347,7 +347,7 @@ struct Contact: Codable, Identifiable, Sendable {
     /// matches the cost profile of the chain-only path (BLAKE3 root
     /// derivation, no prekey burn). Independent from
     /// `chainServeCooldown` because the bundle path's 6 h cap was
-    /// sized for kyber1024 work that the refresh path skips.
+    /// sized for ML-KEM-1024 work that the refresh path skips.
     /// Threshold is short enough that proactive rotation (which
     /// triggers at ~13 000 messages on a 16 384-token chain) never
     /// hits the cap in normal use, and tight enough that a buggy

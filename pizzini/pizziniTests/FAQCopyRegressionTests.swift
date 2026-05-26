@@ -133,6 +133,41 @@ struct FAQCopyRegressionTests {
         #expect(FAQSection.documentMetadata.rawValue == "documentMetadata")
         #expect(FAQSection.executableWarning.rawValue == "executableWarning")
     }
+
+    /// PZ-H1 / KEM truthfulness: the code ships FIPS-203 ML-KEM-1024
+    /// (`KeyType::MLKEM1024`). The FAQ must name that exact primitive —
+    /// not the 768 parameter set we don't use, and not the draft "Kyber"
+    /// terminology we migrated off. If the implementation ever changes
+    /// (e.g. a libsignal upgrade brings 768), this test changes in the
+    /// same commit as the copy, so they can't drift apart silently.
+    @Test
+    func encryptionClaimsFips203MLKEM1024() {
+        let combined = FAQSection.encryption.combinedBody
+        #expect(combined.localizedCaseInsensitiveContains("ML-KEM-1024"))
+        #expect(combined.localizedCaseInsensitiveContains("FIPS 203"))
+        // We ship 1024, not 768 — never name a parameter set we don't use.
+        #expect(!combined.localizedCaseInsensitiveContains("ML-KEM-768"))
+        // No regression to draft-Kyber terminology now that we're FIPS-203.
+        #expect(!combined.localizedCaseInsensitiveContains("Kyber"))
+    }
+
+    /// PZ-M26: the encryption answer must scope "only you can read it"
+    /// to message *contents* and keep the delivery-metadata caveat —
+    /// the relay still sees recipient, timing, and size.
+    @Test
+    func encryptionKeepsMetadataCaveat() {
+        let combined = FAQSection.encryption.combinedBody
+        #expect(combined.localizedCaseInsensitiveContains("metadata"))
+    }
+
+    /// The crypto-primitives list must name the real KEM too.
+    @Test
+    func cryptoPrimitivesClaimsFips203MLKEM1024() {
+        let combined = FAQSection.cryptoPrimitives.combinedBody
+        #expect(combined.localizedCaseInsensitiveContains("ML-KEM-1024"))
+        #expect(!combined.localizedCaseInsensitiveContains("ML-KEM-768"))
+        #expect(!combined.localizedCaseInsensitiveContains("Kyber"))
+    }
 }
 
 private extension FAQSection {

@@ -1,6 +1,6 @@
 # Pizzini
 
-A post-quantum, end-to-end encrypted iOS messenger. No phone numbers, no central directory, no metadata. Signal-grade privacy without Signal's compromises.
+A post-quantum, end-to-end encrypted iOS messenger. No phone numbers, no central directory, no accounts. Signal-grade privacy without Signal's compromises. (The relay still observes unavoidable transport metadata — the recipient address, message timing, and ciphertext size — but never the sender or any plaintext; see the metadata discussion below.)
 
 [pizzini.app](https://pizzini.app)
 
@@ -8,11 +8,11 @@ A post-quantum, end-to-end encrypted iOS messenger. No phone numbers, no central
 
 Signal is the reference. Pizzini diverges where Signal made compromises we don't have to:
 
-- **No phone number.** Pairwise random IDs. Pairing happens via QR or invite link, out of band.
+- **No phone number.** Pairwise random IDs. Pairing happens via QR code or a pasted contact card, out of band.
 - **Tor-only transport.** No clearnet fallback. Sealed sender over onion routing.
 - **Stateless relays, app-side fanout across a bundled fleet.** Relays hold no per-user accounts and no plaintext message bodies. The current fleet is three Tor onion services hosted in DE / NO / US — but all three are run by a single operator on one provider, so the "multiple jurisdictions / no single seizable server" property is aspirational: it only holds once independent operators run independent infrastructure. Two routing maps persist across restarts under ChaCha20-Poly1305 with 0600 permissions: the offline-message queue (libsignal-sealed ciphertexts, sender-chosen TTL up to 7 days, per-peer cap) and the APNs push-token map (30-day TTL). The v2 delivery-token chain-validator cursors and bundle-request rate buckets persist in separate bounded encrypted stores so restart does not reset replay/rate state. Live route tables, verify-key caches, HELLO replay sets, and hashcash buckets stay in memory only and are wiped on restart. Encryption at rest is defence-in-depth against operator mistakes, not against an attacker who has seized the machine.
 - **Cryptographic erasure on duress.** Real wipe, not pretend mode.
-- **Post-quantum from day one.** PQXDH and Triple Ratchet, via libsignal.
+- **Post-quantum message confidentiality.** A hybrid X25519 + NIST-standardized ML-KEM-1024 (FIPS 203) key agreement (PQXDH) and the SPQR/Triple Ratchet, via libsignal, protect message contents against a future quantum adversary. Identity and group-operation signatures are still classical (Ed25519/XEd25519) — a post-quantum *signature* is on the roadmap, so authentication is not yet PQ (see Cryptographic primitives).
 - **Reproducible builds, signed transparency log.** Relay binaries are reproducible under a pinned Docker toolchain (`scripts/build-relay-release.sh`); each SHA-256 is signed by the operator's Ed25519 key and committed to `transparency-log.ndjson`. On every reconnect iOS clients check the binary hash each relay *self-reports* against the log — this detects an unsigned/unannounced binary, but a compromised relay host can report a genuine signed hash while running modified code, so it is not tamper-proof attestation (which needs hardware support). The log is append-only with no revocation, so a match means a build was signed at some point, not that it is the current one. Multi-maintainer co-signing, build revocation, and hardware-rooted attestation are known gaps.
 
 ## Stack
@@ -29,7 +29,7 @@ Signal is the reference. Pizzini diverges where Signal made compromises we don't
 
 ## Cryptographic primitives
 
-- **KEM**: X25519 + ML-KEM-768 (libsignal PQXDH).
+- **KEM**: a hybrid key agreement based on classical X25519 and NIST-standardized **ML-KEM-1024, as specified in FIPS 203** (libsignal PQXDH; `KeyType::MLKEM1024` via the `mlkem1024` feature → libcrux-ml-kem 0.0.8 FIPS path), 1568-byte keys/ciphertexts. ML-KEM-768 is not exposed by the pinned libsignal (it would require a library upgrade), so 1024 is the reachable FIPS-203 parameter set — and it carries a higher (NIST Level 5) security margin. The bundle wire format is `BUNDLE_VERSION = 3`.
 - **Ratchet**: Double Ratchet + SPQR, i.e. libsignal's Triple Ratchet — the PQ ratchet stage Signal deployed in October 2025.
 - **Signature**: XEd25519 and Ed25519 throughout (identity keys, delivery-token verify keys, group-op signatures, transparency-log operator key). A post-quantum identity signature (ML-DSA-65 or SLH-DSA-SHA2-128s) is on the roadmap.
 - **AEAD**: ChaCha20-Poly1305 for relay state files. libsignal uses AES-256-GCM internally for sealed-sender envelopes.

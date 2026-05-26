@@ -172,9 +172,9 @@ struct GroupInvitationView: View {
     private func verificationCaption(for member: GroupMember, in group: ChatGroup) -> String? {
         guard let myCard = store.myCard else { return nil }
         if member.peerId == myCard.peerId { return nil }
-        if store.state.contacts.contains(where: { $0.identityPub == member.peerId }) {
-            return "verified 1:1"
-        }
+        let state = store.state.contacts
+            .first(where: { $0.identityPub == member.peerId })?
+            .verificationState
         let inserterName = member.addedBy.flatMap { addedBy -> String? in
             if addedBy == myCard.peerId { return "you" }
             if let contact = store.state.contacts.first(where: { $0.identityPub == addedBy }) {
@@ -182,9 +182,30 @@ struct GroupInvitationView: View {
             }
             return nil
         }
-        if let inserterName {
-            return "added by \(inserterName) — not verified in person"
+        return Self.memberVerificationCaption(state: state, inserterName: inserterName)
+    }
+
+    /// Caption shown under a group member's name. `state` is that member's
+    /// 1:1 contact verification status, or nil when they are not in the local
+    /// contact list. Must NEVER claim "verified 1:1" unless the contact was
+    /// actually verified out of band (`.verified`); merely appearing in the
+    /// contact list (scanned or pasted) is not verification.
+    nonisolated static func memberVerificationCaption(
+        state: ContactVerificationState?,
+        inserterName: String?
+    ) -> String? {
+        switch state {
+        case .verified:
+            return "verified 1:1"
+        case .scannedUnverified:
+            return "in your contacts — scanned, not verified"
+        case .pastedUnverified:
+            return "in your contacts — pasted, not verified"
+        case nil:
+            if let inserterName {
+                return "added by \(inserterName) — not verified in person"
+            }
+            return "not verified in person"
         }
-        return "not verified in person"
     }
 }

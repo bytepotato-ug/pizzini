@@ -230,12 +230,12 @@ struct ContentView: View {
                     )
                 }
             }
-            Tab("Profil", systemImage: "person.crop.circle", value: TabKind.profile) {
+            Tab("Profile", systemImage: "person.crop.circle", value: TabKind.profile) {
                 NavigationStack {
                     ProfileView(card: store.myCard)
                 }
             }
-            Tab("Einstellungen", systemImage: "gearshape", value: TabKind.settings) {
+            Tab("Settings", systemImage: "gearshape", value: TabKind.settings) {
                 NavigationStack {
                     SettingsView(store: store)
                 }

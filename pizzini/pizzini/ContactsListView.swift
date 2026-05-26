@@ -49,6 +49,12 @@ struct ContactsListView: View {
     /// Confirmation-dialog state for the `+` add-contact action sheet.
     /// Local to the toolbar — no need to plumb up to ContentView.
     @State private var showAddContactDialog = false
+
+    /// Contact awaiting confirmation of an irreversible swipe-to-delete.
+    /// Deleting a contact destroys the secure session and conversation
+    /// with no undo, so the destructive swipe stages the contact here and
+    /// `store.deleteContact` only runs after the user confirms.
+    @State private var contactPendingDeletion: Contact?
     /// Sheet that lets the user assemble a new group (name + initial
     /// 1:1 contacts to invite). Local to the list — surfaced via the
     /// "+" toolbar menu.
@@ -374,6 +380,22 @@ struct ContactsListView: View {
         .sheet(isPresented: $showNewGroupSheet) {
             NewGroupSheet(store: store, onDismiss: { showNewGroupSheet = false })
         }
+        .confirmationDialog(
+            "Delete contact?",
+            isPresented: Binding(
+                get: { contactPendingDeletion != nil },
+                set: { presenting in if !presenting { contactPendingDeletion = nil } }
+            ),
+            presenting: contactPendingDeletion
+        ) { contact in
+            Button("Delete \(contact.displayName)", role: .destructive) {
+                store.deleteContact(contact)
+                contactPendingDeletion = nil
+            }
+            Button("Cancel", role: .cancel) { contactPendingDeletion = nil }
+        } message: { contact in
+            Text("This permanently deletes your conversation and secure session with \(contact.displayName). You can't undo this — you'd have to add and verify them again.")
+        }
     }
 
     @ViewBuilder
@@ -408,7 +430,7 @@ struct ContactsListView: View {
             }
             .swipeActions(edge: .trailing) {
                 Button(role: .destructive) {
-                    store.deleteContact(contact)
+                    contactPendingDeletion = contact
                 } label: {
                     Label("Delete", systemImage: "trash")
                 }

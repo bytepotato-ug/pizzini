@@ -272,8 +272,14 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
         case .encryption:
             return """
             Every message is end-to-end encrypted. Only you and the \
-            person you're talking to can read what's sent — not the \
+            person you're talking to can read what you say — not the \
             relay, not us, not anyone in between.
+
+            Encryption protects the contents of your messages. The relay \
+            still has to see some delivery metadata — the recipient's \
+            address, the timing, and the size of each message — to pass \
+            it along. It never sees who sent it (sealed sender) or any \
+            plaintext. See "Relay visibility" for the full picture.
 
             Pizzini uses Signal's libsignal library — the same protocol \
             Signal Messenger uses, with the post-quantum upgrades \
@@ -682,7 +688,9 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
         case .encryption:
             return """
             Key exchange uses PQXDH, combining classical X25519 with \
-            the post-quantum ML-KEM-768. Ongoing messages ride the \
+            NIST-standardized ML-KEM-1024 (FIPS 203), the post-quantum \
+            key-encapsulation standard. Ongoing \
+            messages ride the \
             Triple Ratchet: Signal's classical Double Ratchet plus \
             the SPQR post-quantum ratchet that Signal shipped in \
             October 2025. Message bytes are sealed with \
@@ -941,7 +949,8 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             return """
             The full list of primitives in use:
 
-            • KEM — X25519 + ML-KEM-768 (libsignal PQXDH).
+            • KEM — X25519 + ML-KEM-1024 (FIPS 203), a hybrid key \
+              agreement via libsignal PQXDH.
             • Ratchet — Double Ratchet + SPQR (libsignal Triple \
               Ratchet, October 2025).
             • Signature — XEd25519 and Ed25519 (identity keys, \

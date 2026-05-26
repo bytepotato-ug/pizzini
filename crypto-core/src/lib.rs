@@ -1248,16 +1248,30 @@ pub unsafe extern "C" fn pizzini_store_seal_receive(
     // `PIZZINI_ERR_BAD_SIGNATURE`, distinct from a generic internal
     // error. The host may still choose to keep the user-facing surface
     // indistinguishable, but the FFI contract carries the truth.
-    let received = match s.seal_receive(sealed_bytes) {
+    let mut received = match s.seal_receive(sealed_bytes) {
         Ok(r) => r,
         Err(SealReceiveError::BadSignature(_)) => return PIZZINI_ERR_BAD_SIGNATURE,
         Err(SealReceiveError::Internal(_)) => return PIZZINI_ERR_INTERNAL,
     };
     let sender_len = received.sender_identity_pub.len();
     let plaintext_len = received.plaintext.len();
-    debug_assert!(sender_len <= out_sender_cap);
-    debug_assert!(plaintext_len <= out_plaintext_cap);
-    // SAFETY: caps verified by the peek; pointers asserted valid.
+    // PZ-M3: hard runtime bound, not a `debug_assert!`. `debug_assert!`
+    // is compiled out of release builds, and release builds ship to
+    // testers and servers — so a release binary would perform the
+    // `copy_nonoverlapping` below with no bounds guard at all. The
+    // `peek_sealed_lengths` upper bounds should already guarantee these
+    // fit, but if the peeked bound and the actual post-decrypt length
+    // ever diverge we must fail closed (return required sizes) rather
+    // than write out of bounds into the caller's buffer.
+    if sender_len > out_sender_cap || plaintext_len > out_plaintext_cap {
+        // SAFETY: length out-pointers asserted non-null above.
+        unsafe {
+            *out_sender_len = sender_len;
+            *out_plaintext_len = plaintext_len;
+        }
+        return PIZZINI_ERR_BUFFER_TOO_SMALL;
+    }
+    // SAFETY: caps verified by the peek and the hard check above; pointers asserted valid.
     unsafe {
         std::ptr::copy_nonoverlapping(
             received.sender_identity_pub.as_ptr(),
@@ -1274,6 +1288,10 @@ pub unsafe extern "C" fn pizzini_store_seal_receive(
         *out_plaintext_len = plaintext_len;
         *out_is_duplicate = if received.is_duplicate { 1 } else { 0 };
     }
+    // PZ-M2: the plaintext has now been copied into the caller's buffer;
+    // wipe our heap copy rather than waiting for the `Drop` at end of
+    // scope to leave it lingering in freed memory.
+    received.plaintext.zeroize();
     PIZZINI_OK
 }
 
@@ -1481,12 +1499,16 @@ pub unsafe extern "C" fn pizzini_store_group_decrypt(
     let s = unsafe { &mut *store };
     let sender = unsafe { std::slice::from_raw_parts(sender_identity, sender_identity_len) };
     let ct = unsafe { std::slice::from_raw_parts(ciphertext, ciphertext_len) };
-    let pt = match s.group_decrypt(sender, ct) {
+    let mut pt = match s.group_decrypt(sender, ct) {
         Ok(b) => b,
         Err(_) => return PIZZINI_ERR_INTERNAL,
     };
     // SAFETY: out_plaintext/out_plaintext_len asserted valid.
-    unsafe { copy_or_size_out(&pt, out_plaintext, out_plaintext_cap, out_plaintext_len) }
+    let rc = unsafe { copy_or_size_out(&pt, out_plaintext, out_plaintext_cap, out_plaintext_len) };
+    // PZ-M2: wipe the decrypted group plaintext from our heap copy after
+    // it has been handed to the caller (or sized out).
+    pt.zeroize();
+    rc
 }
 
 #[cfg(test)]

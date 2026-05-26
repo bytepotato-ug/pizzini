@@ -243,20 +243,35 @@ enum TransparencyLogConfig {
         return key
     }
 
-    /// Decoded log URL. Only `https://` is accepted — a plain
-    /// `http://` URL would let an active network attacker
-    /// substitute the response body without our signature check
-    /// catching it (the attacker still couldn't forge entries,
-    /// but they could deliver a truncated/empty body which we'd
-    /// have to reject anyway). Rejecting at the parse layer is
-    /// the clean place.
+    /// Decoded log URL. `https://` is accepted for any host. `http://`
+    /// is accepted ONLY for a `.onion` host (PZ-M20): a Tor hidden
+    /// service already provides end-to-end transport confidentiality and
+    /// cryptographic authentication of the onion address, so a clearnet
+    /// active attacker can't substitute the body, and entries are
+    /// Ed25519-signed on top. Clearnet `http://` stays rejected — there
+    /// an attacker could swap the response. This lets the log fetch move
+    /// onto an operator `.onion` mirror (killing the GitHub reconnect
+    /// beacon) without requiring TLS termination on the hidden service.
     nonisolated static var logURL: URL? {
         let trimmed = logURLString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               let url = URL(string: trimmed),
-              url.scheme?.lowercased() == "https"
+              urlSchemeIsAcceptable(url)
         else { return nil }
         return url
+    }
+
+    /// Pure scheme/host gate for the log URL, extracted so the
+    /// onion-only `http://` exception can be unit-tested.
+    nonisolated static func urlSchemeIsAcceptable(_ url: URL) -> Bool {
+        switch url.scheme?.lowercased() {
+        case "https":
+            return true
+        case "http":
+            return url.host?.hasSuffix(".onion") == true
+        default:
+            return false
+        }
     }
 }
 

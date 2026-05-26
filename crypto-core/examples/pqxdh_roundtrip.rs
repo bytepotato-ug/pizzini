@@ -1,7 +1,7 @@
 //! End-to-end PQXDH handshake demo.
 //!
 //! Two parties (Alice, Bob) each hold their own InMemSignalProtocolStore.
-//! Bob publishes a PreKeyBundle (EC + signed-EC + Kyber1024); Alice processes
+//! Bob publishes a PreKeyBundle (EC + signed-EC + ML-KEM-1024); Alice processes
 //! it to establish a session, encrypts a message, and Bob decrypts. Asserts
 //! that the plaintext round-trips and that Alice's first message is of type
 //! PreKey (i.e., she initiated via PQXDH).
@@ -69,9 +69,9 @@ fn pqxdh_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
         .now_or_never()
         .expect("in-mem store is sync")?;
 
-    // ── Bob: Kyber1024 PQ prekey (also signed by identity) ───────────
+    // ── Bob: ML-KEM-1024 PQ prekey (also signed by identity) ─────────
     let bob_kyber_id: u32 = 1;
-    let bob_kyber_kp = kem::KeyPair::generate(kem::KeyType::Kyber1024, &mut rng);
+    let bob_kyber_kp = kem::KeyPair::generate(kem::KeyType::MLKEM1024, &mut rng);
     let bob_kyber_sig = bob_id
         .private_key()
         .calculate_signature(&bob_kyber_kp.public_key.serialize(), &mut rng)?;

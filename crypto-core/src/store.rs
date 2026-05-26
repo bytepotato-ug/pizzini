@@ -16,7 +16,7 @@
 //! u16 signed_pre_key_public_len + bytes
 //! u16 signed_pre_key_signature_len + bytes
 //! u32 kyber_pre_key_id
-//! u32 kyber_pre_key_public_len + bytes   (Kyber1024 ≈ 1568 B)
+//! u32 kyber_pre_key_public_len + bytes   (ML-KEM-1024 ≈ 1568 B)
 //! u16 kyber_pre_key_signature_len + bytes
 //! u16 identity_key_len + bytes           (33 B, X25519 public)
 //! u16 delivery_token_verify_key_len + bytes  (33 B, libsignal PublicKey
@@ -89,7 +89,7 @@ use libsignal_protocol::{
 use uuid::Uuid;
 use rand::{Rng, TryRngCore as _, rngs::OsRng};
 use sha2::Sha512;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 // Crypto-core runs inside the iOS process. Peer-aware diagnostics
 // (which print peer identity_pubs) are gated on an explicit RUNTIME
@@ -207,7 +207,12 @@ fn unpad_plaintext(padded: &[u8]) -> Result<Vec<u8>, SignalProtocolError> {
     Ok(padded[PADDING_LEN_PREFIX..PADDING_LEN_PREFIX + real_len].to_vec())
 }
 
-const BUNDLE_VERSION: u8 = 2;
+// Bumped 2 → 3 with the KEM migration from draft Kyber1024 to FIPS-203
+// ML-KEM-1024 (PZ-H1). The kem public key's serialized KeyType byte
+// changes (0x08 → 0x0A), so a v2 bundle is wire-incompatible; rejecting
+// it explicitly on the version byte is cleaner than a downstream KEM
+// mismatch.
+const BUNDLE_VERSION: u8 = 3;
 /// Store snapshot version. v1 = pre-Phase-1 (no sender certificate). v2 =
 /// added the trailing sender-certificate field. v3 = appended the
 /// SenderKey state list for libsignal group messaging (Phase 6 group
@@ -492,7 +497,7 @@ impl DeviceStore {
 
         let kyber_id = self.next_kyber_pre_key_id;
         self.next_kyber_pre_key_id = next_id(self.next_kyber_pre_key_id);
-        let kyber_kp = kem::KeyPair::generate(kem::KeyType::Kyber1024, &mut rng);
+        let kyber_kp = kem::KeyPair::generate(kem::KeyType::MLKEM1024, &mut rng);
         let kyber_sig = id_kp
             .private_key()
             .calculate_signature(&kyber_kp.public_key.serialize(), &mut rng)?;
@@ -730,6 +735,14 @@ impl DeviceStore {
         &mut self,
     ) -> Result<&SenderCertificate, SignalProtocolError> {
         let now = now_millis();
+        // PZ-L2: refuse to mint against a garbage/pre-epoch clock rather
+        // than silently producing an already-expired certificate.
+        if !clock_is_sane_for_cert(now) {
+            return Err(SignalProtocolError::InvalidArgument(
+                "system clock is before 2020; refusing to mint an already-expired sender certificate"
+                    .into(),
+            ));
+        }
         let needs_mint = match &self.sender_certificate {
             None => true,
             Some(cert) => {
@@ -1015,7 +1028,14 @@ impl DeviceStore {
             // peer running mismatched padding code surfaces here as
             // an explicit error instead of returning garbage to the
             // chat UI.
-            Ok(padded) => unpad_plaintext(&padded)?,
+            Ok(padded) => {
+                // PZ-M2: the ratchet output is decrypted (padded)
+                // plaintext — the most sensitive data we hold. Wrap it
+                // so its heap buffer is wiped on drop, including the
+                // early-return error path through `unpad_plaintext`.
+                let padded = Zeroizing::new(padded);
+                unpad_plaintext(&padded)?
+            }
             Err(SignalProtocolError::DuplicatedMessage(timestamp, counter)) => {
                 // libsignal's ratchet rejected the inner ciphertext
                 // because its (chain, counter) pair was already
@@ -1399,6 +1419,20 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// 2020-01-01T00:00:00Z in epoch milliseconds. `now_millis()` collapses
+/// a pre-epoch system clock to `0`; any timestamp below this floor means
+/// the device clock is unset or garbage. Minting a sender certificate
+/// against such a value would set its expiration near 1970 — a cert that
+/// is born already-expired and silently breaks every send (PZ-L2).
+const MIN_SANE_EPOCH_MILLIS: u64 = 1_577_836_800_000;
+
+/// Whether `now` is plausible enough to anchor a freshly-minted sender
+/// certificate's validity window. Pure so the boundary can be unit-tested
+/// without mocking the wall clock.
+fn clock_is_sane_for_cert(now: u64) -> bool {
+    now >= MIN_SANE_EPOCH_MILLIS
+}
+
 fn address_for(identity_public: &[u8]) -> ProtocolAddress {
     ProtocolAddress::new(
         hex_lower(identity_public),
@@ -1637,6 +1671,19 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clock_sanity_rejects_pre_epoch_fallback() {
+        // `now_millis()` returns 0 for a pre-epoch clock — must be rejected.
+        assert!(!clock_is_sane_for_cert(0));
+        // Any 1970-era value is garbage for this app and would mint a
+        // dead cert.
+        assert!(!clock_is_sane_for_cert(1_000));
+        assert!(!clock_is_sane_for_cert(MIN_SANE_EPOCH_MILLIS - 1));
+        // The floor itself and the real wall clock are sane.
+        assert!(clock_is_sane_for_cert(MIN_SANE_EPOCH_MILLIS));
+        assert!(clock_is_sane_for_cert(now_millis()));
+    }
 
     #[test]
     fn rehydrate_keeps_identity() {

@@ -2096,7 +2096,7 @@ final class ChatStore: NSObject {
     nonisolated private static let hashcashChallengeTag = Data("pizzini.hashcash.bundle.v1".utf8)
 
     /// F-402: BUNDLE_RESPONSE wire size for the decoy path. A real
-    /// Pizzini bundle is 1858 bytes (kyber1024 PK 1568 + 4× signatures
+    /// Pizzini bundle is 1858 bytes (ML-KEM-1024 PK 1568 + 4× signatures
     /// 64 each + 4× public keys 33 each + headers/IDs); we round up to
     /// 1860 to absorb future tweaks below detection.
     private static let decoyBundleSize = 1860
@@ -2127,7 +2127,7 @@ final class ChatStore: NSObject {
     /// check. Pruned to entries newer than 60s on access.
     private var decoyAggregateRecent: [Date] = []
     /// Pacing budget for the real BUNDLE_RESPONSE + chainSeedDelivery
-    /// path on a modern phone — kyber1024 keygen + one sealed-sender
+    /// path on a modern phone — ML-KEM-1024 keygen + one sealed-sender
     /// envelope encrypt runs ~1s in steady state. Decoy waits within
     /// this window before emitting so the relay can't time-distinguish
     /// "Y is in Alice's contacts" from "Y is not". 50ms jitter prevents
@@ -2890,7 +2890,7 @@ final class ChatStore: NSObject {
     /// the 80 % `shouldRotate` threshold and they've asked us to
     /// mint + ship a fresh one. Identical to the
     /// `BUNDLE_REQUEST → publishBundle + serveChain` path but
-    /// shorter cooldown (30 min) because we skip the kyber1024
+    /// shorter cooldown (30 min) because we skip the ML-KEM-1024
     /// prekey burn entirely — this path mints a chain only.
     @MainActor
     private func handleChainRefreshRequest(
@@ -4772,7 +4772,7 @@ extension ChatStore: RelayClientDelegate {
             // issueTokens. A paired peer can otherwise loop BUNDLE_REQUEST
             // (the per-recipient hashcash bound is per-hour and they have
             // our peer_id, so they can grind one proof per hour) and
-            // burn one one-time prekey + one kyber1024 keygen per
+            // burn one one-time prekey + one ML-KEM-1024 keygen per
             // request — a CPU/battery DoS amplified by the existing
             // F-402 ability for a malicious relay to inject requests.
             if let last = self.state.contacts[idx].lastBundleServedAt,

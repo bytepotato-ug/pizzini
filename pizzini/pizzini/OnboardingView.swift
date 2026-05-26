@@ -172,6 +172,11 @@ struct OnboardingView: View {
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
+        // Merge the glyph's own accessibility label and the descriptive
+        // text into a single VoiceOver element so the row reads once
+        // ("<status>, <explanation>") instead of announcing the glyph
+        // label and the legend text as two separate stops.
+        .accessibilityElement(children: .combine)
     }
 
     private var welcomeStep: some View {

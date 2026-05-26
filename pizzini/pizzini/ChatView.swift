@@ -1443,12 +1443,32 @@ struct ChatStatusIcon: View {
 /// `checkmark` symbols rather than a Unicode `✓✓` so it stays in
 /// the same rendering pipeline as the rest.
 struct ChatStatusGlyph: View {
-    enum Kind: Sendable, Equatable {
+    enum Kind: Sendable, Equatable, CaseIterable {
         case pending, sent, delivered, read, failed
+
+        /// VoiceOver label for the glyph. `.help()` is surfaced only to
+        /// pointer hover (iPadOS) and is ignored by VoiceOver, so each
+        /// glyph also needs an explicit accessibility label — otherwise
+        /// it reads as a bare, unlabeled image and the send status is
+        /// invisible to a VoiceOver user.
+        var accessibilityLabel: String {
+            switch self {
+            case .pending:   return "Queued, waiting for the connection"
+            case .sent:      return "Sent"
+            case .delivered: return "Delivered to their phone"
+            case .read:      return "Read"
+            case .failed:    return "Expired before reaching them"
+            }
+        }
     }
     let kind: Kind
 
     var body: some View {
+        glyph.accessibilityLabel(kind.accessibilityLabel)
+    }
+
+    @ViewBuilder
+    private var glyph: some View {
         switch kind {
         case .pending:
             // Orange to match the other "waiting" hourglass surfaces

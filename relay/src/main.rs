@@ -84,7 +84,7 @@
 //!                              we can wake it on offline SEND:
 //!   u16 token_len + token_bytes
 //!
-//! Bundle exchange exists because Kyber1024 (~1568 B) does not fit a
+//! Bundle exchange exists because ML-KEM-1024 (~1568 B) does not fit a
 //! comfortably-scannable QR. Discovery QRs carry only `peer_id +
 //! lan_address`; the actual bundle hops through the relay on first contact.
 //! This is the same shape Signal uses (server stores bundles for fetch).
@@ -442,6 +442,13 @@ const PENDING_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// XEd25519 verify key wire size — 1-byte DJB type prefix + 32-byte point.
 const VERIFY_KEY_LEN: usize = 33;
+/// Upper bound on a peer id (`to_id` / `from_id`). A peer id is the
+/// 33-byte serialized libsignal identity public key; 64 bytes is a
+/// generous cap. These ids become routing-map and pending-queue keys,
+/// so an unbounded `u16` blob (up to 64 KiB) would let a peer force the
+/// relay to store an oversized key, amplifying memory far past the
+/// message body it accompanies (PZ-H3).
+const MAX_PEER_ID_BYTES: usize = 64;
 /// Delivery-token wire layout: chainID(16) + index_be_u32(4) + value(32).
 ///
 /// Recipient mints a hash chain (root = H^n(seed)), ships the seed to the
@@ -2448,18 +2455,31 @@ fn spawn_hello_replay_gc(hello_replays: HelloReplays) {
     });
 }
 
+/// Read a length-prefixed peer id (`to_id` / `from_id`) and reject any
+/// blob larger than a real identity public key. Left unbounded, the
+/// `u16` length lets a peer supply up to 64 KiB that the relay would
+/// then store verbatim as a routing-map / pending-queue key — a memory-
+/// amplification DoS out of proportion to the frame (PZ-H3).
+fn read_peer_id(c: &mut Cursor<'_>) -> std::io::Result<Vec<u8>> {
+    let id = c.u16_blob()?;
+    if id.len() > MAX_PEER_ID_BYTES {
+        return Err(invalid("peer id exceeds maximum length"));
+    }
+    Ok(id.to_vec())
+}
+
 fn parse_routed(body: &[u8]) -> std::io::Result<ParsedRouted> {
     let mut c = Cursor::new(body);
-    let to_id = c.u16_blob()?.to_vec();
-    let from_id = c.u16_blob()?.to_vec();
+    let to_id = read_peer_id(&mut c)?;
+    let from_id = read_peer_id(&mut c)?;
     // Anything after the routing prefix is opaque to the relay.
     Ok(ParsedRouted { to_id, from_id })
 }
 
 fn parse_bundle_request(body: &[u8]) -> std::io::Result<ParsedBundleRequest> {
     let mut c = Cursor::new(body);
-    let to_id = c.u16_blob()?.to_vec();
-    let from_id = c.u16_blob()?.to_vec();
+    let to_id = read_peer_id(&mut c)?;
+    let from_id = read_peer_id(&mut c)?;
     let hashcash_nonce = c.u64()?;
     if !c.is_empty() {
         return Err(invalid("trailing bytes after BUNDLE_REQUEST"));
@@ -2476,7 +2496,7 @@ fn parse_bundle_request(body: &[u8]) -> std::io::Result<ParsedBundleRequest> {
 fn parse_sealed(body: &[u8]) -> std::io::Result<ParsedSealed> {
     let total_len = body.len();
     let mut c = Cursor::new(body);
-    let to_id = c.u16_blob()?.to_vec();
+    let to_id = read_peer_id(&mut c)?;
     let ttl_seconds = c.u32()?;
     let token = c.u16_blob()?.to_vec();
     // Remaining bytes are the sealed ciphertext — opaque to the relay.
@@ -2682,6 +2702,43 @@ mod tests {
         out.extend_from_slice(token);
         out.extend_from_slice(sealed);
         out
+    }
+
+    fn build_routed_body(to: &[u8], from: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(to.len() as u16).to_be_bytes());
+        out.extend_from_slice(to);
+        out.extend_from_slice(&(from.len() as u16).to_be_bytes());
+        out.extend_from_slice(from);
+        out
+    }
+
+    /// PZ-H3: `to_id`/`from_id` must be bounded before they can become
+    /// routing-map / pending-queue keys, so a peer can't inflate relay
+    /// memory with a 64 KiB id blob.
+    #[test]
+    fn parse_routed_bounds_peer_id_length() {
+        // A 33-byte id (a real identity key) parses fine.
+        let ok = build_routed_body(&[7u8; 33], &[9u8; 33]);
+        let parsed = parse_routed(&ok).expect("33-byte ids accepted");
+        assert_eq!(parsed.to_id.len(), 33);
+        assert_eq!(parsed.from_id.len(), 33);
+
+        // The 64-byte cap itself is still accepted (generous bound).
+        let at_cap = build_routed_body(&vec![1u8; MAX_PEER_ID_BYTES], &[2u8; 33]);
+        assert!(parse_routed(&at_cap).is_ok());
+
+        // One byte over the cap on either id is rejected before any map
+        // insertion happens.
+        let big_to = build_routed_body(&vec![0u8; MAX_PEER_ID_BYTES + 1], &[9u8; 33]);
+        assert!(parse_routed(&big_to).is_err());
+        let big_from = build_routed_body(&[3u8; 33], &vec![0u8; MAX_PEER_ID_BYTES + 1]);
+        assert!(parse_routed(&big_from).is_err());
+
+        // A maximal u16 blob (64 KiB) — the unbounded-attack shape — is
+        // rejected.
+        let huge = build_routed_body(&vec![0u8; u16::MAX as usize], &[1u8; 33]);
+        assert!(parse_routed(&huge).is_err());
     }
 
     // ───── STATUS_RESPONSE encoding ─────────────────────────

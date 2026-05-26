@@ -60,7 +60,7 @@ fn pqxdh_roundtrip_in_memory() {
         .unwrap()
         .unwrap();
 
-    let bob_kyber_kp = kem::KeyPair::generate(kem::KeyType::Kyber1024, &mut rng);
+    let bob_kyber_kp = kem::KeyPair::generate(kem::KeyType::MLKEM1024, &mut rng);
     let bob_kyber_id: u32 = 1;
     let bob_kyber_sig = bob_id
         .private_key()
@@ -188,7 +188,7 @@ fn bidirectional_session_falls_back_to_whisper() {
         .unwrap()
         .unwrap();
 
-    let bob_kyber_kp = kem::KeyPair::generate(kem::KeyType::Kyber1024, &mut rng);
+    let bob_kyber_kp = kem::KeyPair::generate(kem::KeyType::MLKEM1024, &mut rng);
     let bob_kyber_sig = bob_id
         .private_key()
         .calculate_signature(&bob_kyber_kp.public_key.serialize(), &mut rng)
