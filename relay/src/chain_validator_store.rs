@@ -38,6 +38,24 @@ const KEY_FILE_NAME: &str = "chain_validators.key";
 /// at AEAD verify.
 const AAD: &[u8] = b"pizzini.relay.chain_validators.v1";
 
+/// PZ-H2: append-only journal alongside the snapshot. Each replay-cursor
+/// advance (and chain registration) appends one small encrypted,
+/// length-prefixed record here and fsyncs it — O(1) — instead of
+/// re-encrypting the WHOLE snapshot + double-fsync on every mutation
+/// (the write-amplification DoS). The snapshot is the periodically
+/// compacted base; the journal holds mutations since the last compaction.
+const JOURNAL_FILE_NAME: &str = "chain_validators.journal";
+
+/// Domain-separated AAD for journal records, distinct from the snapshot's
+/// `AAD`, so a snapshot blob can't be replayed as a journal record (or
+/// vice-versa) under the shared key.
+const JOURNAL_AAD: &[u8] = b"pizzini.relay.chain_validators.journal.v1";
+
+/// Compact (rewrite snapshot + truncate journal) once this many records
+/// have been appended since the last compaction. Bounds journal size and
+/// startup replay cost while keeping the per-advance write O(1) amortized.
+const JOURNAL_COMPACT_THRESHOLD: u64 = 4096;
+
 pub const CHAIN_ID_LEN: usize = 16;
 pub const CHAIN_VALUE_LEN: usize = 32;
 
@@ -90,6 +108,18 @@ struct StoreDoc {
     entries: HashMap<String, StoredEntry>,
 }
 
+/// One appended mutation (PZ-H2): the full authoritative `StoredEntry`
+/// for a composite key. GC removals do NOT append a tombstone —
+/// `gc_expired` compacts instead — so every journal record is an upsert.
+/// Replay is monotonic (see `apply_monotonic`), so a stale record left
+/// behind by a crash between snapshot-write and journal-truncate can
+/// never regress a cursor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JournalRecord {
+    key: String,
+    entry: StoredEntry,
+}
+
 /// Outcome of a validation attempt. `Accepted` means state was
 /// advanced and persisted; `Rejected` means nothing changed.
 #[derive(Debug, PartialEq, Eq)]
@@ -114,9 +144,13 @@ pub struct ChainRegistration {
 
 pub struct ChainValidatorStore {
     path: PathBuf,
+    journal_path: PathBuf,
     key: [u8; encrypted_file::KEY_LEN],
     /// `(peer_id, chain_id) → state`.
     map: HashMap<(Vec<u8>, [u8; CHAIN_ID_LEN]), ChainState>,
+    /// Records appended to the journal since the last compaction; drives
+    /// the `JOURNAL_COMPACT_THRESHOLD` compaction trigger.
+    journal_len: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -148,7 +182,7 @@ impl ChainValidatorStore {
         let key_path = state_dir.join(KEY_FILE_NAME);
         let key = encrypted_file::load_or_create_key(&key_path, "chain-validator")?;
 
-        let map = match fs::read(&path) {
+        let mut map = match fs::read(&path) {
             Ok(bytes) => {
                 let plaintext = encrypted_file::decrypt_with_aad(&key, &bytes, AAD)
                     .or_else(|_| encrypted_file::decrypt(&key, &bytes))?;
@@ -160,7 +194,31 @@ impl ChainValidatorStore {
             Err(e) => return Err(e),
         };
 
-        Ok(ChainValidatorStore { path, key, map })
+        // PZ-H2: fold the append-only journal over the snapshot. Monotonic
+        // apply means a record can only advance a cursor, never regress it,
+        // so a crash between a compaction's snapshot-write and journal-
+        // truncate is safe (the stale records are <= the snapshot and are
+        // ignored).
+        let journal_path = state_dir.join(JOURNAL_FILE_NAME);
+        let replayed = replay_journal(&journal_path, &key, max_age, &mut map)?;
+
+        let mut store = ChainValidatorStore {
+            path,
+            journal_path,
+            key,
+            map,
+            journal_len: replayed,
+        };
+        // Make the journal file exist with a durable directory entry, so
+        // every subsequent append needs only a file fsync (not a parent-dir
+        // fsync) on the hot path.
+        store.ensure_journal_durable_exists()?;
+        // If we just folded a non-empty journal, compact once at startup so
+        // the snapshot is current and the journal starts small.
+        if replayed > 0 {
+            store.compact()?;
+        }
+        Ok(store)
     }
 
     pub fn len(&self) -> usize {
@@ -198,18 +256,16 @@ impl ChainValidatorStore {
         if per_peer >= MAX_CHAINS_PER_PEER {
             return Ok(RegisterOutcome::RejectedCap);
         }
-        self.map.insert(
-            key,
-            ChainState {
-                root: reg.root,
-                length: reg.length,
-                last_index: 0,
-                last_value: reg.root,
-                registered_unix: now,
-                last_used_unix: now,
-            },
-        );
-        self.persist()?;
+        let state = ChainState {
+            root: reg.root,
+            length: reg.length,
+            last_index: 0,
+            last_value: reg.root,
+            registered_unix: now,
+            last_used_unix: now,
+        };
+        self.map.insert(key, state.clone());
+        self.append_journal(&reg.peer_id, &reg.chain_id, &state)?;
         Ok(RegisterOutcome::Registered)
     }
 
@@ -273,7 +329,13 @@ impl ChainValidatorStore {
         state.last_index = index;
         state.last_value = *value;
         state.last_used_unix = encrypted_file::unix_now();
-        self.persist()?;
+        // Clone the advanced state so the `&mut self.map` borrow held by
+        // `state` ends before `append_journal` reborrows `&mut self`.
+        let advanced = state.clone();
+        // PZ-H2: persist the advance via an O(1) fsync'd journal append.
+        // The append is durable BEFORE we return `Accepted` — that is the
+        // replay guarantee (a crash after the OK can't roll the cursor back).
+        self.append_journal(peer_id, chain_id, &advanced)?;
         Ok(ValidateOutcome::Accepted)
     }
 
@@ -289,34 +351,116 @@ impl ChainValidatorStore {
         self.map.retain(|_, state| state.last_used_unix > cutoff);
         let removed = before - self.map.len();
         if removed > 0 {
-            self.persist()?;
+            // Compaction rewrites the snapshot without the removed entries
+            // and truncates the journal, so the removals are durable and the
+            // journal can't re-introduce a purged chain on the next load.
+            self.compact()?;
         }
         Ok(removed)
     }
 
-    fn persist(&self) -> io::Result<()> {
+    /// Append one mutation to the journal and fsync it. O(1) in the store
+    /// size — this is the hot-path replacement for a full snapshot rewrite.
+    /// The fsync makes the record durable BEFORE the caller treats the
+    /// advance/registration as committed (the replay guarantee). Triggers a
+    /// compaction once the journal passes `JOURNAL_COMPACT_THRESHOLD`.
+    fn append_journal(
+        &mut self,
+        peer_id: &[u8],
+        chain_id: &[u8; CHAIN_ID_LEN],
+        state: &ChainState,
+    ) -> io::Result<()> {
+        let rec = JournalRecord {
+            key: composite_key(peer_id, chain_id),
+            entry: stored_entry_of(state),
+        };
+        let plaintext = serde_json::to_vec(&rec).map_err(io::Error::other)?;
+        let ciphertext = encrypted_file::encrypt_with_aad(&self.key, &plaintext, JOURNAL_AAD)?;
+        let len: u32 = ciphertext
+            .len()
+            .try_into()
+            .map_err(|_| io::Error::other("journal record too large"))?;
+        let mut framed = Vec::with_capacity(4 + ciphertext.len());
+        framed.extend_from_slice(&len.to_be_bytes());
+        framed.extend_from_slice(&ciphertext);
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.journal_path)?;
+            f.write_all(&framed)?;
+            // sync_all flushes the appended bytes + the file-size metadata.
+            // The directory entry is already durable (ensure_journal_durable_
+            // exists), so no parent-dir fsync is needed on the hot path.
+            f.sync_all()?;
+        }
+        self.journal_len += 1;
+        if self.journal_len >= JOURNAL_COMPACT_THRESHOLD {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Rewrite the snapshot from the in-memory map, then truncate the
+    /// journal. Order matters: the snapshot (which subsumes every journal
+    /// record) is made durable FIRST, so a crash before truncation just
+    /// leaves stale journal records that monotonic replay ignores.
+    fn compact(&mut self) -> io::Result<()> {
+        self.write_snapshot()?;
+        self.truncate_journal()?;
+        self.journal_len = 0;
+        Ok(())
+    }
+
+    /// Serialize the whole map and atomically replace the snapshot file.
+    /// This is the (now rare) O(n) write; the per-mutation hot path is
+    /// `append_journal`.
+    fn write_snapshot(&self) -> io::Result<()> {
         let mut doc = StoreDoc::default();
         for ((peer_id, chain_id), state) in &self.map {
-            let composite = format!(
-                "{}:{}",
-                encrypted_file::hex_encode(peer_id),
-                encrypted_file::hex_encode(chain_id),
-            );
-            doc.entries.insert(
-                composite,
-                StoredEntry {
-                    root_hex: encrypted_file::hex_encode(&state.root),
-                    length: state.length,
-                    last_index: state.last_index,
-                    last_value_hex: encrypted_file::hex_encode(&state.last_value),
-                    registered_unix: state.registered_unix,
-                    last_used_unix: state.last_used_unix,
-                },
-            );
+            doc.entries
+                .insert(composite_key(peer_id, chain_id), stored_entry_of(state));
         }
         let plaintext = serde_json::to_vec(&doc).map_err(io::Error::other)?;
         let ciphertext = encrypted_file::encrypt_with_aad(&self.key, &plaintext, AAD)?;
         encrypted_file::write_atomic(&self.path, &ciphertext)
+    }
+
+    /// Empty the journal (O_TRUNC keeps the same inode + directory entry, so
+    /// no parent-dir fsync is needed) and fsync so the truncation is durable
+    /// before the next append starts a fresh sequence.
+    fn truncate_journal(&self) -> io::Result<()> {
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.journal_path)?;
+        encrypted_file::restrict_permissions(&self.journal_path, 0o600);
+        f.sync_all()
+    }
+
+    /// Create the journal file (empty) if it doesn't exist yet, tighten its
+    /// permissions, and fsync the parent directory so the new file's
+    /// directory entry is durable. After this, an append's `sync_all` alone
+    /// makes the appended record durable.
+    fn ensure_journal_durable_exists(&self) -> io::Result<()> {
+        if self.journal_path.exists() {
+            return Ok(());
+        }
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.journal_path)?;
+        encrypted_file::restrict_permissions(&self.journal_path, 0o600);
+        if let Some(parent) = self.journal_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Ok(dir) = fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -339,6 +483,66 @@ pub enum RegisterOutcome {
     RejectedCap,
 }
 
+/// Composite hex key `{peer_hex}:{chain_hex}` used in the JSON snapshot
+/// and journal records.
+fn composite_key(peer_id: &[u8], chain_id: &[u8]) -> String {
+    format!(
+        "{}:{}",
+        encrypted_file::hex_encode(peer_id),
+        encrypted_file::hex_encode(chain_id),
+    )
+}
+
+/// Project an in-memory `ChainState` to its serializable form.
+fn stored_entry_of(state: &ChainState) -> StoredEntry {
+    StoredEntry {
+        root_hex: encrypted_file::hex_encode(&state.root),
+        length: state.length,
+        last_index: state.last_index,
+        last_value_hex: encrypted_file::hex_encode(&state.last_value),
+        registered_unix: state.registered_unix,
+        last_used_unix: state.last_used_unix,
+    }
+}
+
+/// Decode a `(composite, StoredEntry)` back to a map key + `ChainState`.
+/// Returns `None` on any malformed field so the caller skips that entry
+/// rather than failing the whole load. Shared by snapshot purge + journal
+/// replay so both decode identically.
+fn decode_entry(
+    composite: &str,
+    entry: &StoredEntry,
+) -> Option<((Vec<u8>, [u8; CHAIN_ID_LEN]), ChainState)> {
+    let (peer_hex, chain_hex) = composite.split_once(':')?;
+    let peer = encrypted_file::hex_decode(peer_hex)?;
+    let chain_id_vec = encrypted_file::hex_decode(chain_hex)?;
+    if chain_id_vec.len() != CHAIN_ID_LEN {
+        return None;
+    }
+    let root_vec = encrypted_file::hex_decode(&entry.root_hex)?;
+    let last_val_vec = encrypted_file::hex_decode(&entry.last_value_hex)?;
+    if root_vec.len() != CHAIN_VALUE_LEN || last_val_vec.len() != CHAIN_VALUE_LEN {
+        return None;
+    }
+    let mut chain_id = [0u8; CHAIN_ID_LEN];
+    chain_id.copy_from_slice(&chain_id_vec);
+    let mut root = [0u8; CHAIN_VALUE_LEN];
+    root.copy_from_slice(&root_vec);
+    let mut last_value = [0u8; CHAIN_VALUE_LEN];
+    last_value.copy_from_slice(&last_val_vec);
+    Some((
+        (peer, chain_id),
+        ChainState {
+            root,
+            length: entry.length,
+            last_index: entry.last_index,
+            last_value,
+            registered_unix: entry.registered_unix,
+            last_used_unix: entry.last_used_unix,
+        },
+    ))
+}
+
 fn purge_stale(
     doc: StoreDoc,
     max_age: Duration,
@@ -346,50 +550,78 @@ fn purge_stale(
     let now = encrypted_file::unix_now();
     let cutoff = now.saturating_sub(max_age.as_secs());
     let mut out: HashMap<(Vec<u8>, [u8; CHAIN_ID_LEN]), ChainState> = HashMap::new();
-    for (composite, entry) in doc.entries {
+    for (composite, entry) in &doc.entries {
         if entry.last_used_unix <= cutoff {
             continue;
         }
-        let Some((peer_hex, chain_hex)) = composite.split_once(':') else {
-            continue;
-        };
-        let Some(peer) = encrypted_file::hex_decode(peer_hex) else {
-            continue;
-        };
-        let Some(chain_id_vec) = encrypted_file::hex_decode(chain_hex) else {
-            continue;
-        };
-        if chain_id_vec.len() != CHAIN_ID_LEN {
-            continue;
+        if let Some((k, state)) = decode_entry(composite, entry) {
+            out.insert(k, state);
         }
-        let Some(root_vec) = encrypted_file::hex_decode(&entry.root_hex) else {
-            continue;
-        };
-        let Some(last_val_vec) = encrypted_file::hex_decode(&entry.last_value_hex) else {
-            continue;
-        };
-        if root_vec.len() != CHAIN_VALUE_LEN || last_val_vec.len() != CHAIN_VALUE_LEN {
-            continue;
-        }
-        let mut chain_id = [0u8; CHAIN_ID_LEN];
-        chain_id.copy_from_slice(&chain_id_vec);
-        let mut root = [0u8; CHAIN_VALUE_LEN];
-        root.copy_from_slice(&root_vec);
-        let mut last_value = [0u8; CHAIN_VALUE_LEN];
-        last_value.copy_from_slice(&last_val_vec);
-        out.insert(
-            (peer, chain_id),
-            ChainState {
-                root,
-                length: entry.length,
-                last_index: entry.last_index,
-                last_value,
-                registered_unix: entry.registered_unix,
-                last_used_unix: entry.last_used_unix,
-            },
-        );
     }
     out
+}
+
+/// Replay the append-only journal over `map`. Each `[u32 len][ciphertext]`
+/// record is decrypted, decoded, and applied monotonically. A truncated or
+/// undecryptable trailing record (a crash mid-append, before the advance
+/// was fsync'd and thus before the caller ever saw `Accepted`) ends replay
+/// cleanly. Stale-by-TTL records are skipped but still counted, so a
+/// startup compaction reclaims them. Returns the number of records read.
+fn replay_journal(
+    path: &Path,
+    key: &[u8; encrypted_file::KEY_LEN],
+    max_age: Duration,
+    map: &mut HashMap<(Vec<u8>, [u8; CHAIN_ID_LEN]), ChainState>,
+) -> io::Result<u64> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let now = encrypted_file::unix_now();
+    let cutoff = now.saturating_sub(max_age.as_secs());
+    let mut applied = 0u64;
+    let mut off = 0usize;
+    while off + 4 <= bytes.len() {
+        let len = u32::from_be_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        if len == 0 || off + len > bytes.len() {
+            break; // truncated trailing record — never durably committed
+        }
+        let ct = &bytes[off..off + len];
+        off += len;
+        let Ok(plaintext) = encrypted_file::decrypt_with_aad(key, ct, JOURNAL_AAD) else {
+            break; // corrupt trailing record — stop, don't fail the load
+        };
+        let Ok(rec) = serde_json::from_slice::<JournalRecord>(&plaintext) else {
+            break;
+        };
+        applied += 1;
+        if rec.entry.last_used_unix <= cutoff {
+            continue;
+        }
+        if let Some((k, state)) = decode_entry(&rec.key, &rec.entry) {
+            apply_monotonic(map, k, state);
+        }
+    }
+    Ok(applied)
+}
+
+/// Insert/overwrite only if it does not regress an existing cursor. This is
+/// what makes a stale post-compaction journal harmless: a record whose
+/// `last_index` is below what the snapshot already holds is ignored, so a
+/// consumed token can never be replayed after a crash.
+fn apply_monotonic(
+    map: &mut HashMap<(Vec<u8>, [u8; CHAIN_ID_LEN]), ChainState>,
+    k: (Vec<u8>, [u8; CHAIN_ID_LEN]),
+    state: ChainState,
+) {
+    match map.get(&k) {
+        Some(existing) if state.last_index < existing.last_index => { /* stale: keep current */ }
+        _ => {
+            map.insert(k, state);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -703,6 +935,63 @@ mod tests {
         let t2 = token_at(&positions, 16, 2);
         assert_eq!(
             store2.validate(&reg.peer_id, &reg.chain_id, 2, &t2).unwrap(),
+            ValidateOutcome::Accepted,
+        );
+    }
+
+    /// PZ-H2 crash-safety: an advance is durable via the append-only
+    /// journal BEFORE `validate` returns `Accepted`, even if the process
+    /// "crashes" before any compaction folds the journal into the
+    /// snapshot. On reload the folded cursor must NOT regress — a replay of
+    /// a consumed index stays rejected, and the next forward index still
+    /// verifies. This is the core replay-monotonicity guarantee the journal
+    /// must never break.
+    #[test]
+    fn replay_cursor_survives_crash_before_compaction() {
+        let tmp = TempDir::new().unwrap();
+        let length: u32 = 16;
+        let (root, positions) = fresh_chain([0x5A; 32], length);
+        let reg = ChainRegistration {
+            peer_id: [0x1B; 33],
+            chain_id: [0x2C; 16],
+            root,
+            length,
+        };
+        {
+            let mut store = make_store(tmp.path());
+            assert_eq!(store.register(reg).unwrap(), RegisterOutcome::Registered);
+            // Advance the cursor to index 3. These advances live ONLY in the
+            // journal — well under JOURNAL_COMPACT_THRESHOLD, so no snapshot
+            // rewrite happened and the snapshot file isn't even created yet.
+            for i in 1..=3u32 {
+                let ti = token_at(&positions, length, i);
+                assert_eq!(
+                    store.validate(&reg.peer_id, &reg.chain_id, i, &ti).unwrap(),
+                    ValidateOutcome::Accepted,
+                );
+            }
+            // The snapshot must NOT yet reflect the advances — proving the
+            // durability came from the fsync'd journal, not a snapshot write.
+            let snapshot = tmp.path().join(FILE_NAME);
+            assert!(
+                !snapshot.exists(),
+                "no full-store snapshot should have been written on the advance hot path"
+            );
+            // Drop without compaction — simulates a crash. Only the fsync'd
+            // journal survives.
+        }
+        // Reload: the journal must be folded so the cursor is back at 3.
+        let mut reloaded = make_store(tmp.path());
+        // Replay of an already-consumed index is rejected (no regression).
+        let t3 = token_at(&positions, length, 3);
+        assert_eq!(
+            reloaded.validate(&reg.peer_id, &reg.chain_id, 3, &t3).unwrap(),
+            ValidateOutcome::OutOfRange,
+        );
+        // The next forward index still verifies → the cursor really is at 3.
+        let t4 = token_at(&positions, length, 4);
+        assert_eq!(
+            reloaded.validate(&reg.peer_id, &reg.chain_id, 4, &t4).unwrap(),
             ValidateOutcome::Accepted,
         );
     }
