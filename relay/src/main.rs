@@ -704,27 +704,40 @@ const BUNDLE_REQ_RATE_GC_INTERVAL: Duration = Duration::from_secs(30 * 60);
 /// + recipient header + payload), hex-encoded for JSON-safety.
 type Pending = Arc<Mutex<PendingStore>>;
 
-/// Per-peer activity log. F-903: gated on `debug_assertions` so a
-/// `--release` relay never prints peer_id metadata to stdout, closing
-/// the production-drift path the module's "no logging that survives a
-/// process restart" rule warns about. Dev builds (default `cargo run`)
-/// keep the diagnostics; release builds (production Tor onion target)
-/// no-op.
-#[cfg(debug_assertions)]
+/// Per-peer activity log. F-RWP-02 / F-PUSH-04: gated on an explicit
+/// RUNTIME opt-in (`PIZZINI_RELAY_DIAG=1`), NOT the build profile. These
+/// lines print routing peer-ids / `to_id`s (the live "who is talking to
+/// whom" graph) via `short_hex`. A `debug_assertions` gate was unsafe
+/// because a debug-profile relay can reach testers/production servers
+/// (operator-confirmed), where the routing graph would land in
+/// stdout → journald (durable). An env opt-in keeps these silent on every
+/// shipped build — debug or release — unless an operator deliberately
+/// turns them on. Mirrors crypto-core's `PIZZINI_CRYPTO_DIAG` (F-CF-02).
+fn relay_diag_value_enables(value: Option<&str>) -> bool {
+    matches!(value, Some("1") | Some("true"))
+}
+
+fn relay_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        relay_diag_value_enables(std::env::var("PIZZINI_RELAY_DIAG").ok().as_deref())
+    })
+}
+
 macro_rules! dev_peer_log {
-    ($($arg:tt)*) => { println!($($arg)*) };
+    ($($arg:tt)*) => {
+        if crate::relay_diag_enabled() {
+            println!($($arg)*);
+        }
+    };
 }
-#[cfg(not(debug_assertions))]
-macro_rules! dev_peer_log {
-    ($($arg:tt)*) => { () };
-}
-#[cfg(debug_assertions)]
 macro_rules! dev_peer_elog {
-    ($($arg:tt)*) => { eprintln!($($arg)*) };
-}
-#[cfg(not(debug_assertions))]
-macro_rules! dev_peer_elog {
-    ($($arg:tt)*) => { () };
+    ($($arg:tt)*) => {
+        if crate::relay_diag_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
 }
 
 #[tokio::main]
@@ -2643,6 +2656,21 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_diag_is_opt_in_not_build_profile() {
+        // F-RWP-02 / F-PUSH-04: the peer-aware relay logs (routing peer-ids /
+        // to_ids) must be silent on every shipped build — debug or release —
+        // unless an operator explicitly opts in via PIZZINI_RELAY_DIAG. Only
+        // "1"/"true" enable; anything else (incl. unset / a debug build that
+        // simply didn't set the var) stays silent.
+        assert!(relay_diag_value_enables(Some("1")));
+        assert!(relay_diag_value_enables(Some("true")));
+        assert!(!relay_diag_value_enables(Some("0")));
+        assert!(!relay_diag_value_enables(Some("")));
+        assert!(!relay_diag_value_enables(Some("yes")));
+        assert!(!relay_diag_value_enables(None));
+    }
 
     fn build_send_v2(to: &[u8], ttl: u32, token: &[u8], sealed: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();

@@ -44,8 +44,18 @@ jobs:
           # cache poisoning from a fork could feed a future main-
           # branch run a tampered dep tree.
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-      - name: cargo test --workspace
-        run: cargo test --workspace --no-fail-fast
+      - name: cargo test --workspace (lockfile frozen)
+        # F-SUP-03: `vendor/` and `.cargo/config.toml` are intentionally NOT
+        # committed (see .gitignore) — `Cargo.lock` is the authoritative,
+        # reviewable dependency pin (exact versions + crates.io checksums +
+        # git tag/commit for git deps). `--locked` fails CI if Cargo.lock is
+        # stale or a PR changes dependencies without an accompanying
+        # (reviewable) lockfile diff, so dependency provenance is enforced
+        # in review without a 313-crate vendored tree in the repo. The
+        # release build additionally uses `cargo vendor --locked` +
+        # `--locked --frozen` inside the pinned container, and the separate
+        # `cargo audit` job denies RUSTSEC advisories.
+        run: cargo test --workspace --locked --no-fail-fast
       - name: PQXDH roundtrip example
         run: cargo run --example pqxdh_roundtrip -p pizzini-crypto-core
 
