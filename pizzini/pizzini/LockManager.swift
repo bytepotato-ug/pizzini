@@ -322,6 +322,17 @@ final class LockManager {
         /// Neither matched — UI shows "Incorrect passcode" and the
         /// user can retry.
         case wrong
+        /// PZ-C7: too many recent failures — the lockout policy has
+        /// blocked this attempt until `retryAt`. UI surfaces a
+        /// countdown; the verify did NOT run (so an attacker can't
+        /// even burn Argon2id cycles during the backoff).
+        case lockedOut(retryAt: Date)
+        /// PZ-C7: hard ceiling reached — the device is permanently
+        /// locked out for this passcode pair. Recovery is a full
+        /// reinstall by the legitimate user. We deliberately do NOT
+        /// silently wipe here, which would let a brute-force attacker
+        /// destroy the user's data by guessing wrong.
+        case permanentlyLocked
     }
 
     /// Submit a passcode string. Returns synchronously — Argon2id
@@ -346,7 +357,43 @@ final class LockManager {
         if wipeInFlight {
             return .wrong
         }
-        switch AppPasscode.check(entry) {
+        // PZ-C7: consult the persistent lockout BEFORE running the slow
+        // Argon2id verify. A blocked attempt returns immediately so an
+        // attacker can't burn CPU during the backoff window either.
+        let now = Date()
+        let priorState = PasscodeLockoutStore.load()
+        let policy = PasscodeLockoutPolicy.production
+        switch policy.decision(
+            attempts: priorState.attempts,
+            lastFailedAt: priorState.lastFailedAt,
+            now: now
+        ) {
+        case .permanentlyLocked:
+            lastError = "Passcode permanently locked after too many failed attempts. Reinstall the app to recover."
+            return .permanentlyLocked
+        case .blocked(let retryAt):
+            lastError = "Too many failed attempts. Try again at \(Self.formatRetry(retryAt))."
+            return .lockedOut(retryAt: retryAt)
+        case .allow:
+            break
+        }
+        // AppPasscode.check is constant-time across .real/.duress/.neither
+        // (always two Argon2id derivations + masked selection).
+        let match = AppPasscode.check(entry)
+        // CRITICAL anti-leak: write the new lockout state in EVERY
+        // branch with the same call shape — same Keychain row, same
+        // fixed-size JSON payload — so the post-verify wall-clock cost
+        // is independent of which match was hit. Combined with
+        // AppPasscode.check's own constant-time guarantee, this stops
+        // an attacker from inferring real vs duress vs neither by
+        // timing the persisted side effect.
+        let nextState = PasscodeLockoutPolicy.nextState(
+            after: match,
+            prior: priorState,
+            now: now
+        )
+        _ = PasscodeLockoutStore.save(nextState)
+        switch match {
         case .real:
             isLocked = false
             isPasscodeSheetPresented = false
@@ -357,5 +404,15 @@ final class LockManager {
         case .neither:
             return .wrong
         }
+    }
+
+    /// Format `retryAt` for display in `lastError`. Uses a localized
+    /// short time style — "9:14 AM" / "21:14" — which is enough
+    /// resolution for backoffs measured in seconds-to-a-minute.
+    private static func formatRetry(_ retryAt: Date) -> String {
+        let fmt = DateFormatter()
+        fmt.timeStyle = .short
+        fmt.dateStyle = .none
+        return fmt.string(from: retryAt)
     }
 }

@@ -511,6 +511,13 @@ enum Storage {
         //    presents as a clean install.
         if clearPasscodes {
             AppPasscode.eraseAll()
+            // PZ-C7: clear the persistent failed-attempt counter too.
+            // The post-wipe surface must equal a fresh install (the
+            // duress feature depends on this); a non-zero attempts
+            // count surviving a wipe would distinguish "wiped device"
+            // from "never installed" the first time the new owner
+            // mistypes a passcode.
+            PasscodeLockoutStore.reset()
         }
         // 3. Attachment sandbox — every received photo/video/PDF the
         //    user exchanged. These bytes are already undecryptable-DB

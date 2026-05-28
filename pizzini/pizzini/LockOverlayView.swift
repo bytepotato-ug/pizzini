@@ -220,6 +220,13 @@ struct LockOverlayView: View {
             // a `.wrong` entry is already observably distinct from
             // `.real`/`.duress` (the app simply stays locked).
             break
+        case .lockedOut, .permanentlyLocked:
+            // PZ-C7: same UI shape as `.wrong` — sheet stays up,
+            // PasscodeEntryView surfaces the lockout message text
+            // from `lockManager.lastError`. No padding to apply: no
+            // verify ran, so there is no latency to align with the
+            // real / duress branches.
+            break
         }
     }
 

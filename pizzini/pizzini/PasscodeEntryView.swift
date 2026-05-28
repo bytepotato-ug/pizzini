@@ -134,6 +134,13 @@ struct PasscodeEntryView: View {
             case .wrong:
                 errorMessage = "Incorrect passcode."
                 onOutcome(outcome)
+            case .lockedOut, .permanentlyLocked:
+                // PZ-C7: the lockout-specific message text already
+                // landed in `LockManager.lastError`; surface it here
+                // so the user sees the countdown / "permanently
+                // locked" notice instead of a generic "incorrect".
+                errorMessage = lockManager.lastError ?? "Too many failed attempts."
+                onOutcome(outcome)
             }
         }
     }
