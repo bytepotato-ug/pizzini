@@ -440,6 +440,15 @@ const MAX_PENDING_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// How often the GC task scans every per-peer queue for expired entries.
 const PENDING_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
+/// PZ-H2: how often the periodic flush task writes the three
+/// non-replay-critical stores (pending, bundle-req-rate, push tokens)
+/// to disk if they're dirty. Mutations now defer to this loop instead
+/// of re-encrypting + double-fsyncing per request, so this interval
+/// also bounds crash-loss of un-flushed mutations to a few seconds
+/// (acceptable: queue is best-effort, rate buckets are soft, push
+/// tokens are re-registered by the client on next reconnect).
+const STORE_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
 /// XEd25519 verify key wire size — 1-byte DJB type prefix + 32-byte point.
 const VERIFY_KEY_LEN: usize = 33;
 /// Upper bound on a peer id (`to_id` / `from_id`). A peer id is the
@@ -945,6 +954,9 @@ async fn main() -> std::io::Result<()> {
     spawn_bundle_req_rate_gc(bundle_req_rate.clone());
     spawn_chain_seed_rate_gc(chain_seed_rate.clone());
     spawn_send_dedupe_gc(send_dedupes.clone());
+    // PZ-H2: periodic flush of the three debounced stores. Mutations
+    // now just mark dirty; this loop is what actually writes them out.
+    spawn_store_flush(pending.clone(), bundle_req_rate.clone(), push_tokens.clone());
 
     // Health endpoint — separate listener on `PIZZINI_RELAY_HEALTH_BIND`
     // (default `127.0.0.1:7778`). Replies with a one-line JSON snapshot
@@ -1149,6 +1161,47 @@ fn spawn_pending_gc(pending: Pending) {
                 Ok(0) => {}
                 Ok(n) => dev_peer_log!("pending: GC dropped {n} expired frames"),
                 Err(e) => eprintln!("[pizzini-relay] warn: pending GC persist failed: {e}"),
+            }
+        }
+    });
+}
+
+/// PZ-H2: periodic flush task for the three non-replay-critical stores.
+/// Each store's mutations now just set a dirty flag (no per-request
+/// re-encrypt + double-fsync); this loop is what actually moves those
+/// mutations to disk every `STORE_FLUSH_INTERVAL` seconds. A no-op
+/// when nothing is dirty, so an idle relay does no disk I/O here.
+/// Locks are taken one at a time and released between stores so a
+/// busy hot path is never blocked waiting on a sibling store's write.
+fn spawn_store_flush(
+    pending: Pending,
+    bundle_req_rate: BundleReqRate,
+    push_tokens: PushTokens,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(STORE_FLUSH_INTERVAL);
+        // First tick fires immediately; skip it so we don't write right
+        // after startup-time loads when nothing has been mutated yet.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            {
+                let mut store = pending.lock().await;
+                if let Err(e) = store.flush() {
+                    eprintln!("[pizzini-relay] warn: pending flush failed: {e}");
+                }
+            }
+            {
+                let mut store = bundle_req_rate.lock().await;
+                if let Err(e) = store.flush() {
+                    eprintln!("[pizzini-relay] warn: bundle-req-rate flush failed: {e}");
+                }
+            }
+            {
+                let mut store = push_tokens.lock().await;
+                if let Err(e) = store.flush() {
+                    eprintln!("[pizzini-relay] warn: push-tokens flush failed: {e}");
+                }
             }
         }
     });

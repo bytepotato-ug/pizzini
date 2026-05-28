@@ -102,6 +102,12 @@ pub struct PushTokenStore {
     tokens_path: PathBuf,
     key: [u8; encrypted_file::KEY_LEN],
     map: HashMap<Vec<u8>, (Vec<u8>, u64)>,
+    /// PZ-H2: mutations set this and return; the periodic flush task
+    /// in `main.rs` (and `Drop`) does the actual rewrite, so the hot
+    /// path stops re-encrypting + double-fsyncing on every insert /
+    /// remove / GC tick. Crash-loss of an un-flushed token registration
+    /// is recoverable — the iOS client re-registers on every reconnect.
+    dirty: bool,
 }
 
 // Manual `Debug` rather than `#[derive]` — a derived impl would print
@@ -171,6 +177,7 @@ impl PushTokenStore {
             tokens_path,
             key,
             map,
+            dirty: false,
         })
     }
 
@@ -189,7 +196,8 @@ impl PushTokenStore {
     pub fn insert(&mut self, peer_id: Vec<u8>, token: Vec<u8>) -> io::Result<()> {
         let now = encrypted_file::unix_now();
         self.map.insert(peer_id, (token, now));
-        self.persist()
+        self.dirty = true;
+        Ok(())
     }
 
     /// Remove an entry for `peer_id` and persist. Returns `true` if
@@ -201,7 +209,7 @@ impl PushTokenStore {
     /// `maybe_send_push` fires duplicates on every inbound SEND.
     pub fn remove(&mut self, peer_id: &[u8]) -> io::Result<bool> {
         if self.map.remove(peer_id).is_some() {
-            self.persist()?;
+            self.dirty = true;
             Ok(true)
         } else {
             Ok(false)
@@ -220,7 +228,7 @@ impl PushTokenStore {
         self.map.retain(|_, (_, ts)| *ts > cutoff);
         let removed = before - self.map.len();
         if removed > 0 {
-            self.persist()?;
+            self.dirty = true;
         }
         Ok(removed)
     }
@@ -252,6 +260,34 @@ impl PushTokenStore {
         let plaintext = serde_json::to_vec(&doc).map_err(io::Error::other)?;
         let ciphertext = encrypted_file::encrypt_with_aad(&self.key, &plaintext, AAD)?;
         encrypted_file::write_atomic(&self.tokens_path, &ciphertext)
+    }
+
+    /// PZ-H2: write pending mutations to disk if any, then clear dirty.
+    /// Called periodically from `main.rs` and on `Drop`. No-op when
+    /// clean — an idle relay rewrites nothing.
+    pub fn flush(&mut self) -> io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        self.persist()?;
+        self.dirty = false;
+        Ok(())
+    }
+}
+
+impl Drop for PushTokenStore {
+    /// Best-effort flush on scope exit. Covers graceful shutdown + test
+    /// reloads. Under `panic = "abort"` Drop does NOT run on a process
+    /// crash — the threat-model-acceptable loss is one re-registration
+    /// round-trip from the affected iOS client.
+    fn drop(&mut self) {
+        if self.dirty {
+            if let Err(e) = self.persist() {
+                eprintln!(
+                    "[pizzini-relay] warn: PushTokenStore drop-flush failed: {e}"
+                );
+            }
+        }
     }
 }
 
@@ -421,6 +457,38 @@ mod tests {
         let mut store = PushTokenStore::load_or_create(&dir).unwrap();
         let removed = store.remove(&[0x00; 33]).unwrap();
         assert!(!removed, "remove should return false for absent entry");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PZ-H2: `insert` defers the disk write. A reload mid-flight sees
+    /// the prior on-disk state; `flush()` (or Drop) makes it durable.
+    #[test]
+    fn insert_is_deferred_until_flush() {
+        let dir = fresh_state_dir("debounce");
+        let mut store = PushTokenStore::load_or_create(&dir).unwrap();
+        store
+            .insert(vec![0x11; 33], vec![0x22; 32])
+            .unwrap();
+        // Pre-flush: the snapshot file hasn't been written yet (first
+        // mutation, so no file exists yet).
+        assert!(
+            !dir.join(TOKENS_FILE_NAME).exists(),
+            "insert must not write inline (debounce broken?)"
+        );
+        // A fresh load reads no entries.
+        {
+            let snap = PushTokenStore::load_or_create(&dir).unwrap();
+            assert_eq!(snap.len(), 0);
+        }
+        store.flush().unwrap();
+        // Post-flush: entry persisted.
+        {
+            let snap = PushTokenStore::load_or_create(&dir).unwrap();
+            assert_eq!(snap.len(), 1);
+            assert_eq!(snap.get_cloned(&[0x11; 33]), Some(vec![0x22; 32]));
+        }
+        // flush() on a clean store is idempotent + no-op.
+        store.flush().unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 }

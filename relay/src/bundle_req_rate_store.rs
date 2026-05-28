@@ -69,6 +69,10 @@ pub struct BundleReqRateStore {
     key: [u8; encrypted_file::KEY_LEN],
     /// `(recipient_peer_id, hour_bucket) → accepted count`.
     counts: HashMap<(Vec<u8>, u64), u32>,
+    /// PZ-H2: mutations set this and return immediately. The periodic
+    /// flush task in `main.rs` (and `Drop`) writes the file out — the
+    /// hot path no longer re-encrypts + double-fsyncs per request.
+    dirty: bool,
 }
 
 // Manual `Debug` to redact the key — same reasoning as the sibling
@@ -110,7 +114,7 @@ impl BundleReqRateStore {
             Err(e) => return Err(e),
         };
 
-        Ok(BundleReqRateStore { path, key, counts })
+        Ok(BundleReqRateStore { path, key, counts, dirty: false })
     }
 
     /// Distinct live `(recipient, hour)` buckets. Drives the startup
@@ -120,24 +124,23 @@ impl BundleReqRateStore {
     }
 
     /// Increment the accepted-count for `(recipient, hour)` and
-    /// persist. Returns the post-increment count so the caller can
-    /// compare it against the cap with the same atomic-under-lock
-    /// semantics the in-memory version had.
+    /// return the post-increment count so the caller can compare it
+    /// against the cap with the same atomic-under-lock semantics the
+    /// in-memory version had.
     ///
-    /// `persist()` runs before the count is returned, so any count the
-    /// caller acts on is already durable on disk. A crash *during* the
-    /// atomic write leaves the previous (pre-increment) file in place
-    /// — but the in-flight request that triggered this increment also
-    /// died with the process and was never served, so the bucket on
-    /// the next load is consistent with "that request never happened".
-    /// This is a vastly smaller window than the old
-    /// wipe-the-whole-table-on-restart behaviour, which handed every
-    /// recipient a fresh full budget on every bounce.
+    /// PZ-H2: persistence is now DEFERRED. The increment is in-memory
+    /// only; the periodic flush task (or `Drop`) writes it to disk.
+    /// A crash between increment and flush loses recent bucket
+    /// increments → the recipient gets a fresh budget for that bucket
+    /// on restart. That window is bounded by the flush interval
+    /// (seconds), still vastly tighter than the pre-store wipe-on-
+    /// restart behaviour, and a Sybil burst still hits the in-memory
+    /// cap inside the same process.
     pub fn increment(&mut self, recipient: Vec<u8>, hour: u64) -> io::Result<u32> {
         let entry = self.counts.entry((recipient, hour)).or_insert(0);
         *entry = entry.saturating_add(1);
         let count = *entry;
-        self.persist()?;
+        self.dirty = true;
         Ok(count)
     }
 
@@ -150,7 +153,7 @@ impl BundleReqRateStore {
         self.counts.retain(|(_, hour), _| *hour >= cutoff);
         let removed = before - self.counts.len();
         if removed > 0 {
-            self.persist()?;
+            self.dirty = true;
         }
         Ok(removed)
     }
@@ -166,6 +169,34 @@ impl BundleReqRateStore {
         let plaintext = serde_json::to_vec(&doc).map_err(io::Error::other)?;
         let ciphertext = encrypted_file::encrypt_with_aad(&self.key, &plaintext, AAD)?;
         encrypted_file::write_atomic(&self.path, &ciphertext)
+    }
+
+    /// PZ-H2: write pending mutations to disk if any, then clear dirty.
+    /// Called periodically from `main.rs` and on `Drop`. No-op when
+    /// clean — an idle relay rewrites nothing.
+    pub fn flush(&mut self) -> io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        self.persist()?;
+        self.dirty = false;
+        Ok(())
+    }
+}
+
+impl Drop for BundleReqRateStore {
+    /// Best-effort flush on scope exit so graceful shutdown + test
+    /// reloads see current state. `panic = "abort"` means Drop does NOT
+    /// run on a process crash — that is the threat-model-acceptable
+    /// loss window for these non-replay-critical buckets.
+    fn drop(&mut self) {
+        if self.dirty {
+            if let Err(e) = self.persist() {
+                eprintln!(
+                    "[pizzini-relay] warn: BundleReqRateStore drop-flush failed: {e}"
+                );
+            }
+        }
     }
 }
 
@@ -320,6 +351,36 @@ mod tests {
         assert_eq!(store.len(), 0);
         assert!(dir.join(KEY_FILE_NAME).exists());
         assert!(!dir.join(FILE_NAME).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PZ-H2: `increment` defers the disk write. A reload mid-flight
+    /// sees the prior on-disk state; `flush()` (or Drop) makes it
+    /// durable.
+    #[test]
+    fn increment_is_deferred_until_flush() {
+        let dir = fresh_state_dir("debounce");
+        let mut store = BundleReqRateStore::load_or_create(&dir, 1).unwrap();
+        store.increment(vec![0xAA; 33], 1).unwrap();
+        // Pre-flush: the file hasn't been written yet (first increment,
+        // so the snapshot file does not exist at all).
+        assert!(
+            !dir.join(FILE_NAME).exists(),
+            "increment must not write inline (debounce broken?)"
+        );
+        // A fresh load reads no buckets.
+        {
+            let snap = BundleReqRateStore::load_or_create(&dir, 1).unwrap();
+            assert_eq!(snap.len(), 0);
+        }
+        store.flush().unwrap();
+        // Post-flush: bucket persisted.
+        {
+            let snap = BundleReqRateStore::load_or_create(&dir, 1).unwrap();
+            assert_eq!(snap.len(), 1);
+        }
+        // flush() on a clean store is idempotent + no-op.
+        store.flush().unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 }

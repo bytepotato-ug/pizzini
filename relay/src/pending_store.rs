@@ -145,6 +145,13 @@ pub struct PendingStore {
     /// Global cap on the total queued-frame byte count across all
     /// queues (measured on the decoded frame bytes).
     max_total_bytes: usize,
+    /// PZ-H2: pending mutations not yet flushed to disk. Mutations
+    /// set this and return immediately; the periodic flush task in
+    /// `main.rs` (and `Drop`) actually rewrites the on-disk file.
+    /// Crash-loss of un-flushed mutations is acceptable here — the
+    /// offline queue is best-effort by threat-model definition; the
+    /// replay-critical store has its own append-only journal.
+    dirty: bool,
 }
 
 /// Outcome of an `enqueue`. `Stored` means the frame was queued and
@@ -231,6 +238,7 @@ impl PendingStore {
             max_distinct_peers,
             max_total_frames,
             max_total_bytes,
+            dirty: false,
         })
     }
 
@@ -350,7 +358,10 @@ impl PendingStore {
             queue.pop_front();
         }
         queue.push_back(frame);
-        self.persist()?;
+        // PZ-H2: defer the file rewrite to the periodic flush task
+        // (or Drop) instead of re-encrypting the whole store + double-
+        // fsync on every enqueue.
+        self.dirty = true;
         Ok(EnqueueOutcome::Stored)
     }
 
@@ -365,10 +376,13 @@ impl PendingStore {
         let now = encrypted_file::unix_now();
         let live: VecDeque<PendingFrame> =
             queue.into_iter().filter(|f| !f.is_expired(now)).collect();
-        // `remove` already mutated `queues` — persist the new state
-        // unconditionally so the recipient doesn't re-receive frames
-        // after a subsequent relay restart.
-        self.persist()?;
+        // `remove` already mutated `queues` — mark dirty so the
+        // periodic flush (or Drop) writes the new state out before a
+        // graceful restart. A *crash* between drain and flush may
+        // cause one re-delivery (the client dedups via messageId /
+        // ratchet counter), which is acceptable for the best-effort
+        // offline queue.
+        self.dirty = true;
         Ok(live)
     }
 
@@ -387,7 +401,8 @@ impl PendingStore {
             !queue.is_empty()
         });
         if dropped > 0 {
-            self.persist()?;
+            // Deferred — flushed by the periodic task / Drop, not inline.
+            self.dirty = true;
         }
         Ok(dropped)
     }
@@ -407,6 +422,35 @@ impl PendingStore {
         let plaintext = serde_json::to_vec(&doc).map_err(io::Error::other)?;
         let ciphertext = encrypted_file::encrypt_with_aad(&self.key, &plaintext, AAD)?;
         encrypted_file::write_atomic(&self.pending_path, &ciphertext)
+    }
+
+    /// PZ-H2: write pending mutations to disk if there are any, then
+    /// clear the dirty flag. Called periodically from `main.rs` and on
+    /// `Drop`. No-op when clean — an idle relay rewrites nothing.
+    pub fn flush(&mut self) -> io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        self.persist()?;
+        self.dirty = false;
+        Ok(())
+    }
+}
+
+impl Drop for PendingStore {
+    /// Best-effort flush on scope exit. Covers the graceful-shutdown and
+    /// test-reload paths: tests that reload after a mutation expect the
+    /// file to be current, and Drop fires when `store` goes out of scope
+    /// in those tests. Under `panic = "abort"` Drop does NOT run on
+    /// process crash — that is the threat-model-acceptable loss window.
+    fn drop(&mut self) {
+        if self.dirty {
+            if let Err(e) = self.persist() {
+                eprintln!(
+                    "[pizzini-relay] warn: PendingStore drop-flush failed: {e}"
+                );
+            }
+        }
     }
 }
 
@@ -833,6 +877,40 @@ mod tests {
             store.enqueue_seed(vec![0; 33], frame_with_ttl(0xEE, 3600)).unwrap(),
             EnqueueOutcome::Stored,
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PZ-H2: `enqueue` no longer re-encrypts + double-fsyncs on every
+    /// call — it just marks dirty. A fresh load mid-flight sees the
+    /// prior on-disk state; an explicit `flush()` (or Drop) is what
+    /// makes the mutation durable.
+    #[test]
+    fn enqueue_is_deferred_until_flush() {
+        let dir = fresh_state_dir("debounce");
+        let alice = vec![0xAA; 33];
+        let mut store = open(&dir, TEST_CAP);
+        store
+            .enqueue(alice.clone(), frame_with_ttl(0x77, 3600))
+            .unwrap();
+        // Pre-flush: a fresh load reads no frames — the mutation lives
+        // only in `store`'s in-memory map.
+        {
+            let snap = open(&dir, TEST_CAP);
+            assert_eq!(
+                snap.total_frames(),
+                0,
+                "enqueue must not persist inline (debounce broken?)"
+            );
+        }
+        store.flush().unwrap();
+        // Post-flush: the frame is on disk and a fresh load sees it.
+        {
+            let snap = open(&dir, TEST_CAP);
+            assert_eq!(snap.total_frames(), 1, "flush must persist pending mutations");
+        }
+        // flush() is idempotent on a clean store — second call must
+        // succeed without touching disk.
+        store.flush().unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 }
