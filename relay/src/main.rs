@@ -969,22 +969,10 @@ async fn main() -> std::io::Result<()> {
     if !health_bind_str.eq_ignore_ascii_case("off") {
         match health_bind_str.parse::<SocketAddr>() {
             Ok(health_bind) => {
-                let routes_h = routes.clone();
-                let pending_h = pending.clone();
-                let push_tokens_h = push_tokens.clone();
-                let verify_keys_h = verify_keys.clone();
-                let chain_validators_h2 = chain_validators.clone();
+                // PZ-M4: the health endpoint is now lock-free and
+                // counter-free, so it borrows no store handles.
                 tokio::spawn(async move {
-                    if let Err(e) = run_health_server(
-                        health_bind,
-                        routes_h,
-                        pending_h,
-                        push_tokens_h,
-                        verify_keys_h,
-                        chain_validators_h2,
-                    )
-                    .await
-                    {
+                    if let Err(e) = run_health_server(health_bind).await {
                         eprintln!("[pizzini-relay] health server exited: {e}");
                     }
                 });
@@ -1080,29 +1068,31 @@ async fn main() -> std::io::Result<()> {
 }
 
 /// Minimal HTTP/1.1 health endpoint. Replies with one of:
-///   `GET /healthz`  → `200 {"status":"ok",...counters...}`
+///   `GET /healthz`  → `200 {"status":"ok"}`
 ///   anything else   → `404 not found`
-/// Hand-rolled rather than pulling in hyper/axum: this is one
-/// request shape and the relay's only build-time HTTP dep is
-/// already implicit via reqwest in the APNs path. A 200-byte
-/// response keeps the surface small.
-async fn run_health_server(
-    bind: SocketAddr,
-    routes: Routes,
-    pending: Pending,
-    push_tokens: PushTokens,
-    verify_keys: VerifyKeys,
-    chain_validators: ChainValidators,
-) -> std::io::Result<()> {
+///
+/// PZ-M4 + PRIVACY: this used to take five hot-path locks per request
+/// (routes, pending, push_tokens, verify_keys, chain_validators) and
+/// return their counts. Two problems with that:
+///   - Lock contention. The relay's hot paths (frame dispatch, token
+///     validation, offline-queue mutation) compete for those same
+///     mutexes; every /healthz probe stalled them for one lock cycle
+///     each. A monitoring agent polling /healthz at any meaningful
+///     frequency could DoS legitimate traffic.
+///   - User-population leak. `connections`, `pending_frames`,
+///     `push_tokens`, `verify_keys`, `chain_validators` together
+///     publish live deployment scale + activity to anyone who can
+///     reach the health bind. The health endpoint is loopback-only by
+///     default, but the leak is unnecessary either way — liveness
+///     does not require population data.
+/// Returning a static `{"status":"ok"}` removes both. A monitoring
+/// agent that needs counters can run a privileged sidecar that reads
+/// process metrics; the relay itself doesn't publish them.
+async fn run_health_server(bind: SocketAddr) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = TcpListener::bind(bind).await?;
     loop {
         let (mut stream, _) = listener.accept().await?;
-        let routes = routes.clone();
-        let pending = pending.clone();
-        let push_tokens = push_tokens.clone();
-        let verify_keys = verify_keys.clone();
-        let chain_validators = chain_validators.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             let n = match stream.read(&mut buf).await {
@@ -1116,14 +1106,8 @@ async fn run_health_server(
                 .map(|line| line.starts_with("GET /healthz"))
                 .unwrap_or(false);
             let body = if is_healthz {
-                let connections = routes.lock().await.len();
-                let pending_total = pending.lock().await.total_frames();
-                let push_total = push_tokens.lock().await.len();
-                let verify_total = verify_keys.lock().await.len();
-                let chain_total = chain_validators.lock().await.len();
-                format!(
-                    "{{\"status\":\"ok\",\"connections\":{connections},\"pending_frames\":{pending_total},\"push_tokens\":{push_total},\"verify_keys\":{verify_total},\"chain_validators\":{chain_total}}}\n"
-                )
+                // Static — no locks, no user-population data.
+                String::from("{\"status\":\"ok\"}\n")
             } else {
                 String::from("not found\n")
             };
