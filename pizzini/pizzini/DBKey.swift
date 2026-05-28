@@ -105,7 +105,22 @@ enum DBKey {
         params: Argon2id.Params = .production,
         persistParams: Bool = true,
     ) throws -> Data {
-        let seed = try unwrapOrCreateSeed()
+        var seed = try unwrapOrCreateSeed()
+        defer {
+            // PZ-M9: the unwrapped seed plaintext is no longer needed
+            // once Argon2id has consumed it. Wipe our copy here rather
+            // than waiting for ARC, which may not run until the next
+            // autorelease pool drain and leaves the bytes in heap
+            // memory until then. The returned DB key is a separate
+            // buffer; its caller (SQLiteStorage.bootstrap) is
+            // responsible for wiping it after handing it to
+            // `Database(rawKey:)`.
+            seed.withUnsafeMutableBytes { ptr in
+                if let base = ptr.baseAddress {
+                    _ = memset(base, 0, ptr.count)
+                }
+            }
+        }
         let salt = try loadOrCreateSalt()
         let key = try Argon2id.derive(
             passphrase: seed,
@@ -208,9 +223,20 @@ enum DBKey {
             return try unwrapSeed(wrapped)
         }
         // First-launch path: generate a 32-byte seed, wrap it,
-        // write the ciphertext into Keychain. The seed itself is
-        // discarded — it lives only inside the SE wrap from now on.
+        // write the ciphertext into Keychain. The returned `Data` is
+        // a fresh copy of the seed bytes; the `seedBytes` array we
+        // generated into is no longer needed after the wrap and is
+        // explicitly wiped (PZ-M9) — leaving a 32-byte plaintext seed
+        // in heap memory would defeat the rest of the at-rest
+        // protection.
         var seedBytes = [UInt8](repeating: 0, count: 32)
+        defer {
+            seedBytes.withUnsafeMutableBufferPointer { buf in
+                if let base = buf.baseAddress {
+                    _ = memset(base, 0, buf.count)
+                }
+            }
+        }
         let rc = SecRandomCopyBytes(kSecRandomDefault, seedBytes.count, &seedBytes)
         guard rc == errSecSuccess else {
             throw DBKeyError.wrapFailed

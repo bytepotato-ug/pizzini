@@ -63,13 +63,19 @@ public final class Database {
         // path. The fix uses the C API + hex form so the SQL
         // never reaches `sqlite3_exec` (and can't be captured into
         // a thrown `DatabaseError.executeFailed.sql` that an NSLog
-        // caller would dump to the unified log). The hex string
-        // lives only on the local Swift stack for the duration of
-        // this call.
-        let hexKey = rawKey.map { String(format: "%02x", $0) }.joined()
-        let xHexKey = "x'\(hexKey)'"
-        let keyingRC: Int32 = xHexKey.withCString { cstr in
-            sqlite3_key_v2(dbHandle, nil, cstr, Int32(strlen(cstr)))
+        // caller would dump to the unified log).
+        //
+        // PZ-M9: the hex form is built in a byte buffer we
+        // explicitly memset on scope exit (see
+        // `withSQLCipherKeyCString`). The previous Swift-`String`
+        // path comment claimed the hex string "lives only on the
+        // local Swift stack" — that was wrong: `String` storage
+        // for any 64-char ASCII string is heap-allocated (the
+        // small-string optimisation tops out at 15 bytes), so the
+        // raw key was lingering in unzeroed heap memory until ARC
+        // ran. It no longer is.
+        let keyingRC: Int32 = Self.withSQLCipherKeyCString(rawKey) { cstr, len in
+            sqlite3_key_v2(dbHandle, nil, cstr, len)
         }
         guard keyingRC == SQLITE_OK else {
             throw DatabaseError.keyingFailed(code: keyingRC)
@@ -121,8 +127,12 @@ public final class Database {
     /// Same `x'<hex>'` discipline as the constructor — bare-bytes
     /// `sqlite3_rekey_v2` would route through PBKDF2 and produce
     /// a different cipher key than the hex form, leaving the DB
-    /// in a permanently-un-openable state. The hex string lives
-    /// only on the stack for the duration of this call.
+    /// in a permanently-un-openable state.
+    ///
+    /// PZ-M9: the hex form is built in a byte buffer we explicitly
+    /// memset on scope exit (see `withSQLCipherKeyCString`), so the
+    /// new raw key isn't left sitting in unzeroed heap memory after
+    /// the rekey returns.
     ///
     /// `newRawKey` must be exactly 32 bytes (a `kSecRandomDefault`-
     /// quality output of the same shape as `DBKey.deriveKey`).
@@ -133,14 +143,59 @@ public final class Database {
     /// one.
     public func rekey(newRawKey: Data) throws {
         precondition(newRawKey.count == 32, "rekey requires a 32-byte key")
-        let hexKey = newRawKey.map { String(format: "%02x", $0) }.joined()
-        let xHexKey = "x'\(hexKey)'"
-        let rc: Int32 = xHexKey.withCString { cstr in
-            sqlite3_rekey_v2(handle, nil, cstr, Int32(strlen(cstr)))
+        let rc: Int32 = Self.withSQLCipherKeyCString(newRawKey) { cstr, len in
+            sqlite3_rekey_v2(handle, nil, cstr, len)
         }
         guard rc == SQLITE_OK else {
             throw DatabaseError.keyingFailed(code: rc)
         }
+    }
+
+    /// PZ-M9: build SQLCipher's `x'<64-hex>'` keying string in a heap
+    /// byte buffer we explicitly zero on scope exit, then hand a
+    /// NUL-terminated C pointer to `body`. The Swift `String` form
+    /// previously used here allocates heap storage we cannot memset
+    /// (and the small-string optimisation tops out at 15 ASCII bytes,
+    /// so a 64-char hex string never gets the in-line representation
+    /// the previous comment claimed). Building it as a `[UInt8]` lets
+    /// us defer-wipe the bytes once `sqlite3_key_v2` /
+    /// `sqlite3_rekey_v2` has consumed them.
+    private static func withSQLCipherKeyCString<R>(
+        _ rawKey: Data,
+        _ body: (UnsafePointer<CChar>, Int32) throws -> R
+    ) rethrows -> R {
+        // Layout: "x'" + 64 hex chars + "'" + NUL = 68 bytes.
+        var buf = [UInt8](repeating: 0, count: 68)
+        defer {
+            buf.withUnsafeMutableBufferPointer { p in
+                if let base = p.baseAddress {
+                    _ = memset(base, 0, p.count)
+                }
+            }
+        }
+        rawKey.withUnsafeBytes { (rawBuf: UnsafeRawBufferPointer) in
+            let key = rawBuf.bindMemory(to: UInt8.self)
+            buf[0] = UInt8(ascii: "x")
+            buf[1] = UInt8(ascii: "'")
+            for i in 0..<32 {
+                let b = key[i]
+                buf[2 + i * 2]     = nibbleToHexAscii(b >> 4)
+                buf[2 + i * 2 + 1] = nibbleToHexAscii(b & 0x0F)
+            }
+            buf[66] = UInt8(ascii: "'")
+            // buf[67] stays 0 (the NUL terminator).
+        }
+        return try buf.withUnsafeBufferPointer { p in
+            let cstr = UnsafeRawPointer(p.baseAddress!)
+                .assumingMemoryBound(to: CChar.self)
+            // 67 = strlen("x'<64hex>'"); the count arg excludes NUL.
+            return try body(cstr, 67)
+        }
+    }
+
+    @inline(__always)
+    private static func nibbleToHexAscii(_ n: UInt8) -> UInt8 {
+        return n < 10 ? (UInt8(ascii: "0") + n) : (UInt8(ascii: "a") + n - 10)
     }
 
     /// Run a single statement with no parameters and no result
