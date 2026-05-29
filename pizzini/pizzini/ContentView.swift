@@ -136,6 +136,11 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: UIScene.didActivateNotification)) { _ in
             lockManager.handleDidActivate()
+            // PZ-M13: the device is necessarily unlocked when a scene
+            // activates (cold launch or resume), so the Keychain is
+            // accessible — finish any duress wipe whose key erase could
+            // not be confirmed earlier. No-op unless the flag is set.
+            store.retryIncompleteDuressWipeIfNeeded()
         }
         .fullScreenCover(isPresented: Binding(
             get: { !store.state.onboardingCompleted && store.initError == nil },

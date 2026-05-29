@@ -23,15 +23,36 @@ struct PasscodeSetupView: View {
 
     @State private var entry: String = ""
     @State private var confirm: String = ""
+    /// PZ-M11: the user's current real passcode, re-entered when setting
+    /// a duress passcode. Required so setup can reject a duress value
+    /// within a fat-finger typo of the real one — the real passcode is
+    /// stored only as a hash, so the plaintext must be supplied here.
+    /// Unused (and not shown) in `.real` mode.
+    @State private var currentReal: String = ""
     @State private var errorMessage: String?
     @State private var inFlight: Bool = false
     @FocusState private var focusedField: Field?
 
-    private enum Field: Hashable { case entry, confirm }
+    private enum Field: Hashable { case currentReal, entry, confirm }
 
     var body: some View {
         NavigationStack {
             Form {
+                if mode == .duress {
+                    // PZ-M11: re-authenticate with the current real
+                    // passcode so setup can compare the two by edit
+                    // distance and reject a typo-confusable duress value.
+                    Section {
+                        SecureField("Current passcode", text: $currentReal)
+                            .keyboardType(.asciiCapable)
+                            .hardenedTextInput()
+                            .focused($focusedField, equals: .currentReal)
+                            .submitLabel(.next)
+                            .onSubmit { focusedField = .entry }
+                    } footer: {
+                        Text("Confirm your real passcode to set the duress passcode.")
+                    }
+                }
                 Section {
                     // No `.textContentType(.newPassword)` on either field
                     // — that hint asks iOS to offer "Save to iCloud
@@ -83,7 +104,7 @@ struct PasscodeSetupView: View {
                         .disabled(!canSave || inFlight)
                 }
             }
-            .onAppear { focusedField = .entry }
+            .onAppear { focusedField = mode == .duress ? .currentReal : .entry }
         }
         .interactiveDismissDisabled()
     }
@@ -106,9 +127,11 @@ struct PasscodeSetupView: View {
     }
 
     private var canSave: Bool {
-        !entry.isEmpty
+        let base = !entry.isEmpty
             && entry.count >= AppPasscode.minLength
             && entry == confirm
+        // PZ-M11: duress setup also needs the current real passcode.
+        return mode == .duress ? base && !currentReal.isEmpty : base
     }
 
     private func save() {
@@ -116,6 +139,7 @@ struct PasscodeSetupView: View {
         inFlight = true
         errorMessage = nil
         let toSet = entry
+        let realEntered = currentReal
         Task { @MainActor in
             await Task.yield()
             defer { inFlight = false }
@@ -124,13 +148,19 @@ struct PasscodeSetupView: View {
                 case .real:
                     try AppPasscode.setPasscode(toSet)
                 case .duress:
-                    try AppPasscode.setDuressPasscode(toSet)
+                    try AppPasscode.setDuressPasscode(toSet, currentRealPasscode: realEntered)
                 }
                 entry = ""
                 confirm = ""
+                currentReal = ""
                 onSaved()
             } catch AppPasscode.PasscodeError.tooShort(let min) {
                 errorMessage = "Passcode must be at least \(min) characters."
+            } catch AppPasscode.PasscodeError.realPasscodeIncorrect {
+                errorMessage = "That isn't your current passcode."
+            } catch AppPasscode.PasscodeError.tooSimilarToReal {
+                errorMessage = "Too close to your real passcode — a single typo could wipe by accident. "
+                    + "Choose something more clearly different."
             } catch AppPasscode.PasscodeError.sameAsExisting {
                 errorMessage = "Duress passcode can't match your real passcode."
             } catch AppPasscode.PasscodeError.keychainWriteFailed {

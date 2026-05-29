@@ -461,12 +461,14 @@ enum Storage {
     ///      duress-aware on its own.
     ///   6. Re-bootstrap a fresh SQLCipher store with new keys.
     ///
-    /// Optionally preserves a subset of `AppState` settings (relay
-    /// host + UX prefs) in the post-wipe state. **Onboarding flags
-    /// and lock-gate flags are NOT preserved** on the duress path —
-    /// the post-wipe UI deliberately routes through onboarding so
-    /// the user (or coercer) is presented with a fresh-install
-    /// experience indistinguishable from a clean app install.
+    /// Post-wipe `AppState` is chosen by `postWipeAppState`. On the
+    /// duress path (`clearPasscodes`) it is a pristine fresh install —
+    /// NOTHING from the prior state is preserved (not even the relay host
+    /// or screenshot self-test cache) — so the device is byte-for-byte
+    /// indistinguishable from a clean app install and routes through
+    /// onboarding. The non-duress reset path preserves the user's
+    /// existing posture (relay host + UX prefs) so an accidental tap
+    /// doesn't strand them in a re-onboarding loop.
     ///
     /// Returns `true` only if the irreversible step (the Keychain key
     /// material erase) was fully confirmed. A `false` return means a
@@ -556,60 +558,10 @@ enum Storage {
             try SQLiteStorage.bootstrap()
             try StorageMigration.run(storage: SQLiteStorage.shared)
             if let snapshot {
-                // Duress preserves a narrow slice: just the relay
-                // host and the inAppHaptics setting, so the post-wipe
-                // app doesn't look like every other fresh install.
-                // Onboarding flags + biometric/passcode/lock posture
-                // are explicitly RESET on the duress path so the user
-                // (and any coercer browsing the wiped device) is
-                // presented with a fresh-install experience that
-                // gates the empty contacts list behind onboarding.
-                let preserved: AppState
-                if clearPasscodes {
-                    preserved = AppState(
-                        relayHost: snapshot.relayHost,
-                        contacts: [],
-                        onboardingCompleted: false,
-                        biometricLockEnabled: false,
-                        autoLockTimeout: .immediately,
-                        attachmentPreviewMode: .off,
-                        panicModeEnabled: false,
-                        qrBlockEffective: snapshot.qrBlockEffective,
-                        qrBlockTestedOSVersion: snapshot.qrBlockTestedOSVersion,
-                        groups: [],
-                        contactsBeforeGroups: true,
-                        inAppHapticsEnabled: false,
-                        notificationsMuted: false,
-                        blockedIdentities: [],
-                    )
-                } else {
-                    // Non-duress reset path (Settings → "Reset
-                    // everything"): preserve the user's existing
-                    // posture so an accidental tap doesn't strand
-                    // them in a re-onboarding loop.
-                    preserved = AppState(
-                        relayHost: snapshot.relayHost,
-                        contacts: [],
-                        onboardingCompleted: snapshot.onboardingCompleted,
-                        biometricLockEnabled: snapshot.biometricLockEnabled,
-                        autoLockTimeout: snapshot.autoLockTimeout,
-                        attachmentPreviewMode: snapshot.attachmentPreviewMode,
-                        panicModeEnabled: snapshot.panicModeEnabled,
-                        qrBlockEffective: snapshot.qrBlockEffective,
-                        qrBlockTestedOSVersion: snapshot.qrBlockTestedOSVersion,
-                        groups: [],
-                        contactsBeforeGroups: snapshot.contactsBeforeGroups,
-                        inAppHapticsEnabled: snapshot.inAppHapticsEnabled,
-                        defaultReadReceiptsEnabled: snapshot.defaultReadReceiptsEnabled,
-                        notificationsMuted: snapshot.notificationsMuted,
-                        // Identity reset wipes contacts — but the block
-                        // list is by identityPub, not contact id, and
-                        // its whole purpose is to outlive contact rows.
-                        // Preserve.
-                        blockedIdentities: snapshot.blockedIdentities,
-                        appearanceMode: snapshot.appearanceMode,
-                    )
-                }
+                let preserved = Self.postWipeAppState(
+                    preserving: snapshot,
+                    clearPasscodes: clearPasscodes,
+                )
                 _ = persist(appState: preserved)
             }
             // The re-bootstrap opened a fresh, genuinely-empty store —
@@ -631,6 +583,56 @@ enum Storage {
         QALog.clear()
         #endif
         return keyMaterialErased
+    }
+
+    /// PZ-H6: the `AppState` re-seeded after a wipe, given the pre-wipe
+    /// `snapshot` and which wipe path is running.
+    ///
+    /// On the **duress** path (`clearPasscodes == true`) this is a
+    /// pristine `AppState()` — every field at its fresh-install default,
+    /// copying *nothing* from `snapshot`. That keeps a duress-wiped
+    /// device byte-for-byte indistinguishable from a never-configured
+    /// install: no preserved relay host, no screenshot self-test cache,
+    /// no surviving UX prefs. Returning `AppState()` wholesale (rather
+    /// than resetting a named subset of fields) is deliberately
+    /// fail-safe — any field added to `AppState` later is fresh on the
+    /// duress path by default, instead of silently inheriting the
+    /// wipe-immunity a hand-maintained field list would grant it.
+    ///
+    /// On the **non-duress** reset path (Settings → "Reset everything")
+    /// the user's existing posture is preserved so an accidental tap
+    /// doesn't strand them in a re-onboarding loop; only the contacts /
+    /// groups (and the identity itself) are cleared. The block list is
+    /// keyed by identityPub, not contact id, and is meant to outlive
+    /// contact rows, so it is preserved here too.
+    ///
+    /// Pure + `nonisolated` so the wipe-vs-fresh decision is unit-testable
+    /// without touching the Keychain / SQLCipher surfaces around it.
+    nonisolated static func postWipeAppState(
+        preserving snapshot: AppState,
+        clearPasscodes: Bool,
+    ) -> AppState {
+        if clearPasscodes {
+            return AppState()
+        }
+        return AppState(
+            relayHost: snapshot.relayHost,
+            contacts: [],
+            onboardingCompleted: snapshot.onboardingCompleted,
+            biometricLockEnabled: snapshot.biometricLockEnabled,
+            autoLockTimeout: snapshot.autoLockTimeout,
+            attachmentPreviewMode: snapshot.attachmentPreviewMode,
+            panicModeEnabled: snapshot.panicModeEnabled,
+            qrBlockEffective: snapshot.qrBlockEffective,
+            qrBlockTestedOSVersion: snapshot.qrBlockTestedOSVersion,
+            groups: [],
+            contactsBeforeGroups: snapshot.contactsBeforeGroups,
+            inAppHapticsEnabled: snapshot.inAppHapticsEnabled,
+            defaultReadReceiptsEnabled: snapshot.defaultReadReceiptsEnabled,
+            notificationsMuted: snapshot.notificationsMuted,
+            blockedIdentities: snapshot.blockedIdentities,
+            appearanceMode: snapshot.appearanceMode,
+        )
     }
 
     /// Wipe the database. Called by "Reset identity" and "Reset

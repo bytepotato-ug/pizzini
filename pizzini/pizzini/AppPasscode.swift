@@ -61,6 +61,12 @@ enum AppPasscode {
         case empty
         case tooShort(minimum: Int)
         case sameAsExisting
+        /// PZ-M11: the duress value is within a fat-finger typo of the
+        /// real passcode (see `maxConfusableEditDistance`).
+        case tooSimilarToReal
+        /// PZ-M11: the `currentRealPasscode` supplied to authorise a
+        /// duress-passcode change did not verify.
+        case realPasscodeIncorrect
     }
 
     /// Minimum passcode length. Argon2id is slow enough that a 4-char
@@ -124,6 +130,85 @@ enum AppPasscode {
             throw PasscodeError.sameAsExisting
         }
         try setPasscodeIntoSlot(passcode, account: duressSlotAccount)
+    }
+
+    /// PZ-M11: set the duress passcode, re-authenticating with the
+    /// current real passcode and rejecting a duress value that sits
+    /// within a fat-finger typo of it.
+    ///
+    /// Why re-auth is required: the real passcode lives only as an
+    /// Argon2id hash, so the *only* way to compare a candidate duress
+    /// value against it by edit distance is to have the real plaintext in
+    /// hand — which means asking for it at duress-setup time. (Brute-
+    /// forcing the hash across the candidate's edit-distance neighbours
+    /// would be dozens of production-cost Argon2id derivations: far too
+    /// slow, and pointless when the user can just type the PIN they know.)
+    ///
+    /// Throws `.realPasscodeIncorrect` if `currentRealPasscode` doesn't
+    /// verify, `.tooSimilarToReal` if the duress value is within
+    /// `maxConfusableEditDistance` of the real one, or `.sameAsExisting` /
+    /// `.tooShort` from the underlying setter.
+    ///
+    /// The TRIGGER side is deliberately untouched: entering the duress
+    /// passcode at the lock screen still wipes immediately, no
+    /// confirmation. This guard lives only at configuration time.
+    static func setDuressPasscode(_ passcode: String, currentRealPasscode: String) throws {
+        guard verifyPasscode(currentRealPasscode) else {
+            throw PasscodeError.realPasscodeIncorrect
+        }
+        if duressTooSimilarToReal(real: currentRealPasscode, duress: passcode) {
+            throw PasscodeError.tooSimilarToReal
+        }
+        try setDuressPasscode(passcode)
+    }
+
+    // MARK: - PZ-M11 duress/real confusability
+
+    /// A duress PIN within this edit distance of the real PIN is rejected
+    /// at setup: a single fat-finger slip of the real PIN (one wrong,
+    /// extra, or missing character, or an adjacent swap) must not land on
+    /// the duress PIN and silently trigger the wipe. `1` rejects the
+    /// immediate typo neighbourhood while leaving an enormous space of
+    /// acceptable duress PINs.
+    nonisolated static let maxConfusableEditDistance = 1
+
+    /// True iff `duress` is within `maxConfusableEditDistance` of `real`
+    /// (identical strings included). Pure + `nonisolated` — unit-tested
+    /// directly off the main actor.
+    nonisolated static func duressTooSimilarToReal(real: String, duress: String) -> Bool {
+        osaDistance(real, duress) <= maxConfusableEditDistance
+    }
+
+    /// Optimal String Alignment distance (restricted Damerau–Levenshtein):
+    /// the minimum number of single-character insertions, deletions,
+    /// substitutions, and adjacent transpositions to turn `a` into `b` —
+    /// the four canonical fat-finger typo classes. Computed over Unicode
+    /// scalars. O(|a|·|b|); PINs are short, so this is trivial.
+    nonisolated static func osaDistance(_ a: String, _ b: String) -> Int {
+        let s = Array(a.unicodeScalars)
+        let t = Array(b.unicodeScalars)
+        let n = s.count
+        let m = t.count
+        if n == 0 { return m }
+        if m == 0 { return n }
+        var d = Array(repeating: Array(repeating: 0, count: m + 1), count: n + 1)
+        for i in 0...n { d[i][0] = i }
+        for j in 0...m { d[0][j] = j }
+        for i in 1...n {
+            for j in 1...m {
+                let cost = s[i - 1] == t[j - 1] ? 0 : 1
+                var best = min(
+                    d[i - 1][j] + 1,       // deletion
+                    d[i][j - 1] + 1,       // insertion
+                    d[i - 1][j - 1] + cost // substitution
+                )
+                if i > 1, j > 1, s[i - 1] == t[j - 2], s[i - 2] == t[j - 1] {
+                    best = min(best, d[i - 2][j - 2] + 1) // adjacent transposition
+                }
+                d[i][j] = best
+            }
+        }
+        return d[n][m]
     }
 
     /// Remove the real passcode. Used when the user disables app-

@@ -170,7 +170,23 @@ final class ChatStore: NSObject {
     /// completed wipe while a usable decryption path may survive.
     /// `ContentView` can surface this so the user knows to retry the
     /// wipe rather than trusting it landed.
-    private(set) var duressWipeIncomplete: Bool = false
+    ///
+    /// PZ-M13: persisted (not just in-memory) so an incomplete wipe is
+    /// retried on the next unlocked foreground even across a force-quit.
+    /// Stored only as a PRESENT key when `true`; clearing sets it ABSENT
+    /// (not `false`) so a *completed* wipe leaves no fresh-install
+    /// telltale in the defaults plist — matching the byte-for-byte
+    /// fresh-install invariant (PZ-H6).
+    private(set) var duressWipeIncomplete: Bool = false {
+        didSet {
+            if duressWipeIncomplete {
+                UserDefaults.standard.set(true, forKey: Self.duressWipeIncompleteDefaultsKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.duressWipeIncompleteDefaultsKey)
+            }
+        }
+    }
+    private static let duressWipeIncompleteDefaultsKey = "pizzini.duressWipeIncomplete"
 
     /// In-memory ring buffer of recent group-flow events. NOT
     /// persisted — this is a runtime diagnostic, not an audit log.
@@ -488,6 +504,13 @@ final class ChatStore: NSObject {
         // install and also for any unset key.
         self.identityResetBannerPending = UserDefaults.standard.bool(
             forKey: Self.identityResetBannerPendingDefaultsKey,
+        )
+        // PZ-M13: restore the incomplete-duress-wipe flag so a wipe that
+        // couldn't confirm key erasure (e.g. Keychain locked mid-wipe) is
+        // retried on the next unlocked foreground, even after a force-quit.
+        // Assigned pre-`super.init()`, so the `didSet` does not fire here.
+        self.duressWipeIncomplete = UserDefaults.standard.bool(
+            forKey: Self.duressWipeIncompleteDefaultsKey,
         )
         super.init()
         // Unrecoverable storage state — refuse to come up against
@@ -3573,20 +3596,20 @@ final class ChatStore: NSObject {
     /// enters the duress passcode at the lock screen.
     ///
     /// Steps, in order:
-    ///   1. Snapshot `state` so `Storage.eraseAndReinitialize` can
-    ///      carry a narrow allowlist of UX prefs into the post-wipe
-    ///      `AppState`. **What actually survives the duress path is
-    ///      only `relayHost` plus the screenshot-self-test cache
-    ///      (`qrBlockEffective` / `qrBlockTestedOSVersion`).** Face ID,
-    ///      auto-lock, panic mode, and `onboardingCompleted` are
-    ///      DELIBERATELY reset to fresh-install defaults — preserving
-    ///      a Face-ID-on or onboarded posture would make the device
-    ///      show a lock screen / skip onboarding, which a genuinely
-    ///      fresh install does not, breaking the "indistinguishable
-    ///      from a clean install" goal. (F-DUR-04:
-    ///      `Storage.eraseAndReinitialize` is the single authoritative
-    ///      definition of the preserved set; keep the README/FAQ copy in
-    ///      sync with it rather than the reverse.)
+    ///   1. Snapshot `state` and pass it to `Storage.eraseAndReinitialize`.
+    ///      **On the duress path NOTHING from the snapshot is preserved**
+    ///      (PZ-H6): `postWipeAppState` returns a pristine `AppState()`,
+    ///      so `relayHost`, the screenshot self-test cache, Face ID,
+    ///      auto-lock, panic mode, and `onboardingCompleted` all reset to
+    ///      fresh-install defaults. The post-wipe surface is byte-for-byte
+    ///      a clean install — routes through onboarding, no lock screen,
+    ///      no configured relay — so a device imaged after the wipe is
+    ///      indistinguishable from one where Pizzini was never set up.
+    ///      (The snapshot is still passed because its presence drives the
+    ///      explicit persist of the fresh `AppState()`; only the
+    ///      non-duress "Reset everything" path reads its fields.
+    ///      `Storage.postWipeAppState` is the single authoritative
+    ///      definition; keep the README/FAQ copy in sync with it.)
     ///   2. Tear down the relay socket + retry timer so no in-
     ///      flight encrypt can reach the network with the soon-to-
     ///      be-orphaned session.
@@ -3672,6 +3695,83 @@ final class ChatStore: NSObject {
         // count on the home screen would itself be a telltale — but
         // via `setBadgeCount` only, touching no App Group key.
         UNUserNotificationCenter.current().setBadgeCount(0) { _ in }
+    }
+
+    // MARK: - PZ-M13 incomplete-wipe retry
+
+    /// What `retryIncompleteDuressWipeIfNeeded` should do, as a pure
+    /// function of the persisted flag and onboarding state. Extracted so
+    /// the safety gate is unit-testable without the Keychain.
+    enum DuressWipeRetryAction: Equatable {
+        /// No incomplete wipe recorded — nothing to do.
+        case noRetry
+        /// An incomplete wipe AND the device is still in the immediate
+        /// post-wipe state (onboarding not yet completed), so no new
+        /// identity has been committed. Safe to finish erasing the stale
+        /// key material.
+        case retryErase
+        /// An incomplete wipe BUT onboarding has since completed — a new
+        /// identity is now committed (and shares the fixed Keychain
+        /// accounts). Re-erasing would destroy that identity's keys, so
+        /// only clear the flag; do NOT erase. The residual — a stale key
+        /// not force-removed once a user fully re-onboards on a
+        /// half-wiped device — is accepted as far less harmful than
+        /// wiping live data.
+        case clearWithoutErase
+    }
+
+    /// PZ-M13: decide whether (and how) to finish an interrupted duress
+    /// wipe. Pure + `nonisolated` for direct unit testing.
+    nonisolated static func duressWipeRetryAction(
+        incomplete: Bool,
+        onboardingCompleted: Bool,
+    ) -> DuressWipeRetryAction {
+        guard incomplete else { return .noRetry }
+        return onboardingCompleted ? .clearWithoutErase : .retryErase
+    }
+
+    /// PZ-M13: on an unlocked foreground, finish a duress wipe whose
+    /// key-material erase could not be confirmed earlier (e.g. the
+    /// Keychain was locked-after-first-unlock mid-wipe), so the duress
+    /// guarantee — the old key is gone — eventually holds.
+    ///
+    /// MUST be called only when the device is unlocked (the Keychain is
+    /// then accessible); `ContentView` invokes it from the scene-activate
+    /// hook, which by definition fires with the device unlocked. The
+    /// `onboardingCompleted` gate (see `DuressWipeRetryAction`) is the
+    /// data-loss guard: it never re-erases once a new identity is
+    /// committed.
+    func retryIncompleteDuressWipeIfNeeded() {
+        switch Self.duressWipeRetryAction(
+            incomplete: duressWipeIncomplete,
+            onboardingCompleted: state.onboardingCompleted,
+        ) {
+        case .noRetry:
+            return
+        case .clearWithoutErase:
+            // A new identity has been committed since the incomplete
+            // wipe; re-erasing would destroy it. Clear the flag only.
+            duressWipeIncomplete = false
+        case .retryErase:
+            // Still in the uncommitted post-wipe state — finish erasing
+            // the stale key material. `eraseKeyMaterial` is idempotent;
+            // retry a bounded number of times in case the first call
+            // races a transient Keychain state. On confirmation, clear
+            // the persisted flag; the now-orphaned (empty, uncommitted)
+            // DB is reconciled to a clean fresh install by
+            // `SQLiteStorage.bootstrap`'s orphan checks on next launch.
+            var erased = DBKey.eraseKeyMaterial()
+            var tries = 0
+            while !erased && tries < 4 {
+                tries += 1
+                erased = DBKey.eraseKeyMaterial()
+            }
+            if erased {
+                duressWipeIncomplete = false
+            }
+            // If still unconfirmed, leave the flag set so the next
+            // unlocked foreground retries.
+        }
     }
 
     // MARK: - Helpers

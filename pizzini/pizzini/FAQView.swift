@@ -920,11 +920,14 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
               token is minted when you re-register through \
               onboarding.
 
-            What survives the wipe (deliberately, to keep the \
-            empty-but-lived-in invariant):
+            What survives the wipe:
 
-            • The relay host you previously configured.
-            • The screenshot self-test cache.
+            • Nothing you set up. The phone is left byte-for-byte like a \
+              fresh install — the relay host, the screenshot self-test \
+              cache, and every other setting are reset to their defaults. \
+              A device imaged after the wipe is indistinguishable from \
+              one where Pizzini was just installed and never opened; \
+              you'll re-enter the relay host during onboarding.
 
             What it does NOT cover:
 
