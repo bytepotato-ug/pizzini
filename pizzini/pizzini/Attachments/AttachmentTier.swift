@@ -102,11 +102,12 @@ enum AttachmentTierClassifier {
     ]
 
     /// Tier-3: strip + warn. ONLY formats for which `MetadataStripper`
-    /// has a real strip pipeline. Adding a format to this set without
-    /// also adding it to `MetadataStripper.imageExtensions` or
-    /// `audioVideoExtensions` would cause the UI banner ("Pizzini
-    /// removed location and camera info") to lie — the user would be
-    /// told their EXIF was stripped when the bytes shipped untouched.
+    /// has a real strip pipeline. Adding a format to this set without a
+    /// matching path in `MetadataStripper` (`imageExtensions`,
+    /// `audioVideoExtensions`, or the dedicated `.gif` branch) would
+    /// cause the UI banner ("Pizzini removed location and camera info")
+    /// to lie — the user would be told their EXIF was stripped when the
+    /// bytes shipped untouched.
     ///
     /// The image set matches `MetadataStripper.imageExtensions`
     /// (ImageIO with EXIF/TIFF/GPS/IPTC/Aux dicts → kCFNull).
@@ -114,12 +115,19 @@ enum AttachmentTierClassifier {
     /// (AVAssetExportSession `metadata = []`).
     ///
     /// Formats removed from this set on 2026-05-11 because no strip
-    /// pipeline existed for them: gif, avi, webm, ogg, flac, opus,
-    /// amr. They classify as `.textFamily` now — Pizzini's pass-
-    /// through default — with no false "we stripped this" banner.
+    /// pipeline existed for them: avi, webm, ogg, flac, opus, amr. They
+    /// classify as `.textFamily` — Pizzini's pass-through default — with
+    /// no false "we stripped this" banner.
+    ///
+    /// PZ-L5 (2026-05-29): `gif` re-added — `MetadataStripper` now has a
+    /// dedicated GIF strip path (`stripGIFMetadata`) that drops the XMP /
+    /// comment tags while preserving frame timing + loop count, so the
+    /// banner is honest for GIFs again.
     private static let mediaExtensions: Set<String> = [
         // image — ImageIO strip path
         "jpg", "jpeg", "heic", "heif", "png", "webp", "tiff", "tif",
+        // gif — dedicated ImageIO strip path (animation-preserving)
+        "gif",
         // av — AVAssetExportSession strip path
         "mp4", "mov", "m4v", "mp3", "m4a", "wav", "aac",
     ]

@@ -132,10 +132,31 @@ enum AttachmentSandbox {
     /// would escape — the only place a `..`-bearing filename can
     /// reach is here, and we close it at the sandbox layer.
     static func assertContained(url: URL, in dir: URL) throws {
-        let resolved = url.standardized.path
-        let parent = dir.standardized.path
-        let parentPrefix = parent.hasSuffix("/") ? parent : parent + "/"
-        if !resolved.hasPrefix(parentPrefix) {
+        // PZ-L6: `standardized` only resolves `.`/`..` lexically — it does
+        // NOT follow symlinks, so a symlinked component under `dir`
+        // pointing outside the sandbox would slip past a string-prefix
+        // check. We must resolve symlinks AND compare PATH COMPONENTS
+        // (not a string prefix, which a sibling like ".../abcEVIL" vs
+        // ".../abc" can fool).
+        //
+        // Subtlety: `resolvingSymlinksInPath` uses realpath-style
+        // semantics and only resolves components that EXIST. This check
+        // runs BEFORE the file is written, so `url`'s leaf does not exist
+        // yet — resolving the full `url` would silently skip symlink
+        // resolution entirely. So resolve the PARENT directory (which
+        // does exist for any real write, and is exactly where a malicious
+        // symlink component would sit) and re-attach the leaf name. `dir`
+        // is resolved the same way, so the iOS `/var` -> `/private/var`
+        // symlink can't cause a false mismatch.
+        let resolvedDir = dir.standardizedFileURL.resolvingSymlinksInPath()
+        let resolvedParent = url.deletingLastPathComponent()
+            .standardizedFileURL.resolvingSymlinksInPath()
+        let resolvedURL = resolvedParent.appendingPathComponent(url.lastPathComponent)
+        let dirComponents = resolvedDir.pathComponents
+        let urlComponents = resolvedURL.pathComponents
+        guard urlComponents.count > dirComponents.count,
+              Array(urlComponents.prefix(dirComponents.count)) == dirComponents
+        else {
             throw SandboxError.writeFailed("path escapes sandbox dir")
         }
     }

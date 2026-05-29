@@ -2,6 +2,7 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 import AVFoundation
+import PDFKit
 
 /// Strips identifying metadata from media files BEFORE they leave the
 /// device. Threat model:
@@ -20,9 +21,13 @@ import AVFoundation
 ///   in UI copy, recommend a borrowed device for highest-risk material.
 ///
 /// Pass-through is the default for anything we don't recognise — Tier
-/// 1 (text) and Tier 2 (archives) need no stripping; Tier 4 (PDF/Office)
-/// hides its author info inside the format and the maintainer's
-/// decision is "warn the user, do not pretend to clean."
+/// 1 (text) and Tier 2 (archives) need no stripping. Tier 4: PZ-L5 now
+/// strips a PDF's document-info dictionary (author / creator / producer
+/// / title / dates) via PDFKit, but XMP packets, annotations, and
+/// embedded-font names can still carry identifying data — so the
+/// attach-time warning is deliberately KEPT. We clean what we can clean
+/// cleanly; we do not claim a fully-scrubbed PDF. Office formats
+/// (doc/docx/…) remain warn-only (no reliable in-process scrubber).
 enum MetadataStripper {
     enum StripError: Error {
         case decodeFailed
@@ -34,15 +39,29 @@ enum MetadataStripper {
     /// returns the bytes to put on the wire (which may be the input
     /// unchanged for pass-through tiers).
     static func stripped(_ data: Data, filename: String, mimeType: String) throws -> Data {
-        let tier = AttachmentTierClassifier.tier(forFilename: filename)
-        guard tier == .mediaStripAndWarn else {
-            // Tier 1, 2, 4, 5 → pass-through. We don't strip what we
-            // don't understand; the warning copy at attach/receive
-            // time is the user-facing safety net.
-            return data
-        }
         let lowerExt = (FilenameSanitizer.trailingExtension(of: filename) ?? "")
             .lowercased()
+        // PZ-L5: PDF stays Tier-4 (authorLeakingDoc) for the attach-time
+        // warning, but we now strip its document-info dictionary on the
+        // way out. Handled before the media-tier guard since PDF is not a
+        // mediaStripAndWarn tier.
+        if lowerExt == "pdf" {
+            return try stripPDFMetadata(data)
+        }
+        let tier = AttachmentTierClassifier.tier(forFilename: filename)
+        guard tier == .mediaStripAndWarn else {
+            // Tier 1, 2, the rest of Tier 4 (Office), 5 → pass-through.
+            // We don't strip what we don't understand; the warning copy
+            // at attach/receive time is the user-facing safety net.
+            return data
+        }
+        if lowerExt == "gif" {
+            // PZ-L5: GIF gets a dedicated path — it can carry XMP /
+            // comment-extension author/software tags, but its frame
+            // timing + loop count live in the GIF property dictionary
+            // and must be preserved or the animation breaks.
+            return try stripGIFMetadata(data)
+        }
         if Self.imageExtensions.contains(lowerExt) {
             return try stripImageMetadata(data)
         }
@@ -53,9 +72,8 @@ enum MetadataStripper {
             // calling.
             return try awaitAVStrip(data, ext: lowerExt)
         }
-        // Tier-3 fall-through: a media-ish extension we don't have a
-        // pipeline for (e.g. `.gif`). Return as-is; the warning copy
-        // still applies.
+        // Fall-through: a media-ish extension we don't have a pipeline
+        // for. Return as-is; the warning copy still applies.
         return data
     }
 
@@ -137,6 +155,109 @@ enum MetadataStripper {
             throw StripError.encodeFailed
         }
         return outBuf as Data
+    }
+
+    // MARK: - GIF strip
+
+    /// GIF metadata strip that PRESERVES animation. A plain
+    /// `stripImageMetadata` round-trip would drop the container loop
+    /// count (a file-level property set via `CGImageDestinationSet
+    /// Properties`, not per-frame) and could lose the per-frame delays —
+    /// turning an animated GIF into a still or a wrong-speed loop. So we
+    /// carry forward ONLY the timing keys (`GIFDelayTime` /
+    /// `GIFUnclampedDelayTime` per frame, `GIFLoopCount` at the
+    /// container) and drop everything else: the XMP packet plus any
+    /// Exif/TIFF/GPS/IPTC dictionaries a tool may have stuffed alongside
+    /// (comment-extension software/author tags go with the XMP/metadata
+    /// rebuild).
+    private static func stripGIFMetadata(_ data: Data) throws -> Data {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else {
+            throw StripError.decodeFailed
+        }
+        let gifType = UTType.gif.identifier as CFString
+        // Extension said .gif but the bytes aren't a GIF: don't silently
+        // transcode into another format (would surprise the recipient).
+        guard CGImageSourceGetType(src) == gifType else {
+            throw StripError.decodeFailed
+        }
+        let count = CGImageSourceGetCount(src)
+        guard count > 0 else { throw StripError.decodeFailed }
+
+        let outBuf = NSMutableData()
+        guard let dst = CGImageDestinationCreateWithData(
+            outBuf as CFMutableData, gifType, count, nil
+        ) else {
+            throw StripError.encodeFailed
+        }
+
+        // Container-level: preserve ONLY the loop count (0 == loop
+        // forever, the GIF default); drop every other container property.
+        let containerProps = CGImageSourceCopyProperties(src, nil) as? [CFString: Any]
+        let srcGIF = containerProps?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+        let loopCount = srcGIF?[kCGImagePropertyGIFLoopCount] ?? 0
+        CGImageDestinationSetProperties(dst, [
+            kCGImagePropertyGIFDictionary: [
+                kCGImagePropertyGIFLoopCount: loopCount,
+            ],
+        ] as CFDictionary)
+
+        for i in 0..<count {
+            // Carry forward only the per-frame timing.
+            var frameGIF: [CFString: Any] = [:]
+            if let props = CGImageSourceCopyPropertiesAtIndex(src, i, nil) as? [CFString: Any],
+               let srcFrameGIF = props[kCGImagePropertyGIFDictionary] as? [CFString: Any] {
+                if let delay = srcFrameGIF[kCGImagePropertyGIFDelayTime] {
+                    frameGIF[kCGImagePropertyGIFDelayTime] = delay
+                }
+                if let unclamped = srcFrameGIF[kCGImagePropertyGIFUnclampedDelayTime] {
+                    frameGIF[kCGImagePropertyGIFUnclampedDelayTime] = unclamped
+                }
+            }
+            let opts: [CFString: Any] = [
+                // Drop the XMP packet.
+                kCGImageDestinationMetadata: CGImageMetadataCreateMutable(),
+                // Keep only timing in the GIF dict.
+                kCGImagePropertyGIFDictionary: frameGIF,
+                // Belt-and-suspenders: null any fingerprinting dicts.
+                kCGImagePropertyExifDictionary: kCFNull as Any,
+                kCGImagePropertyTIFFDictionary: kCFNull as Any,
+                kCGImagePropertyGPSDictionary: kCFNull as Any,
+                kCGImagePropertyIPTCDictionary: kCFNull as Any,
+            ]
+            CGImageDestinationAddImageFromSource(dst, src, i, opts as CFDictionary)
+        }
+        guard CGImageDestinationFinalize(dst) else {
+            throw StripError.encodeFailed
+        }
+        return outBuf as Data
+    }
+
+    // MARK: - PDF strip
+
+    /// PZ-L5: clear a PDF's document-info dictionary (Author, Creator,
+    /// Producer, Title, Subject, Keywords, CreationDate, ModDate) via
+    /// PDFKit, then re-serialize. Removes the most common PDF identity
+    /// leak — the authoring app + author name + timestamps.
+    ///
+    /// LIMITATION (why the attach-time warning stays): PDFKit does not
+    /// expose the XMP `/Metadata` stream, per-annotation data, or
+    /// embedded-font names for removal, so a PDF authored by a tool that
+    /// duplicates author/date into XMP may retain it. We strip what we
+    /// can cleanly strip; we do not claim a fully-scrubbed PDF.
+    private static func stripPDFMetadata(_ data: Data) throws -> Data {
+        guard let doc = PDFDocument(data: data) else {
+            // Not a parseable PDF (corrupt, or mislabeled). Don't
+            // transform bytes we can't open — pass through; the
+            // attach-time warning still applies.
+            return data
+        }
+        // Empty (not nil) so the re-serialized PDF carries an empty Info
+        // dictionary instead of the original author/app/date fields.
+        doc.documentAttributes = [:]
+        guard let out = doc.dataRepresentation() else {
+            throw StripError.encodeFailed
+        }
+        return out
     }
 
     // MARK: - Audio / video strip
