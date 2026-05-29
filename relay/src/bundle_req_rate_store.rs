@@ -22,9 +22,12 @@
 //!   • Atomic write on every increment (write-to-temp + rename).
 //!     `BUNDLE_REQUEST` is a first-contact event, not on the hot send
 //!     path, so the per-increment persist cost is amortised away.
-//!   • Hour-bucket TTL purge on load: a bucket older than the current
-//!     hour minus `BUCKET_RETENTION_HOURS` is dropped, so the file
-//!     does not accumulate dead buckets across long uptimes.
+//!   • Hour-bucket TTL purge on load: a bucket strictly older than the
+//!     current hour minus `BUCKET_RETENTION_HOURS` is dropped (PZ-L4:
+//!     load-purge and runtime GC share one boundary predicate; see
+//!     `is_stale_bucket` for why this store keeps `< cutoff` rather than
+//!     the timestamp stores' `<= cutoff`), so the file does not
+//!     accumulate dead buckets across long uptimes.
 //!
 //! Fails (returns `Err`) on a corrupt key file or a tampered blob —
 //! refusing to start is the right call. Continuing with an empty map
@@ -144,13 +147,13 @@ impl BundleReqRateStore {
         Ok(count)
     }
 
-    /// Drop buckets older than `current_hour - BUCKET_RETENTION_HOURS`.
-    /// Persists if any were dropped. Returns the count of dropped
-    /// buckets for logging.
+    /// Drop buckets strictly older than `current_hour -
+    /// BUCKET_RETENTION_HOURS`. Persists if any were dropped. Returns
+    /// the count of dropped buckets for logging.
     pub fn gc_stale(&mut self, current_hour: u64) -> io::Result<usize> {
         let cutoff = current_hour.saturating_sub(BUCKET_RETENTION_HOURS);
         let before = self.counts.len();
-        self.counts.retain(|(_, hour), _| *hour >= cutoff);
+        self.counts.retain(|(_, hour), _| !is_stale_bucket(*hour, cutoff));
         let removed = before - self.counts.len();
         if removed > 0 {
             self.dirty = true;
@@ -200,7 +203,27 @@ impl Drop for BundleReqRateStore {
     }
 }
 
-/// Drop buckets older than the retention window and decode the
+/// PZ-L4: a bucket is stale (drop it) iff its hour is *strictly older*
+/// than the cutoff (`< cutoff`, i.e. keep `>= cutoff`). `gc_stale` and
+/// the load-time `purge_stale` both route through this one predicate so
+/// they can never disagree about a boundary bucket.
+///
+/// NOTE the deliberate difference from the timestamp stores
+/// (`push_token_store` / `chain_validator_store`), which drop at *or
+/// past* their cutoff (`<= cutoff`): here `cutoff = current_hour -
+/// BUCKET_RETENTION_HOURS` is computed with a *saturating* sub, so at
+/// the epoch floor (`current_hour <= BUCKET_RETENTION_HOURS`) the cutoff
+/// clamps up to `current_hour` itself. Under `<=` that would purge the
+/// *current* bucket — the live counter the rate limiter reads — which
+/// must never happen. `<` keeps the current bucket for every
+/// `current_hour` because `current_hour < current_hour - k` is never
+/// true. Do not "standardise" this to `<=`.
+#[inline]
+fn is_stale_bucket(hour: u64, cutoff: u64) -> bool {
+    hour < cutoff
+}
+
+/// Drop buckets strictly older than the retention window and decode the
 /// composite hex keys back into the live map shape. A malformed key
 /// is silently skipped (a corrupt single row is less destructive
 /// than refusing to start; the next increment overwrites it).
@@ -214,7 +237,7 @@ fn purge_stale(doc: StoreDoc, current_hour: u64) -> HashMap<(Vec<u8>, u64), u32>
         let Ok(hour) = hour_str.parse::<u64>() else {
             continue;
         };
-        if hour < cutoff {
+        if is_stale_bucket(hour, cutoff) {
             continue;
         }
         let Some(recipient) = encrypted_file::hex_decode(recipient_hex) else {
@@ -382,5 +405,32 @@ mod tests {
         // flush() on a clean store is idempotent + no-op.
         store.flush().unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pzl4_is_stale_bucket_keeps_boundary_hour() {
+        // PZ-L4, shared by gc_stale and load-purge: this hour-bucket store
+        // drops STRICTLY older than the cutoff and keeps the boundary
+        // hour (`< cutoff`), unlike the timestamp stores' `<= cutoff`.
+        // The boundary-keep is what protects the current bucket at the
+        // saturating-sub floor (see `pzl4_current_bucket_is_never_purged`).
+        let cutoff = 100u64;
+        assert!(is_stale_bucket(cutoff - 1, cutoff), "older hour is stale");
+        assert!(!is_stale_bucket(cutoff, cutoff), "boundary hour is kept");
+        assert!(!is_stale_bucket(cutoff + 1, cutoff), "newer hour is kept");
+    }
+
+    #[test]
+    fn pzl4_current_bucket_is_never_purged() {
+        // Safety invariant: the rate decision only ever reads the current
+        // bucket, so the retention boundary must never drop it — for any
+        // current_hour, including the saturating-sub edge near zero.
+        for current_hour in [0u64, 1, 2, 3, 100, u64::MAX] {
+            let cutoff = current_hour.saturating_sub(BUCKET_RETENTION_HOURS);
+            assert!(
+                !is_stale_bucket(current_hour, cutoff),
+                "current bucket (hour={current_hour}) must survive purge",
+            );
+        }
     }
 }

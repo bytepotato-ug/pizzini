@@ -225,7 +225,7 @@ impl PushTokenStore {
         let now = encrypted_file::unix_now();
         let cutoff = now.saturating_sub(max_age.as_secs());
         let before = self.map.len();
-        self.map.retain(|_, (_, ts)| *ts > cutoff);
+        self.map.retain(|_, (_, ts)| !is_stale(*ts, cutoff));
         let removed = before - self.map.len();
         if removed > 0 {
             self.dirty = true;
@@ -299,12 +299,24 @@ impl Drop for PushTokenStore {
 /// rather than failing the whole load — a corrupt single row is
 /// less destructive than refusing to start, and the persist on next
 /// insert overwrites the corruption.
+/// PZ-L4: an entry is stale (drop it) iff its `last_refreshed_unix` is
+/// at or past the cutoff second (`<= cutoff`). Both the load-time
+/// `purge_stale` and the runtime `gc_expired` route their decision
+/// through this one predicate, so a reload and the GC can never disagree
+/// about the entry that is exactly `max_age` old. The sibling stores
+/// (`bundle_req_rate_store`, `chain_validator_store`) use the same
+/// drop-at-or-past-cutoff boundary.
+#[inline]
+fn is_stale(last_refreshed_unix: u64, cutoff: u64) -> bool {
+    last_refreshed_unix <= cutoff
+}
+
 fn purge_stale(doc: StoreDoc, max_age: Duration) -> HashMap<Vec<u8>, (Vec<u8>, u64)> {
     let now = encrypted_file::unix_now();
     let cutoff = now.saturating_sub(max_age.as_secs());
     let mut map = HashMap::with_capacity(doc.entries.len());
     for (peer_hex, entry) in doc.entries {
-        if entry.last_refreshed_unix < cutoff {
+        if is_stale(entry.last_refreshed_unix, cutoff) {
             continue;
         }
         let peer_id = match encrypted_file::hex_decode(&peer_hex) {
@@ -490,5 +502,20 @@ mod tests {
         // flush() on a clean store is idempotent + no-op.
         store.flush().unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pzl4_is_stale_drops_at_or_past_cutoff() {
+        // PZ-L4 boundary, shared by load-purge and runtime GC: an entry
+        // exactly at the cutoff second is stale (the fix — it used to be
+        // kept by the load path); one second newer survives; older is
+        // stale. The `== cutoff` case is the whole point of the finding.
+        let cutoff = 1_000_000u64;
+        assert!(is_stale(cutoff - 1, cutoff), "older than cutoff is stale");
+        assert!(
+            is_stale(cutoff, cutoff),
+            "exactly at cutoff is stale (PZ-L4: was kept under the old `< cutoff`)",
+        );
+        assert!(!is_stale(cutoff + 1, cutoff), "newer than cutoff is kept");
     }
 }

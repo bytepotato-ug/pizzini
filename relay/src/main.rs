@@ -272,6 +272,33 @@ const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// slow-loris campaign can do is hold `MAX_CONNECTIONS` permits
 /// for up to `FRAME_READ_TIMEOUT` each — bounded.
 const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// PZ-M6: per-connection inbound-frame rate limit, expressed as a token
+/// bucket. `FRAME_RATE_BURST` is the capacity (frames a freshly-active
+/// or reconnecting connection may push with no delay); `FRAME_RATE_
+/// REFILL_PER_SEC` is the sustained ceiling once the burst is spent.
+///
+/// The `FRAME_READ_TIMEOUT` above bounds *slow* senders; nothing bounded
+/// a *fast* one. A single HELLO-authenticated connection could blast
+/// frames as fast as the socket allowed, spinning the relay's per-frame
+/// hot path (parse → token check → dedupe → lock) and contending the
+/// shared mutexes — a CPU/lock-amplification DoS that the connection cap
+/// alone does not address (it bounds connection count, not per-connection
+/// throughput). The bucket throttles each connection to a sustained
+/// `FRAME_RATE_REFILL_PER_SEC`, so the COVER comment's "bounded by
+/// MAX_CONCURRENT_CONNECTIONS × frame rate" is now literally true.
+///
+/// Sizing: a reconnect drains at most `MAX_PENDING_PER_PEER` (100)
+/// queued frames to the client, which then ACKs each — a ≤100-frame
+/// inbound burst that the 256 capacity absorbs with headroom. Client
+/// cover traffic is ~1 frame / 30 s (`RelayClient.coverInterval`), and
+/// human-driven SENDs are a few per second, so 64/s sustained never
+/// touches a legitimate client. A flooder is throttled from unbounded
+/// down to 64/s. Connection-local + reset on disconnect, matching the
+/// existing "per-connection cap = politeness, global cap = guarantee"
+/// division of labor; the global PendingStore caps remain the hard
+/// resource guarantee.
+const FRAME_RATE_BURST: f64 = 256.0;
+const FRAME_RATE_REFILL_PER_SEC: f64 = 64.0;
 /// Protocol v3 adds the F-203 HELLO possession proof. The added fields
 /// (timestamp, nonce, signature) prevent a network-positioned attacker
 /// from squatting another peer's `peer_id` to drain that peer's queued
@@ -578,6 +605,19 @@ type VerifyKeys = Arc<Mutex<HashMap<PeerId, (Vec<u8>, Instant)>>>;
 const VERIFY_KEY_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// How often the GC walks the verify_keys table.
 const VERIFY_KEY_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// PZ-M7: hard cardinality cap on the verify_keys table. Until now it was
+/// bounded only by `VERIFY_KEY_TTL` (30 days), so a sustained flood of
+/// fabricated identities — each landing one signed HELLO — could pile up
+/// entries that linger for a month. At the cap we refuse to register a
+/// *new* identity's verify_key (the HELLO still succeeds for online
+/// routing; only the persistent offline-delivery registration is
+/// deferred) but never evict an existing one: evicting would break the
+/// N-002 guarantee that a peer disconnected for under `VERIFY_KEY_TTL`
+/// keeps its key so inbound SENDs can still be queued. Same fail-closed
+/// shape as the `chain_seed_rate` / `PendingStore` distinct-key caps.
+/// 500k entries ≈ a few tens of MB — generous for honest distinct-peer
+/// load on a single relay, low enough to bound a flood.
+const MAX_VERIFY_KEYS: usize = 500_000;
 type ChainValidators = Arc<Mutex<chain_validator_store::ChainValidatorStore>>;
 /// HELLO replay set: (peer_id, nonce) keys. Lookup runs on every
 /// HELLO (not every SEND), so the table stays in-memory and cheap.
@@ -588,6 +628,28 @@ type HelloReplays = Arc<Mutex<HashMap<HelloReplayKey, Instant>>>;
 /// by `HELLO_TIMESTAMP_TOLERANCE`, so a 15-minute tick comfortably
 /// covers anything inside the acceptance window.
 const HELLO_REPLAY_GC_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// PZ-M7: hard cardinality cap on the HELLO replay set. The GC only
+/// runs every `HELLO_REPLAY_GC_INTERVAL` (15 min) while entries become
+/// useless after `HELLO_REPLAY_WINDOW` (2 min), so between ticks the set
+/// can accumulate up to ~15 minutes of distinct HELLOs. At the cap we
+/// accept the HELLO but stop *recording* new nonces — the ±
+/// `HELLO_MAX_CLOCK_SKEW_SECS` timestamp window is the primary replay
+/// bound regardless, and refusing-new (rather than evicting) avoids
+/// purging a still-protective recent nonce under a flood.
+const MAX_HELLO_REPLAYS: usize = 200_000;
+
+/// PZ-M7: admission rule shared by the two age-only anti-abuse tables
+/// (`verify_keys`, `hello_replays`). A key already present is always
+/// admitted (it is a refresh/update, not growth); a *new* key is
+/// admitted only while the table is below `cap`. At capacity the new key
+/// is refused rather than evicting an existing one — see the per-table
+/// constants for why eviction is the wrong call in each case. Pure +
+/// inlined so the boundary is one tested expression, not duplicated at
+/// each call site.
+#[inline]
+fn admits_new_soft_state(is_known: bool, current_len: usize, cap: usize) -> bool {
+    is_known || current_len < cap
+}
 
 /// SEND dedupe table: blake3 hash of sealed_ciphertext → Instant.
 /// Keyed under the HELLO-authenticated sender, so two distinct
@@ -868,6 +930,11 @@ async fn main() -> std::io::Result<()> {
         store.len(),
     );
     let push_tokens: PushTokens = Arc::new(Mutex::new(store));
+    // PZ-M5: in-memory concurrency + coalescing gate for offline-push
+    // wake-ups. Not persisted — in-flight push tasks do not survive a
+    // restart anyway, and a fresh process legitimately starts with no
+    // wake-ups outstanding. Shared (`Arc`) with every connection.
+    let push_gate = PushGate::new(MAX_INFLIGHT_PUSH);
     // Persistent offline-message queue. Same shape as the push-token
     // store: built BEFORE the listener accept loop so a corrupt state
     // file surfaces at startup, not silently mid-traffic. Per-peer
@@ -1034,6 +1101,7 @@ async fn main() -> std::io::Result<()> {
                 let chain_seed_rate_h = chain_seed_rate.clone();
                 let send_dedupes_h = send_dedupes.clone();
                 let apns = apns.clone();
+                let push_gate_h = push_gate.clone();
                 let status_snapshot = status_snapshot.clone();
                 tokio::spawn(async move {
                     // Move the permit into the task so it lives exactly as
@@ -1053,6 +1121,7 @@ async fn main() -> std::io::Result<()> {
                         chain_seed_rate_h,
                         send_dedupes_h,
                         apns,
+                        push_gate_h,
                         status_snapshot,
                         peer_addr,
                     )
@@ -1204,6 +1273,7 @@ async fn handle_connection(
     chain_seed_rate: ChainSeedRate,
     send_dedupes: SendDedupes,
     apns: Option<Arc<ApnsClient>>,
+    push_gate: Arc<PushGate>,
     status_snapshot: Arc<RelayStatus>,
     peer_addr: SocketAddr,
 ) -> std::io::Result<()> {
@@ -1251,7 +1321,20 @@ async fn handle_connection(
     // when offline themselves.
     {
         let mut vk = verify_keys.lock().await;
-        vk.insert(peer_id.clone(), (verify_key, Instant::now()));
+        // PZ-M7: refuse a brand-new identity once the table is full,
+        // rather than evicting an existing recipient (which would break
+        // N-002 offline delivery). An already-known peer always refreshes.
+        let is_known = vk.contains_key(&peer_id);
+        if admits_new_soft_state(is_known, vk.len(), MAX_VERIFY_KEYS) {
+            vk.insert(peer_id.clone(), (verify_key, Instant::now()));
+        } else {
+            dev_peer_elog!(
+                "[{peer_addr}] verify-key table at cap ({MAX_VERIFY_KEYS}); refusing new \
+                 identity {} — online routing still works, offline-delivery registration \
+                 deferred until TTL frees a slot",
+                short_hex(&peer_id),
+            );
+        }
     }
     // Gate peer-id-bearing log lines behind
     // `dev_peer_log!` so the relay's "no per-peer log lines in
@@ -1299,6 +1382,7 @@ async fn handle_connection(
         &chain_seed_rate,
         &send_dedupes,
         apns.clone(),
+        &push_gate,
         &peer_id,
         &our_tx,
         &status_snapshot,
@@ -1335,6 +1419,53 @@ async fn handle_connection(
     read_result
 }
 
+/// PZ-M6: connection-local token bucket throttling inbound frame
+/// processing. One per connection, created at the top of `read_loop`
+/// and dropped with the connection. `now` is injected (not read from a
+/// clock inside) so the throttle decision is a pure function of state +
+/// timestamp and unit-testable without sleeping.
+///
+/// Tokens may go negative: a frame is always "accepted" (we never drop
+/// or disconnect on rate — frames are already HELLO-authenticated and
+/// individually bounded), but going negative borrows against future
+/// refill and the caller is told to wait off the deficit before
+/// processing. Over a sustained overload this converges throughput to
+/// `refill_per_sec`; a burst up to `capacity` passes with no delay.
+struct FrameRateLimiter {
+    capacity: f64,
+    refill_per_sec: f64,
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl FrameRateLimiter {
+    fn new(capacity: f64, refill_per_sec: f64, now: Instant) -> Self {
+        Self {
+            capacity,
+            refill_per_sec,
+            tokens: capacity,
+            last_refill: now,
+        }
+    }
+
+    /// Account for one inbound frame. Returns how long the caller should
+    /// sleep before processing it: `Duration::ZERO` while within budget,
+    /// or the time needed to repay the borrowed deficit once the burst
+    /// capacity is spent.
+    fn throttle(&mut self, now: Instant) -> Duration {
+        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+        self.last_refill = now;
+        self.tokens -= 1.0;
+        if self.tokens >= 0.0 {
+            Duration::ZERO
+        } else {
+            // `refill_per_sec` is a positive constant, so this is finite.
+            Duration::from_secs_f64(-self.tokens / self.refill_per_sec)
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn read_loop(
     reader: &mut (impl AsyncReadExt + Unpin),
@@ -1346,6 +1477,7 @@ async fn read_loop(
     chain_seed_rate: &ChainSeedRate,
     send_dedupes: &SendDedupes,
     apns: Option<Arc<ApnsClient>>,
+    push_gate: &Arc<PushGate>,
     self_id: &[u8],
     our_tx: &mpsc::UnboundedSender<Vec<u8>>,
     status_snapshot: &Arc<RelayStatus>,
@@ -1355,6 +1487,12 @@ async fn read_loop(
     // `to_id` cardinality per source — see
     // `CHAIN_SEED_DELIVERY_MAX_DISTINCT_TO_IDS`. Resets on disconnect.
     let mut chain_seed_to_ids: HashSet<PeerId> = HashSet::new();
+    // PZ-M6: connection-local frame-rate token bucket. Throttles a
+    // single connection's inbound frame *processing* rate so a fast
+    // flooder cannot spin the per-frame hot path / contend the shared
+    // locks. Reset per connection (fresh burst on each accepted HELLO).
+    let mut frame_rate =
+        FrameRateLimiter::new(FRAME_RATE_BURST, FRAME_RATE_REFILL_PER_SEC, Instant::now());
     loop {
         // Idle-timeout window resets per frame. A legitimate client
         // in a quiet conversation can sit silently for up to
@@ -1370,6 +1508,15 @@ async fn read_loop(
         };
         if frame.is_empty() {
             return Err(invalid("empty frame"));
+        }
+        // PZ-M6: charge this frame against the connection's rate budget.
+        // Within burst/sustained limits this is a no-op; past them we
+        // sleep off the deficit before processing, capping throughput at
+        // FRAME_RATE_REFILL_PER_SEC. No lock is held here, so the sleep
+        // is safe and only delays this one connection.
+        let wait = frame_rate.throttle(Instant::now());
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
         }
         match frame[0] {
             FRAME_TYPE_HELLO => return Err(invalid("duplicate HELLO")),
@@ -1613,7 +1760,8 @@ async fn read_loop(
                         short_hex(&parsed.to_id),
                         parsed.ttl_seconds,
                     );
-                    maybe_send_push(&parsed.to_id, push_tokens, apns.as_ref()).await;
+                    maybe_send_push(&parsed.to_id, push_tokens, apns.as_ref(), push_gate)
+                        .await;
                 }
             }
             FRAME_TYPE_BUNDLE_REQUEST => {
@@ -2156,6 +2304,110 @@ fn leading_zero_bits(bytes: &[u8]) -> u32 {
 /// network event from the inbound frame that triggered it.
 const PUSH_JITTER_MAX: Duration = Duration::from_secs(25);
 
+/// PZ-M5: ceiling on the number of offline-push wake-up tasks that may
+/// be in flight (sleeping out their jitter or mid-POST) at once. Each
+/// admitted wake-up holds one `Semaphore` permit for the whole lifetime
+/// of its task; once this many are outstanding, further wake-ups are
+/// dropped — best-effort, since the message is already in the offline
+/// queue and is delivered on the recipient's next reconnect. Without
+/// this bound a flood of offline SENDs drives unbounded `tokio::spawn`
+/// calls, each holding a token blob and a 25 s timer. Mirrors the
+/// `MAX_PENDING_DISTINCT_PEERS` offline-queue ceiling: a relay
+/// legitimately waking more than this many *distinct* recipients inside
+/// a single jitter window is already past its design envelope.
+const MAX_INFLIGHT_PUSH: usize = 1024;
+
+/// PZ-M5: concurrency + coalescing gate in front of the offline-push
+/// `tokio::spawn`. Enforces two independent abuse bounds at admission:
+///
+///  1. **Per-recipient coalescing.** A wake-up is content-free ("New
+///     message") and the device fetches its *entire* offline queue on
+///     wake, so one wake-up per recipient suffices no matter how many
+///     messages are queued. While a wake-up task for a recipient is
+///     still in flight, a second offline SEND to that same recipient
+///     schedules no new wake-up: the in-flight task wakes the device
+///     *after* this message is already queued, so the device still
+///     fetches it. A burst of N messages to one recipient collapses to
+///     a single APNs POST.
+///
+///  2. **Global in-flight ceiling** (`MAX_INFLIGHT_PUSH`, see above).
+///
+/// Admission is non-blocking (`try_acquire_owned`): the SEND read loop
+/// must never block on the push pipeline. The permit is acquired
+/// *before* the in-flight set is touched, so a wake-up that loses the
+/// ceiling race never marks its recipient in-flight — which would
+/// otherwise suppress that recipient's future wake-ups, with no task
+/// left to clear the marker.
+struct PushGate {
+    limit: Arc<Semaphore>,
+    /// Recipients with a wake-up task currently in flight. A plain
+    /// `std::sync` mutex (not tokio): each critical section is one set
+    /// probe/insert/remove, never held across an `.await`, and
+    /// `PushAdmit::drop` (a sync fn) must be able to clear the entry.
+    in_flight: std::sync::Mutex<HashSet<PeerId>>,
+}
+
+impl PushGate {
+    fn new(max_inflight: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limit: Arc::new(Semaphore::new(max_inflight)),
+            in_flight: std::sync::Mutex::new(HashSet::new()),
+        })
+    }
+
+    /// Try to admit a wake-up for `recipient`. Returns a guard if a
+    /// wake-up task should be spawned, or `None` if it must be skipped
+    /// because a wake-up for this recipient is already in flight
+    /// (coalesced) or the global ceiling is reached (dropped). On
+    /// `None` the in-flight set is left exactly as it was.
+    fn try_admit(self: &Arc<Self>, recipient: &[u8]) -> Option<PushAdmit> {
+        // Permit first: if the ceiling is hit we return without ever
+        // inserting into the in-flight set (see the type docs for why
+        // that ordering matters).
+        let permit = Arc::clone(&self.limit).try_acquire_owned().ok()?;
+        let key = recipient.to_vec();
+        {
+            let mut in_flight = self.in_flight.lock().unwrap();
+            if !in_flight.insert(key.clone()) {
+                // Already in flight -> coalesce. `permit` releases here.
+                return None;
+            }
+        }
+        Some(PushAdmit {
+            recipient: key,
+            gate: Arc::clone(self),
+            _permit: permit,
+        })
+    }
+
+    #[cfg(test)]
+    fn in_flight_len(&self) -> usize {
+        self.in_flight.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    fn available_permits(&self) -> usize {
+        self.limit.available_permits()
+    }
+}
+
+/// RAII guard for an admitted offline-push wake-up, held inside the
+/// spawned task for its whole lifetime. On drop it (a) removes the
+/// recipient from the in-flight set — closing that recipient's
+/// coalescing window so a later message schedules a fresh wake-up —
+/// and (b) releases the `Semaphore` permit via `_permit`'s own drop.
+struct PushAdmit {
+    recipient: PeerId,
+    gate: Arc<PushGate>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for PushAdmit {
+    fn drop(&mut self) {
+        self.gate.in_flight.lock().unwrap().remove(&self.recipient);
+    }
+}
+
 /// Look up the recipient's push token; if present and APNs is configured,
 /// fire a payload-opaque "New message" wake-up. Errors are logged only —
 /// push is best-effort and must never break relay forwarding.
@@ -2163,11 +2415,25 @@ async fn maybe_send_push(
     recipient: &[u8],
     push_tokens: &PushTokens,
     apns: Option<&Arc<ApnsClient>>,
+    push_gate: &Arc<PushGate>,
 ) {
     let Some(client) = apns else { return };
     let token = match push_tokens.lock().await.get_cloned(recipient) {
         Some(t) => t,
         None => return,
+    };
+    // PZ-M5: bound the number of concurrently-spawned wake-up tasks and
+    // coalesce per recipient. `try_admit` returns `None` when a wake-up
+    // for this recipient is already in flight (that one will still wake
+    // the device after this message is queued) or when the global
+    // in-flight ceiling is reached. Push is best-effort, so a skipped
+    // wake-up just relies on the recipient's next reconnect.
+    let Some(admit) = push_gate.try_admit(recipient) else {
+        dev_peer_log!(
+            "push: skipped wake-up for {} (coalesced or at in-flight ceiling)",
+            short_hex(recipient),
+        );
+        return;
     };
     let recipient_dbg = short_hex(recipient);
     let client = client.clone();
@@ -2180,6 +2446,10 @@ async fn maybe_send_push(
         )
     };
     tokio::spawn(async move {
+        // Hold the admission guard for the whole task: on completion it
+        // releases the semaphore permit AND clears this recipient from
+        // the in-flight set, reopening it for a future wake-up.
+        let _admit = admit;
         tokio::time::sleep(jitter).await;
         match client.send_wakeup(&token).await {
             Ok(_) => dev_peer_log!("push: sent wake-up to {recipient_dbg}"),
@@ -2349,7 +2619,12 @@ async fn verify_hello_possession_proof(
     if set.contains_key(&key) {
         return Err("HELLO replay (peer_id, nonce) already seen".into());
     }
-    set.insert(key, Instant::now());
+    // PZ-M7: at capacity, accept this (non-replayed) HELLO but stop
+    // recording new nonces — the timestamp-skew window already bounds
+    // replays, and refusing-new avoids evicting a still-recent nonce.
+    if admits_new_soft_state(false, set.len(), MAX_HELLO_REPLAYS) {
+        set.insert(key, Instant::now());
+    }
     Ok(())
 }
 
@@ -3892,5 +4167,201 @@ mod tests {
             SEND_DEDUPE_MAX_ENTRIES,
             "the cap-hit eviction must keep the table size at cap, not exceed it",
         );
+    }
+
+    // PZ-M5: the offline-push spawn is bounded + coalesced by `PushGate`.
+    // `try_admit` and `PushAdmit::drop` are both synchronous and runtime-
+    // agnostic (tokio's `Semaphore::try_acquire_owned` needs no executor),
+    // so these are plain `#[test]`s — no message wire, no APNs, no sleep.
+
+    #[test]
+    fn pzm5_push_gate_coalesces_same_recipient_while_in_flight() {
+        let gate = PushGate::new(4);
+        let a = b"recipient-A".as_slice();
+
+        // First wake-up for A is admitted and holds a permit.
+        let admit1 = gate.try_admit(a).expect("first wake-up admitted");
+        assert_eq!(gate.in_flight_len(), 1);
+        assert_eq!(gate.available_permits(), 3);
+
+        // A second offline SEND to A while the first is still in flight is
+        // coalesced: no new task, no second permit consumed.
+        assert!(
+            gate.try_admit(a).is_none(),
+            "a wake-up already in flight for A must coalesce",
+        );
+        assert_eq!(gate.in_flight_len(), 1, "coalesce must not grow the set");
+        assert_eq!(
+            gate.available_permits(),
+            3,
+            "a coalesced wake-up must release the permit it briefly took",
+        );
+
+        // Once the in-flight task finishes (guard dropped), A's coalescing
+        // window closes: the permit returns and a fresh wake-up is admitted.
+        drop(admit1);
+        assert_eq!(gate.in_flight_len(), 0);
+        assert_eq!(gate.available_permits(), 4);
+        let _admit2 = gate.try_admit(a).expect("wake-up admitted again after drop");
+        assert_eq!(gate.in_flight_len(), 1);
+        assert_eq!(gate.available_permits(), 3);
+    }
+
+    #[test]
+    fn pzm5_push_gate_enforces_global_ceiling_without_poisoning() {
+        // Ceiling of 2 concurrent wake-up tasks.
+        let gate = PushGate::new(2);
+        let a = b"recipient-A".as_slice();
+        let b = b"recipient-B".as_slice();
+        let c = b"recipient-C".as_slice();
+
+        let admit_a = gate.try_admit(a).expect("A admitted");
+        let _admit_b = gate.try_admit(b).expect("B admitted");
+        assert_eq!(gate.available_permits(), 0);
+        assert_eq!(gate.in_flight_len(), 2);
+
+        // C arrives at the ceiling: dropped (best-effort). Crucially, the
+        // rejection must NOT mark C in-flight — otherwise C's future
+        // wake-ups would be suppressed forever with no task to clear it.
+        assert!(gate.try_admit(c).is_none(), "C must be dropped at the ceiling");
+        assert_eq!(
+            gate.in_flight_len(),
+            2,
+            "a ceiling rejection must not insert the rejected recipient",
+        );
+
+        // Free one slot; C is admittable now, proving it was not poisoned.
+        drop(admit_a);
+        assert_eq!(gate.available_permits(), 1);
+        assert_eq!(gate.in_flight_len(), 1);
+        let _admit_c = gate.try_admit(c).expect("C admitted once a permit frees");
+        assert_eq!(gate.in_flight_len(), 2);
+        assert_eq!(gate.available_permits(), 0);
+    }
+
+    #[test]
+    fn pzm5_push_gate_admits_distinct_recipients_independently() {
+        // Coalescing is per-recipient, not a global single-flight: distinct
+        // recipients each get their own wake-up while permits remain.
+        let gate = PushGate::new(4);
+        let _a = gate.try_admit(b"A").expect("A admitted");
+        let _b = gate.try_admit(b"B").expect("B admitted");
+        let _c = gate.try_admit(b"C").expect("C admitted");
+        assert_eq!(gate.in_flight_len(), 3);
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    // PZ-M6: the per-connection inbound frame-rate token bucket.
+    // `FrameRateLimiter::throttle` takes `now` as an argument, so these
+    // are deterministic plain `#[test]`s — no runtime, no real sleeping;
+    // time is advanced by adding `Duration`s to a base `Instant`.
+
+    #[test]
+    fn pzm6_frame_rate_allows_full_burst_with_no_delay() {
+        let t0 = Instant::now();
+        let mut rl = FrameRateLimiter::new(8.0, 4.0, t0);
+        // The whole burst capacity passes at the same instant, undelayed.
+        for i in 0..8 {
+            assert_eq!(
+                rl.throttle(t0),
+                Duration::ZERO,
+                "burst frame {i} must not be throttled",
+            );
+        }
+    }
+
+    #[test]
+    fn pzm6_frame_rate_throttles_once_burst_is_spent() {
+        let t0 = Instant::now();
+        let mut rl = FrameRateLimiter::new(8.0, 4.0, t0);
+        for _ in 0..8 {
+            assert_eq!(rl.throttle(t0), Duration::ZERO);
+        }
+        // 9th frame at the same instant: 1-token deficit at 4/s -> 250ms.
+        assert_eq!(rl.throttle(t0).as_millis(), 250, "first over-budget frame");
+        // 10th: 2-token deficit -> 500ms. Waits grow with sustained overage.
+        assert_eq!(rl.throttle(t0).as_millis(), 500, "second over-budget frame");
+    }
+
+    #[test]
+    fn pzm6_frame_rate_refills_with_elapsed_time() {
+        let t0 = Instant::now();
+        let mut rl = FrameRateLimiter::new(8.0, 4.0, t0);
+        for _ in 0..8 {
+            let _ = rl.throttle(t0);
+        }
+        // Immediately over budget...
+        assert!(rl.throttle(t0) > Duration::ZERO);
+        // ...but after 2s at 4 tokens/s, 8 tokens have refilled (back to
+        // full), so a frame passes undelayed again.
+        let later = t0 + Duration::from_secs(2);
+        assert_eq!(
+            rl.throttle(later),
+            Duration::ZERO,
+            "tokens must refill as real time passes",
+        );
+    }
+
+    #[test]
+    fn pzm6_frame_rate_sustained_overrate_converges_to_refill() {
+        // Push strictly faster than refill: once the burst is spent, the
+        // per-frame wait converges to exactly 1/refill (here 10/s -> 100ms),
+        // i.e. sustained throughput is pinned at the refill rate.
+        let t0 = Instant::now();
+        let mut rl = FrameRateLimiter::new(4.0, 10.0, t0);
+        for _ in 0..4 {
+            assert_eq!(rl.throttle(t0), Duration::ZERO);
+        }
+        // Caller honours each returned wait, then sends the next frame.
+        let mut now = t0;
+        let mut last = Duration::ZERO;
+        for _ in 0..5 {
+            let wait = rl.throttle(now);
+            assert!(wait > Duration::ZERO, "sustained overage stays throttled");
+            now += wait;
+            last = wait;
+        }
+        assert_eq!(last.as_millis(), 100, "steady-state wait == 1/refill");
+    }
+
+    #[test]
+    fn pzm6_frame_rate_idle_does_not_overfill_past_capacity() {
+        // A long idle period must not bank more than `capacity` tokens —
+        // otherwise a connection could idle to accumulate an unbounded
+        // burst and then flood. After 100s idle on a 4-token bucket,
+        // exactly 4 frames pass instantly, then throttling resumes.
+        let t0 = Instant::now();
+        let mut rl = FrameRateLimiter::new(4.0, 10.0, t0);
+        for _ in 0..4 {
+            let _ = rl.throttle(t0);
+        }
+        let after_idle = t0 + Duration::from_secs(100);
+        for i in 0..4 {
+            assert_eq!(
+                rl.throttle(after_idle),
+                Duration::ZERO,
+                "post-idle burst frame {i} (capped at capacity) is undelayed",
+            );
+        }
+        assert!(
+            rl.throttle(after_idle) > Duration::ZERO,
+            "the 5th post-idle frame exceeds the capped burst and throttles",
+        );
+    }
+
+    #[test]
+    fn pzm7_soft_state_admission_refuses_new_at_cap_keeps_known() {
+        // PZ-M7 boundary shared by the verify_keys + hello_replays caps.
+        // Below cap: a new key is admitted.
+        assert!(admits_new_soft_state(false, 0, 4), "new key admitted when empty");
+        assert!(admits_new_soft_state(false, 3, 4), "new key admitted just under cap");
+        // At or over cap: a NEW key is refused (fail-closed).
+        assert!(!admits_new_soft_state(false, 4, 4), "new key refused at cap");
+        assert!(!admits_new_soft_state(false, 99, 4), "new key refused over cap");
+        // A KNOWN key is ALWAYS admitted — it is a refresh, not growth —
+        // so an existing recipient's verify_key is never evicted/refused
+        // even at the cap (preserves the N-002 offline-delivery guarantee).
+        assert!(admits_new_soft_state(true, 4, 4), "known key refreshes at cap");
+        assert!(admits_new_soft_state(true, 99, 4), "known key refreshes over cap");
     }
 }

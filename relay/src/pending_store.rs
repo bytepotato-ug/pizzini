@@ -254,14 +254,23 @@ impl PendingStore {
         self.queues.len()
     }
 
-    /// Total decoded-frame bytes queued across all peers. Used by the
-    /// global byte-count cap in `enqueue`.
+    /// Total queued bytes counted against the global byte cap: decoded
+    /// frame bytes PLUS the per-recipient key bytes (each queue's
+    /// `peer_id`, stored once as the map key). PZ-L3: the key bytes were
+    /// previously uncounted, so a sender spraying many distinct `to_id`s
+    /// could hold up to `max_distinct_peers` worth of key storage above
+    /// what the byte ceiling accounted for. Counting them keeps the cap
+    /// honest about true queued memory; the term is itself bounded
+    /// because the distinct-peer count is capped by `max_distinct_peers`.
     fn total_bytes(&self) -> usize {
-        self.queues
+        let frame_bytes: usize = self
+            .queues
             .values()
             .flat_map(|q| q.iter())
             .map(|f| f.byte_len())
-            .sum()
+            .sum();
+        let key_bytes: usize = self.queues.keys().map(|k| k.len()).sum();
+        frame_bytes + key_bytes
     }
 
     /// Append a frame to `peer_id`'s queue, evicting the oldest
@@ -339,7 +348,10 @@ impl PendingStore {
         // Global byte-count cap. Account for the bytes the per-peer
         // eviction would reclaim so a steady-state full per-peer
         // queue can still rotate without tripping the global cap.
-        let incoming = frame.byte_len();
+        // PZ-L3: a brand-new queue also adds its `peer_id` key to the
+        // counted footprint; an existing queue's key is already included
+        // in `total_bytes()`. Account for it so the cap check matches.
+        let incoming = frame.byte_len() + if is_new_peer { peer_id.len() } else { 0 };
         let reclaimed = if per_peer_eviction {
             self.queues
                 .get(&peer_id)
@@ -745,11 +757,13 @@ mod tests {
 
     #[test]
     fn global_byte_cap_refuses_overflow() {
-        // Total queued bytes are hard-bounded. `frame_with_ttl`
-        // produces 64-byte frames; a 200-byte cap admits 3 of them.
+        // Total queued bytes are hard-bounded. `frame_with_ttl` produces
+        // 64-byte frames and each distinct recipient adds its 33-byte
+        // peer_id key (PZ-L3), so a distinct-peer entry costs 97 bytes. A
+        // 300-byte cap admits 3 (=291) and refuses the 4th (=388).
         let dir = fresh_state_dir("globalbytes");
         let mut store =
-            PendingStore::load_or_create(&dir, TEST_CAP, TEST_MAX_PEERS, TEST_MAX_FRAMES, 200)
+            PendingStore::load_or_create(&dir, TEST_CAP, TEST_MAX_PEERS, TEST_MAX_FRAMES, 300)
                 .unwrap();
         for i in 0..3u8 {
             assert_eq!(
@@ -759,7 +773,8 @@ mod tests {
                 EnqueueOutcome::Stored,
             );
         }
-        // 4th 64-byte frame would push past 200 bytes — refused.
+        // 4th distinct-peer entry (64 frame + 33 key) would push past 300
+        // bytes — refused.
         assert_eq!(
             store
                 .enqueue(vec![0xAB; 33], frame_with_ttl(0xAB, 3600))
@@ -775,9 +790,10 @@ mod tests {
         // oldest, push newest) without tripping the global byte cap —
         // the reclaimed bytes are accounted for.
         let dir = fresh_state_dir("globalrotate");
-        // per-peer cap 2, byte cap exactly 2 frames' worth (128).
+        // per-peer cap 2; byte cap = exactly 2 frames + alice's one key
+        // (2*64 + 33 = 161, PZ-L3) so the queue can sit full at the cap.
         let mut store =
-            PendingStore::load_or_create(&dir, 2, TEST_MAX_PEERS, TEST_MAX_FRAMES, 128).unwrap();
+            PendingStore::load_or_create(&dir, 2, TEST_MAX_PEERS, TEST_MAX_FRAMES, 161).unwrap();
         let alice = vec![0xAA; 33];
         assert_eq!(
             store.enqueue(alice.clone(), frame_with_ttl(1, 3600)).unwrap(),
@@ -798,6 +814,40 @@ mod tests {
         assert_eq!(drained.len(), 2);
         assert_eq!(drained[0].bytes()[0], 2);
         assert_eq!(drained[1].bytes()[0], 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pzl3_total_bytes_counts_per_recipient_key_once() {
+        // PZ-L3: total_bytes() must count each queue's peer_id key (so the
+        // global cap sees the memory a distinct-to_id spray actually
+        // holds), and count it once per recipient — not per frame.
+        let dir = fresh_state_dir("pzl3keys");
+        let mut store = PendingStore::load_or_create(
+            &dir,
+            TEST_CAP,
+            TEST_MAX_PEERS,
+            TEST_MAX_FRAMES,
+            TEST_MAX_BYTES,
+        )
+        .unwrap();
+        // Two distinct 33-byte recipients, one 64-byte frame each.
+        store.enqueue(vec![1u8; 33], frame_with_ttl(1, 3600)).unwrap();
+        store.enqueue(vec![2u8; 33], frame_with_ttl(2, 3600)).unwrap();
+        // 2 frames * 64 + 2 keys * 33 = 128 + 66 = 194.
+        assert_eq!(
+            store.total_bytes(),
+            194,
+            "total_bytes must include both 64-byte frames AND both 33-byte peer_id keys",
+        );
+        // A second frame to an EXISTING recipient adds only frame bytes —
+        // the key was already counted once.
+        store.enqueue(vec![1u8; 33], frame_with_ttl(3, 3600)).unwrap();
+        assert_eq!(
+            store.total_bytes(),
+            194 + 64,
+            "an existing recipient's extra frame adds no second key",
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
