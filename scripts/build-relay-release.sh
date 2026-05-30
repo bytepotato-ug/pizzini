@@ -72,6 +72,41 @@ SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct HEAD)"
 export SOURCE_DATE_EPOCH
 
 if [[ -z "${INSIDE_DOCKER:-}" ]]; then
+    # PZ-C8: HARD-FAIL on unpinned reproducibility inputs BEFORE any
+    # build work (and before the docker probe, so a misconfiguration is
+    # caught even where docker is absent). A mutable base tag,
+    # unversioned apt packages, or an unpinned Debian snapshot each float
+    # the binary digest between two builds of the same commit — silently
+    # breaking the cross-operator reproducibility the transparency log
+    # depends on. There is deliberately NO working unpinned default
+    # (the prior WARN-and-continue taught operators to ignore the
+    # mismatch): the operator must commit the exact pins.
+    RELAY_BASE_IMAGE="${RELAY_BASE_IMAGE:-}"
+    APT_PINS="${APT_PINS:-}"
+    DEBIAN_SNAPSHOT="${DEBIAN_SNAPSHOT:-}"
+    pin_errors=0
+    if [[ "$RELAY_BASE_IMAGE" != *"@sha256:"* ]]; then
+        echo "error: RELAY_BASE_IMAGE must be digest-pinned (…@sha256:<64 hex>)." >&2
+        echo "       e.g. RELAY_BASE_IMAGE='rust:1.95.0-bookworm@sha256:<digest>'" >&2
+        echo "       Obtain: docker buildx imagetools inspect rust:1.95.0-bookworm" >&2
+        pin_errors=1
+    fi
+    if [[ "$APT_PINS" != *"="* ]]; then
+        echo "error: APT_PINS must pin every package to an exact version (name=version)." >&2
+        echo "       e.g. APT_PINS='protobuf-compiler=3.21.12-3 pkg-config=1.8.1-1'" >&2
+        pin_errors=1
+    fi
+    if [[ ! "$DEBIAN_SNAPSHOT" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
+        echo "error: DEBIAN_SNAPSHOT must be a snapshot.debian.org timestamp" >&2
+        echo "       (YYYYMMDDThhmmssZ). The pinned apt versions must resolve from a" >&2
+        echo "       frozen snapshot, not the rolling mirror (which GCs old versions)." >&2
+        echo "       e.g. DEBIAN_SNAPSHOT=20260501T000000Z" >&2
+        pin_errors=1
+    fi
+    if [[ "$pin_errors" -ne 0 ]]; then
+        echo "error: refusing to build without pinned, reproducible inputs (PZ-C8)." >&2
+        exit 1
+    fi
     # Outer invocation: re-exec ourselves inside the pinned
     # `rust:1.95.0-bookworm` image with the repo bind-mounted
     # at /work. The inner invocation sets INSIDE_DOCKER so we
@@ -89,25 +124,13 @@ if [[ -z "${INSIDE_DOCKER:-}" ]]; then
     echo "==> Reproducible relay build (inside docker)"
     echo "    repo  : $REPO_ROOT"
     echo "    commit: $GIT_SHA"
-    # F-TL-05: pin the build inputs that otherwise float. A bare
-    # `rust:1.95.0-bookworm` tag is mutable, and `apt-get install
-    # protobuf-compiler pkg-config` pulls whatever Debian publishes that
-    # day — both can change the binary digest between two builds of the
-    # same commit, breaking the cross-operator reproducibility the
-    # transparency log relies on. For a bit-reproducible build set BOTH:
-    #   RELAY_BASE_IMAGE="rust:1.95.0-bookworm@sha256:<digest>"
-    #   APT_PINS="protobuf-compiler=<ver> pkg-config=<ver>"
-    # Defaults keep the script working; a WARN fires when unpinned.
-    RELAY_BASE_IMAGE="${RELAY_BASE_IMAGE:-rust:1.95.0-bookworm}"
-    APT_PINS="${APT_PINS:-protobuf-compiler pkg-config}"
-    if [[ "$RELAY_BASE_IMAGE" != *"@sha256:"* ]]; then
-        echo "    WARN: RELAY_BASE_IMAGE is a mutable tag ($RELAY_BASE_IMAGE)." >&2
-        echo "          Set it to an @sha256: digest for a reproducible build." >&2
-    fi
-    if [[ "$APT_PINS" != *"="* ]]; then
-        echo "    WARN: APT_PINS unpinned ($APT_PINS) — set name=version for reproducibility." >&2
-    fi
+    # Inputs validated + pinned at the top of this block (PZ-C8):
+    # RELAY_BASE_IMAGE is @sha256-digest-pinned, APT_PINS are
+    # name=version, DEBIAN_SNAPSHOT is a frozen snapshot.debian.org
+    # timestamp. The container build below points apt at that snapshot
+    # so the versioned specs resolve to the exact archived packages.
     echo "    image : $RELAY_BASE_IMAGE"
+    echo "    apt   : $APT_PINS @ snapshot $DEBIAN_SNAPSHOT"
     # `cargo vendor` once on the host (outside the container) so the
     # offline build inside docker has every dep on disk. Idempotent;
     # produces `vendor/` + `.cargo/config.toml`-equivalent stdout we
@@ -136,14 +159,28 @@ if [[ -z "${INSIDE_DOCKER:-}" ]]; then
         -e HOST_UID="$HOST_UID" \
         -e HOST_GID="$HOST_GID" \
         -e APT_PINS="$APT_PINS" \
+        -e DEBIAN_SNAPSHOT="$DEBIAN_SNAPSHOT" \
         -v "$REPO_ROOT":/work:rw \
         -w /work \
         "$RELAY_BASE_IMAGE" \
         bash -c '
             set -euo pipefail
-            apt-get update -qq
-            # F-TL-05: install the pinned package specs (name=version when
-            # APT_PINS is pinned; bare names otherwise — see the WARN above).
+            # PZ-C8: pin apt to the frozen Debian snapshot so the
+            # name=version specs resolve to the EXACT archived packages.
+            # The rolling mirror garbage-collects old versions, which
+            # would either fail the install or float the binary digest.
+            # Replace all default sources (bookworm images ship deb822
+            # .sources files) with the snapshot archive; disable the
+            # Valid-Until check (snapshot Release files are intentionally
+            # stale-dated).
+            rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
+            {
+              echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main"
+              echo "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main"
+            } > /etc/apt/sources.list
+            apt-get -o Acquire::Check-Valid-Until=false update -qq
+            # Install the exact pinned versions (name=version, enforced by
+            # the outer PZ-C8 guard).
             apt-get install -y --no-install-recommends $APT_PINS >/dev/null
             mkdir -p /build-home
             # The bind-mounted repo is owned by HOST_UID but the
@@ -187,6 +224,27 @@ if [[ -z "${INSIDE_DOCKER:-}" ]]; then
     echo "    size      : $BIN_SIZE_BYTES bytes"
     echo "    sha256    : $BIN_SHA256"
     echo "    git commit: $GIT_SHA ($SHORT_SHA)"
+    # PZ-C8: enforce the committed expected digest. If
+    # scripts/relay-expected-sha256.txt exists (one 64-hex line), a
+    # mismatch is fatal — a build that does not reproduce the published
+    # digest must never be shipped or logged. If absent, this is the
+    # first pinned build: print the digest so the operator can commit it,
+    # after which CI (PZ-C9) enforces it on every subsequent build.
+    EXPECTED_FILE="$REPO_ROOT/scripts/relay-expected-sha256.txt"
+    if [[ -f "$EXPECTED_FILE" ]]; then
+        EXPECTED_SHA="$(tr -d '[:space:]' <"$EXPECTED_FILE")"
+        if [[ "$BIN_SHA256" != "$EXPECTED_SHA" ]]; then
+            echo >&2
+            echo "error: relay digest mismatch — built $BIN_SHA256," >&2
+            echo "       expected $EXPECTED_SHA (scripts/relay-expected-sha256.txt)." >&2
+            echo "       The build did NOT reproduce the committed digest. Do not ship or publish." >&2
+            exit 1
+        fi
+        echo "    expected  : matches committed digest"
+    else
+        echo "    NOTE: no committed expected digest at $EXPECTED_FILE." >&2
+        echo "          Commit the sha256 above there so CI enforces reproducibility henceforth." >&2
+    fi
     echo
     echo "Transparency-log entry to publish (single line):"
     echo "{\"git_sha\":\"$GIT_SHA\",\"binary_sha256\":\"$BIN_SHA256\",\"binary_size\":$BIN_SIZE_BYTES}"
