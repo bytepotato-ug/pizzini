@@ -65,6 +65,11 @@ final class AttachmentReassembler {
         var receivedIndices: Set<UInt32>
         var firstSeenAt: Date
         var expiresAt: Date
+        /// PZ-L7: running total of chunk bytes written to disk for this
+        /// in-flight attachment. Summed across `pending` to enforce the
+        /// global disk budget. Defaulted so the existing memberwise
+        /// init call site needn't pass it.
+        var bytesWritten: UInt64 = 0
     }
 
     /// 24h cap on a partial reassembly. Matches the relay's max
@@ -80,6 +85,27 @@ final class AttachmentReassembler {
     /// never approaches this number; 32 is generous and bounds the
     /// damage to ~32 × 64 MiB worst-case per peer.
     static let perPeerPendingCap: Int = 32
+
+    /// PZ-L7: global ceiling on total in-flight (partial-reassembly)
+    /// bytes across ALL peers. `perPeerPendingCap` above bounds one
+    /// peer's attachment COUNT; without a global byte budget, N distinct
+    /// paired peers each sitting just under that count cap could still
+    /// sum to arbitrary disk. 256 MiB is 4× the 64 MiB worst-case single
+    /// attachment — generous for legitimate concurrent receives (the
+    /// picker ships one attachment per send), tight enough to bound a
+    /// multi-peer flood. The 24h reaper and completion/discard free it.
+    nonisolated static let globalInFlightByteBudget: UInt64 = 256 * 1024 * 1024
+
+    /// PZ-L7: would writing `incoming` more bytes push total in-flight
+    /// reassembly bytes past `budget`? Overflow-safe — never forms
+    /// `inFlight + incoming` (which could wrap on attacker-influenced
+    /// sizes). Pure + `nonisolated` so the boundary is unit-tested
+    /// directly off the main actor.
+    nonisolated static func wouldExceedDiskBudget(
+        inFlight: UInt64, incoming: UInt64, budget: UInt64
+    ) -> Bool {
+        inFlight >= budget || incoming > budget - inFlight
+    }
 
     /// Receive-side memoisation of completed transfers, keyed on
     /// `peer + attachmentId` (matching `pending`, not on attachmentId
@@ -187,6 +213,22 @@ final class AttachmentReassembler {
             return .rejected(.oversizedChunk)
         }
 
+        // **Global disk budget (PZ-L7).** The per-peer cap above bounds
+        // one peer; this bounds the SUM across all peers, so a swarm of
+        // distinct paired identities each just under their per-peer cap
+        // can't collectively pin arbitrary disk. Checked at write time
+        // (not just new-attachment admission) so an existing transfer
+        // can't grow the total past budget either. Fail closed; the
+        // reaper / completion / discard free the bytes.
+        let inFlightBytes = pending.values.reduce(UInt64(0)) { $0 + $1.bytesWritten }
+        if Self.wouldExceedDiskBudget(
+            inFlight: inFlightBytes,
+            incoming: UInt64(envelope.chunkBytes.count),
+            budget: Self.globalInFlightByteBudget,
+        ) {
+            return .rejected(.writeFailed)
+        }
+
         // Persist this chunk to its index file.
         guard let chunkURL = chunkFileURL(
             attachmentId: envelope.attachmentId, index: envelope.chunkIndex
@@ -203,6 +245,7 @@ final class AttachmentReassembler {
         }
 
         entry.receivedIndices.insert(envelope.chunkIndex)
+        entry.bytesWritten += UInt64(envelope.chunkBytes.count)
         pending[key] = entry
 
         if entry.receivedIndices.count == Int(entry.chunkCount) {

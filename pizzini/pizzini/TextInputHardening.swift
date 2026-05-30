@@ -54,6 +54,32 @@ extension View {
     }
 }
 
+/// PZ-L8: the field-level keyboard-cache hardening, extracted so it can
+/// be re-applied on every update AND unit-tested directly. Disables the
+/// smart-typography + spell-checking flags that train the on-disk
+/// keyboard caches under `~/Library/Keyboard/`, and clears the input-
+/// assistant bar groups that shadow the recent draft. Idempotent — safe
+/// to call on every render.
+enum TextInputHardener {
+    @MainActor static func harden(_ field: UITextField) {
+        field.smartDashesType = .no
+        field.smartQuotesType = .no
+        field.smartInsertDeleteType = .no
+        field.spellCheckingType = .no
+        field.inputAssistantItem.leadingBarButtonGroups = []
+        field.inputAssistantItem.trailingBarButtonGroups = []
+    }
+
+    @MainActor static func harden(_ view: UITextView) {
+        view.smartDashesType = .no
+        view.smartQuotesType = .no
+        view.smartInsertDeleteType = .no
+        view.spellCheckingType = .no
+        view.inputAssistantItem.leadingBarButtonGroups = []
+        view.inputAssistantItem.trailingBarButtonGroups = []
+    }
+}
+
 private struct HardenedTextInput: ViewModifier {
     let autocap: TextInputAutocapitalization
 
@@ -82,13 +108,16 @@ private struct HardenedTextInput: ViewModifier {
 /// has no first-class API for these as of iOS 18, so the bridge is
 /// the supported path.
 ///
-/// The walker is one-shot per appearance. If SwiftUI replaces the
-/// underlying UIKit text input (e.g. on a re-render that flips the
-/// `.textFieldStyle`), the new field inherits its UIKit defaults and
-/// this modifier would need to re-apply. The `.id`-stability of the
-/// containing field across normal renders means in practice the
-/// re-render path is rare; if it surfaces, attach via a `.task`
-/// instead. For now we accept the one-shot semantics.
+/// PZ-L8: the walker re-runs on EVERY `updateUIView`, not once per
+/// appearance. If SwiftUI replaces the underlying UIKit text input
+/// (e.g. a re-render that flips `.textFieldStyle` or the field's
+/// identity), the replacement comes up with UIKit's smart-typography /
+/// spell-checking defaults ON and would train the keyboard cache from
+/// the first keystroke. `harden` is idempotent, so re-applying on each
+/// update is safe; the coalescing in `scheduleProbe` bounds it to one
+/// walk per update burst while still guaranteeing the FINAL field state
+/// is covered — the old one-shot guard could drop that trailing
+/// re-harden.
 private struct SmartTypographyDisabler: UIViewRepresentable {
     func makeUIView(context: Context) -> ProbeView {
         ProbeView()
@@ -99,7 +128,8 @@ private struct SmartTypographyDisabler: UIViewRepresentable {
     }
 
     final class ProbeView: UIView {
-        private var probeScheduled = false
+        private var probeInFlight = false
+        private var rehardenRequested = false
 
         override init(frame: CGRect) {
             super.init(frame: frame)
@@ -116,13 +146,25 @@ private struct SmartTypographyDisabler: UIViewRepresentable {
         }
 
         func scheduleProbe() {
-            guard !probeScheduled else { return }
-            probeScheduled = true
+            // PZ-L8: trailing-coalesced re-harden. Every update requests a
+            // (re-)harden; a burst collapses to one in-flight walk, but a
+            // request that lands WHILE a walk is running re-arms it, so the
+            // final field state is always covered (the old guard dropped
+            // that trailing re-harden, leaving a replaced field unhardened).
+            rehardenRequested = true
+            guard !probeInFlight else { return }
+            probeInFlight = true
             // Defer one runloop tick so SwiftUI has finished mounting
             // its UITextField/UITextView children.
             DispatchQueue.main.async { [weak self] in
-                self?.probeScheduled = false
-                self?.harden(in: self?.superview)
+                guard let self else { return }
+                self.probeInFlight = false
+                guard self.rehardenRequested else { return }
+                self.rehardenRequested = false
+                self.harden(in: self.superview)
+                // An update during the walk leaves `rehardenRequested`
+                // set — chase it so the latest field is covered too.
+                if self.rehardenRequested { self.scheduleProbe() }
             }
         }
 
@@ -136,25 +178,14 @@ private struct SmartTypographyDisabler: UIViewRepresentable {
         }
 
         private func applyRecursively(to view: UIView) {
+            // Zeroing the input-assistant bar groups (inside `harden`)
+            // also stops the keyboard's QuickType / paste suggestions from
+            // rendering the last-typed words above the bar after a send.
             if let tf = view as? UITextField {
-                tf.smartDashesType = .no
-                tf.smartQuotesType = .no
-                tf.smartInsertDeleteType = .no
-                tf.spellCheckingType = .no
-                // Partial mitigation: zero the input
-                // assistant's leading bar groups so the keyboard's
-                // QuickType / paste suggestions don't render the
-                // last-typed words above the bar after a send.
-                tf.inputAssistantItem.leadingBarButtonGroups = []
-                tf.inputAssistantItem.trailingBarButtonGroups = []
+                TextInputHardener.harden(tf)
             }
             if let tv = view as? UITextView {
-                tv.smartDashesType = .no
-                tv.smartQuotesType = .no
-                tv.smartInsertDeleteType = .no
-                tv.spellCheckingType = .no
-                tv.inputAssistantItem.leadingBarButtonGroups = []
-                tv.inputAssistantItem.trailingBarButtonGroups = []
+                TextInputHardener.harden(tv)
             }
             for sub in view.subviews {
                 applyRecursively(to: sub)
