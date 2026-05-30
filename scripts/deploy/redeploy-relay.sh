@@ -199,5 +199,15 @@ if (( ${#failed_deploy[@]} > 0 )); then
 fi
 ok "all ${#targets[@]} target(s) on $LOCAL_SHA"
 echo
+# PZ-L9: emit the full canonical entry schema — {git_sha, binary_sha256,
+# binary_size} — matching build-relay-release.sh and the `entry` object
+# in transparency-log.ndjson. The prior entry omitted git_sha, so an
+# operator could publish a malformed half-entry. git_sha is this
+# checkout's HEAD, which is correct for the standard flow
+# (build-relay-release.sh builds from a clean HEAD, then redeploy ships
+# that binary). If you deployed a binary built from a DIFFERENT commit
+# (e.g. a custom PIZZINI_RELAY_BINARY), publish the entry that
+# build-relay-release.sh printed for THAT build instead.
+REDEPLOY_GIT_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 echo "transparency-log entry (publish when ready):"
-echo "  {\"binary_sha256\":\"$LOCAL_SHA\",\"binary_size\":$LOCAL_SIZE}"
+echo "  {\"git_sha\":\"$REDEPLOY_GIT_SHA\",\"binary_sha256\":\"$LOCAL_SHA\",\"binary_size\":$LOCAL_SIZE}"
