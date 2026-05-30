@@ -1,74 +1,69 @@
 // Embed reproducible-build provenance into the relay binary.
 //
 // At compile time we capture:
-//   * `GIT_SHA`  — full 40-char hex of the source commit producing
-//                  this binary. The single most useful "what code
-//                  is running on the relay" identifier; reported
-//                  verbatim through the `STATUS_RESPONSE` frame.
-//   * `GIT_DIRTY` — "1" iff the working tree had uncommitted changes
-//                   at build time; "0" otherwise. Production builds
-//                   refuse to publish a transparency-log entry if
-//                   this is "1", because a dirty build cannot be
-//                   independently reproduced from public source.
+//   * `GIT_SHA`   — full 40-char hex of the source commit producing this
+//                   binary. The single most useful "what code is running
+//                   on the relay" identifier; reported verbatim through
+//                   the `STATUS_RESPONSE` frame.
+//   * `GIT_DIRTY` — "1" iff the working tree had uncommitted changes at
+//                   build time; "0" otherwise.
 //
-// Determinism caveat: we deliberately do NOT embed the build time,
-// hostname, or absolute paths — these would diverge between
-// builds of the same commit on different machines and break
-// reproducibility. `cargo` doesn't embed them by default; we just
-// avoid the build-script anti-patterns that would.
+// PZ-M14: these come from ENVIRONMENT VARIABLES injected by the
+// reproducible-build wrapper (`scripts/build-relay-release.sh`), NOT
+// from shelling out to `git` here. Invoking `git` inside build.rs is
+// non-hermetic: it depends on `git` being installed and configured in
+// the build environment (the container `safe.directory` workaround it
+// used to need), and it makes the embedded provenance — and therefore
+// the binary digest — a function of the build host's git state rather
+// than purely of the injected, recorded inputs. Reading env vars
+// removes that dependency: the wrapper computes GIT_SHA/GIT_DIRTY once,
+// on the host where git is clean, and passes them into the pinned
+// container.
+//
+// When the vars are absent (a bare `cargo build` / `cargo test` outside
+// the wrapper) the provenance is the explicit "unknown" sentinel — never
+// a silently-wrong value, and distinct from "clean" so the
+// transparency-log verifier refuses to treat such a binary as
+// reproducible. The reproducible/publish path always goes through the
+// wrapper, which sets both vars; a bare release build is for local
+// verification only and is not transparency-log-eligible.
+//
+// Determinism caveat: we deliberately embed no build time, hostname, or
+// absolute paths — those would diverge between builds of the same commit
+// and break reproducibility.
 
-use std::process::Command;
+const UNKNOWN: &str = "unknown";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    // Only need to re-run when HEAD moves or the working tree
-    // changes. Cargo doesn't natively watch .git/, so we instruct
-    // it to rerun if either of these moves.
-    println!("cargo:rerun-if-changed=../.git/HEAD");
-    println!("cargo:rerun-if-changed=../.git/index");
+    // Re-run when the injected provenance changes. We no longer watch
+    // `.git/` because build.rs no longer reads it.
+    println!("cargo:rerun-if-env-changed=GIT_SHA");
+    println!("cargo:rerun-if-env-changed=GIT_DIRTY");
 
-    // On the release profile the embedded provenance must be a
-    // deterministic function of the commit, never of the build
-    // host's git configuration (e.g. a `safe.directory` miss under
-    // a container bind-mount making `git` fail). A release build
-    // that cannot read its own commit refuses to build rather than
-    // baking the "unknown" sentinel — which would also change the
-    // binary digest and silently break the reproducible-build
-    // contract the transparency log depends on.
-    let is_release = std::env::var("PROFILE").as_deref() == Ok("release");
-    let git_sha = match run_git(&["rev-parse", "HEAD"]) {
-        Some(sha) => sha,
-        None if is_release => panic!(
-            "relay build.rs: `git rev-parse HEAD` failed on the release \
-             profile. The relay's transparency-log self-attestation requires \
-             a real commit sha; refusing to bake the \"unknown\" sentinel. If \
-             building inside a container over a bind-mount, run `git config \
-             --global --add safe.directory <repo>` first."
-        ),
-        // Not-a-git-checkout fallback for non-release builds (e.g.
-        // building from a `cargo package` tarball, or a dev build
-        // outside a checkout). Make the absence loud in the embedded
-        // value so it is obviously not transparency-log-eligible.
-        None => "unknown".to_string(),
-    };
-    let dirty = match run_git(&["status", "--porcelain"]) {
-        Some(s) => if s.trim().is_empty() { "0" } else { "1" }.to_string(),
-        None if is_release => panic!(
-            "relay build.rs: `git status --porcelain` failed on the release \
-             profile. Cannot determine whether the working tree is clean; \
-             refusing to bake the \"unknown\" sentinel."
-        ),
-        None => "unknown".to_string(),
-    };
+    let git_sha = provenance("GIT_SHA");
+    let git_dirty = normalize_dirty(provenance("GIT_DIRTY"));
 
     println!("cargo:rustc-env=PIZZINI_GIT_SHA={git_sha}");
-    println!("cargo:rustc-env=PIZZINI_GIT_DIRTY={dirty}");
+    println!("cargo:rustc-env=PIZZINI_GIT_DIRTY={git_dirty}");
 }
 
-fn run_git(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
+/// Read an injected provenance var, trimming whitespace; absent or empty
+/// becomes the `UNKNOWN` sentinel.
+fn provenance(name: &str) -> String {
+    match std::env::var(name) {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => UNKNOWN.to_string(),
     }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Canonicalise the dirty flag to the wire vocabulary the relay's
+/// `RelayStatus` decoder expects: "0" (clean), "1" (dirty), or the
+/// "unknown" sentinel (decoded as 2). Any other truthy value is treated
+/// as dirty, fail-safe.
+fn normalize_dirty(v: String) -> String {
+    match v.as_str() {
+        "0" | "1" | UNKNOWN => v,
+        _ => "1".to_string(),
+    }
 }

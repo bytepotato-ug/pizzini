@@ -64,6 +64,13 @@ fi
 
 GIT_SHA="$(git rev-parse HEAD)"
 SHORT_SHA="$(git rev-parse --short HEAD)"
+# PZ-M14: provenance is computed HERE, on the host where git is clean,
+# and injected into the container as env vars; relay/build.rs reads them
+# instead of shelling to git inside the build (which needed the
+# safe.directory workaround and made the digest depend on the build
+# host's git). The clean-tree gate above already refused a dirty tracked
+# tree, so a reproducible build is always clean.
+GIT_DIRTY="0"
 
 # Pin SOURCE_DATE_EPOCH to the commit timestamp so any "embedded
 # build time" anywhere in the dep tree (cargo metadata, build.rs
@@ -131,15 +138,11 @@ if [[ -z "${INSIDE_DOCKER:-}" ]]; then
     # so the versioned specs resolve to the exact archived packages.
     echo "    image : $RELAY_BASE_IMAGE"
     echo "    apt   : $APT_PINS @ snapshot $DEBIAN_SNAPSHOT"
-    # `cargo vendor` once on the host (outside the container) so the
-    # offline build inside docker has every dep on disk. Idempotent;
-    # produces `vendor/` + `.cargo/config.toml`-equivalent stdout we
-    # capture into `.cargo/config-vendor.toml`.
-    if [[ ! -d "$REPO_ROOT/vendor" ]]; then
-        echo "==> cargo vendor (one-time)"
-        mkdir -p "$REPO_ROOT/.cargo"
-        cargo vendor --locked vendor > "$REPO_ROOT/.cargo/config-vendor.toml"
-    fi
+    # PZ-M14: `cargo vendor` now runs INSIDE the container (below) using
+    # the container's pinned cargo, so the vendored tree and the build
+    # that consumes it share one toolchain — no dependency on whatever
+    # cargo the host happens to have. (`vendor/` is reused when already
+    # present; `cargo vendor --locked` is deterministic given Cargo.lock.)
     # Run docker as root inside the container so `apt-get update +
     # install protobuf-compiler pkg-config` works (the rust:bookworm
     # base image doesn't ship protoc, and apt-get needs root for
@@ -160,6 +163,8 @@ if [[ -z "${INSIDE_DOCKER:-}" ]]; then
         -e HOST_GID="$HOST_GID" \
         -e APT_PINS="$APT_PINS" \
         -e DEBIAN_SNAPSHOT="$DEBIAN_SNAPSHOT" \
+        -e GIT_SHA="$GIT_SHA" \
+        -e GIT_DIRTY="$GIT_DIRTY" \
         -v "$REPO_ROOT":/work:rw \
         -w /work \
         "$RELAY_BASE_IMAGE" \
@@ -190,15 +195,21 @@ if [[ -z "${INSIDE_DOCKER:-}" ]]; then
             # provenance (and therefore the binary digest) depend on
             # the host git config instead of the commit. Mark /work
             # trusted so build.rs always reads the real commit.
-            git config --global --add safe.directory /work
+            # PZ-M14: relay/build.rs now reads GIT_SHA/GIT_DIRTY from the
+            # env (injected via docker -e above), so it no longer shells
+            # to git — the old `git config --global --add safe.directory
+            # /work` workaround is gone with it.
             # Inside-container path-remap: every host-side path
             # disappears, replaced by the fixed sentinels.
             export RUSTFLAGS="--remap-path-prefix=/work=/build --remap-path-prefix=/build-home=/build-home"
-            # The .cargo/config-vendor.toml from `cargo vendor`
-            # points at /work/vendor — use it via $CARGO_HOME so
-            # cargo offlines through the vendored tree.
             mkdir -p /work/.cargo
-            cp /work/.cargo/config-vendor.toml /work/.cargo/config.toml
+            # PZ-M14: vendor INSIDE the container with the container'\''s
+            # pinned cargo. Network is needed only for this step; the
+            # build below runs offline. Writes the vendor config cargo
+            # consumes via $CARGO_HOME=/work/.cargo.
+            if [[ ! -d /work/vendor ]]; then
+                cargo vendor --locked /work/vendor > /work/.cargo/config.toml
+            fi
             export CARGO_NET_OFFLINE=true
             # Capture rc so we always chown back even on build failure;
             # otherwise the host is left with a root-owned target/
