@@ -243,6 +243,24 @@ trap 'rm -rf "$WORK"' EXIT
 
 ICEPA_DIR="$WORK/Tor.framework"
 
+# PZ-H11: TOR_PIN_COMMIT is MANDATORY. A git tag is mutable, so building
+# the transport trust anchor (every client routes 100% of its traffic
+# through this library) from an unverified, tag-resolved commit is
+# refused outright — not merely warned. Guarded BEFORE the clone so a
+# missing pin fails fast without any network. Discover the commit to pin
+# WITHOUT a build:
+#   git ls-remote "$ICEPA_REPO" "refs/tags/$VERSION^{}"
+# then re-run with TOR_PIN_COMMIT=<that 40-hex commit>.
+if [[ -z "${TOR_PIN_COMMIT:-}" ]]; then
+    echo "error: TOR_PIN_COMMIT is required — the transport library must be built" >&2
+    echo "       from a content-pinned commit, not the mutable tag $VERSION." >&2
+    echo "       Discover the commit the tag resolves to (no build needed):" >&2
+    echo "         git ls-remote \"$ICEPA_REPO\" \"refs/tags/$VERSION^{}\"" >&2
+    echo "       then re-run with TOR_PIN_COMMIT=<that commit> (and optionally" >&2
+    echo "       TOR_SUBMODULE_PIN=<tor submodule commit> for explicit verification)." >&2
+    exit 1
+fi
+
 echo "==> Cloning iCepa/Tor.framework $VERSION"
 # Shallow clone of the pinned tag. We need the working tree of iCepa's
 # build-xcframework.sh + Tor/mmap-cache.patch, not history.
@@ -258,20 +276,32 @@ git clone --depth 1 --branch "$VERSION" --recursive --shallow-submodules \
 # commit) so the operator can record it and turn on verification.
 TOR_RESOLVED_COMMIT="$(git -C "$ICEPA_DIR" rev-parse HEAD)"
 TOR_SUBMODULE_COMMIT="$(git -C "$ICEPA_DIR" submodule status 2>/dev/null | awk '/Tor\/tor/ {print $1}' | tr -d '+-' || true)"
-if [[ -n "${TOR_PIN_COMMIT:-}" ]]; then
-    if [[ "$TOR_RESOLVED_COMMIT" != "$TOR_PIN_COMMIT" ]]; then
-        echo "ERROR: iCepa Tor.framework commit mismatch." >&2
-        echo "  expected (TOR_PIN_COMMIT): $TOR_PIN_COMMIT" >&2
-        echo "  got (tag $VERSION now points at): $TOR_RESOLVED_COMMIT" >&2
-        echo "  Refusing to build the transport library from an unverified commit." >&2
+# TOR_PIN_COMMIT is mandatory (guarded before the clone). Verify the
+# tag actually resolved to the pinned commit.
+if [[ "$TOR_RESOLVED_COMMIT" != "$TOR_PIN_COMMIT" ]]; then
+    echo "ERROR: iCepa Tor.framework commit mismatch." >&2
+    echo "  expected (TOR_PIN_COMMIT): $TOR_PIN_COMMIT" >&2
+    echo "  got (tag $VERSION now points at): $TOR_RESOLVED_COMMIT" >&2
+    echo "  Refusing to build the transport library from an unverified commit." >&2
+    exit 1
+fi
+echo "==> Verified iCepa commit matches TOR_PIN_COMMIT ($TOR_RESOLVED_COMMIT)"
+# PZ-H11: the tor submodule is the actual upstream Tor source iCepa
+# wraps. The pinned iCepa commit transitively fixes it, but verify it
+# explicitly when a pin is recorded (defense against an iCepa gitlink
+# that points somewhere unexpected). If unset, surface it for recording.
+if [[ -n "${TOR_SUBMODULE_PIN:-}" ]]; then
+    if [[ "$TOR_SUBMODULE_COMMIT" != "$TOR_SUBMODULE_PIN" ]]; then
+        echo "ERROR: tor submodule commit mismatch." >&2
+        echo "  expected (TOR_SUBMODULE_PIN): $TOR_SUBMODULE_PIN" >&2
+        echo "  got: $TOR_SUBMODULE_COMMIT" >&2
+        echo "  Refusing: the actual Tor source is not the pinned one." >&2
         exit 1
     fi
-    echo "==> Verified iCepa commit matches TOR_PIN_COMMIT ($TOR_RESOLVED_COMMIT)"
+    echo "==> Verified tor submodule matches TOR_SUBMODULE_PIN ($TOR_SUBMODULE_COMMIT)"
 else
-    echo "==> WARNING: TOR_PIN_COMMIT is not set — building from tag $VERSION without a content pin."
-    echo "    Record this and re-run with TOR_PIN_COMMIT set to enforce it on every future build:"
-    echo "      TOR_PIN_COMMIT=$TOR_RESOLVED_COMMIT"
-    [[ -n "$TOR_SUBMODULE_COMMIT" ]] && echo "      (tor submodule commit: $TOR_SUBMODULE_COMMIT)"
+    echo "==> NOTE: TOR_SUBMODULE_PIN unset — record the tor submodule commit to verify it explicitly:"
+    echo "      TOR_SUBMODULE_PIN=$TOR_SUBMODULE_COMMIT"
 fi
 
 patch_icepa_build_script "$ICEPA_DIR/build-xcframework.sh"
@@ -307,6 +337,42 @@ if ! nm_check_pow_solver "$OUTPUT"; then
     echo "==> BUILD FAILED: PoW solver regression" >&2
     exit 1
 fi
+
+# PZ-H11: record / verify a per-slice libtor.a SHA-256 manifest. This
+# digest is the NET-RESULT integrity check: it changes if ANY build
+# input drifts — the tor source, the OpenSSL/libevent/lzma versions
+# iCepa fetched, or the toolchain. So even though those deps are pinned
+# only transitively (via the iCepa commit + iCepa's own build), a digest
+# mismatch catches the drift and refuses to ship the changed library.
+echo "==> Recording / verifying libtor.a slice digests"
+TOR_DIGEST_FILE="$REPO_ROOT/scripts/tor-expected-libtor-sha256.txt"
+TOR_DIGEST_TMP="$(mktemp)"
+for lib in "$OUTPUT"/*/libtor.a; do
+    [[ -f "$lib" ]] || continue
+    slice="$(basename "$(dirname "$lib")")"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sum="$(sha256sum "$lib" | awk '{print $1}')"
+    else
+        sum="$(shasum -a 256 "$lib" | awk '{print $1}')"
+    fi
+    printf '%s  %s\n' "$slice" "$sum"
+done | sort > "$TOR_DIGEST_TMP"
+echo "    slice digests:"
+sed 's/^/      /' "$TOR_DIGEST_TMP"
+if [[ -f "$TOR_DIGEST_FILE" ]]; then
+    if ! diff -q "$TOR_DIGEST_FILE" "$TOR_DIGEST_TMP" >/dev/null 2>&1; then
+        echo "error: libtor.a digest mismatch vs committed $TOR_DIGEST_FILE:" >&2
+        diff "$TOR_DIGEST_FILE" "$TOR_DIGEST_TMP" >&2 || true
+        echo "       a build input drifted — do NOT ship this transport library." >&2
+        rm -f "$TOR_DIGEST_TMP"
+        exit 1
+    fi
+    echo "    digests match committed manifest"
+else
+    echo "    NOTE: no committed digest manifest at $TOR_DIGEST_FILE." >&2
+    echo "          Commit the slice digests above so CI enforces them henceforth." >&2
+fi
+rm -f "$TOR_DIGEST_TMP"
 
 echo "==> Done"
 echo "    XCFramework:  $OUTPUT"
