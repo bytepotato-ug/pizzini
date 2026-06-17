@@ -667,6 +667,7 @@ enum Storage {
                     defaultReadReceiptsEnabled: preserved.defaultReadReceiptsEnabled,
                     notificationsMuted: preserved.notificationsMuted,
                     blockedIdentities: preserved.blockedIdentities,
+                    appearanceMode: preserved.appearanceMode,
                 ))
                 // Re-persist the block-list rows: `wipeAndReopen()`
                 // truncated the table, and `persist(appState:)` only

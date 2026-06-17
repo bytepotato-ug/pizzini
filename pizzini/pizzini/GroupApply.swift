@@ -461,6 +461,11 @@ extension ChatGroup {
             // SKDM-create time; this branch never overwrites it,
             // even when the op is our own (the host calls apply on
             // its own freshly-signed RotateSenderKey op).
+            // Keep the superseded dist-id so in-flight messages under the
+            // operator's previous chain still validate (acceptsDistId).
+            if let prior = memberDistributionIds[op.operatorIdentity], prior != newDistributionId {
+                recordSupersededDistId(for: op.operatorIdentity, oldDist: prior)
+            }
             memberDistributionIds[op.operatorIdentity] = newDistributionId
             return .ok
         }
@@ -503,6 +508,7 @@ extension ChatGroup {
             // Drop any lingering dist-id binding from before the
             // remove so the next SKDM cleanly installs the fresh chain.
             memberDistributionIds.removeValue(forKey: peerId)
+            previousMemberDistributionIds.removeValue(forKey: peerId)
             if peerId != sx.localIdentityPub {
                 sx.newActiveMembers.insert(peerId)
             }
@@ -547,6 +553,7 @@ extension ChatGroup {
         // accidentally reuse a stale chain if the same peerId is
         // later re-added at a fresh dist_id.
         memberDistributionIds.removeValue(forKey: peerId)
+        previousMemberDistributionIds.removeValue(forKey: peerId)
         // Drop them from the "we've shipped our SKDM" set so a
         // subsequent re-add gets a fresh broadcast.
         mySkdmRecipients.remove(peerId)

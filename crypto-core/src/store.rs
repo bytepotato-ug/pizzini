@@ -571,6 +571,15 @@ impl DeviceStore {
     /// actual handshake — so the peer survives `serialize`/`from_serialized`
     /// even if the session never completed).
     pub fn register_peer(&mut self, peer_identity: &[u8]) {
+        // Length guard: `serialize` length-prefixes each stored identity
+        // with a u16 (`write_u16_blob`), so an identity longer than
+        // u16::MAX can't round-trip and would `abort` the process at
+        // serialize time — far from this call. Real serialized
+        // IdentityKeys are 33 bytes; anything past the ceiling is caller
+        // misuse, so drop it here rather than detonate later.
+        if peer_identity.len() > u16::MAX as usize {
+            return;
+        }
         if !self.peers.iter().any(|p| p.as_slice() == peer_identity) {
             self.peers.push(peer_identity.to_vec());
         }
@@ -715,6 +724,11 @@ impl DeviceStore {
         sender_identity: &[u8],
         distribution_id: [u8; SENDER_KEY_DISTRIBUTION_ID_LEN],
     ) {
+        // Same u16 length-prefix guard as `register_peer`: a sender
+        // identity past u16::MAX would abort the process at `serialize`.
+        if sender_identity.len() > u16::MAX as usize {
+            return;
+        }
         let already = self
             .sender_key_index
             .iter()
