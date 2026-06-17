@@ -1534,29 +1534,47 @@ async fn read_loop(
                 let frame_type = frame[0];
                 let frame_len = frame.len();
                 let map = routes.lock().await;
-                if let Some(target) = map.get(&parsed.to_id) {
-                    let _ = target.send(frame);
+                let to_queue: Option<Vec<u8>> = match map.get(&parsed.to_id) {
+                    // Recipient online — hand the frame to its writer
+                    // task. If the channel is closed the writer task has
+                    // already exited (a half-dead route lingers in the
+                    // table until the read side times out): recover the
+                    // frame and fall through to the offline queue instead
+                    // of silently dropping it.
+                    Some(target) => target.send(frame).err().map(|e| e.0),
+                    None => Some(frame),
+                };
+                drop(map);
+                if let Some(frame) = to_queue {
+                    enqueue_pending(&parsed.to_id, frame, parsed.ttl_seconds, pending, PendingClass::Authorized).await;
+                    // Close the HELLO-insert vs drain race: the recipient
+                    // may have finished its reconnect drain between our
+                    // offline check above and this enqueue. If it's online
+                    // now, re-drain (atomic under the pending lock, so a
+                    // concurrent HELLO drain can't double-forward) instead
+                    // of stranding the frame until the next reconnect;
+                    // otherwise wake it with a push.
+                    let now_online = routes.lock().await.contains_key(&parsed.to_id);
+                    if now_online {
+                        dev_peer_log!(
+                            "queued type={frame_type} → {} then re-drained (raced reconnect)",
+                            short_hex(&parsed.to_id),
+                        );
+                        drain_pending(&parsed.to_id, pending, routes).await;
+                    } else {
+                        dev_peer_log!(
+                            "queued type={frame_type} → {}: recipient offline or channel dead (ttl={}s)",
+                            short_hex(&parsed.to_id),
+                            parsed.ttl_seconds,
+                        );
+                        maybe_send_push(&parsed.to_id, push_tokens, apns.as_ref()).await;
+                    }
+                } else {
                     dev_peer_log!(
                         "forward type={frame_type} → {} ({frame_len} bytes, ttl={}s)",
                         short_hex(&parsed.to_id),
                         parsed.ttl_seconds,
                     );
-                } else {
-                    drop(map);
-                    enqueue_pending(
-                        &parsed.to_id,
-                        frame,
-                        parsed.ttl_seconds,
-                        pending,
-                        PendingClass::Authorized,
-                    )
-                    .await;
-                    dev_peer_log!(
-                        "queued type={frame_type} → {}: recipient offline (ttl={}s)",
-                        short_hex(&parsed.to_id),
-                        parsed.ttl_seconds,
-                    );
-                    maybe_send_push(&parsed.to_id, push_tokens, apns.as_ref()).await;
                 }
             }
             FRAME_TYPE_BUNDLE_REQUEST => {
@@ -1736,7 +1754,11 @@ async fn read_loop(
                 }
                 let rate_outcome = {
                     let now = Instant::now();
-                    let cutoff = now - CHAIN_SEED_DELIVERY_RATE_WINDOW;
+                    // checked_sub: on a freshly-booted relay (uptime <
+                    // window) bare subtraction panics; clamp to `now` so
+                    // the rate window simply collapses (fail-open for the
+                    // first minute after boot) instead of crashing.
+                    let cutoff = now.checked_sub(CHAIN_SEED_DELIVERY_RATE_WINDOW).unwrap_or(now);
                     let mut map = chain_seed_rate.lock().await;
                     let key = (parsed.from_id.clone(), parsed.to_id.clone());
                     if !map.contains_key(&key) && map.len() >= CHAIN_SEED_RATE_MAX_ENTRIES {
@@ -1785,15 +1807,15 @@ async fn read_loop(
                 chain_seed_to_ids.insert(parsed.to_id.clone());
                 let frame_len = frame.len();
                 let map = routes.lock().await;
-                if let Some(target) = map.get(&parsed.to_id) {
-                    let _ = target.send(frame);
-                    dev_peer_log!(
-                        "forward CHAIN_SEED_DELIVERY {} → {} ({frame_len} bytes)",
-                        short_hex(&parsed.from_id),
-                        short_hex(&parsed.to_id),
-                    );
-                } else {
-                    drop(map);
+                let to_queue: Option<Vec<u8>> = match map.get(&parsed.to_id) {
+                    // Channel closed ⇒ recipient's writer task already
+                    // exited; recover the frame and queue it rather than
+                    // dropping a chain seed the recipient still needs.
+                    Some(target) => target.send(frame).err().map(|e| e.0),
+                    None => Some(frame),
+                };
+                drop(map);
+                if let Some(frame) = to_queue {
                     // Queue with the full MAX_PENDING_TTL — chain
                     // seeds carry no sender-chosen TTL field and are
                     // useful whenever the recipient drains, up to
@@ -1806,8 +1828,21 @@ async fn read_loop(
                         PendingClass::Seed,
                     )
                     .await;
+                    // Close the reconnect-drain race (see SEND path): if
+                    // the recipient came online between our offline check
+                    // and this enqueue, re-drain so the seed isn't
+                    // stranded until its next reconnect.
+                    if routes.lock().await.contains_key(&parsed.to_id) {
+                        drain_pending(&parsed.to_id, pending, routes).await;
+                    }
                     dev_peer_log!(
-                        "queued CHAIN_SEED_DELIVERY {} → {}: recipient offline",
+                        "queued CHAIN_SEED_DELIVERY {} → {}: recipient offline or channel dead",
+                        short_hex(&parsed.from_id),
+                        short_hex(&parsed.to_id),
+                    );
+                } else {
+                    dev_peer_log!(
+                        "forward CHAIN_SEED_DELIVERY {} → {} ({frame_len} bytes)",
                         short_hex(&parsed.from_id),
                         short_hex(&parsed.to_id),
                     );
@@ -2017,12 +2052,21 @@ fn spawn_chain_validator_gc(validators: ChainValidators) {
 /// memory dump reveals only peers active in the last `VERIFY_KEY_TTL`)
 /// without breaking offline-message delivery for recently-disconnected
 /// recipients.
+fn instant_cutoff(window: Duration) -> Instant {
+    // Bare `Instant::now() - window` PANICS on underflow when host
+    // uptime < window. tokio intervals fire their first tick
+    // immediately, so a GC task computing a multi-day cutoff would
+    // abort on its first run on any freshly-booted relay — and die
+    // silently, leaving its table unpruned. Clamp to now instead.
+    Instant::now().checked_sub(window).unwrap_or_else(Instant::now)
+}
+
 fn spawn_verify_keys_gc(verify_keys: VerifyKeys) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(VERIFY_KEY_GC_INTERVAL);
         loop {
             tick.tick().await;
-            let cutoff = Instant::now() - VERIFY_KEY_TTL;
+            let cutoff = instant_cutoff(VERIFY_KEY_TTL);
             let mut table = verify_keys.lock().await;
             let before = table.len();
             table.retain(|_, (_, last_touched)| *last_touched > cutoff);
@@ -2344,7 +2388,7 @@ fn spawn_send_dedupe_gc(dedupes: SendDedupes) {
         let mut tick = tokio::time::interval(SEND_DEDUPE_GC_INTERVAL);
         loop {
             tick.tick().await;
-            let cutoff = Instant::now() - SEND_DEDUPE_WINDOW;
+            let cutoff = instant_cutoff(SEND_DEDUPE_WINDOW);
             let mut table = dedupes.lock().await;
             let before = table.len();
             table.retain(|_, t| *t > cutoff);
@@ -2361,7 +2405,7 @@ fn spawn_chain_seed_rate_gc(rate: ChainSeedRate) {
         let mut tick = tokio::time::interval(CHAIN_SEED_RATE_GC_INTERVAL);
         loop {
             tick.tick().await;
-            let cutoff = Instant::now() - CHAIN_SEED_DELIVERY_RATE_WINDOW;
+            let cutoff = instant_cutoff(CHAIN_SEED_DELIVERY_RATE_WINDOW);
             let mut map = rate.lock().await;
             let before = map.len();
             // Per-entry: drop timestamps older than the window. After
@@ -2423,7 +2467,7 @@ fn spawn_hello_replay_gc(hello_replays: HelloReplays) {
         let mut tick = tokio::time::interval(HELLO_REPLAY_GC_INTERVAL);
         loop {
             tick.tick().await;
-            let cutoff = Instant::now() - HELLO_REPLAY_WINDOW;
+            let cutoff = instant_cutoff(HELLO_REPLAY_WINDOW);
             let mut set = hello_replays.lock().await;
             let before = set.len();
             set.retain(|_, t| *t > cutoff);

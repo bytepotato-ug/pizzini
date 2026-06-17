@@ -392,6 +392,14 @@ public final class RelayClient: @unchecked Sendable {
     /// the user doesn't see a spurious "Connection refused" on
     /// first launch. Reset to 0 on every new `connect()` call.
     private var socksRetries: Int = 0
+
+    /// Bumped on every `disconnect()` (which `connect()` always calls
+    /// first). A pending SOCKS retry scheduled via `queue.asyncAfter`
+    /// captures this value and bails if it no longer matches — so a
+    /// retry queued before a disconnect/background or a fresh connect
+    /// can't resurrect a Tor dial against a torn-down/superseded
+    /// connection (or defeat the dial-budget `.failed` terminal state).
+    private var connectGeneration: Int = 0
     // `public` so pizziniTests/DialBudgetTests can pin the
     // dial-budget invariant. These are config knobs, not API
     // contract — the published value matters only as a backstop
@@ -866,8 +874,12 @@ public final class RelayClient: @unchecked Sendable {
             state = .connecting
             let attempt = socksRetries
             relayLog.info("socks: retry \(attempt)/\(Self.maxSocksRetries) in \(Int(Self.socksRetryDelay))s — \(reason, privacy: .public)")
+            let gen = connectGeneration
             queue.asyncAfter(deadline: .now() + Self.socksRetryDelay) { [weak self] in
-                guard let self else { return }
+                // Bail if a disconnect/background or a fresh connect
+                // happened while we waited — the captured generation no
+                // longer matches, so this dial is stale.
+                guard let self, self.connectGeneration == gen else { return }
                 self.openSocksConnection(
                     socksPort: socksPort,
                     targetHost: targetHost,
@@ -897,6 +909,10 @@ public final class RelayClient: @unchecked Sendable {
         }
         connection = nil
         readBuffer.removeAll()
+        // Invalidate any SOCKS retry still queued via `queue.asyncAfter`.
+        // Without this it fires after a disconnect/background and
+        // resurrects a Tor dial the host explicitly tore down.
+        connectGeneration += 1
         // Drop the dial-budget watchdog — there's no dial in flight
         // after a disconnect. `connect()` re-arms it for the next
         // onion dial.

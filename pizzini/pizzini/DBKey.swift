@@ -452,7 +452,7 @@ enum DBKey {
             return true
         }
         let epoch = bytes.withUnsafeBytes { raw -> UInt64 in
-            let beValue = raw.load(as: UInt64.self)
+            let beValue = raw.loadUnaligned(as: UInt64.self)
             return UInt64(bigEndian: beValue)
         }
         let last = Date(timeIntervalSince1970: TimeInterval(epoch))

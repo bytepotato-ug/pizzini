@@ -710,12 +710,17 @@ extension ChatStore {
             Task { [weak self] in
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                 guard let self else { return }
-                self.sendSealedToRelays(
+                let relayedCount = self.sendSealedToRelays(
                     toPeer: leg.recipient,
                     sealedCiphertext: leg.sealed,
                     ttlSeconds: leg.ttl,
                     baseToken: leg.token,
                 )
+                // Relays can drop during the fan-out jitter sleep above;
+                // only stamp relayedAt if the leg actually left a socket,
+                // else keep it pending so the retry walk re-sends it
+                // rather than showing a false ✓ for a dropped message.
+                guard relayedCount > 0 else { return }
                 if var updated = self.outbox.entries[leg.messageId] {
                     updated.relayedAt = Date()
                     updated.token = Data() // F-505: scrub once relayed
@@ -1024,14 +1029,20 @@ extension ChatStore {
                     )
                     outbox.entries[messageId] = entry
                     Storage.upsertOutboxEntry(entry)
-                    sendSealedToRelays(
+                    let relayedCount = sendSealedToRelays(
                         toPeer: recipient,
                         sealedCiphertext: sealed,
                         ttlSeconds: ttl,
                         baseToken: token,
                     )
-                    entry.relayedAt = now
-                    entry.token = Data() // F-505 scrub-on-relay
+                    // Only mark relayed if a relay actually took the chunk
+                    // (a relay can drop mid fan-out). Otherwise leave it
+                    // pending for the retry walk instead of a false ✓ that
+                    // never re-sends and leaves the recipient incomplete.
+                    if relayedCount > 0 {
+                        entry.relayedAt = now
+                        entry.token = Data() // F-505 scrub-on-relay
+                    }
                     outbox.entries[messageId] = entry
                     Storage.upsertOutboxEntry(entry)
                 } catch {
@@ -1145,8 +1156,7 @@ extension ChatStore {
         // chunk produced for group G can only ever be decrypted-and-
         // reassembled in group G. nil on either side is fail-closed.
         guard let ctDistId = GroupEnvelope.distributionId(fromSenderKeyMessage: ciphertext),
-              let expectedDistId = state.groups[gIdx].memberDistributionIds[sender],
-              ctDistId == expectedDistId else {
+              state.groups[gIdx].acceptsDistId(ctDistId, from: sender) else {
             pzLog(
                 "[pizzini.group] groupFileChunk ← \(short(sender)) for \(short(groupId)):"
                     + " DROPPED — sender-key distribution-id does not match this group",
@@ -1729,6 +1739,13 @@ extension ChatStore {
             )
             return
         }
+        // Preserve the superseded dist-id so a sender-key message still
+        // in flight under the sender's PREVIOUS chain (libsignal keeps
+        // old chains) isn't dropped by the binding gate after this
+        // rotation. See `ChatGroup.acceptsDistId`.
+        if let prior = state.groups[gIdx].memberDistributionIds[sender], prior != dist {
+            state.groups[gIdx].recordSupersededDistId(for: sender, oldDist: prior)
+        }
         state.groups[gIdx].memberDistributionIds[sender] = dist
         // Mark the sender as .active now that we can decrypt them.
         if let mIdx = state.groups[gIdx].members.firstIndex(where: {
@@ -1791,8 +1808,7 @@ extension ChatStore {
         // `SenderKeyMessage` produced for group G can only ever be
         // decrypted-and-rendered in group G.
         guard let ctDistId = GroupEnvelope.distributionId(fromSenderKeyMessage: ciphertext),
-              let expectedDistId = state.groups[gIdx].memberDistributionIds[sender],
-              ctDistId == expectedDistId else {
+              state.groups[gIdx].acceptsDistId(ctDistId, from: sender) else {
             pzLog(
                 "[pizzini.group] groupChat ← \(short(sender)) for \(short(groupId)):"
                     + " DROPPED — sender-key distribution-id does not match this group"

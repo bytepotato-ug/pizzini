@@ -101,6 +101,19 @@ struct ChatGroup: Codable, Identifiable, Sendable {
     /// deliberate to avoid hex-encoding noise at every read site.
     var memberDistributionIds: [Data: UUID]
 
+    /// In-memory only (deliberately NOT in `CodingKeys`, not stored in
+    /// SQLite): recently-superseded dist-ids per sender. libsignal keeps
+    /// a peer's old sender-key chain after they rotate, so a
+    /// `SenderKeyMessage` still in flight under the previous chain stays
+    /// decryptable — but the cross-group binding gate would drop it
+    /// because `memberDistributionIds[sender]` now holds only the NEW
+    /// dist-id. Recording the prior dist-id(s) here lets `acceptsDistId`
+    /// admit those in-flight messages (common after a member-remove
+    /// mass-rotation, where every remaining member rotates at once).
+    /// Resets on relaunch; the residual is a message that straddles BOTH
+    /// a rotation AND an app restart — a far narrower window.
+    var previousMemberDistributionIds: [Data: [UUID]] = [:]
+
     /// Counter advanced by every successful `group_encrypt` from this
     /// device. Crosses `ChatGroup.rotationMessageThreshold` triggers a
     /// rotation. Reset on rotation.
@@ -478,6 +491,31 @@ struct ChatGroup: Codable, Identifiable, Sendable {
         self.mySkdmRecipients = mySkdmRecipients
         self.recentOpDigests = recentOpDigests
         self.pendingInvitation = pendingInvitation
+    }
+
+    /// How many superseded dist-ids to retain per sender. Covers a few
+    /// back-to-back rotations within one session.
+    static let distIdHistoryDepth = 4
+
+    /// Record a sender's just-superseded dist-id so a message still in
+    /// flight under their previous chain validates. Deduped + bounded.
+    mutating func recordSupersededDistId(for sender: Data, oldDist: UUID) {
+        var history = previousMemberDistributionIds[sender] ?? []
+        guard !history.contains(oldDist) else { return }
+        history.append(oldDist)
+        if history.count > ChatGroup.distIdHistoryDepth {
+            history.removeFirst(history.count - ChatGroup.distIdHistoryDepth)
+        }
+        previousMemberDistributionIds[sender] = history
+    }
+
+    /// True if `distId` is the sender's CURRENT or a recently-superseded
+    /// dist-id for this group. Fail-closed: false when the sender has no
+    /// recorded SKDM (current nil) and no history, preserving the
+    /// original cross-group-splice protection.
+    func acceptsDistId(_ distId: UUID, from sender: Data) -> Bool {
+        if memberDistributionIds[sender] == distId { return true }
+        return previousMemberDistributionIds[sender]?.contains(distId) ?? false
     }
 }
 
