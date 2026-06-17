@@ -879,3 +879,77 @@ func realSignedOp(
         signature: sig,
     )
 }
+
+/// Regression for the post-rotation group-message-loss bug: libsignal
+/// keeps a peer's old sender-key chain so a `SenderKeyMessage` still in
+/// flight under the PREVIOUS dist-id stays decryptable, but the
+/// cross-group binding gate used to accept only the single current
+/// dist-id and silently dropped it (a burst of dropped messages on every
+/// member-remove mass-rotation). `acceptsDistId` now also admits
+/// recently-superseded dist-ids, recorded on each rotation/SKDM apply.
+@Suite("ChatGroup sender-key dist-id history")
+struct ChatGroupDistIdHistoryTests {
+    @Test("acceptsDistId admits the current and a superseded dist-id, rejects others")
+    func acceptsCurrentAndSuperseded() throws {
+        var env = try Env.bootstrap()
+        let current = UUID()
+        let superseded = UUID()
+        env.group.memberDistributionIds[env.bobId] = current
+        env.group.recordSupersededDistId(for: env.bobId, oldDist: superseded)
+
+        #expect(env.group.acceptsDistId(current, from: env.bobId))
+        #expect(env.group.acceptsDistId(superseded, from: env.bobId))
+        #expect(!env.group.acceptsDistId(UUID(), from: env.bobId))
+    }
+
+    @Test("acceptsDistId is fail-closed for a sender with no recorded dist-id")
+    func failClosedForUnknownSender() throws {
+        let env = try Env.bootstrap()
+        let stranger = Data(repeating: 0x42, count: 33)
+        #expect(!env.group.acceptsDistId(UUID(), from: stranger))
+    }
+
+    @Test("applying RotateSenderKey keeps the operator's previous chain acceptable")
+    func rotatePreservesPreviousChain() throws {
+        var env = try Env.bootstrap()
+        let dist1 = UUID()
+        env.group.memberDistributionIds[env.bobId] = dist1
+
+        let dist2 = UUID()
+        let op = try env.bobSign(kind: .rotateSenderKey(newDistributionId: dist2))
+        env.expectApplied(env.group.apply(op), atEpoch: 1)
+
+        #expect(env.group.memberDistributionIds[env.bobId] == dist2)     // new chain is current
+        #expect(env.group.acceptsDistId(dist2, from: env.bobId))         // new chain accepted
+        #expect(env.group.acceptsDistId(dist1, from: env.bobId))         // in-flight old-chain message still accepted
+    }
+
+    @Test("RemoveMember clears the removed peer's dist-id history")
+    func removeClearsHistory() throws {
+        var env = try Env.bootstrap()
+        env.group.memberDistributionIds[env.bobId] = UUID()
+        let superseded = UUID()
+        env.group.recordSupersededDistId(for: env.bobId, oldDist: superseded)
+        #expect(env.group.acceptsDistId(superseded, from: env.bobId))
+
+        let op = try env.adminSign(kind: .removeMember(peerId: env.bobId))
+        env.expectApplied(env.group.apply(op), atEpoch: 1)
+        #expect(!env.group.acceptsDistId(superseded, from: env.bobId))
+    }
+
+    @Test("dist-id history is bounded, evicting the oldest")
+    func historyIsBounded() throws {
+        var env = try Env.bootstrap()
+        env.group.memberDistributionIds[env.bobId] = UUID()
+        // Record one more than the retained depth (all distinct).
+        var recorded: [UUID] = []
+        for _ in 0...ChatGroup.distIdHistoryDepth {
+            let d = UUID()
+            recorded.append(d)
+            env.group.recordSupersededDistId(for: env.bobId, oldDist: d)
+        }
+        #expect(recorded.count == ChatGroup.distIdHistoryDepth + 1)
+        #expect(!env.group.acceptsDistId(recorded.first!, from: env.bobId))  // oldest evicted
+        #expect(env.group.acceptsDistId(recorded.last!, from: env.bobId))    // most recent kept
+    }
+}

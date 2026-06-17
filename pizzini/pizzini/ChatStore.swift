@@ -913,6 +913,14 @@ final class ChatStore: NSObject {
     func userTryAgainExpired(messageId: Data) {
         guard let entry = outbox.entries[messageId] else { return }
         guard entry.failedAt != nil || entry.hasExpired(now: Date()) else { return }
+        // Never re-send a message a relay already accepted: it sits in
+        // that relay's offline queue under its own (slightly later) TTL,
+        // so a re-send would duplicate it at the recipient and burn a
+        // fresh chain token — the same `relayedAt == nil` discipline
+        // `shouldRetry` and `userRetryAttachment` enforce. A
+        // relayed-then-expired row resolves to ✗ on the next retry-walk
+        // tick; recovery for a genuinely lost message is a fresh compose.
+        guard entry.relayedAt == nil else { return }
         guard let idx = contactIndex(forIdentity: entry.recipientPeerId) else { return }
         // Recover original text from the log row. Only plain text rows
         // carry the cleartext on disk; attachment rows have `text`
@@ -2686,14 +2694,23 @@ final class ChatStore: NSObject {
                     )
                     return
                 }
-                sendSealedToRelays(
+                let count = sendSealedToRelays(
                     toPeer: contactId,
                     sealedCiphertext: sealed,
                     ttlSeconds: ttl,
                     baseToken: token,
                 )
-                entry.relayedAt = now
-                entry.token = Data() // F-505: scrub once relayed
+                // Only mark the chunk relayed if a relay actually took it.
+                // `readyRelays` can empty between the entry guard and here
+                // (a relay drops mid-attachment); stamping relayedAt
+                // unconditionally would leave the chunk a false ✓ the
+                // retry walk never re-sends (shouldRetry bails on
+                // relayedAt != nil) and the receiver with a permanently
+                // incomplete set. Mirrors the 1:1 text path's count gate.
+                if count > 0 {
+                    entry.relayedAt = now
+                    entry.token = Data() // F-505: scrub once relayed
+                }
                 outbox.entries[messageId] = entry
                 Storage.upsertOutboxEntry(entry)
             } catch {
@@ -3387,6 +3404,11 @@ final class ChatStore: NSObject {
             // covering the same-or-newer highestMessageId).
             guard persistSession() else {
                 pzLog("[pizzini] read-receipt ABORTED — session persist failed; no ciphertext on wire")
+                // No frame reached the wire — return the token index the
+                // mint advanced + persisted eagerly, so the chain isn't
+                // shortened for nothing (invariant: an index is consumed
+                // iff a frame carrying it actually went out).
+                rollbackV2DeliveryToken(forContactAt: idx, mintedIndex: v2.index)
                 return
             }
             sendSealedToRelays(
@@ -3397,6 +3419,7 @@ final class ChatStore: NSObject {
             )
         } catch {
             pzLog("[pizzini] read-receipt encrypt failed: \(error)")
+            rollbackV2DeliveryToken(forContactAt: idx, mintedIndex: v2.index)
         }
     }
 
@@ -4721,12 +4744,20 @@ extension ChatStore: RelayClientDelegate {
                     continue
                 }
                 let wire = HashChainToken.encode(v2)
-                sendSealedToRelays(
+                let relayedCount = sendSealedToRelays(
                     toPeer: entry.recipientPeerId,
                     sealedCiphertext: entry.sealedCiphertext,
                     ttlSeconds: UInt32(entry.ttl),
                     baseToken: wire,
                 )
+                // No relay ready ⇒ the frame went nowhere: return the
+                // minted token index and don't count this as a retry. The
+                // next walk re-sends with a fresh token once a relay is
+                // up; the entry stays un-relayed (relayedAt nil).
+                guard relayedCount > 0 else {
+                    rollbackV2DeliveryToken(forContactAt: idx, mintedIndex: v2.index)
+                    continue
+                }
                 var e = entry
                 e.retries += 1
                 // `relayedAt` records the FIRST time bytes left our
@@ -4829,6 +4860,8 @@ extension ChatStore: RelayClientDelegate {
             // recover, with the ratchet state consistent again.
             guard persistSession() else {
                 pzLog("[pizzini] ACK to \(self.short(toPeer)) ABORTED — session persist failed; no ciphertext on wire")
+                // No frame on the wire ⇒ return the minted token index.
+                rollbackV2DeliveryToken(forContactAt: idx, mintedIndex: v2.index)
                 return
             }
             // D3 fanout: the sender of the SEND we're acking may be
@@ -4843,6 +4876,7 @@ extension ChatStore: RelayClientDelegate {
             )
         } catch {
             pzLog("[pizzini] failed to emit ACK to \(self.short(toPeer)): \(error)")
+            rollbackV2DeliveryToken(forContactAt: idx, mintedIndex: v2.index)
         }
     }
 
