@@ -3230,6 +3230,19 @@ mod tests {
         assert_eq!(clamp_ttl(24 * 3600), Duration::from_secs(24 * 3600));
     }
 
+    #[test]
+    fn instant_cutoff_clamps_oversized_window_without_panic() {
+        // Regression: bare `Instant::now() - VERIFY_KEY_TTL` PANICS when
+        // host uptime is below the window (the common fresh-boot case),
+        // which killed the GC tasks on their first tick. `instant_cutoff`
+        // must clamp instead of panic — for any window, up to absurd.
+        let ten_years = Duration::from_secs(10 * 365 * 24 * 3600);
+        let cutoff = instant_cutoff(ten_years); // must not panic
+        assert!(cutoff <= Instant::now());
+        // A normal window still lands at-or-before now.
+        assert!(instant_cutoff(Duration::from_secs(60)) <= Instant::now());
+    }
+
     /// Build a structurally-valid v3 HELLO body. Signature is dummy
     /// bytes — for parse-side tests only; verification happens
     /// separately via `verify_hello_possession_proof`.

@@ -2253,6 +2253,25 @@ mod tests {
     }
 
     #[test]
+    fn register_peer_rejects_oversize_identity_no_serialize_panic() {
+        // An identity longer than u16::MAX can't round-trip the u16
+        // length prefix `serialize` writes, and previously aborted the
+        // process there. `register_peer` must drop it (not store it), and
+        // `serialize` must stay panic-free. Real IdentityKeys are 33 B.
+        let mut s = DeviceStore::fresh().unwrap();
+        let before = s.peers.len();
+        let oversize = vec![0u8; (u16::MAX as usize) + 1];
+        s.register_peer(&oversize);
+        assert_eq!(s.peers.len(), before, "oversize identity must be dropped");
+        // A normal-length identity is still registered.
+        let ok_id = vec![5u8; 33];
+        s.register_peer(&ok_id);
+        assert!(s.peers.iter().any(|p| p == &ok_id), "valid identity must register");
+        // serialize must succeed (no u16 length-prefix abort).
+        assert!(s.serialize().is_ok());
+    }
+
+    #[test]
     fn crypto_diag_requires_explicit_env_optin() {
         // F-CF-02: peer-aware diagnostics must stay silent on every
         // shipped build unless the operator explicitly opts in. Only
