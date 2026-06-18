@@ -463,10 +463,7 @@ extension ChatGroup {
             // its own freshly-signed RotateSenderKey op).
             // Keep the superseded dist-id so in-flight messages under the
             // operator's previous chain still validate (acceptsDistId).
-            if let prior = memberDistributionIds[op.operatorIdentity], prior != newDistributionId {
-                recordSupersededDistId(for: op.operatorIdentity, oldDist: prior)
-            }
-            memberDistributionIds[op.operatorIdentity] = newDistributionId
+            setMemberDistId(newDistributionId, for: op.operatorIdentity)
             return .ok
         }
     }

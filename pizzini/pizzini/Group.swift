@@ -509,6 +509,18 @@ struct ChatGroup: Codable, Identifiable, Sendable {
         previousMemberDistributionIds[sender] = history
     }
 
+    /// Install `newDist` as the sender's current dist-id, recording the
+    /// previous one in history so an in-flight message under the old
+    /// chain still validates. THE write path for remote-sender dist-id
+    /// updates — prefer this over a bare `memberDistributionIds[...] =`
+    /// so the supersede-record can never be forgotten at a new site.
+    mutating func setMemberDistId(_ newDist: UUID, for sender: Data) {
+        if let prior = memberDistributionIds[sender], prior != newDist {
+            recordSupersededDistId(for: sender, oldDist: prior)
+        }
+        memberDistributionIds[sender] = newDist
+    }
+
     /// True if `distId` is the sender's CURRENT or a recently-superseded
     /// dist-id for this group. Fail-closed: false when the sender has no
     /// recorded SKDM (current nil) and no history, preserving the
