@@ -142,7 +142,20 @@ nm_check_pow_solver() {
         # `nm -gU` on a static archive walks every member object and
         # emits global defined symbols. The PoW solver is exported as
         # `_hs_pow_solve` on Mach-O (leading underscore).
-        if ! nm -gU "$lib" 2>/dev/null | grep -q ' _hs_pow_solve$'; then
+        #
+        # Capture nm's output into a variable BEFORE matching — do NOT
+        # pipe it into `grep -q`. `grep -q` exits on the first match and
+        # closes the pipe, which SIGPIPEs `nm` (exit 141). Under the
+        # `set -o pipefail` at the top of this script that turns a
+        # SUCCESSFUL match into a non-zero pipeline, and the `if !`
+        # inverts it into a FALSE "_hs_pow_solve missing" — fired
+        # non-deterministically, depending on where the symbol lands in
+        # nm's 20k-line output (the modern llvm-nm shipped with Xcode
+        # makes this reliably reproducible). Reading into `$syms` first
+        # removes the pipe, and runs nm once instead of twice.
+        local syms
+        syms="$(nm -gU "$lib" 2>/dev/null || true)"
+        if ! grep -q ' _hs_pow_solve$' <<<"$syms"; then
             echo "ERROR: $lib does not export _hs_pow_solve" >&2
             echo "  PoW client solver missing — this build cannot ride out a DoS." >&2
             echo "  Re-check the sed patch in patch_icepa_build_script()." >&2
@@ -151,7 +164,7 @@ nm_check_pow_solver() {
         # Equi-X belt-and-braces: hs_pow_solve calls equix_solve, so
         # the latter must also be present. If the solver linked but
         # equix didn't, that's a more subtle gap.
-        if ! nm -gU "$lib" 2>/dev/null | grep -qE ' _equix_(solve|alloc|new)'; then
+        if ! grep -qE ' _equix_(solve|alloc|new)' <<<"$syms"; then
             echo "ERROR: $lib does not export any _equix_* symbol" >&2
             echo "  Equi-X library was not staged into the static archive." >&2
             missing=1
