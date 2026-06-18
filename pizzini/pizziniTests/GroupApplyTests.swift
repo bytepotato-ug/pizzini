@@ -952,4 +952,43 @@ struct ChatGroupDistIdHistoryTests {
         #expect(!env.group.acceptsDistId(recorded.first!, from: env.bobId))  // oldest evicted
         #expect(env.group.acceptsDistId(recorded.last!, from: env.bobId))    // most recent kept
     }
+
+    // Security regression: the dist-id history must NOT re-open the
+    // cross-group splice F-GRP-05 blocks. distributionIdCollidesAcrossGroups
+    // must treat a dist-id retained in ANOTHER group's history as a
+    // collision, not just a current binding.
+    @Test("a dist-id retired to another group's history collides cross-group (splice closed)")
+    func crossGroupHistoryCollision() throws {
+        let alice = try Session()
+        let bob = try Session()
+        let aliceId = try alice.identityPublic()
+        let bobId = try bob.identityPublic()
+        func makeGroup(_ idByte: UInt8) throws -> ChatGroup {
+            let gid = Data(repeating: idByte, count: 16)
+            let op = try realSignedCreate(
+                by: alice, groupId: gid, name: "g",
+                members: [(aliceId, .admin, "A"), (bobId, .member, "B")],
+            )
+            return try #require(ChatGroup.create(
+                fromCreate: op, signedBytes: try op.encoded(), localIdentityPub: aliceId,
+            ))
+        }
+        var g1 = try makeGroup(0xA1)
+        var g2 = try makeGroup(0xB2)
+        let shared = UUID()
+        // Bob's dist-id `shared` is CURRENT in g2.
+        g2.memberDistributionIds[bobId] = shared
+        // In g1 Bob rotated `shared` away — it now lives only in history.
+        g1.memberDistributionIds[bobId] = UUID()
+        g1.recordSupersededDistId(for: bobId, oldDist: shared)
+        // The cross-group check must see g1's history binding, so the gate
+        // can't accept a `shared` ciphertext spliced into g1.
+        #expect(ChatStore.distributionIdCollidesAcrossGroups(
+            [g1, g2], targetGroupId: g2.id, sender: bobId, dist: shared,
+        ))
+        // A dist-id bound nowhere else is not a collision.
+        #expect(!ChatStore.distributionIdCollidesAcrossGroups(
+            [g1, g2], targetGroupId: g2.id, sender: bobId, dist: UUID(),
+        ))
+    }
 }

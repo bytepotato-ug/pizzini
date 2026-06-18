@@ -1156,7 +1156,15 @@ extension ChatStore {
         // chunk produced for group G can only ever be decrypted-and-
         // reassembled in group G. nil on either side is fail-closed.
         guard let ctDistId = GroupEnvelope.distributionId(fromSenderKeyMessage: ciphertext),
-              state.groups[gIdx].acceptsDistId(ctDistId, from: sender) else {
+              state.groups[gIdx].acceptsDistId(ctDistId, from: sender),
+              // Reject a dist-id that is also bound to this sender in a
+              // DIFFERENT group (current or history): accepting it here
+              // while it is renderable there is the cross-group splice
+              // F-GRP-05 blocks at install — re-checked here because the
+              // history relaxation can otherwise re-open it.
+              !Self.distributionIdCollidesAcrossGroups(
+                  state.groups, targetGroupId: groupId, sender: sender, dist: ctDistId,
+              ) else {
             pzLog(
                 "[pizzini.group] groupFileChunk ← \(short(sender)) for \(short(groupId)):"
                     + " DROPPED — sender-key distribution-id does not match this group",
@@ -1671,7 +1679,17 @@ extension ChatStore {
         sender: Data,
         dist: UUID,
     ) -> Bool {
-        groups.contains { $0.id != targetGroupId && $0.memberDistributionIds[sender] == dist }
+        groups.contains {
+            guard $0.id != targetGroupId else { return false }
+            // Current OR recently-superseded binding in another group:
+            // `acceptsDistId` admits historical dist-ids at decrypt time,
+            // so a dist-id bound to this sender ANYWHERE else — even as a
+            // retired chain in another group's history — must count as a
+            // collision, else it can be spliced across groups (the
+            // F-GRP-05 history gap).
+            return $0.memberDistributionIds[sender] == dist
+                || ($0.previousMemberDistributionIds[sender]?.contains(dist) ?? false)
+        }
     }
 
     /// Process a peer's incoming `groupKeyDistribution` (0x07) inner
@@ -1739,14 +1757,11 @@ extension ChatStore {
             )
             return
         }
-        // Preserve the superseded dist-id so a sender-key message still
-        // in flight under the sender's PREVIOUS chain (libsignal keeps
-        // old chains) isn't dropped by the binding gate after this
-        // rotation. See `ChatGroup.acceptsDistId`.
-        if let prior = state.groups[gIdx].memberDistributionIds[sender], prior != dist {
-            state.groups[gIdx].recordSupersededDistId(for: sender, oldDist: prior)
-        }
-        state.groups[gIdx].memberDistributionIds[sender] = dist
+        // Install the new chain, preserving the superseded dist-id so a
+        // sender-key message still in flight under the sender's PREVIOUS
+        // chain (libsignal keeps old chains) isn't dropped by the binding
+        // gate after this rotation. See `ChatGroup.acceptsDistId`.
+        state.groups[gIdx].setMemberDistId(dist, for: sender)
         // Mark the sender as .active now that we can decrypt them.
         if let mIdx = state.groups[gIdx].members.firstIndex(where: {
             $0.peerId == sender && $0.status == .pendingSKDM
@@ -1808,7 +1823,13 @@ extension ChatStore {
         // `SenderKeyMessage` produced for group G can only ever be
         // decrypted-and-rendered in group G.
         guard let ctDistId = GroupEnvelope.distributionId(fromSenderKeyMessage: ciphertext),
-              state.groups[gIdx].acceptsDistId(ctDistId, from: sender) else {
+              state.groups[gIdx].acceptsDistId(ctDistId, from: sender),
+              // Reject a dist-id also bound to this sender in a DIFFERENT
+              // group (current or history) — the cross-group splice the
+              // history relaxation could otherwise re-open past F-GRP-05.
+              !Self.distributionIdCollidesAcrossGroups(
+                  state.groups, targetGroupId: groupId, sender: sender, dist: ctDistId,
+              ) else {
             pzLog(
                 "[pizzini.group] groupChat ← \(short(sender)) for \(short(groupId)):"
                     + " DROPPED — sender-key distribution-id does not match this group"
