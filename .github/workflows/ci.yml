@@ -68,7 +68,18 @@ jobs:
         # behind the advisory-db format again.
         run: cargo install --locked cargo-audit --version "^0.22"
       - name: cargo audit --deny warnings
-        run: cargo audit --deny warnings
+        # Scoped exception: RUSTSEC-2026-0173 flags `proc-macro-error2`
+        # as "unmaintained" (NOT a vulnerability) as of 2026-06-07. It is
+        # a build-time proc-macro dependency pulled in transitively by the
+        # verified post-quantum crypto stack:
+        #   proc-macro-error2 ← hax-lib-macros 0.3.6 ← hax-lib 0.3.6
+        #     ← libcrux-ml-kem / libcrux-sha3 / spqr  (ML-KEM-768 + SPQR)
+        # It is never reached at runtime and cannot be dropped without
+        # bumping the pinned libcrux/hax verification stack. `--deny
+        # warnings` stays in force for every other advisory; revisit this
+        # single ID when the crypto stack updates hax-lib past
+        # proc-macro-error2.
+        run: cargo audit --deny warnings --ignore RUSTSEC-2026-0173
 
   sqlcipher-amalgamation-check:
     # Verify the committed amalgamation matches its
