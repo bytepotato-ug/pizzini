@@ -3388,12 +3388,18 @@ final class ChatStore: NSObject {
                 rollbackV2DeliveryToken(forContactAt: idx, mintedIndex: v2.index)
                 return
             }
-            sendSealedToRelays(
+            let count = sendSealedToRelays(
                 toPeer: contact.identityPub,
                 sealedCiphertext: sealed,
                 ttlSeconds: contact.ttlSeconds,
                 baseToken: token,
             )
+            // No relay was ready ⇒ the frame went nowhere. Read receipts
+            // aren't in the retry walk, so nothing re-sends to consume the
+            // index — return it, matching the persist-fail/throw branches.
+            if count == 0 {
+                rollbackV2DeliveryToken(forContactAt: idx, mintedIndex: v2.index)
+            }
         } catch {
             pzLog("[pizzini] read-receipt encrypt failed: \(error)")
             rollbackV2DeliveryToken(forContactAt: idx, mintedIndex: v2.index)
@@ -4739,12 +4745,18 @@ extension ChatStore: RelayClientDelegate {
             // connected to any subset of the fleet. Fan the ACK out
             // so they get ✓✓ via whichever relay's queue holds their
             // session.
-            sendAckToRelays(
+            let count = sendAckToRelays(
                 toPeer: toPeer,
                 sealedCiphertext: sealed,
                 ttlSeconds: Self.defaultTTLSeconds,
                 baseToken: token,
             )
+            // No relay ready ⇒ no ACK on the wire. ACKs aren't in the
+            // retry walk, so return the minted index (matches the abort
+            // branches above and the retry walk's count==0 rollback).
+            if count == 0 {
+                rollbackV2DeliveryToken(forContactAt: idx, mintedIndex: v2.index)
+            }
         } catch {
             pzLog("[pizzini] failed to emit ACK to \(self.short(toPeer)): \(error)")
             rollbackV2DeliveryToken(forContactAt: idx, mintedIndex: v2.index)
