@@ -127,7 +127,9 @@ struct ContactsListView: View {
                 Button {
                     showAddContactDialog = true
                 } label: {
-                    Image(systemName: "plus")
+                    // `Label` so it survives the "…" overflow menu as a
+                    // tappable row too (see the search button below).
+                    Label("Add", systemImage: "plus")
                 }
                 .accessibilityLabel("Add contact")
                 // Attach the dialog to the trigger button so iOS uses
@@ -197,7 +199,15 @@ struct ContactsListView: View {
                     searchActive = true
                     searchFocused = true
                 } label: {
-                    Image(systemName: "magnifyingglass")
+                    // `Label` (not a bare `Image`) so this still renders
+                    // as a tappable "Search" row when iOS collapses the
+                    // trailing toolbar items into the "…" overflow menu —
+                    // which happens at large Dynamic Type, where the
+                    // centred wordmark eats the width. An icon-only button
+                    // becomes an empty, dead row in that menu (it had no
+                    // visible text to tap), which is why search was
+                    // unreachable on a 12 Pro with large text.
+                    Label("Search", systemImage: "magnifyingglass")
                 }
                 .accessibilityLabel("Search chats and messages")
             }
