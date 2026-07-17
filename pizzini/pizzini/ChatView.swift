@@ -615,9 +615,18 @@ struct ChatView: View {
                         .padding(.top, 48)
                 }
                 ForEach(contact.log) { entry in
+                    let showReads = contact.effectiveReadReceiptsEnabled(
+                        globalDefault: store.state.defaultReadReceiptsEnabled,
+                    )
+                    let peerHasRead = showReads && entry.readAt != nil
+                    let full = rowFullStatus(forEntry: entry, peerHasRead: peerHasRead)
                     ChatRow(
                         entry: entry,
                         status: rowStatus(forEntry: entry),
+                        fullStatus: full,
+                        attachmentProgress: attachmentSendProgress(forEntry: entry, status: full),
+                        onRetry: rowRetryAction(forEntry: entry, status: full),
+                        onTryAgain: rowTryAgainAction(forEntry: entry, status: full),
                         resolveURL: { info in store.attachmentURL(for: info) },
                         previewMode: store.state.attachmentPreviewMode,
                         onInfoTap: { section in faqAnchor = section },
@@ -640,9 +649,7 @@ struct ChatView: View {
                         // is independent so toggling back on
                         // restores the eye without reissuing
                         // anything on the wire.
-                        showReadReceipts: contact.effectiveReadReceiptsEnabled(
-                            globalDefault: store.state.defaultReadReceiptsEnabled,
-                        ),
+                        showReadReceipts: showReads,
                     ).id(entry.id)
                 }
             }
@@ -895,11 +902,93 @@ struct ChatView: View {
     /// Resolve the right OutboxEntry.Status for a chat row. Plain chat
     /// rows look up by their own messageId; attachment rows roll up
     /// across all chunks via OutboxStore.attachmentStatus(forId:).
+    /// Kept on the existing ChatStatusIcon surface; the richer
+    /// `ChatRowStatus` (with retryable / expired branches) flows
+    /// via `rowFullStatus(forEntry:peerHasRead:)` below.
     private func rowStatus(forEntry entry: PersistedMessage) -> OutboxEntry.Status? {
         if entry.kind == .attachment, let aid = entry.attachment?.attachmentId {
             return store.outbox.attachmentStatus(forId: aid)
         }
         return entry.messageId.flatMap { store.outboxEntry(forMessageId: $0)?.status }
+    }
+
+    /// Full `ChatRowStatus` for a row: drives the glyph plus the
+    /// Retry / Try Again affordances. Pure mapping lives in
+    /// `Outbox.rowStatus(inputs:)`; this is the wiring that
+    /// derives the inputs from the persisted entry or
+    /// chunked-attachment rollup. Returns nil for inbound rows
+    /// and `.me` rows whose outbox entry has been GC'd.
+    private func rowFullStatus(
+        forEntry entry: PersistedMessage,
+        peerHasRead: Bool,
+    ) -> ChatRowStatus? {
+        let now = Date()
+        if entry.kind == .attachment, let aid = entry.attachment?.attachmentId {
+            guard let inputs = store.outbox.attachmentInputs(
+                forId: aid, now: now, peerHasRead: peerHasRead,
+            ) else { return nil }
+            return pizzini.rowStatus(inputs: inputs)
+        }
+        guard let mid = entry.messageId,
+              let outboxEntry = store.outboxEntry(forMessageId: mid)
+        else { return nil }
+        let inputs = ChatRowStatusInputs.from(
+            entry: outboxEntry, now: now, peerHasRead: peerHasRead,
+        )
+        return pizzini.rowStatus(inputs: inputs)
+    }
+
+    /// Send progress (0.0 → 1.0) for an outbound attachment row, or
+    /// nil for plain-text rows and inbound rows. Suppressed once
+    /// the attachment is delivered so the progress bar disappears
+    /// and the row falls back to the standard ✓ glyph.
+    private func attachmentSendProgress(
+        forEntry entry: PersistedMessage,
+        status: ChatRowStatus?,
+    ) -> Double? {
+        guard entry.kind == .attachment,
+              entry.side == .me,
+              let aid = entry.attachment?.attachmentId
+        else { return nil }
+        let counts = store.outbox.attachmentChunkCounts(forId: aid)
+        guard counts.total > 0 else { return nil }
+        switch status {
+        case .delivered, .read: return nil
+        default:
+            return attachmentProgressPercent(
+                chunksAcked: counts.relayed + counts.delivered,
+                totalChunks: counts.total,
+            )
+        }
+    }
+
+    /// Build a Retry closure for a stuck pending row. Returns nil
+    /// for any other state so the button doesn't render.
+    private func rowRetryAction(
+        forEntry entry: PersistedMessage,
+        status: ChatRowStatus?,
+    ) -> (() -> Void)? {
+        guard case .pending(let retryable) = status, retryable else { return nil }
+        if entry.kind == .attachment, let aid = entry.attachment?.attachmentId {
+            return { [weak store] in store?.userRetryAttachment(attachmentId: aid) }
+        }
+        if let mid = entry.messageId {
+            return { [weak store] in store?.userRetry(messageId: mid) }
+        }
+        return nil
+    }
+
+    /// Build a Try Again closure for an expired row. Plain text
+    /// rows only — chunked attachments aren't covered (the rollup-
+    /// expired case is vanishingly rare and out of scope for S5).
+    private func rowTryAgainAction(
+        forEntry entry: PersistedMessage,
+        status: ChatRowStatus?,
+    ) -> (() -> Void)? {
+        guard status == .expired,
+              entry.kind != .attachment,
+              let mid = entry.messageId else { return nil }
+        return { [weak store] in store?.userTryAgainExpired(messageId: mid) }
     }
 
     private func sendDraft(contact: Contact) {
@@ -1087,6 +1176,19 @@ struct ChatView: View {
 struct ChatRow: View {
     let entry: PersistedMessage
     let status: OutboxEntry.Status?
+    /// Richer per-row status driving affordances next to the
+    /// glyph (Retry on a stuck pending row, Try Again on an
+    /// expired row, the inline progress bar on a sending
+    /// attachment). Nil for inbound rows, system rows, and `.me`
+    /// rows whose outbox entry has been GC'd post-delivery.
+    let fullStatus: ChatRowStatus?
+    /// Send progress for an in-flight chunked attachment: 0.0 → 1.0.
+    /// Drives the thin progress bar at the bottom of the bubble (U4).
+    let attachmentProgress: Double?
+    /// User taps "Retry" on a stuck-pending row.
+    let onRetry: (() -> Void)?
+    /// User taps "Try Again" on a TTL-expired row.
+    let onTryAgain: (() -> Void)?
     /// Resolves an inbound attachment's sandbox-relative path back to a
     /// concrete URL. Closure rather than direct ChatStore access so the
     /// row stays cheap to construct in tests / previews.
@@ -1121,6 +1223,10 @@ struct ChatRow: View {
     init(
         entry: PersistedMessage,
         status: OutboxEntry.Status? = nil,
+        fullStatus: ChatRowStatus? = nil,
+        attachmentProgress: Double? = nil,
+        onRetry: (() -> Void)? = nil,
+        onTryAgain: (() -> Void)? = nil,
         resolveURL: @escaping (AttachmentInfo) -> URL? = { _ in nil },
         previewMode: AttachmentPreviewMode = .off,
         onInfoTap: ((FAQSection) -> Void)? = nil,
@@ -1130,6 +1236,10 @@ struct ChatRow: View {
     ) {
         self.entry = entry
         self.status = status
+        self.fullStatus = fullStatus
+        self.attachmentProgress = attachmentProgress
+        self.onRetry = onRetry
+        self.onTryAgain = onTryAgain
         self.resolveURL = resolveURL
         self.previewMode = previewMode
         self.onInfoTap = onInfoTap
@@ -1155,6 +1265,8 @@ struct ChatRow: View {
                         captionText: entry.text,
                         previewMode: previewMode,
                         onInfoTap: onInfoTap,
+                        sendProgress: attachmentProgress,
+                        progressTint: fullStatus == .failed ? .red : .accentColor,
                     )
                     .overlay(focusedMatchRing)
                 } else {
@@ -1164,6 +1276,9 @@ struct ChatRow: View {
                         .background(bubbleColor)
                         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         .overlay(focusedMatchRing)
+                }
+                if entry.side == .me, fullStatus == .expired, entry.kind != .system {
+                    expiredBanner
                 }
                 metadata
             }
@@ -1241,8 +1356,41 @@ struct ChatRow: View {
                     read: showReadReceipts && entry.readAt != nil,
                 )
             }
+            if entry.side == .me,
+               case .pending(let retryable) = fullStatus,
+               retryable,
+               let onRetry,
+               entry.kind != .system {
+                Button("Retry", action: onRetry)
+                    .font(.caption2.weight(.medium))
+                    .buttonStyle(.borderless)
+                    .tint(.accentColor)
+                    .accessibilityLabel("Retry sending this message")
+            }
         }
         .font(.caption2)
+    }
+
+    /// Inline "Expired — peer was offline too long" banner with a
+    /// "Try Again" button. Rendered on outbound rows whose
+    /// `fullStatus == .expired`. Tapping Try Again calls
+    /// `onTryAgain` which re-queues the message under a fresh
+    /// TTL clock (`ChatStore.userTryAgainExpired`).
+    private var expiredBanner: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "nosign")
+                .foregroundStyle(.red)
+            Text("Expired — peer was offline too long")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            if let onTryAgain {
+                Button("Try again", action: onTryAgain)
+                    .font(.caption2.weight(.medium))
+                    .buttonStyle(.borderless)
+                    .tint(.accentColor)
+                    .accessibilityLabel("Try sending this message again")
+            }
+        }
     }
 
     private var timestampText: String {
@@ -1358,6 +1506,13 @@ struct AttachmentRowCard: View {
     /// "no info button" (e.g. a row in a context where deep-linking
     /// to FAQ doesn't make sense).
     let onInfoTap: ((FAQSection) -> Void)?
+    /// Send progress 0.0…1.0 for an in-flight chunked attachment.
+    /// Nil hides the progress bar entirely (plain rows, completed
+    /// attachments, inbound rows).
+    let sendProgress: Double?
+    /// Tint for the progress bar — accent while sending, red on
+    /// failure. The parent ChatRow computes this off `fullStatus`.
+    let progressTint: Color
 
     @State private var presentingShare = false
     @State private var presentingPreview = false
@@ -1369,7 +1524,9 @@ struct AttachmentRowCard: View {
         resolveURL: @escaping (AttachmentInfo) -> URL?,
         captionText: String,
         previewMode: AttachmentPreviewMode = .off,
-        onInfoTap: ((FAQSection) -> Void)? = nil
+        onInfoTap: ((FAQSection) -> Void)? = nil,
+        sendProgress: Double? = nil,
+        progressTint: Color = .accentColor
     ) {
         self.info = info
         self.side = side
@@ -1378,6 +1535,8 @@ struct AttachmentRowCard: View {
         self.captionText = captionText
         self.previewMode = previewMode
         self.onInfoTap = onInfoTap
+        self.sendProgress = sendProgress
+        self.progressTint = progressTint
     }
 
     var body: some View {
@@ -1437,6 +1596,20 @@ struct AttachmentRowCard: View {
                         previewButton
                     }
                 }
+            }
+            // Thin chunk-by-chunk progress bar at the bottom of the
+            // bubble while the attachment is sending. Disappears the
+            // instant `sendProgress` clears (caller suppresses it
+            // once the attachment is delivered). On failure the
+            // parent ChatRow flips `progressTint` red so the user
+            // sees WHY the row didn't progress to ✓.
+            if let p = sendProgress {
+                ProgressView(value: p)
+                    .progressViewStyle(.linear)
+                    .tint(progressTint)
+                    .accessibilityValue(
+                        Text("\(Int(p * 100)) percent sent")
+                    )
             }
         }
         .padding(.horizontal, 12)

@@ -812,6 +812,116 @@ final class ChatStore: NSObject {
         outbox.entries[id]
     }
 
+    /// User-initiated retry of a stuck pending entry. The auto-retry
+    /// walk already re-broadcasts on a `max(30, retries*60)` baseline;
+    /// this entry-point exists so a user staring at a row that's been
+    /// pending past `OutboxEntry.userRetryThreshold` can kick the
+    /// re-broadcast without waiting for the next walker tick. Hits the
+    /// same `broadcastToRelays` path as a fresh send and re-mints the
+    /// v2 delivery token (the previous one is single-use and the
+    /// chain has very likely advanced behind it).
+    ///
+    /// Plain-message path. Attachments use
+    /// `userRetryAttachment(attachmentId:)` which re-emits only the
+    /// chunks that never reached a relay (S2).
+    @MainActor
+    func userRetry(messageId: Data) {
+        guard let entry = outbox.entries[messageId] else { return }
+        // Already relayed / delivered / failed — nothing to retry.
+        // The UI's `rowStatus` mapping won't expose a Retry button for
+        // these states, but the entry-point stays defensive against a
+        // race where the user tapped just as an ACK landed.
+        guard entry.deliveredAt == nil,
+              entry.failedAt == nil,
+              entry.relayedAt == nil
+        else { return }
+        guard let idx = contactIndex(forIdentity: entry.recipientPeerId) else { return }
+        guard relayState == .connected else { return }
+        guard let v2 = mintV2DeliveryToken(forContactAt: idx) else {
+            pzLog("[pizzini] user retry: chain missing / exhausted for \(short(entry.recipientPeerId))")
+            return
+        }
+        let wire = HashChainToken.encode(v2)
+        let count = broadcastToRelays {
+            $0.sendSealed(
+                toPeer: entry.recipientPeerId,
+                sealedCiphertext: entry.sealedCiphertext,
+                ttlSeconds: UInt32(entry.ttl),
+                token: wire,
+            )
+        }
+        var e = entry
+        e.retries += 1
+        if count > 0 {
+            // Same gate as the original send path: only flip to
+            // `.relayed` when bytes actually left ≥1 socket. A
+            // user-initiated retry while every relay happens to be
+            // mid-rotation should NOT advance the row to ✓.
+            e.relayedAt = Date()
+            e.token = Data() // F-505: scrub once relayed.
+        }
+        outbox.entries[messageId] = e
+        Storage.upsertOutboxEntry(e)
+    }
+
+    /// User-initiated per-chunk retry for a stuck attachment. The
+    /// auto-retry walker already covers each chunk individually
+    /// (every chunk has its own `OutboxEntry`); this is the user-
+    /// initiated kick that bypasses the `max(30, retries*60)`
+    /// baseline. Crucially: re-emits ONLY chunks where `relayedAt`
+    /// is still nil — chunks that already left the socket sit in
+    /// the relay's offline queue under the existing ratchet step
+    /// and re-sending them would duplicate frames at the receiver
+    /// + burn extra chain tokens (audit S2).
+    @MainActor
+    func userRetryAttachment(attachmentId: Data) {
+        guard relayState == .connected else { return }
+        let stuck = outbox.entries.values.filter {
+            $0.attachmentId == attachmentId
+                && $0.deliveredAt == nil
+                && $0.failedAt == nil
+                && $0.relayedAt == nil
+        }
+        for entry in stuck {
+            userRetry(messageId: entry.messageId)
+        }
+    }
+
+    /// User-initiated re-send of a TTL-expired message. The brief is
+    /// that a queued message that aged out behind an offline peer
+    /// must NOT disappear silently — the row sits at `.expired` until
+    /// the user taps Try Again. This entry-point:
+    ///
+    ///   1. Resolves the original chat-row text via the log lookup.
+    ///   2. Deletes the failed outbox entry + tombstones it from
+    ///      persistent storage.
+    ///   3. Calls `send(_:to:)` which mints a fresh sentAt + token
+    ///      and re-encrypts under the current ratchet step.
+    ///
+    /// Plain text messages only — chunked attachments aren't
+    /// covered (an attachment that ages out is a rare case and the
+    /// user can re-attach the file from disk).
+    @MainActor
+    func userTryAgainExpired(messageId: Data) {
+        guard let entry = outbox.entries[messageId] else { return }
+        guard entry.failedAt != nil || entry.hasExpired(now: Date()) else { return }
+        guard let idx = contactIndex(forIdentity: entry.recipientPeerId) else { return }
+        // Recover original text from the log row. Only plain text rows
+        // carry the cleartext on disk; attachment rows have `text`
+        // populated with the caption only, not the file bytes.
+        guard let logRow = state.contacts[idx].log.last(where: {
+            $0.side == .me && $0.messageId == messageId
+        }) else { return }
+        guard logRow.kind != .attachment, !logRow.text.isEmpty else { return }
+        let text = logRow.text
+        // Drop the failed entry so the user doesn't see two indicators
+        // for the same logical message. The log row stays — sending
+        // re-pushes a fresh row.
+        outbox.entries.removeValue(forKey: messageId)
+        Storage.deleteOutboxEntry(messageId: messageId)
+        send(text, to: state.contacts[idx])
+    }
+
     /// Forwards the APNs device token to the relay so it can wake us
     /// when a SEND lands while we're disconnected. Called by
     /// `AppDelegate` once iOS has issued a token. With multi-relay
