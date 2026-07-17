@@ -29,9 +29,15 @@ jobs:
       # resolves to and inject code into our macOS runner. Bump
       # deliberately, copying the SHA from the upstream release.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # 1.84.0
-        with:
-          toolchain: "1.84.0"
+        # The SHA pins the dtolnay/rust-toolchain *action release*
+        # (its `# v…` tag) — NOT the Rust compiler version. With no
+        # `toolchain:` input the action reads the channel from
+        # rust-toolchain.toml, so CI compiles with the exact same
+        # version reproducible relay builds use (C9 — single source of
+        # truth; no second hardcoded version to drift). Bumping Rust is
+        # a one-line edit to rust-toolchain.toml, coordinated with the
+        # transparency-log refresh.
+        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # v1 (reads rust-toolchain.toml)
       - name: Set up protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
@@ -66,9 +72,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # 1.84.0
-        with:
-          toolchain: "1.84.0"
+        # SHA pins the action release; Rust version comes from
+        # rust-toolchain.toml (C9). See cargo-test job for rationale.
+        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # v1 (reads rust-toolchain.toml)
       - name: Install cargo-audit
         # `^0.21` could not parse newer RustSec advisory-db TOML
         # frontmatter (e.g. RUSTSEC-2026-0073) and errored out loading
@@ -79,6 +85,26 @@ jobs:
         run: cargo install --locked cargo-audit --version "^0.22"
       - name: cargo audit --deny warnings
         run: cargo audit --deny warnings
+
+  sbom:
+    # PZ-M18: generate a CycloneDX SBOM of the workspace and enforce it
+    # matches the committed digest, so the shipped dependency tree is
+    # auditable and a silent dep change fails CI. Hard gate only once
+    # scripts/sbom-expected-sha256.txt is committed (the first run of
+    # scripts/generate-sbom.sh prints the digest to commit); until then
+    # the script generates + prints and passes.
+    name: SBOM (CycloneDX) reproducibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        # SHA pins the action release; Rust version comes from
+        # rust-toolchain.toml (C9).
+        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # v1 (reads rust-toolchain.toml)
+      - name: Install cargo-cyclonedx (pinned)
+        run: cargo install --locked cargo-cyclonedx --version "=0.5.7"
+      - name: Generate SBOM + verify committed digest
+        run: scripts/generate-sbom.sh
 
   sqlcipher-amalgamation-check:
     # Verify the committed amalgamation matches its
@@ -114,6 +140,56 @@ jobs:
             exit 1
           fi
 
+  transparency-log-verify:
+    # PZ-C9: cryptographically verify every entry in the public
+    # transparency log against the tracked operator public key, on
+    # every push and PR. Catches a tampered/forged log entry, a
+    # corrupted append, or a signing-input regression (H12) the moment
+    # it lands — before any client trusts it. No secrets, no build
+    # artifacts: the log and the pubkey are both in-repo.
+    name: Transparency log signatures verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Ed25519 signatures over raw entry bytes
+        run: scripts/verify-transparency-log.sh transparency-log.ndjson operator-key.pub.pem
+
+  relay-reproducibility:
+    # PZ-C9: rebuild the relay deterministically in the digest-pinned
+    # container and confirm the SHA-256 matches the committed expected
+    # digest (build-relay-release.sh self-enforces this via PZ-C8 once
+    # scripts/relay-expected-sha256.txt exists).
+    #
+    # This is a HARD gate only once two operator-committed inputs are
+    # present: (1) scripts/relay-expected-sha256.txt (the first pinned
+    # build prints the digest to commit), and (2) the digest-pinned
+    # base image + apt pins, supplied as repo-level CI variables
+    # (Settings → Variables) so they are reviewable config, not floating
+    # tags. Until then the job emits a notice and passes — it cannot
+    # invent a reproducible baseline it does not have.
+    name: Relay reproducible-build digest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rebuild in pinned container + compare to committed digest
+        env:
+          RELAY_BASE_IMAGE: ${{ vars.RELAY_BASE_IMAGE }}
+          APT_PINS: ${{ vars.RELAY_APT_PINS }}
+          DEBIAN_SNAPSHOT: ${{ vars.RELAY_DEBIAN_SNAPSHOT }}
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/relay-expected-sha256.txt ]; then
+            echo "::notice::scripts/relay-expected-sha256.txt absent — run scripts/build-relay-release.sh once in the pinned container and commit the printed digest to enable this gate (PZ-C9/C8)."
+            exit 0
+          fi
+          if [ -z "${RELAY_BASE_IMAGE:-}" ] || [ -z "${APT_PINS:-}" ]; then
+            echo "::error::relay-expected-sha256.txt is committed but the RELAY_BASE_IMAGE / RELAY_APT_PINS repo variables are unset — the digest cannot be reproduced without the pinned build inputs."
+            exit 1
+          fi
+          # build-relay-release.sh hard-fails (PZ-C8) if the rebuilt
+          # binary's SHA-256 != the committed expected digest.
+          scripts/build-relay-release.sh
+
   ios-build:
     name: iOS device + simulator slices build clean
     runs-on: macos-15
@@ -121,9 +197,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # 1.84.0
+        # SHA pins the action release; Rust version comes from
+        # rust-toolchain.toml (C9). See cargo-test job for rationale.
+        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # v1 (reads rust-toolchain.toml)
         with:
-          toolchain: "1.84.0"
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
       - name: Set up protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0

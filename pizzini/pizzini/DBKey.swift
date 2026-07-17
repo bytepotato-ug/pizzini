@@ -472,17 +472,50 @@ enum DBKey {
     /// the user a fresh salt that's not reachable to any
     /// pre-install Keychain reader.
     static func rotationDue(now: Date = Date()) -> Bool {
-        guard let bytes = Keychain.read(account: lastRotationAccount),
-              bytes.count == MemoryLayout<UInt64>.size
-        else {
-            return true
+        var epoch: UInt64?
+        if let bytes = Keychain.read(account: lastRotationAccount),
+           bytes.count == MemoryLayout<UInt64>.size {
+            epoch = bytes.withUnsafeBytes { raw -> UInt64 in
+                let beValue = raw.load(as: UInt64.self)
+                return UInt64(bigEndian: beValue)
+            }
         }
-        let epoch = bytes.withUnsafeBytes { raw -> UInt64 in
-            let beValue = raw.load(as: UInt64.self)
-            return UInt64(bigEndian: beValue)
-        }
+        return rotationDue(lastRotationEpoch: epoch, now: now)
+    }
+
+    /// Pure rotation-due decision: given the persisted last-rotation
+    /// epoch (`nil` = no slot present / never recorded) and `now`,
+    /// is a rotation due? Factored out of the Keychain-reading
+    /// overload so it can be unit-tested on the simulator, where the
+    /// Keychain/SE is entitlement-gated and gives false negatives.
+    static func rotationDue(lastRotationEpoch: UInt64?, now: Date) -> Bool {
+        guard let epoch = lastRotationEpoch else { return true }
         let last = Date(timeIntervalSince1970: TimeInterval(epoch))
         return now.timeIntervalSince(last) >= rotationInterval
+    }
+
+    /// Record `now` as the moment the current salt/key became live,
+    /// starting the periodic-rotation clock (PZ-H7 / F-DUR-02).
+    ///
+    /// Called by `SQLiteStorage.bootstrap` when it mints a FRESH
+    /// database — first install OR the post-duress re-bootstrap. The
+    /// salt `loadOrCreateSalt` just generated is already a fresh
+    /// 32-byte `SecRandomCopyBytes` value, so the otherwise-forced
+    /// immediate rotation (`rotationDue()` returns true while the slot
+    /// is absent) would re-derive from a new salt + `rekey` + `VACUUM`
+    /// for zero security gain. On the duress re-bootstrap that forced
+    /// rotation runs inside the unlock-latency window and can push
+    /// submit→drop past the padding ceiling, leaking "a wipe just
+    /// happened" to a stopwatch-equipped coercer. Seeding the clock
+    /// here is byte-for-byte identical for a clean install and a
+    /// duress re-bootstrap, so it introduces no post-wipe telltale
+    /// (H6). Returns false on Keychain write failure (non-fatal — the
+    /// next launch simply re-evaluates `rotationDue` and rotates then).
+    @discardableResult
+    static func seedRotationClock(now: Date = Date()) -> Bool {
+        var epochBE = UInt64(now.timeIntervalSince1970).bigEndian
+        let stampBytes = withUnsafeBytes(of: &epochBE) { Data($0) }
+        return Keychain.write(stampBytes, account: lastRotationAccount)
     }
 
     /// Run a full at-rest key rotation against the already-open

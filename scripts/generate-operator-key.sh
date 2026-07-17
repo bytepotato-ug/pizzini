@@ -23,8 +23,14 @@
 # To rotate: generate a new keypair, publish the new public key
 # under a versioned name (e.g. `operator-key-v2.pub.pem`),
 # co-sign the rotation announcement with both old and new keys.
-# Plan the iOS app's ability to accept multiple verify keys
-# before rotating.
+# The iOS client already accepts multiple verify keys during a
+# rotation window (PZ-M16): add the new key's base64 to
+# `TransparencyLogConfig.operatorRotationVerifyKeysBase64` (entries
+# signed by EITHER key then verify), ship that build, sign new
+# entries under the new key, and drop the retired key from the
+# primary/rotation lists in a later release. NB: this is 1-of-M
+# rotation, not an N-of-M signing threshold (that would change the
+# signed-entry wire schema — a separate, deferred design decision).
 
 set -euo pipefail
 
@@ -44,24 +50,45 @@ cd "$OUT_DIR"
 # forms round-trip cleanly through `openssl pkeyutl` for signing
 # and verification.
 #
-# F-SUP-07: the trust-root private key should not sit on disk in
-# cleartext. Set OPERATOR_KEY_ENCRYPT=1 to write a passphrase-
-# encrypted PKCS#8 (AES-256); `openssl` prompts for the passphrase
-# here and again when `sign-transparency-entry.sh` reads the key, so
-# the plaintext key never persists. Default stays unencrypted to keep
-# the existing non-interactive signing flow working unchanged — but
-# encrypted-at-rest (or a hardware token / `age`-encrypted backup) is
-# the recommended posture for the airgapped signing machine.
+# F-SUP-07 / PZ-M17: the trust-root private key must not sit on disk
+# in cleartext. The key is now AES-256 passphrase-encrypted by
+# DEFAULT (PKCS#8). `sign-transparency-entry.sh` handles the encrypted
+# key — it reads the passphrase from $OPERATOR_KEY_PASS, or prompts on
+# the terminal — so the plaintext key never persists.
+#
+# Passphrase source for generation, mirroring the signer:
+#   • $OPERATOR_KEY_PASS set  → used non-interactively (airgapped
+#     automation), via `-pass env:OPERATOR_KEY_PASS` (never on argv).
+#   • unset                   → openssl prompts interactively.
+#
+# Escape hatch: OPERATOR_KEY_ENCRYPT=0 writes a legacy plaintext key
+# (NOT recommended; only for a hardware-token / `age`-wrapped flow
+# that provides at-rest protection by other means).
+#
 # Destruction: when retiring the key, overwrite + remove it
 # (`rm -P operator-key.pem` on macOS, or `shred -u` on Linux) rather
 # than a plain `rm`.
-if [[ "${OPERATOR_KEY_ENCRYPT:-0}" == "1" ]]; then
-    openssl genpkey -algorithm ED25519 -aes256 -out operator-key.pem
+# `genpkey` takes `-pass` (passphrase for the key it WRITES); `pkey`
+# takes `-passin` (passphrase to DECRYPT the key it READS). Different
+# flags for the same secret, so build both forms.
+GEN_PASS_ARGS=()
+PKEY_PASSIN_ARGS=()
+if [[ -n "${OPERATOR_KEY_PASS:-}" ]]; then
+    GEN_PASS_ARGS=(-pass env:OPERATOR_KEY_PASS)
+    PKEY_PASSIN_ARGS=(-passin env:OPERATOR_KEY_PASS)
+fi
+if [[ "${OPERATOR_KEY_ENCRYPT:-1}" != "0" ]]; then
+    openssl genpkey -algorithm ED25519 -aes256 \
+        ${GEN_PASS_ARGS[@]+"${GEN_PASS_ARGS[@]}"} -out operator-key.pem
 else
     openssl genpkey -algorithm ED25519 -out operator-key.pem
 fi
 chmod 0600 operator-key.pem
-openssl pkey -in operator-key.pem -pubout -out operator-key.pub.pem
+# Extracting the public half reads the (now encrypted-by-default)
+# private key, so it needs the same passphrase. Reuse $OPERATOR_KEY_PASS
+# when present; otherwise openssl prompts.
+openssl pkey -in operator-key.pem \
+    ${PKEY_PASSIN_ARGS[@]+"${PKEY_PASSIN_ARGS[@]}"} -pubout -out operator-key.pub.pem
 chmod 0644 operator-key.pub.pem
 
 # Also emit the raw 32-byte public key as base64 — the form the

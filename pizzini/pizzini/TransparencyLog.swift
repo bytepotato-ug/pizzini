@@ -48,15 +48,27 @@ enum TransparencyLog {
         let gitSha: String
         let binarySha256Hex: String
         let binarySize: Int
-        /// Canonical bytes the signature was computed over —
-        /// `compact-jq(entry)`. Stored alongside the decoded
-        /// fields so verification can replay the exact input
-        /// bytes the signer fed to openssl, byte-for-byte.
-        let canonicalJSON: Data
+        /// The operator's LITERAL `entry`-value bytes, lifted
+        /// verbatim out of the NDJSON line (PZ-H12). The signature
+        /// is verified over these exact bytes — never a
+        /// Swift-recomputed canonical form. There is therefore
+        /// exactly ONE canonicaliser in the whole system: the
+        /// signer's `jq -cS`. The verifier reads bytes; it does not
+        /// re-derive them. This kills the prior jq-vs-Swift
+        /// two-canonicaliser hazard, where a divergence between the
+        /// producer's `jq -cS` and the verifier's
+        /// `JSONSerialization.sortedKeys` could either reject a
+        /// genuine entry (availability) or let two byte-distinct
+        /// payloads share one signature (confusion).
+        let rawEntryJSON: Data
     }
 
-    /// One signed log line. `entry.canonicalJSON || "\n" || signedAt`
-    /// is the message the Ed25519 signature covers. See
+    /// One signed log line. `entry.rawEntryJSON || "\n" || signedAt`
+    /// is the message the Ed25519 signature covers — the literal
+    /// `entry` bytes from the line, a newline, then the `signed_at`
+    /// string. `signed_at` stays inside the signed message so a
+    /// malicious operator still cannot backdate (or forward-date,
+    /// to defeat the monotonic rollback floor) an entry. See
     /// `scripts/sign-transparency-entry.sh` for the producer side.
     struct SignedEntry: Equatable, Sendable {
         let entry: Entry
@@ -90,7 +102,13 @@ enum TransparencyLog {
               let signedAt = raw["signed_at"] as? String,
               let sig = raw["sig_b64"] as? String
         else { return nil }
-        guard let entry = decodeEntry(entryDict) else { return nil }
+        // PZ-H12: capture the operator's literal `entry`-value bytes
+        // from the line. The signature is checked against these,
+        // not against a re-serialisation of `entryDict` (which
+        // `JSONSerialization` cannot reproduce byte-for-byte).
+        guard let rawEntry = rawValueBytes(forKey: "entry", inLine: json),
+              let entry = decodeEntry(entryDict, rawEntryJSON: rawEntry)
+        else { return nil }
         return SignedEntry(entry: entry, signedAt: signedAt, signatureBase64: sig)
     }
 
@@ -124,22 +142,45 @@ enum TransparencyLog {
         return entries
     }
 
-    /// Verify one signed entry against the pinned operator
-    /// verify key. The signature covers
-    /// `canonicalJSON || "\n" || signedAt` — the exact byte
-    /// pattern the signer assembled in
-    /// `sign-transparency-entry.sh`.
+    /// Verify one signed entry against the configured operator verify
+    /// key(s). The signature covers
+    /// `rawEntryJSON || "\n" || signedAt` — the operator's literal
+    /// `entry` bytes (lifted from the line, never re-canonicalised),
+    /// a newline, then `signed_at`. Matches the exact byte pattern
+    /// the signer assembled in `sign-transparency-entry.sh`.
+    ///
+    /// PZ-M16: an entry is `.valid` if its single signature validates
+    /// under ANY currently-accepted key (primary + rotation keys),
+    /// which is what makes a key rotation a non-flag-day change — old
+    /// and new keys both verify during the transition window. This is
+    /// 1-of-M, NOT an N-of-M *threshold*: each entry still carries
+    /// exactly one `sig_b64`. A true threshold (require N independent
+    /// operator signatures per entry) is a deliberately-deferred
+    /// design decision because it is wire-breaking — it adds a
+    /// `sig_b64` array to the entry schema and forces every signer +
+    /// the Swift parser + the bash verifier to change together.
     static func verify(_ signed: SignedEntry) -> VerificationResult {
-        guard let publicKey = TransparencyLogConfig.operatorVerifyKey else {
+        verify(signed, keys: TransparencyLogConfig.operatorVerifyKeys)
+    }
+
+    /// Key-set-injectable core of `verify` (PZ-M16). Exposed so the
+    /// 1-of-M rotation acceptance can be unit-tested with throwaway
+    /// keys — the shipped `operatorVerifyKeys` is a `let` derived from
+    /// build-time constants and can't be mutated at runtime.
+    static func verify(
+        _ signed: SignedEntry,
+        keys: [Curve25519.Signing.PublicKey],
+    ) -> VerificationResult {
+        guard !keys.isEmpty else {
             return .operatorKeyMissing
         }
         guard let sig = Data(base64Encoded: signed.signatureBase64) else {
             return .badSignature
         }
-        var input = signed.entry.canonicalJSON
+        var input = signed.entry.rawEntryJSON
         input.append(0x0A) // newline separator — see signer script
         input.append(contentsOf: signed.signedAt.utf8)
-        return publicKey.isValidSignature(sig, for: input) ? .valid : .badSignature
+        return keys.contains { $0.isValidSignature(sig, for: input) } ? .valid : .badSignature
     }
 
     /// Convenience: does `log` contain any verified entry whose
@@ -156,40 +197,128 @@ enum TransparencyLog {
 
     // MARK: - private
 
-    private static func decodeEntry(_ dict: [String: Any]) -> Entry? {
+    /// Decode the display fields from the already-parsed `entry`
+    /// dict, pairing them with the operator's `rawEntryJSON` bytes
+    /// captured separately from the line. The dict is used ONLY to
+    /// surface git_sha / sha / size in the UI — never to
+    /// reconstruct the signed message (that is `rawEntryJSON`,
+    /// PZ-H12).
+    private static func decodeEntry(_ dict: [String: Any], rawEntryJSON: Data) -> Entry? {
         guard let gitSha = dict["git_sha"] as? String,
               let sha = dict["binary_sha256"] as? String,
               let size = (dict["binary_size"] as? Int)
                 ?? (dict["binary_size"] as? Double).map({ Int($0) })
         else { return nil }
-        // Re-serialise the entry dict in canonical (sorted-keys,
-        // compact) form so the signature input matches what
-        // `sign-transparency-entry.sh` produced via `jq -cS`. We
-        // can't reuse the input bytes directly because
-        // `JSONSerialization` doesn't preserve the original
-        // ordering — we have to canonicalise ourselves to be
-        // sure.
-        guard let canonical = canonicalJSON(dict) else { return nil }
         return Entry(
             gitSha: gitSha,
             binarySha256Hex: sha,
             binarySize: size,
-            canonicalJSON: canonical
+            rawEntryJSON: rawEntryJSON
         )
     }
 
-    /// Sorted-keys, no-whitespace JSON serialisation matching
-    /// `jq -cS`. JSONSerialization's `.sortedKeys` option gives
-    /// us this directly when `.withoutEscapingSlashes` is added
-    /// (`/` would otherwise be escaped to `\/` on older runtimes;
-    /// jq doesn't escape it, so we must match).
-    private static func canonicalJSON(_ value: Any) -> Data? {
-        guard JSONSerialization.isValidJSONObject(value) else { return nil }
-        let options: JSONSerialization.WritingOptions = [
-            .sortedKeys,
-            .withoutEscapingSlashes,
-        ]
-        return try? JSONSerialization.data(withJSONObject: value, options: options)
+    /// Lift the LITERAL bytes of a top-level object member's value
+    /// out of a single NDJSON line, without parsing into Foundation
+    /// types and re-serialising (PZ-H12). For
+    /// `{"entry":<V>,"signed_at":…}` and key `"entry"` this returns
+    /// exactly `<V>` — the bytes the operator's `jq -cS` emitted and
+    /// signed. Returns nil if the line is not a top-level object or
+    /// the key is absent.
+    ///
+    /// This is a minimal, allocation-light JSON value-span scanner.
+    /// It respects string literals (so braces/colons/commas inside a
+    /// string value don't confuse the walk) and backslash escapes.
+    /// It does NOT validate the whole document — `parseSignedEntry`
+    /// has already run `JSONSerialization` for that; here we only
+    /// need the byte range of one value.
+    static func rawValueBytes(forKey key: String, inLine line: Data) -> Data? {
+        let b = [UInt8](line)
+        let n = b.count
+        var i = 0
+
+        func isWS(_ c: UInt8) -> Bool { c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D }
+        func skipWS() { while i < n, isWS(b[i]) { i += 1 } }
+
+        // Scan a string starting at b[i] == '"'; return index just
+        // past the closing quote, or nil if unterminated.
+        func scanStringEnd(from start: Int) -> Int? {
+            var j = start + 1
+            while j < n {
+                let c = b[j]
+                if c == 0x5C { j += 2; continue } // backslash: skip escaped byte
+                if c == 0x22 { return j + 1 }     // closing quote
+                j += 1
+            }
+            return nil
+        }
+
+        // Scan any JSON value starting at index i; return index just
+        // past its last byte, or nil on malformed input.
+        func scanValueEnd(from start: Int) -> Int? {
+            guard start < n else { return nil }
+            switch b[start] {
+            case 0x22: // string
+                return scanStringEnd(from: start)
+            case 0x7B, 0x5B: // object '{' or array '['
+                let open = b[start]
+                let close: UInt8 = open == 0x7B ? 0x7D : 0x5D
+                var depth = 0
+                var j = start
+                var inStr = false
+                while j < n {
+                    let c = b[j]
+                    if inStr {
+                        if c == 0x5C { j += 2; continue }
+                        if c == 0x22 { inStr = false }
+                    } else if c == 0x22 {
+                        inStr = true
+                    } else if c == open {
+                        depth += 1
+                    } else if c == close {
+                        depth -= 1
+                        if depth == 0 { return j + 1 }
+                    }
+                    j += 1
+                }
+                return nil // unbalanced
+            default: // number / true / false / null — read to delimiter
+                var j = start
+                while j < n {
+                    let c = b[j]
+                    if c == 0x2C || c == 0x7D || c == 0x5D || isWS(c) { break }
+                    j += 1
+                }
+                return j > start ? j : nil
+            }
+        }
+
+        skipWS()
+        guard i < n, b[i] == 0x7B else { return nil } // top-level object
+        i += 1
+        let keyBytes = [UInt8](key.utf8)
+        while true {
+            skipWS()
+            if i < n, b[i] == 0x7D { return nil } // end of object, key not found
+            guard i < n, b[i] == 0x22, let keyEnd = scanStringEnd(from: i) else { return nil }
+            // Member keys in this log are simple ASCII (no escapes),
+            // so a direct byte compare of the quoted span's interior
+            // is exact.
+            let thisKey = Array(b[(i + 1)..<(keyEnd - 1)])
+            i = keyEnd
+            skipWS()
+            guard i < n, b[i] == 0x3A else { return nil } // ':'
+            i += 1
+            skipWS()
+            let valStart = i
+            guard let valEnd = scanValueEnd(from: valStart) else { return nil }
+            if thisKey == keyBytes {
+                return Data(b[valStart..<valEnd])
+            }
+            i = valEnd
+            skipWS()
+            if i < n, b[i] == 0x2C { i += 1; continue } // next member
+            return nil // no more members
+        }
     }
 }
 
@@ -201,12 +330,31 @@ enum TransparencyLog {
 /// the worst failure mode for a transparency-log feature is
 /// silently approving everything.
 enum TransparencyLogConfig {
-    /// Operator's Ed25519 public key, base64 of the raw 32-byte
-    /// form (the same string
+    /// Operator's PRIMARY (current) Ed25519 public key, base64 of the
+    /// raw 32-byte form (the same string
     /// `scripts/generate-operator-key.sh` prints under "Raw
     /// Ed25519 public key (base64)"). Empty default = no log
     /// verification (UI renders "not configured").
     nonisolated static let operatorVerifyKeyBase64: String = "QlHwZ2S6RoU2B4J7ucPYAZueCIbiJaFZsyVawnhylpg="
+
+    /// PZ-M16 — additional operator verify keys accepted DURING A KEY
+    /// ROTATION, base64 raw-32 each. This is the multi-key verify
+    /// capability `scripts/generate-operator-key.sh` says to ship
+    /// "before rotating": to rotate, publish the new public key here
+    /// (or move the retiring key here) so entries signed under EITHER
+    /// the primary or any listed key verify while the transition
+    /// completes, then drop the retired key on the next app release.
+    ///
+    /// Trust model: an entry is accepted if its signature validates
+    /// under the primary OR any key in this list (1-of-M) — the
+    /// standard rotation window where old and new keys both sign. This
+    /// is intentionally NOT an N-of-M *threshold* (which would require
+    /// several signatures per entry and is wire-breaking — it changes
+    /// the signed-entry schema; see the note on `verify`). Default is
+    /// empty, so a non-rotating deployment behaves EXACTLY as the
+    /// single-key build did — adding a key here is the only way to
+    /// widen the accepted set.
+    nonisolated static let operatorRotationVerifyKeysBase64: [String] = []
 
     /// Public URL of the operator's NDJSON transparency log file.
     /// MUST be hosted on infrastructure **independent of the
@@ -227,20 +375,37 @@ enum TransparencyLogConfig {
     /// IP-leak trade-off, see `fetchAndCache` comment).
     nonisolated static let logURLString: String = "https://raw.githubusercontent.com/bytepotato-ug/pizzini/main/transparency-log.ndjson"
 
-    /// Decoded form. Returns nil for unset / malformed keys —
-    /// the verifier propagates this to
-    /// `VerificationResult.operatorKeyMissing` so the UI can
-    /// surface "transparency log not configured" rather than a
-    /// confusing "signature invalid".
-    nonisolated static var operatorVerifyKey: Curve25519.Signing.PublicKey? {
-        let trimmed = operatorVerifyKeyBase64
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    /// Decode one base64 raw-32 Ed25519 public key, or nil if the
+    /// string is empty / malformed / the wrong length.
+    nonisolated static func decodeVerifyKey(_ base64: String) -> Curve25519.Signing.PublicKey? {
+        let trimmed = base64.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               let raw = Data(base64Encoded: trimmed),
               raw.count == 32,
               let key = try? Curve25519.Signing.PublicKey(rawRepresentation: raw)
         else { return nil }
         return key
+    }
+
+    /// All currently-accepted operator verify keys: the primary plus
+    /// any rotation keys (PZ-M16), malformed/empty entries dropped.
+    /// `verify` accepts an entry whose signature validates under ANY
+    /// of these. Empty = no log verification (UI renders "not
+    /// configured"); the worst failure mode is silently approving
+    /// everything, so an unconfigured build returns an empty set and
+    /// `verify` reports `.operatorKeyMissing`.
+    nonisolated static var operatorVerifyKeys: [Curve25519.Signing.PublicKey] {
+        ([operatorVerifyKeyBase64] + operatorRotationVerifyKeysBase64)
+            .compactMap(decodeVerifyKey)
+    }
+
+    /// Decoded PRIMARY key, or nil if unset/malformed. Retained for
+    /// the "is the log feature configured at all?" checks in the UI
+    /// (`RelayAttestationView`, `ChatStore`) and tests; equivalent to
+    /// `operatorVerifyKeys.first`. `verify` itself uses the full
+    /// `operatorVerifyKeys` set.
+    nonisolated static var operatorVerifyKey: Curve25519.Signing.PublicKey? {
+        operatorVerifyKeys.first
     }
 
     /// Decoded log URL. `https://` is accepted for any host. `http://`

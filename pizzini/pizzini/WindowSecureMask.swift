@@ -130,6 +130,43 @@ final class WindowSecureMask: NSObject {
         applyToWindow(window)
     }
 
+    /// PZ-M10 — should a synchronous bridging cover be raised before
+    /// we schedule the deferred reparent? Yes exactly when masking is
+    /// enabled AND this activation will actually do a fresh reparent.
+    ///
+    /// • masking disabled (self-test says the secure-text trick is
+    ///   broken on this OS) → no cover; a black flash would be pure
+    ///   theatre with no mask to bridge to.
+    /// • already masked-and-intact (a no-op re-activation) → no cover;
+    ///   flashing one would be a visible glitch with nothing to hide.
+    ///
+    /// When it returns true the contract is: an opaque cover is on
+    /// screen for every frame between now and the reparent commit, so
+    /// the OS capture pipeline never sees an unmasked live frame during
+    /// the one-runloop deferral.
+    nonisolated static func shouldRaiseBridgingCover(
+        maskingEnabled: Bool,
+        alreadyMaskedAndIntact: Bool,
+    ) -> Bool {
+        maskingEnabled && !alreadyMaskedAndIntact
+    }
+
+    /// Build the opaque cover that bridges the activate→reparent gap.
+    /// Black, full-window, follows resize, non-interactive. It is added
+    /// as a window subview so it sits inside `window.layer`'s subtree
+    /// and therefore rides along when the window layer is reparented
+    /// under the secure mask — there is never a frame where the cover
+    /// is gone but the mask is not yet installed.
+    private func makeBridgingCover(for window: UIWindow) -> UIView {
+        let cover = UIView(frame: window.bounds)
+        cover.backgroundColor = .black
+        cover.isOpaque = true
+        cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        cover.isUserInteractionEnabled = false
+        cover.accessibilityElementsHidden = true
+        return cover
+    }
+
     private func applyToWindow(_ window: UIWindow) {
         let key = ObjectIdentifier(window)
         // If we already applied to this window AND the layer chain is
@@ -138,22 +175,53 @@ final class WindowSecureMask: NSObject {
         // discard it depending on the transition; re-validate the
         // parentage so we re-wire if needed rather than trusting the
         // bookkeeping.
+        let alreadyIntact: Bool = masked.contains(key)
+            && (fields[key].flatMap {
+                resolveSecureLayer(in: $0)?.sublayers?.contains(window.layer)
+            } ?? false)
+        guard Self.shouldRaiseBridgingCover(
+            maskingEnabled: ChatStore.shared.shouldMaskAppContents,
+            alreadyMaskedAndIntact: alreadyIntact,
+        ) else {
+            // Either masking is disabled, or the window is already
+            // masked-and-intact — nothing to do, no cover to flash.
+            return
+        }
+        // Stale bookkeeping (masked but layer chain broken) — clear it
+        // and fall through to re-apply.
         if masked.contains(key) {
-            if let field = fields[key],
-               resolveSecureLayer(in: field)?.sublayers?.contains(window.layer) == true {
-                return
-            }
-            // Layer chain is broken — clear bookkeeping and fall
-            // through to re-apply.
             masked.remove(key)
             fields.removeValue(forKey: key)
         }
+
+        // PZ-M10: close the cold-launch / Stage-Manager-bring-back race.
+        // `applyToWindow` runs synchronously on the main thread during
+        // scene activation, but the reparent below is deferred one
+        // runloop turn (it needs `window.layer.superlayer` + the initial
+        // layout pass). Between activation and that turn, the live,
+        // UNMASKED window would render to the screenshot / recording /
+        // mirroring pipeline. Raise an opaque cover NOW — in the same
+        // synchronous turn that lays out the first content frame, so the
+        // first composited frame is already black — and tear it down only
+        // after the reparent has landed (or failed). The multitasking
+        // snapshot is covered separately by `PrivacyShieldWindow`; this
+        // closes the live-foreground-capture gap that shield does not.
+        let cover = makeBridgingCover(for: window)
+        window.addSubview(cover)
+
         // Two preconditions for the reparent to land:
         //   1. window.layer.superlayer must already exist — that's the
         //      slot we hand the secure field's layer into.
         //   2. The window must have completed its initial layout pass.
         // Deferring one runloop turn satisfies both on iOS 17/18/26.
-        DispatchQueue.main.async { [weak self, weak window] in
+        DispatchQueue.main.async { [weak self, weak window, weak cover] in
+            // Remove the bridging cover on EVERY exit path. On success
+            // the window layer is already under the secure mask by the
+            // time this runs, so lifting the cover reveals masked
+            // content with no gap. On failure we revert to the
+            // pre-M10 behaviour (unmasked but usable) rather than
+            // leaving the UI stuck behind a black cover.
+            defer { cover?.removeFromSuperview() }
             guard let self, let window else { return }
             guard let parent = window.layer.superlayer else { return }
 

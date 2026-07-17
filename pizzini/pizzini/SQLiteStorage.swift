@@ -178,6 +178,12 @@ final class SQLiteStorage {
         // (`BootstrapError.keyMaterialUnavailable`) rather than
         // proceed against `AppState()` defaults.
         let dbFileExists = fm.fileExists(atPath: path)
+        // Track whether THIS bootstrap minted the database from nothing
+        // (first install OR the post-duress re-bootstrap). A freshly
+        // minted DB already has a fresh `SecRandom` salt, so the forced
+        // immediate key rotation below is redundant — and on the duress
+        // path it inflates unlock latency (PZ-H7 / F-DUR-02).
+        var dbFreshlyCreated = !dbFileExists
         var db = try openWithRecovery(path: path, params: params, dbFileExists: dbFileExists)
         do {
             try Migrator.run(on: db)
@@ -206,6 +212,8 @@ final class SQLiteStorage {
             let freshParams = DBKey.loadStoredParams()
             db = try openWithRecovery(path: path, params: freshParams, dbFileExists: false)
             try Migrator.run(on: db)
+            // The self-heal just minted a brand-new DB + salt.
+            dbFreshlyCreated = true
         }
         let inst = SQLiteStorage(db: db, path: path)
         shared = inst
@@ -216,6 +224,20 @@ final class SQLiteStorage {
         // explicitly and the cost is one no-op syscall per file.
         try? inst.reassertDatabaseFileAttributes()
 
+        // PZ-H7 / F-DUR-02: a freshly minted DB already carries a fresh
+        // `SecRandom` salt, so seed the rotation clock to "now" instead
+        // of letting the absent-slot case force an immediate, pointless
+        // rotation (re-deriving from yet another new salt + rekey +
+        // VACUUM over an empty file). Crucially this runs identically
+        // for a clean install and the post-duress re-bootstrap, so it
+        // keeps the unlock-latency-critical duress path off the forced
+        // rotation WITHOUT making the post-wipe state distinguishable
+        // from a clean install (H6). The periodic rotation still fires
+        // later, once `rotationInterval` actually elapses.
+        if dbFreshlyCreated {
+            _ = DBKey.seedRotationClock()
+        }
+
         // Rotate the at-rest encryption key if it's been
         // longer than `DBKey.rotationInterval` since the last
         // rotation. Runs INLINE on bootstrap — Argon2id + rekey +
@@ -225,7 +247,9 @@ final class SQLiteStorage {
         // logged but non-fatal: the DB is still openable under the
         // current key, so the user keeps working; the next launch
         // re-evaluates `rotationDue` and tries again. Better than
-        // refusing to boot the chat over a missed rotation.
+        // refusing to boot the chat over a missed rotation. On a
+        // freshly minted DB the seed above makes this false, so the
+        // redundant first-launch rotation no longer runs.
         if DBKey.rotationDue() {
             do {
                 _ = try DBKey.rotateKeyMaterial(liveDB: db, params: params)

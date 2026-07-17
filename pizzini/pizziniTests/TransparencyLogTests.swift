@@ -53,7 +53,7 @@ struct TransparencyLogTests {
         let dummy = TransparencyLog.SignedEntry(
             entry: TransparencyLog.Entry(
                 gitSha: "x", binarySha256Hex: "y", binarySize: 1,
-                canonicalJSON: Data(#"{"binary_sha256":"y","binary_size":1,"git_sha":"x"}"#.utf8)
+                rawEntryJSON: Data(#"{"binary_sha256":"y","binary_size":1,"git_sha":"x"}"#.utf8)
             ),
             signedAt: "t",
             signatureBase64: ""
@@ -117,7 +117,7 @@ struct TransparencyLogTests {
         let entry = TransparencyLog.SignedEntry(
             entry: TransparencyLog.Entry(
                 gitSha: "x", binarySha256Hex: "y", binarySize: 1,
-                canonicalJSON: Data()
+                rawEntryJSON: Data()
             ),
             signedAt: "t",
             signatureBase64: ""
@@ -176,7 +176,7 @@ struct TransparencyLogTests {
                 gitSha: "x",
                 binarySha256Hex: "ABCDEF123",
                 binarySize: 1,
-                canonicalJSON: Data()
+                rawEntryJSON: Data()
             ),
             signedAt: "t",
             signatureBase64: ""
@@ -187,5 +187,194 @@ struct TransparencyLogTests {
         // is silent acceptance).
         #expect(TransparencyLog.contains(binarySha256Hex: "abcdef123", in: [entry]) == false)
         #expect(TransparencyLog.contains(binarySha256Hex: "ABCDEF123", in: [entry]) == false)
+    }
+}
+
+/// PZ-H12 — the signature is verified over the operator's LITERAL
+/// `entry` bytes lifted from the line, never a Swift-recomputed
+/// canonical form. These tests pin (a) that the byte extractor is
+/// exact and parse-faithful, (b) that the real committed log still
+/// verifies under the bundled operator key (the change is
+/// backward-compatible — no re-signing), and (c) that two
+/// byte-distinct-but-logically-equal payloads can NOT share a
+/// signature (the canonicalisation-confusion the single-canonicaliser
+/// design eliminates).
+@Suite("TransparencyLog — PZ-H12 raw-entry-bytes signing")
+struct TransparencyLogRawBytesTests {
+    /// The four entries committed to `transparency-log.ndjson`, as
+    /// public literals. Signed by the bundled operator key
+    /// (`TransparencyLogConfig.operatorVerifyKeyBase64`) under the
+    /// pre-H12 scheme; they must still verify after the switch to
+    /// raw-byte verification, proving backward compatibility.
+    static let committedLog = """
+    {"entry":{"binary_sha256":"9d0d6ed4178b18f6fed9a9619771a732afe5ab52019d99e406aa63c7f8180ebb","binary_size":3521856,"git_sha":"5e42f248c53e5a3dfaeb699af05dedbc634b123d"},"signed_at":"2026-05-11T18:19:35Z","sig_b64":"TkdI+iUwthSELqKm4jQmYpKJjqokkoZJAcjtXZHK1ZOkhwgc20OCRkE0OufYthH8EOjk/WNDStw4uv9T0BxIBA=="}
+    {"entry":{"binary_sha256":"bbf6de18599ade1ed136d58014c4c5ce6c16000c6a05bc134c12e0e8cd0c38c5","binary_size":3554752,"git_sha":"3bb92425c7d9e3511cef1ee80dc1da14ae68c4a0"},"signed_at":"2026-05-13T09:56:16Z","sig_b64":"hGDiwFXmuv6+uZaeVXgPcczynDCNmECrrlG0Koi9cIIzmimmP6XKTlG5v9P9m9E26OKiH6p/Tte/UMBCGrxhDg=="}
+    {"entry":{"binary_sha256":"597299bd9296ac20858f91cb3209a6848fdb6debdfcadc0212adc779c719918a","binary_size":3590304,"git_sha":"82866b32fb18675e777458d42c828eb953a3175b"},"signed_at":"2026-05-13T14:51:31Z","sig_b64":"tH7KnsH+rH/ZwSkCK198sUwtzydhYhnh1/TEd/Y+aHOGX2JpvYYFvNsanHEf8pTmt24GCbojaD/3a6tN1/FECQ=="}
+    {"entry":{"binary_sha256":"14c97fa5a17162214d53f270591198faa67df7fc418dc40963212243b7e46ea2","binary_size":3590304,"git_sha":"56f2ee8974c013f65543090753d9049d07cc5e2f"},"signed_at":"2026-05-13T23:54:21Z","sig_b64":"RI9UnmqEXC2iaNOWZ7JIfKjyemm61+8jLKOjk+b2yTvIYumrOy9SUyDjQT85uZBBL6EOlDQLaKZMzAk7A1P0Bg=="}
+    """
+
+    @Test("the real committed log verifies under the bundled operator key (backward-compatible, no re-sign)")
+    func committedLogStillVerifies() throws {
+        // This test is meaningful only on a build that actually pins
+        // the operator key (the shipping default does). If a future
+        // build ships keyless, skip the assertion rather than red.
+        try #require(TransparencyLogConfig.operatorVerifyKey != nil,
+                     "bundled build must pin the operator key for this regression")
+        let entries = TransparencyLog.parseLog(Data(Self.committedLog.utf8))
+        #expect(entries.count == 4)
+        for entry in entries {
+            #expect(TransparencyLog.verify(entry) == .valid)
+        }
+        #expect(TransparencyLog.verifiedCount(in: entries) == 4)
+    }
+
+    @Test("rawValueBytes lifts the LITERAL entry bytes, preserving order/whitespace (no re-canonicalisation)")
+    func rawExtractIsByteFaithful() throws {
+        // Keys deliberately NOT sorted and padded with whitespace.
+        // A canonicalising extractor would "fix" these; the literal
+        // extractor must return them untouched.
+        let line = #"{ "entry": {"git_sha":"z", "binary_size": 7 ,"binary_sha256":"qq"}, "signed_at":"t","sig_b64":"AA"}"#
+        let raw = try #require(TransparencyLog.rawValueBytes(forKey: "entry", inLine: Data(line.utf8)))
+        #expect(String(decoding: raw, as: UTF8.self) == #"{"git_sha":"z", "binary_size": 7 ,"binary_sha256":"qq"}"#)
+    }
+
+    @Test("rawValueBytes respects string literals containing braces/commas/colons")
+    func rawExtractRespectsStrings() throws {
+        // A string value containing }, , and : must not terminate the
+        // value-span scan early.
+        let line = #"{"entry":{"binary_sha256":"a}b,c:d","binary_size":1,"git_sha":"x"},"signed_at":"t","sig_b64":"AA"}"#
+        let raw = try #require(TransparencyLog.rawValueBytes(forKey: "entry", inLine: Data(line.utf8)))
+        #expect(String(decoding: raw, as: UTF8.self) == #"{"binary_sha256":"a}b,c:d","binary_size":1,"git_sha":"x"}"#)
+    }
+
+    @Test("rawValueBytes returns nil for a non-object line or absent key")
+    func rawExtractNilCases() {
+        #expect(TransparencyLog.rawValueBytes(forKey: "entry", inLine: Data(#"[1,2,3]"#.utf8)) == nil)
+        #expect(TransparencyLog.rawValueBytes(forKey: "entry", inLine: Data(#"{"signed_at":"t"}"#.utf8)) == nil)
+        #expect(TransparencyLog.rawValueBytes(forKey: "entry", inLine: Data(#"{"#.utf8)) == nil)
+    }
+
+    /// Reproduce EXACTLY the message `TransparencyLog.verify` feeds to
+    /// Ed25519: `entry.rawEntryJSON || 0x0A || signedAt`. Used to
+    /// prove the confusion property with a test-local key (the bundled
+    /// key is a `let`, so we exercise the byte assembly, not the
+    /// pinned key).
+    private static func verifyInput(for signed: TransparencyLog.SignedEntry) -> Data {
+        var input = signed.entry.rawEntryJSON
+        input.append(0x0A)
+        input.append(contentsOf: signed.signedAt.utf8)
+        return input
+    }
+
+    @Test("two byte-distinct but logically-equal entries can NOT share a signature")
+    func noCanonicalisationConfusion() throws {
+        // Same logical entry, two different byte encodings (key order
+        // differs). Under a canonicalising verifier both collapse to
+        // one form and a signature over one would wrongly validate the
+        // other. Under raw-byte verification their signing inputs
+        // differ, so a signature is bound to exactly one encoding.
+        let lineA = #"{"entry":{"binary_sha256":"aa","binary_size":1,"git_sha":"gg"},"signed_at":"2026-01-01T00:00:00Z","sig_b64":"AA"}"#
+        let lineB = #"{"entry":{"git_sha":"gg","binary_size":1,"binary_sha256":"aa"},"signed_at":"2026-01-01T00:00:00Z","sig_b64":"AA"}"#
+
+        let a = try #require(TransparencyLog.parseSignedEntry(Data(lineA.utf8)))
+        let b = try #require(TransparencyLog.parseSignedEntry(Data(lineB.utf8)))
+
+        // Both decode to the same logical fields…
+        #expect(a.entry.binarySha256Hex == b.entry.binarySha256Hex)
+        #expect(a.entry.gitSha == b.entry.gitSha)
+        // …but the bytes actually signed are different.
+        #expect(a.entry.rawEntryJSON != b.entry.rawEntryJSON)
+
+        let inputA = Self.verifyInput(for: a)
+        let inputB = Self.verifyInput(for: b)
+        #expect(inputA != inputB)
+
+        // With a real key: a signature over A's exact bytes validates
+        // A and is REJECTED for B — no canonicalisation collapse.
+        let key = Curve25519.Signing.PrivateKey()
+        let sigA = try key.signature(for: inputA)
+        #expect(key.publicKey.isValidSignature(sigA, for: inputA))
+        #expect(!key.publicKey.isValidSignature(sigA, for: inputB))
+    }
+
+    @Test("a whitespace-padded re-encoding of a signed entry no longer verifies (bytes are bound)")
+    func whitespaceReencodingRejected() throws {
+        let compact = #"{"entry":{"binary_sha256":"aa","binary_size":1,"git_sha":"gg"},"signed_at":"2026-01-01T00:00:00Z","sig_b64":"AA"}"#
+        let padded  = #"{"entry":{"binary_sha256":"aa", "binary_size":1, "git_sha":"gg"},"signed_at":"2026-01-01T00:00:00Z","sig_b64":"AA"}"#
+
+        let c = try #require(TransparencyLog.parseSignedEntry(Data(compact.utf8)))
+        let p = try #require(TransparencyLog.parseSignedEntry(Data(padded.utf8)))
+        #expect(c.entry.rawEntryJSON != p.entry.rawEntryJSON)
+
+        let key = Curve25519.Signing.PrivateKey()
+        let sigCompact = try key.signature(for: Self.verifyInput(for: c))
+        #expect(!key.publicKey.isValidSignature(sigCompact, for: Self.verifyInput(for: p)))
+    }
+}
+
+/// PZ-M16 — multi-key verification for operator key ROTATION. An entry
+/// is accepted if its single signature validates under ANY currently
+/// configured key (primary + rotation keys), so publishing a new key
+/// alongside the old makes rotation a non-flag-day change. These pin
+/// the key decoding + the 1-of-M acceptance/rejection with throwaway
+/// keys (the shipped key set is a build-time `let`). NB: this is NOT a
+/// threshold scheme — each entry still carries exactly one signature.
+@Suite("TransparencyLog — PZ-M16 rotation keys")
+struct TransparencyLogRotationKeysTests {
+    /// Build a SignedEntry whose signing input (rawEntryJSON || \n ||
+    /// signedAt) is signed by `signer`.
+    private static func signedEntry(by signer: Curve25519.Signing.PrivateKey) throws -> TransparencyLog.SignedEntry {
+        let rawEntry = Data(#"{"binary_sha256":"aa","binary_size":1,"git_sha":"gg"}"#.utf8)
+        let signedAt = "2026-01-01T00:00:00Z"
+        var input = rawEntry
+        input.append(0x0A)
+        input.append(contentsOf: signedAt.utf8)
+        let sig = try signer.signature(for: input)
+        return TransparencyLog.SignedEntry(
+            entry: TransparencyLog.Entry(
+                gitSha: "gg", binarySha256Hex: "aa", binarySize: 1, rawEntryJSON: rawEntry),
+            signedAt: signedAt,
+            signatureBase64: sig.base64EncodedString())
+    }
+
+    @Test("decodeVerifyKey accepts a valid raw-32 base64 key, rejects junk")
+    func decodeKey() {
+        let valid = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation.base64EncodedString()
+        #expect(TransparencyLogConfig.decodeVerifyKey(valid) != nil)
+        #expect(TransparencyLogConfig.decodeVerifyKey("") == nil)
+        #expect(TransparencyLogConfig.decodeVerifyKey("not-base64!!") == nil)
+        // Valid base64 but wrong length (16 bytes, not 32).
+        #expect(TransparencyLogConfig.decodeVerifyKey(Data(repeating: 0, count: 16).base64EncodedString()) == nil)
+    }
+
+    @Test("the shipped build exposes the primary key as the head of the key set")
+    func primaryIsFirst() throws {
+        try #require(TransparencyLogConfig.operatorVerifyKey != nil)
+        #expect(TransparencyLogConfig.operatorVerifyKeys.isEmpty == false)
+        #expect(TransparencyLogConfig.operatorVerifyKeys.first?.rawRepresentation
+            == TransparencyLogConfig.operatorVerifyKey?.rawRepresentation)
+    }
+
+    @Test("empty key set reports operatorKeyMissing, never .valid")
+    func emptyKeySetMissing() throws {
+        let signed = try Self.signedEntry(by: Curve25519.Signing.PrivateKey())
+        #expect(TransparencyLog.verify(signed, keys: []) == .operatorKeyMissing)
+    }
+
+    @Test("1-of-M: an entry signed by ANY configured key verifies; an unlisted signer is rejected")
+    func oneOfMAcceptance() throws {
+        let keyA = Curve25519.Signing.PrivateKey()
+        let keyB = Curve25519.Signing.PrivateKey() // the "new" rotation key
+        let keyC = Curve25519.Signing.PrivateKey() // never configured
+
+        let signedByB = try Self.signedEntry(by: keyB)
+
+        // Only the old key configured → entry signed by the new key fails.
+        #expect(TransparencyLog.verify(signedByB, keys: [keyA.publicKey]) == .badSignature)
+        // Rotation window: both keys configured → the new key's entry verifies.
+        #expect(TransparencyLog.verify(signedByB, keys: [keyA.publicKey, keyB.publicKey]) == .valid)
+        // A signer outside the configured set is never accepted.
+        let signedByC = try Self.signedEntry(by: keyC)
+        #expect(TransparencyLog.verify(signedByC, keys: [keyA.publicKey, keyB.publicKey]) == .badSignature)
     }
 }
