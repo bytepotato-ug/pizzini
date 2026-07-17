@@ -457,7 +457,21 @@ struct ChatView: View {
                 }
             }
             .sheet(isPresented: $showSafetyNumber) {
+                // S9-04: SwiftUI `.sheet` content is presented at the
+                // window level, OUTSIDE the chat root's
+                // `.screenCaptureShielded()` overlay (which composites
+                // only as a ZStack sibling of the modified content). On a
+                // healthy device the window-level `WindowSecureMask`
+                // black-frames the whole window for recording too, so
+                // this sheet is covered; but when the secure-text mask is
+                // degraded (`qrBlockEffective == false`) that reparent is
+                // skipped and the in-body recording shield is the ONLY
+                // recording defense. Apply it directly to the sheet so
+                // the SAS verification digits are blanked during a live
+                // recording / external display even in the degraded
+                // state, not just when the window mask is healthy.
                 SafetyNumberView(store: store, contactID: contactID)
+                    .screenCaptureShielded()
             }
             .alert("Rename contact", isPresented: $renaming) {
                 TextField("name", text: $renameDraft)
@@ -1747,6 +1761,24 @@ struct AttachmentRowCard: View {
 /// to use the `[URL]` form) — and our resolver may legitimately return
 /// nil if the sandbox copy was already GC'd post-TTL. Wrap with our
 /// own modifier so a nil URL is a no-op rather than a crash.
+///
+/// **OS cache residual (S8-04).** `QLPreviewController` renders the item
+/// out-of-process in `com.apple.quicklook.ThumbnailsAgent`, which seeds
+/// rendered representations/thumbnails into an OS cache OUTSIDE our
+/// sandbox. That cache is not `isExcludedFromBackup`-flagged and is NOT
+/// reachable by `AttachmentSandbox.eraseEverything()` (attachments tree
+/// only) or the duress wipe — there is no public API to enumerate or
+/// purge another process's QuickLook cache, so it is a DOCUMENTED
+/// RESIDUAL we cannot fully close from in-process code. We minimise our
+/// own contribution two ways: (1) we hand QuickLook the IN-SANDBOX file
+/// URL directly (no decrypted copy is made here), so the bytes we
+/// control are still swept by the attachment GC + duress wipe; (2) the
+/// `pzqlTemporaryURL` helper below is the single sanctioned way to make
+/// a temp copy IF one is ever needed — it uses the `pzql-` prefix in
+/// `NSTemporaryDirectory()` so `AttachmentSandbox.sweepTemporaryStaging()`
+/// (launch + duress) reclaims it. After the preview session ends we make
+/// a best-effort attempt to drop QuickLook's per-item thumbnail
+/// representation (see `QLPreviewWrapper.previewControllerDidDismiss`).
 extension View {
     fileprivate func quickLookPreview(
         _ isPresented: Binding<Bool>,
@@ -1802,9 +1834,42 @@ private struct QLPreviewWrapper: UIViewControllerRepresentable {
             url as NSURL
         }
         func previewControllerDidDismiss(_ controller: QLPreviewController) {
+            // Best-effort OS-cache hygiene on session end (S8-04).
+            // iOS exposes NO public API to enumerate or purge the
+            // out-of-process QuickLook ThumbnailsAgent cache for a
+            // previewed item (`QLThumbnailGenerator` only GENERATES
+            // thumbnails; there is no symmetric "evict" call, and the
+            // cache lives in another process's container we cannot
+            // reach). So the only honest thing we can do here is sweep
+            // any `pzql-` temp copy WE created back out of
+            // `NSTemporaryDirectory()` — the in-sandbox original we
+            // handed QuickLook is already covered by the attachment GC /
+            // duress wipe. The ThumbnailsAgent representation itself is a
+            // documented residual recoverable only on AFU seizure; it is
+            // disclosed as such rather than papered over with a
+            // non-existent API.
+            AttachmentSandbox.sweepTemporaryStaging()
             onDismiss()
         }
     }
+}
+
+/// Single sanctioned way to stage a temporary copy of an attachment for
+/// QuickLook / Save-to-Files when handing the in-sandbox URL directly is
+/// not possible (S8-04). The copy is created with the `pzql-` prefix in
+/// `NSTemporaryDirectory()` so `AttachmentSandbox.sweepTemporaryStaging()`
+/// (run on launch and on the duress wipe) reclaims it — without the
+/// prefix a decrypted copy would survive both the attachment GC and the
+/// cryptographic-erasure wipe. Currently the QuickLook / Save paths hand
+/// the in-sandbox URL straight through and make NO copy, so this is a
+/// guarded affordance for any future caller that must materialise one;
+/// it deliberately funnels every such copy through the swept prefix.
+@MainActor
+func pzqlTemporaryURL(for filename: String) -> URL {
+    let safe = filename.isEmpty ? "attachment" : filename
+    let name = "pzql-\(UUID().uuidString)-\(safe)"
+    return URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent(name)
 }
 
 /// Bridges `UIDocumentInteractionController` into SwiftUI. Triggered by
@@ -1813,6 +1878,16 @@ private struct QLPreviewWrapper: UIViewControllerRepresentable {
 /// rather than ShareLink/UIActivityViewController so the user surface
 /// is the focused "Save to Files / Open in…" menu rather than a
 /// full share sheet.
+///
+/// **OS cache residual (S8-04).** Like the QuickLook path, this can seed
+/// share-"recents" and (on the `presentPreview` fallback, which is
+/// suppressed under preview mode `.off` — see `allowPreviewFallback`) a
+/// QuickLook render into OS caches outside our sandbox that the duress
+/// wipe cannot reach. We hand the IN-SANDBOX URL directly (no decrypted
+/// copy made here), so the bytes we control are swept by the attachment
+/// GC / duress wipe; the OS-side recents/render residual is documented
+/// and bounded (recoverable only on AFU seizure, and only for an item
+/// the user explicitly tapped Save/Open on).
 struct DocumentInteractionPresenter: UIViewControllerRepresentable {
     @Binding var isPresented: Bool
     let url: URL?

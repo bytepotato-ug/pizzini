@@ -94,6 +94,17 @@ let package = Package(
                 .define("NDEBUG", to: "1"),
                 .define("HAVE_USLEEP", to: "1"),
                 .define("SQLITE_OS_UNIX", to: "1"),
+                // F-S11-04: compile out SQLCipher's os_log device-logging
+                // path. The vendored amalgamation otherwise emits
+                // `os_log(OS_LOG_DEFAULT, …, sqlite3_sql(stmt))` (query
+                // text) and `os_log(…"%{public}s"…)` to the on-disk unified
+                // log — a query-shape / error-context metadata sink. These
+                // two macros gate every `os_log` call site in the
+                // amalgamation (`#if !defined(SQLCIPHER_OMIT_LOG_DEVICE)` /
+                // `#ifndef SQLCIPHER_OMIT_DEFAULT_LOGGING`), so defining
+                // them removes the sink at compile time with no runtime cost.
+                .define("SQLCIPHER_OMIT_LOG_DEVICE"),
+                .define("SQLCIPHER_OMIT_DEFAULT_LOGGING"),
             ]
         ),
         .target(

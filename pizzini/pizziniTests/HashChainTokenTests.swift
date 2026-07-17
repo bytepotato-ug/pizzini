@@ -72,7 +72,10 @@ struct HashChainTokenTests {
                 return
             }
             if let prior {
-                let next = Blake3.hash(token.value)
+                // F-S4-05: the chain step is now domain-separated —
+                // `BLAKE3(chainStepDomain || value)` via `applyHash`, not a
+                // bare `Blake3.hash(value)`.
+                let next = HashChainToken.applyHash(token.value, times: 1)
                 #expect(next == prior, "H(token[i+1]) must equal token[i]")
             }
             prior = token.value

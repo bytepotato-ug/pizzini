@@ -26,10 +26,20 @@
 #   * SOURCE_DATE_EPOCH        — pinned to the commit timestamp so
 #                                 any embedded build clock is
 #                                 deterministic
-#   * `cargo vendor`           — every crate fetched offline from
-#                                 the committed `vendor/` directory,
-#                                 closing the `--frozen` git-deps
-#                                 refresh hole
+#   * `cargo vendor`           — every crate is vendored offline before
+#                                 the docker build. The `vendor/` tree
+#                                 itself is gitignored and regenerated
+#                                 per machine, so it is NOT trusted on
+#                                 faith: after vendoring, the whole tree
+#                                 is hashed into a single digest and
+#                                 asserted against the committed
+#                                 `scripts/vendor-sha256.txt` (FATAL on
+#                                 drift). This closes the `--frozen`
+#                                 git-deps refresh hole AND the gap that
+#                                 git sources like libsignal carry no
+#                                 content checksum in Cargo.lock (S12-04).
+#                                 Re-pin on a deliberate dep bump with
+#                                 `VENDOR_PIN=update`.
 #
 # Docker is required: there is no host opt-out (F-SUP-06), so every
 # operator's build runs in the identical pinned environment and the
@@ -98,6 +108,80 @@ if [[ -z "${INSIDE_DOCKER:-}" ]]; then
         mkdir -p "$REPO_ROOT/.cargo"
         cargo vendor --locked vendor > "$REPO_ROOT/.cargo/config-vendor.toml"
     fi
+    # S12-04: the vendored tree (vendor/ + .cargo/) is gitignored and
+    # regenerated per machine, and libsignal is a git source whose
+    # integrity rests on a SHA-1 commit ref with no content checksum in
+    # Cargo.lock. So after vendoring we compute a deterministic checksum
+    # manifest of the WHOLE vendored tree and assert it against the
+    # committed expected hash. A drift (a different libsignal tree served
+    # for the pinned ref, a poisoned crate, an out-of-date Cargo.lock)
+    # FATAL-aborts the build BEFORE anything is compiled — fail closed.
+    #
+    # Bump path: when Cargo.lock legitimately changes, regenerate the
+    # manifest with `VENDOR_PIN=update scripts/build-relay-release.sh`
+    # and commit scripts/vendor-sha256.txt alongside Cargo.lock.
+    verify_vendor_checksum() {
+        local manifest="$REPO_ROOT/scripts/vendor-sha256.txt"
+        local sumtool
+        if command -v sha256sum >/dev/null 2>&1; then
+            sumtool="sha256sum"
+        elif command -v shasum >/dev/null 2>&1; then
+            sumtool="shasum -a 256"
+        else
+            echo "error: neither sha256sum nor shasum found — cannot verify vendor tree." >&2
+            exit 1
+        fi
+        # Single digest over the sorted list of "<sha>  <path>" lines for
+        # every file under vendor/. LC_ALL=C + sort make the ordering
+        # stable across machines; paths are repo-relative so they don't
+        # leak the builder's absolute paths.
+        local actual
+        actual="$(cd "$REPO_ROOT" && find vendor -type f -print0 \
+            | LC_ALL=C sort -z \
+            | xargs -0 $sumtool \
+            | $sumtool \
+            | awk '{print $1}')"
+        if [[ "${VENDOR_PIN:-}" == "update" ]]; then
+            printf '%s\n' "$actual" > "$manifest"
+            echo "==> VENDOR_PIN=update: wrote vendor manifest hash to $manifest"
+            echo "    commit scripts/vendor-sha256.txt alongside Cargo.lock."
+            return 0
+        fi
+        if [[ ! -f "$manifest" ]]; then
+            echo "FATAL: $manifest is missing — the vendored-tree integrity anchor." >&2
+            echo "  Regenerate once with: VENDOR_PIN=update scripts/build-relay-release.sh" >&2
+            echo "  then review and commit scripts/vendor-sha256.txt." >&2
+            exit 1
+        fi
+        # The committed manifest may carry the sentinel `UNPINNED` if no
+        # operator has generated the real hash on a cargo-capable machine
+        # yet (this environment couldn't run `cargo vendor`). That is
+        # fail-closed by design: the build REFUSES until the real digest
+        # is pinned, rather than silently trusting the tree.
+        local expected
+        expected="$(grep -vE '^[[:space:]]*#' "$manifest" | tr -d '[:space:]')"
+        if [[ "$expected" == "UNPINNED" || -z "$expected" ]]; then
+            echo "FATAL: scripts/vendor-sha256.txt is not pinned yet (sentinel UNPINNED)." >&2
+            echo "  The vendored-tree integrity anchor has no real hash recorded." >&2
+            echo "  On a machine with cargo + network, regenerate and review it:" >&2
+            echo "    VENDOR_PIN=update scripts/build-relay-release.sh" >&2
+            echo "  then commit scripts/vendor-sha256.txt. Refusing to build until then." >&2
+            exit 1
+        fi
+        if [[ "$actual" != "$expected" ]]; then
+            echo "FATAL: vendored dependency tree checksum mismatch." >&2
+            echo "  expected (scripts/vendor-sha256.txt): $expected" >&2
+            echo "  got (cargo vendor output):            $actual" >&2
+            echo "  The vendored tree differs from the reviewed snapshot — a git" >&2
+            echo "  source (e.g. libsignal) may have been served a different tree," >&2
+            echo "  or Cargo.lock changed without regenerating the manifest." >&2
+            echo "  Refusing to build. If this is an intentional dependency bump," >&2
+            echo "  review the diff and re-pin with VENDOR_PIN=update." >&2
+            exit 1
+        fi
+        echo "==> Verified vendored tree matches scripts/vendor-sha256.txt ($actual)"
+    }
+    verify_vendor_checksum
     # Run docker as root inside the container so `apt-get update +
     # install protobuf-compiler pkg-config` works (the rust:bookworm
     # base image doesn't ship protoc, and apt-get needs root for

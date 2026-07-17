@@ -320,35 +320,29 @@ enum HashChainToken {
 
     // MARK: - Internal helpers
 
-    // AUDIT-DECISION-NEEDED: the v2 chain step below is a bare
-    // `BLAKE3(value)` with no domain-separation tag and no chain-id
-    // mixed in. Chain isolation is therefore only a probabilistic
-    // property of the 32-byte seed being random and never reused —
-    // not a structural property of the hash. The proper fix is a
-    // domain-separated step, `BLAKE3(b"pizzini.chain-token.v2" ||
-    // chain_id || value)`, but that is a wire-format change that must
-    // land on the relay side (`chain_validator_store`) BYTE-FOR-BYTE
-    // identically or every existing chain breaks. There is no chain
-    // *version* field to gate on today: `HashChainToken.Chain` has no
-    // version, and the relay distinguishes v1 (84-byte token) from v2
-    // (52-byte token) purely by length — there is no clean
-    // version-negotiation hook to let old chains keep the bare hash
-    // while new chains adopt the domain-separated one. Changing the
-    // step unilaterally here would desync every in-flight chain.
-    // Needs a coordinated design decision (add a chain-version byte to
-    // the `Chain` wire layout + the relay validator, then gate) before
-    // it can be implemented safely. Left as-is for now.
+    /// S4-05: domain-separation tag for one hash-chain step. The step
+    /// is `BLAKE3(chainStepDomain || value)`, NOT a bare
+    /// `BLAKE3(value)`, so the chain construction is domain-separated
+    /// from every other BLAKE3 use and carries a version (`v2` in the
+    /// tag) for future migration. These bytes MUST match the relay's
+    /// `chain_validator_store::CHAIN_STEP_DOMAIN` byte-for-byte — both
+    /// sides prepend exactly this prefix before each BLAKE3 step. A tag
+    /// change makes every value built under the old tag stop validating,
+    /// which is the intended loud migration boundary.
+    static let chainStepDomain = Data("pizzini-v2-delivery-token-chain".utf8)
 
-    /// Apply BLAKE3 `n` times. `n == 0` returns the input unchanged.
-    /// Hash primitive must match the relay's `chain_validator_store`
-    /// bit-for-bit — both sides use BLAKE3 so the app's hash audit
-    /// surface stays single-primitive (the same one used by hashcash
-    /// and the group-op digests).
+    /// Apply the domain-separated chain step `n` times: each step is
+    /// `BLAKE3(chainStepDomain || value)`. `n == 0` returns the input
+    /// unchanged. Must match the relay's `chain_validator_store`
+    /// `chain_step` bit-for-bit (same BLAKE3 primitive, same domain
+    /// prefix) or the relay will reject every token.
     static func applyHash(_ input: Data, times n: Int) -> Data {
         precondition(n >= 0, "hash iteration count must be non-negative")
         var current = input
         for _ in 0..<n {
-            current = Blake3.hash(current)
+            var stepInput = chainStepDomain
+            stepInput.append(current)
+            current = Blake3.hash(stepInput)
         }
         return current
     }

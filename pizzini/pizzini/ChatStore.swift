@@ -205,7 +205,15 @@ final class ChatStore: NSObject {
     /// can exfiltrate over Lightning. os_log .debug is dropped at
     /// the kernel level on release devices.
     func diagLog(_ category: String, _ message: String) {
+        // F-S11-01: `message` can carry plaintext group names + contact
+        // peer-id prefixes, and `%{public}@` would persist them to the
+        // on-disk unified log — recoverable under a coerced/MDM
+        // debug-logging profile. Compile the os_log out of release
+        // entirely; the in-memory `diagEvents` ring buffer below never
+        // touches disk and `QALog` is already DEBUG-only.
+        #if DEBUG
         os_log(.debug, "[pizzini.%{public}@] %{public}@", category, message)
+        #endif
         // QA-debug persistent log (DEBUG only — release builds compile
         // the recording path out so a deployed app never carries the
         // forensic-attack surface). See `QALog.swift` for the file
@@ -444,6 +452,12 @@ final class ChatStore: NSObject {
     /// from `groupAttachmentRouting` to look up the destination
     /// group.
     let groupReassembler = AttachmentReassembler()
+    /// F-S6-01: groups for which we've already surfaced an equivocation
+    /// (forked-log) warning this session — dedupes the sticky warning so
+    /// a sustained fork doesn't spam the chat with a system row per
+    /// divergent message. In-memory: the warning is also written to the
+    /// group log (persisted), so re-warning after relaunch is harmless.
+    var groupEquivocationWarned: Set<Data> = []
     /// Which chat surface the user is currently looking at, if any.
     /// Used by the receive path to suppress the in-app haptic when a
     /// message arrives in the chat the user is already in (the
@@ -3634,6 +3648,28 @@ final class ChatStore: NSObject {
     /// padding lives in the caller, not here.
     func duressWipe() {
         let snapshot = state
+        // F-S7-05: flag the wiped state for the Notification Service
+        // Extension so any push that wakes it DURING the wipe paints
+        // nothing ("New message" on a supposedly-fresh device would be a
+        // duress oracle). This is belt-and-suspenders over the APNs token
+        // rotation below; it is CLEARED again when `eraseAndReinitialize`
+        // drops the whole App Group suite (step 5), so the post-wipe device
+        // carries no `duressWiped` tell and stays byte-indistinguishable
+        // from a fresh install.
+        SharedAppGroup.duressWiped = true
+        // F-S7-01: proactively tell every connected relay to drop our
+        // (peer-id → APNs token) mapping BEFORE tearing the sockets down.
+        // `deregisterPush()` only emits the wire DEREGISTER_PUSH frame
+        // while the relay is still `.connected`, so it must run before
+        // `teardownRelay()` cancels the connections. This collapses the
+        // relay's post-duress retention of the old identity↔token map
+        // from up to 30 days to immediate — a genuine fresh install holds
+        // no such mapping, so this tightens duress indistinguishability at
+        // the relay. (The on-device leg is already closed by the APNs
+        // token rotation `unregisterForRemoteNotifications()` below.)
+        for relay in relays {
+            relay.deregisterPush()
+        }
         teardownRelay()
         session = nil
         myIdentityPublicCached = nil
@@ -3862,10 +3898,12 @@ final class ChatStore: NSObject {
             // existing handlers will call `refreshAppBadge` again with
             // the correct count. Closes the foreground-race that
             // produced the "badge=5 when only 1 unread" bug.
-            defaults.set(
-                Date().timeIntervalSince1970,
-                forKey: SharedAppGroup.mainAppActiveEpochKey,
-            )
+            //
+            // F-S11-03/F-S7-07: write the heartbeat COARSENED to a 30s
+            // bucket (not a precise wall-clock epoch) so the App Group
+            // plist — AFU-readable and visible to a co-resident App-Group
+            // app — no longer leaks a precise last-foreground timestamp.
+            SharedAppGroup.recordMainAppActive(into: defaults)
         }
     }
 
@@ -4695,6 +4733,12 @@ extension ChatStore: RelayClientDelegate {
         // already been cryptographically erased.
         let sandboxCutoff = now.addingTimeInterval(-7 * 24 * 60 * 60)
         _ = AttachmentSandbox.cleanup(olderThan: sandboxCutoff)
+        // F-S8-03/F-S7-02: sweep Pizzini's transient NSTemporaryDirectory
+        // staging (pre-strip picker originals with EXIF/GPS, AV round-trip
+        // intermediates, decrypted QuickLook copies). iOS purges tmp on its
+        // own schedule, but not promptly — sweeping on this maintenance
+        // pass bounds how long a GPS-bearing original lingers off-store.
+        AttachmentSandbox.sweepTemporaryStaging()
     }
 
     @MainActor

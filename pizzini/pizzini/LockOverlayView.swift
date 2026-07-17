@@ -164,7 +164,7 @@ struct LockOverlayView: View {
         }
     }
 
-    /// Fixed wall-clock ceiling, measured from the moment
+    /// Wall-clock ceiling, measured from the moment
     /// `handlePasscodeOutcome` is entered to the moment the lock
     /// drops. The duress branch runs a full cryptographic erasure
     /// (Keychain wipes, DB unlink, attachment-tree delete, a fresh
@@ -173,23 +173,83 @@ struct LockOverlayView: View {
     /// before it drops the lock. Left unpadded, the duress unlock
     /// takes visibly longer — a stopwatch-equipped coercer reads that
     /// delta as "a duress passcode was just used." Padding BOTH the
-    /// real and the duress branch to this fixed ceiling makes the
+    /// real and the duress branch to this ceiling makes the
     /// passcode-submit → lock-drop latency statistically identical
-    /// for `.real` and `.duress`. The value must comfortably exceed
-    /// the worst-case `duressWipe()` wall-clock on the slowest
-    /// supported device.
-    private static let unlockLatencyCeiling: TimeInterval = 3.0
+    /// for `.real` and `.duress`.
+    ///
+    /// **S7-04 — the pad must not fail open.** The old code used a
+    /// FIXED 3.0 s ceiling. If the synchronous `duressWipe()` overran
+    /// 3.0 s on a slow / thermally-throttled device, the duress branch
+    /// dropped the lock immediately (`remaining <= 0`), landing the
+    /// duress unlock LATER than a real unlock — the exact stopwatch
+    /// tell the pad exists to hide. The fix below makes the ceiling an
+    /// ADAPTIVE, monotonically-non-decreasing FLOOR that BOTH branches
+    /// honor:
+    ///
+    ///   • Both `.real` and `.duress` pad to `adaptiveCeiling`, so they
+    ///     converge on the same observable latency.
+    ///   • If a duress wipe is measured to take longer than the current
+    ///     ceiling, the ceiling is RAISED (to the measured time plus a
+    ///     margin) so every SUBSEQUENT unlock — real or duress — pads to
+    ///     the higher value and the two paths stay indistinguishable on
+    ///     that device thereafter.
+    ///   • The overrunning duress event itself is still padded to the
+    ///     (newly-raised) ceiling rather than dropping immediately, so
+    ///     it never lands at the bare wipe time. The invariant is: the
+    ///     duress path never completes FASTER than the ceiling, and the
+    ///     ceiling only ever grows to cover the worst wipe seen — so the
+    ///     real path is never observably faster than the duress path.
+    ///
+    /// `adaptiveCeiling` is process-lifetime in-memory state (a static
+    /// var). It is deliberately NOT persisted: a stored "slowest wipe"
+    /// value would itself be a faint duress tell at rest, and the
+    /// conservative initial value already exceeds the wipe on supported
+    /// hardware in the common case.
+    private static let initialUnlockLatencyCeiling: TimeInterval = 3.0
+
+    /// Margin added above a measured over-budget wipe when raising the
+    /// ceiling, so the raised ceiling sits comfortably ABOVE the worst
+    /// observed wipe rather than exactly at it (an exact match would
+    /// leave the next duress event landing right at the wipe time again
+    /// under jitter).
+    private static let ceilingHeadroom: TimeInterval = 0.5
+
+    /// Adaptive ceiling. Starts at `initialUnlockLatencyCeiling` and
+    /// only ever grows (see `noteWipeDurationAndCeiling`). Shared by
+    /// the real and duress branches so both pad to the same target.
+    /// `nonisolated(unsafe)` is safe here: every read/write happens on
+    /// the main actor (the view's handlers and the padding `Task` are
+    /// all `@MainActor`).
+    nonisolated(unsafe) private static var adaptiveCeiling: TimeInterval =
+        initialUnlockLatencyCeiling
+
+    /// Raise the adaptive ceiling if `measuredWipe` (the wall-clock the
+    /// synchronous duress wipe actually took) came within / exceeded
+    /// the current ceiling. Returns the ceiling to pad THIS event to.
+    /// Monotonic: the ceiling never shrinks, so a single fast wipe
+    /// after a slow one cannot re-open the timing gap.
+    @MainActor
+    private static func raiseCeilingIfNeeded(forWipe measuredWipe: TimeInterval) -> TimeInterval {
+        // If the wipe came close to or past the current ceiling, grow
+        // the ceiling to cover it with headroom. "Close to" (>= ceiling
+        // − headroom) is included so we raise BEFORE an actual overrun
+        // leaks, not only after.
+        if measuredWipe >= adaptiveCeiling - ceilingHeadroom {
+            adaptiveCeiling = measuredWipe + ceilingHeadroom
+        }
+        return adaptiveCeiling
+    }
 
     private func handlePasscodeOutcome(_ outcome: LockManager.PasscodeOutcome) {
         let start = CFAbsoluteTimeGetCurrent()
         switch outcome {
         case .unlocked:
-            // Pad to the fixed ceiling so a real unlock is not
+            // Pad to the adaptive ceiling so a real unlock is not
             // observably faster than a duress wipe. The pad runs as
             // an async sleep — the sheet stays up (still showing the
             // neutral passcode UI, no flash of contacts) until the
             // ceiling elapses, then the lock drops.
-            dropLockAfterPadding(from: start) {
+            dropLockAfterPadding(from: start, to: Self.adaptiveCeiling) {
                 lockManager.isPasscodeSheetPresented = false
             }
         case .duress:
@@ -205,13 +265,19 @@ struct LockOverlayView: View {
             // against any racing entry (e.g. panicked second tap
             // arriving after the first cleared the passcode slots).
             lockManager.beginDuressWipe()
+            let wipeStart = CFAbsoluteTimeGetCurrent()
             store.duressWipe()
-            // The wipe is done; pad the *remaining* time to the same
-            // fixed ceiling the real-unlock branch pays, then drop
-            // the lock. If the wipe already overran the ceiling the
-            // pad is zero — the ceiling is sized so that is the rare
-            // case, not the norm.
-            dropLockAfterPadding(from: start) {
+            let measuredWipe = CFAbsoluteTimeGetCurrent() - wipeStart
+            // **S7-04 fix.** Measure how long the synchronous wipe took
+            // and raise the shared adaptive ceiling if it ran long, so
+            // every subsequent real/duress unlock pads to (at least)
+            // this duration — keeping the two paths indistinguishable
+            // even on a slow device. Pad THIS event to the (possibly
+            // raised) ceiling: because the ceiling is now ≥ the wipe
+            // time + headroom, there is always a positive pad left and
+            // the duress unlock never drops at the bare wipe time.
+            let ceiling = Self.raiseCeilingIfNeeded(forWipe: measuredWipe)
+            dropLockAfterPadding(from: start, to: ceiling) {
                 lockManager.unlockAfterDuress()
             }
         case .wrong:
@@ -223,18 +289,29 @@ struct LockOverlayView: View {
         }
     }
 
-    /// Sleep until `unlockLatencyCeiling` has elapsed since `start`,
-    /// then run `drop` on the main actor. A non-blocking async pad —
-    /// the lock overlay + passcode sheet stay on screen (showing the
+    /// Sleep until `ceiling` seconds have elapsed since `start`, then
+    /// run `drop` on the main actor. A non-blocking async pad — the
+    /// lock overlay + passcode sheet stay on screen (showing the
     /// neutral passcode UI, never the real contacts) for the duration,
     /// so the only thing the pad equalises is the wall-clock to the
     /// lock-drop, not anything visible mid-pad.
+    ///
+    /// **Invariant (S7-04):** `ceiling` is the SAME shared adaptive
+    /// value for the real and the duress branch, and for the duress
+    /// branch it is guaranteed ≥ the just-measured wipe time + headroom.
+    /// So `remaining` is non-negative on the duress path (the lock
+    /// never drops at the bare wipe time), and both paths land at the
+    /// same observable latency. The `remaining <= 0` guard remains only
+    /// as a defensive fast-path for the real branch (which does almost
+    /// no work and always has time left); it can no longer fail the
+    /// duress path open.
     private func dropLockAfterPadding(
         from start: CFAbsoluteTime,
+        to ceiling: TimeInterval,
         _ drop: @escaping () -> Void,
     ) {
         let elapsed = CFAbsoluteTimeGetCurrent() - start
-        let remaining = Self.unlockLatencyCeiling - elapsed
+        let remaining = ceiling - elapsed
         guard remaining > 0 else {
             drop()
             return

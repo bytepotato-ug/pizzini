@@ -80,11 +80,18 @@ enum AttachmentSandbox {
         try mutable.setResourceValues(v)
     }
 
-    /// Per-attachment inbound directory. Caller passes the 16-byte
-    /// attachment id (the wire-format grouping key); we hex-encode it
-    /// for filesystem readability.
-    static func inboundDirectory(forAttachmentId id: Data) throws -> URL {
-        try perAttachmentDirectory(parent: inboundName, id: id)
+    /// Per-attachment inbound directory, namespaced by the SENDER's
+    /// identity. F-S8-01: the on-disk path MUST include the sender, not
+    /// the attachmentId alone. The in-memory reassembler tables are keyed
+    /// `(peer, attachmentId)`, but if the disk layout were keyed by
+    /// attachmentId alone, a malicious group member who observed another
+    /// member's broadcast attachmentId could re-send under that id and
+    /// overwrite the bytes behind the first sender's already-delivered
+    /// attachment (a sender-attributed content spoof). Putting the sender
+    /// hex in the path gives every sender a disjoint namespace, so two
+    /// senders reusing one attachmentId can never collide on disk.
+    static func inboundDirectory(forAttachmentId id: Data, sender: Data) throws -> URL {
+        try perAttachmentDirectory(parent: inboundName, id: id, sender: sender)
     }
 
     /// Per-attachment outbound staging directory. Same shape as inbound
@@ -100,10 +107,11 @@ enum AttachmentSandbox {
     /// presents to `UIDocumentInteractionController`.
     static func writeAssembledFile(
         attachmentId: Data,
+        sender: Data,
         sanitizedFilename: String,
         contents: Data
     ) throws -> URL {
-        let dir = try inboundDirectory(forAttachmentId: attachmentId)
+        let dir = try inboundDirectory(forAttachmentId: attachmentId, sender: sender)
         let url = dir.appending(path: sanitizedFilename, directoryHint: .notDirectory)
         // Defense in depth on top of FilenameSanitizer: if the URL
         // resolves outside the per-attachment directory (which would
@@ -140,6 +148,33 @@ enum AttachmentSandbox {
         }
     }
 
+    /// Filename prefixes Pizzini uses for its transient staging files in
+    /// `NSTemporaryDirectory()`: the picker stages PRE-STRIP originals
+    /// (`pick-…`, still carrying EXIF/GPS) and `AttachmentThumbnail` /
+    /// QuickLook decrypt-to-temp files (`pzql-…`); the AV stripper stages
+    /// `av-in-…`/`av-out-…` round-trip files.
+    static let temporaryStagingPrefixes = ["pick-", "av-in-", "av-out-", "pzql-"]
+
+    /// F-S8-03 / F-S7-02: remove Pizzini's transient staging files from
+    /// `NSTemporaryDirectory()`. iOS purges tmp on its own schedule — not
+    /// promptly, and NOT as part of a duress wipe — so a GPS-bearing
+    /// pre-strip original (or a decrypted QuickLook copy) could otherwise
+    /// outlive the cryptographic-erasure wipe. Call on launch and on
+    /// duress. Only Pizzini-prefixed files are touched; the shared tmp
+    /// dir's other contents are left alone.
+    static func sweepTemporaryStaging() {
+        let fm = FileManager.default
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        guard let kids = try? fm.contentsOfDirectory(
+            at: tmp, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles],
+        ) else { return }
+        for child in kids where temporaryStagingPrefixes.contains(
+            where: { child.lastPathComponent.hasPrefix($0) }
+        ) {
+            try? fm.removeItem(at: child)
+        }
+    }
+
     /// Wipe the entire `attachments/` tree — every inbound directory,
     /// every outbound staging directory, every assembled file. Called
     /// by `Storage.eraseAndReinitialize` as part of the duress flow so
@@ -171,20 +206,35 @@ enum AttachmentSandbox {
         let fm = FileManager.default
         guard let rootURL = try? root() else { return 0 }
         var removed = 0
-        for parent in [inboundName, outboundName] {
-            let parentURL = rootURL.appending(path: parent, directoryHint: .isDirectory)
+        // Reap per-attachment `{id}` directories older than the cutoff.
+        func reapAttachmentDirs(in parentURL: URL) {
             guard let kids = try? fm.contentsOfDirectory(
                 at: parentURL,
                 includingPropertiesForKeys: [.contentModificationDateKey],
                 options: [.skipsHiddenFiles],
-            ) else { continue }
+            ) else { return }
             for child in kids {
                 let mtime = (try? child.resourceValues(forKeys: [.contentModificationDateKey])
                     .contentModificationDate) ?? .distantFuture
-                if mtime < cutoff {
-                    if (try? fm.removeItem(at: child)) != nil {
-                        removed += 1
-                    }
+                if mtime < cutoff, (try? fm.removeItem(at: child)) != nil {
+                    removed += 1
+                }
+            }
+        }
+        // Outbound: `outgoing/{id}` — id dirs directly under the parent.
+        reapAttachmentDirs(in: rootURL.appending(path: outboundName, directoryHint: .isDirectory))
+        // Inbound: `incoming/{sender}/{id}` since F-S8-01 namespaced it by
+        // sender — reap each sender's id dirs, then drop now-empty sender dirs.
+        let inboundURL = rootURL.appending(path: inboundName, directoryHint: .isDirectory)
+        if let senderDirs = try? fm.contentsOfDirectory(
+            at: inboundURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles],
+        ) {
+            for senderDir in senderDirs {
+                reapAttachmentDirs(in: senderDir)
+                if let remaining = try? fm.contentsOfDirectory(
+                    at: senderDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles],
+                ), remaining.isEmpty {
+                    try? fm.removeItem(at: senderDir)
                 }
             }
         }
@@ -206,22 +256,25 @@ enum AttachmentSandbox {
             || parts.contains("Documents")
     }
 
-    private static func perAttachmentDirectory(parent: String, id: Data) throws -> URL {
+    /// `sender`, when non-nil (inbound), inserts a `{senderHex}` path
+    /// component before the attachment-id component so every sender gets
+    /// a disjoint on-disk namespace (F-S8-01). Outbound staging passes
+    /// nil — it is the local user's own staging and has no cross-sender
+    /// collision surface. `withIntermediateDirectories` creates the whole
+    /// chain; the iCloud-backup exclusion set on the `attachments/` root
+    /// in `root()` covers the entire subtree.
+    private static func perAttachmentDirectory(
+        parent: String, id: Data, sender: Data? = nil
+    ) throws -> URL {
         let r = try root()
-        let parentURL = r.appending(path: parent, directoryHint: .isDirectory)
         let hex = id.map { String(format: "%02x", $0) }.joined()
-        let dir = parentURL.appending(path: hex, directoryHint: .isDirectory)
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: parentURL.path) {
-            try fm.createDirectory(
-                at: parentURL,
-                withIntermediateDirectories: true,
-                attributes: [
-                    .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication,
-                ],
-            )
-            try assertSandboxAttributes(parentURL)
+        var dir = r.appending(path: parent, directoryHint: .isDirectory)
+        if let sender {
+            let senderHex = sender.map { String(format: "%02x", $0) }.joined()
+            dir = dir.appending(path: senderHex, directoryHint: .isDirectory)
         }
+        dir = dir.appending(path: hex, directoryHint: .isDirectory)
+        let fm = FileManager.default
         if !fm.fileExists(atPath: dir.path) {
             try fm.createDirectory(
                 at: dir,

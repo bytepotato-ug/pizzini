@@ -125,6 +125,12 @@ pub fn encrypt_with_aad(
 /// by `encrypt`. Returns the plaintext or an `io::Error` if the
 /// envelope is truncated, the tag doesn't verify (wrong key /
 /// tampered file), or the AEAD primitive fails.
+///
+/// S4-07: no longer used on any store-load path — the stores now decrypt
+/// AAD-only. Retained as a tested primitive (and the empty-AAD partner
+/// to `encrypt`); `#[allow(dead_code)]` keeps the no-AAD round-trip
+/// tests compiling without re-introducing a no-AAD load path.
+#[allow(dead_code)]
 pub fn decrypt(key: &[u8; KEY_LEN], bytes: &[u8]) -> io::Result<Vec<u8>> {
     decrypt_with_aad(key, bytes, &[])
 }
@@ -153,17 +159,29 @@ pub fn decrypt_with_aad(
     })
 }
 
-/// Write `bytes` to `path` atomically: write to `<path>.tmp`, fsync,
-/// chmod 0600, rename. A crash anywhere before the rename leaves the
-/// prior canonical file intact; the rename itself is atomic on POSIX
-/// (and on macOS APFS / Linux ext4 / btrfs / xfs).
+/// Write `bytes` to `path` atomically: create the `<path>.tmp` with
+/// mode 0600 *at creation time*, write, fsync, rename. A crash anywhere
+/// before the rename leaves the prior canonical file intact; the rename
+/// itself is atomic on POSIX (and on macOS APFS / Linux ext4 / btrfs /
+/// xfs).
+///
+/// S4-06: the temp file is opened with explicit `0o600` via
+/// `OpenOptions::mode` so the bytes — which for the `*.key` files are
+/// the raw 32-byte store encryption key — are never even transiently
+/// visible at the umask-default (typically 0644) mode. The previous
+/// create-then-chmod ordering left a sub-millisecond window where a
+/// reader who could open the temp file saw it at the broader mode.
+/// `mode()` is Unix-only; non-Unix hosts fall back to the plain create
+/// (best-effort, same as `restrict_permissions`).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = unique_tmp_path(path);
     {
-        let mut f = fs::File::create(&tmp)?;
+        let mut f = create_private(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
+    // Belt-and-braces on Unix (the create already set 0600); the sole
+    // effect on non-Unix is to keep prior behaviour.
     restrict_permissions(&tmp, 0o600);
     fs::rename(&tmp, path)?;
     // F-RP-04: fsync the parent directory so the rename (the directory entry
@@ -199,6 +217,29 @@ fn unique_tmp_path(path: &Path) -> std::path::PathBuf {
     path.with_extension(format!("{base_ext}.{}.{}.tmp", std::process::id(), seq))
 }
 
+/// S4-06: create `tmp` for exclusive write with mode `0o600` *at open
+/// time* on Unix, so the secret bytes never exist at a broader
+/// umask-derived mode for any window. `create_new(false)` is implied by
+/// `create(true).truncate(true)`; we do NOT use `create_new` because a
+/// stale temp from a crashed prior writer at the same pid+seq must be
+/// overwritable. The 0600 mode is applied via `mode()` before the file
+/// is opened, so it wins over the umask for the create.
+#[cfg(unix)]
+fn create_private(tmp: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(tmp)
+}
+
+#[cfg(not(unix))]
+fn create_private(tmp: &Path) -> io::Result<fs::File> {
+    fs::File::create(tmp)
+}
+
 /// chmod helper. POSIX-only — on Windows / other non-Unix this is a
 /// no-op (silently). The `set_permissions` call is best-effort: a
 /// host that refuses (e.g. exotic filesystem) still gets correctness
@@ -216,6 +257,22 @@ pub fn restrict_permissions(path: &Path, mode: u32) {
 
 #[cfg(not(unix))]
 pub fn restrict_permissions(_path: &Path, _mode: u32) {}
+
+/// S4-08: operator-visible signal that a store dropped corrupt rows on
+/// load. Release-safe (a plain `eprintln!`, NOT gated out of release)
+/// and deliberately carries ONLY a count plus the store label — never a
+/// peer-id, token, or any secret. A non-zero count means the on-disk
+/// store had partial corruption that still passed the whole-file AEAD
+/// tag (e.g. a torn write of an individual field); those individual
+/// records were lost. Whole-file decrypt failure is handled separately
+/// (refuse to start). No-op when `dropped == 0` so a clean load is silent.
+pub fn warn_dropped_rows(store: &str, dropped: usize) {
+    if dropped > 0 {
+        eprintln!(
+            "[pizzini-relay] warn: {store} store dropped {dropped} corrupt row(s) on load"
+        );
+    }
+}
 
 /// Wall-clock unix seconds. Used by stores for TTL / last-refreshed
 /// timestamps that need to survive serialization (unlike `Instant`,
@@ -335,6 +392,37 @@ mod tests {
         assert!(a.to_string_lossy().ends_with(".tmp"));
         assert!(b.to_string_lossy().ends_with(".tmp"));
         assert_ne!(a, p.to_path_buf());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_private_opens_at_0600() {
+        // S4-06: the temp file holding the raw store key must be 0600
+        // from the moment it exists — never at the umask-default (e.g.
+        // 0644) mode. 0600 already excludes every group/other bit a
+        // normal umask (0022 / 0077) would strip, so `OpenOptions::mode`
+        // yields exactly 0600 under any sane umask — i.e. the secret is
+        // not group/world-readable for even the create→chmod window the
+        // old code left open.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("secret.tmp");
+        let f = create_private(&p).unwrap();
+        drop(f);
+        let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "temp file must be created at 0600, got {mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_final_file_is_0600() {
+        // The committed file (post-rename) inherits the temp's 0600.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("state.bin");
+        write_atomic(&path, b"committed").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "committed file must be 0600, got {mode:o}");
     }
 
     #[test]

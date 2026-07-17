@@ -513,10 +513,14 @@ enum Storage {
             AppPasscode.eraseAll()
         }
         // 3. Attachment sandbox — every received photo/video/PDF the
-        //    user exchanged. These bytes are already undecryptable-DB
-        //    orphans by now; clearing them is cleanup, not a
-        //    confidentiality boundary.
+        //    user exchanged. The in-app store under Application Support is
+        //    removed wholesale; the `NSTemporaryDirectory()` staging files
+        //    (pre-strip picker originals that still carry EXIF/GPS, AV
+        //    round-trip intermediates, decrypted QuickLook copies) are
+        //    swept too — F-S8-03/F-S7-02: those would otherwise outlive the
+        //    wipe and leak a GPS-bearing original after a duress event.
         AttachmentSandbox.eraseEverything()
+        AttachmentSandbox.sweepTemporaryStaging()
         // 4. Unlink the SQLCipher database file + WAL + SHM sidecars.
         SQLiteStorage.unlinkDatabaseFiles()
         // 5. Scrub the app-wide persistence surfaces that are not the

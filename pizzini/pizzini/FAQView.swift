@@ -895,8 +895,8 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             • Every contact and every libsignal session — including \
               the long-term identity key. You'll have a new identity \
               on next launch.
-            • Every received attachment file on disk, including those \
-              saved to Files via Pizzini.
+            • Every received attachment in Pizzini's in-app store on \
+              disk.
             • The SQLCipher database file and its WAL/SHM sidecars.
             • The Secure-Enclave wrap, the Argon2id salt, the wrapped \
               seed, and BOTH passcode slots (real and duress).
@@ -915,6 +915,10 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             • A forensic image taken before the wipe.
             • Messages already in flight at other relays.
             • Copies of your QR photographed or sent via another app.
+            • Files you exported with "Save to Files" (or shared to \
+              another app). Those copies live in the Files app / \
+              iCloud Drive, outside Pizzini's sandbox, and the wipe \
+              cannot reach them. Delete them there separately.
             """
 
         case .panicMode:

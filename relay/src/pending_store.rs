@@ -211,11 +211,13 @@ impl PendingStore {
 
         let queues = match fs::read(&pending_path) {
             Ok(bytes) => {
-                // Domain-AAD decrypt with legacy-no-AAD fallback for
-                // files written before The next persist
-                // rewrites with the AAD path.
-                let plaintext = encrypted_file::decrypt_with_aad(&key, &bytes, AAD)
-                    .or_else(|_| encrypted_file::decrypt(&key, &bytes))?;
+                // S4-07: AAD-only decrypt. The previous unconditional
+                // no-AAD fallback was a one-time migration shim for files
+                // written before this store adopted per-store AAD; it
+                // weakened AEAD domain separation for the binary's
+                // lifetime and is removed. A blob that does not verify
+                // under this store's AAD fails the load (refuse to start).
+                let plaintext = encrypted_file::decrypt_with_aad(&key, &bytes, AAD)?;
                 let doc: StoreDoc = serde_json::from_slice(&plaintext).map_err(io::Error::other)?;
                 drop_expired(doc, encrypted_file::unix_now())
             }
@@ -419,16 +421,24 @@ fn drop_expired(
     now: u64,
 ) -> HashMap<Vec<u8>, VecDeque<PendingFrame>> {
     let mut map = HashMap::with_capacity(doc.queues.len());
+    // S4-08: count peer-queue rows skipped because the peer-id key is
+    // malformed (non-hex), distinct from queues that simply emptied out
+    // via per-frame TTL. Surfaced as an operator count, no peer-id.
+    let mut corrupt = 0usize;
     for (peer_hex, queue) in doc.queues {
         let peer_id = match encrypted_file::hex_decode(&peer_hex) {
             Some(p) => p,
-            None => continue,
+            None => {
+                corrupt += 1;
+                continue;
+            }
         };
         let live: VecDeque<PendingFrame> = queue.into_iter().filter(|f| !f.is_expired(now)).collect();
         if !live.is_empty() {
             map.insert(peer_id, live);
         }
     }
+    encrypted_file::warn_dropped_rows("pending-queue", corrupt);
     map
 }
 

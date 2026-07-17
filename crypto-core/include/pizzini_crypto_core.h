@@ -483,30 +483,6 @@ int32_t pizzini_verify_delivery_token(const uint8_t *verify_key,
                                       uintptr_t token_len);
 
 /**
- * Verify an arbitrary XEd25519 signature `sig` over `message`, claimed
- * to be produced by the IdentityKey whose 33-byte serialized public
- * half is `identity_pub`.
- *
- * Returns `PIZZINI_OK` on a valid signature, `PIZZINI_ERR_BAD_SIGNATURE`
- * if the signature does not match, or `PIZZINI_ERR_INVALID_ARG` for
- * length / null mismatches. Used by the Swift host to authenticate
- * signed `GroupOp` log entries: the signer's identity-public is
- * embedded in the op header and the recipient verifies the signature
- * before applying the op.
- *
- * # Safety
- * All pointers must be non-null and refer to memory of the declared
- * sizes. `identity_pub_len` must equal the IdentityKey wire size
- * (33 bytes — 1-byte DJB type prefix + 32-byte point).
- */
-int32_t pizzini_verify_identity_signature(const uint8_t *identity_pub,
-                                          uintptr_t identity_pub_len,
-                                          const uint8_t *message,
-                                          uintptr_t message_len,
-                                          const uint8_t *signature,
-                                          uintptr_t signature_len);
-
-/**
  * Domain-separated identity signature verify. The signed
  * bytes the verifier reconstructs are
  * `u16_be(context_tag_len) || context_tag || message`. A caller that
@@ -527,30 +503,6 @@ int32_t pizzini_verify_identity_signature_v2(const uint8_t *identity_pub,
                                              uintptr_t message_len,
                                              const uint8_t *signature,
                                              uintptr_t signature_len);
-
-/**
- * Sign `payload` with the local IdentityKey's private half. F-203:
- * used by the iOS client to attach a possession proof to its HELLO
- * frame so a network-positioned attacker can't squat someone else's
- * peer_id and drain that peer's queued mail. The relay verifies the
- * returned 64-byte Ed25519 signature against the IdentityKey extracted
- * from the HELLO's `peer_id` field.
- *
- * The store is borrowed immutably — signing doesn't mutate any
- * libsignal state.
- *
- * # Safety
- * `store` must point to a live `DeviceStore`.
- * `payload` must point to `payload_len` readable bytes.
- * `out_sig` must point to `out_cap` writable bytes.
- * `out_len` must point to a valid `usize`.
- */
-int32_t pizzini_store_identity_sign(struct DeviceStore *store,
-                                    const uint8_t *payload,
-                                    uintptr_t payload_len,
-                                    uint8_t *out_sig,
-                                    uintptr_t out_cap,
-                                    uintptr_t *out_len);
 
 /**
  * Domain-separated identity sign. Signs

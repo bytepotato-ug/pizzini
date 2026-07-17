@@ -312,18 +312,29 @@ public final class RelayClient: @unchecked Sendable {
             // anything, so the only signal in the Console.app dump
             // is the perRelayState dict mutating in ChatStore, which
             // is too far downstream to tell us WHICH write fired.
+            //
+            // S5-03/S11-02: the onion prefix is an identifying
+            // artifact. `.info`/`.notice`/`.error` all persist the
+            // line to the on-disk unified log on RELEASE (the earlier
+            // comment claiming `.info` stays out of release sysdiagnose
+            // archives was WRONG — `.info` is captured live from the
+            // in-memory ring at sysdiagnose-capture time, it is not
+            // a release-disk guarantee). So this whole transition
+            // line — which carries the relay onion prefix — is now
+            // compiled out of release via `#if DEBUG`. The delegate
+            // dispatch below is the load-bearing part and stays
+            // unconditional.
+            #if DEBUG
             // %{public}@ formatting because the relay onion is a
             // public address (already on the wire in the SOCKS
             // CONNECT) and the transition itself is the entire
-            // diagnostic value.
-            // info level (not notice) — onion hostnames stay out of
-            // release sysdiagnose archives by default. Local Console
-            // debugging keeps the same diagnostic value because info
-            // is still streamed live.
+            // diagnostic value. DEBUG-only build, so no release-disk
+            // persistence concern.
             let hostPrefix = lastTargetHost.prefix(12)
             relayLog.info(
                 "state: \(hostPrefix, privacy: .public)… \(String(describing: oldValue), privacy: .public) → \(String(describing: snapshot), privacy: .public)"
             )
+            #endif
             let delegate = self.delegate
             let client = self
             queue.async {
@@ -1149,8 +1160,17 @@ public final class RelayClient: @unchecked Sendable {
         lastFrameSentAt = Date()
         connection.send(content: frame, completion: .contentProcessed { [weak self] error in
             if let error {
+                // S5-03/S11-02: this `.error` line carries the relay
+                // onion prefix (`lastTargetHost`) at `.public`, which
+                // persists to the on-disk unified log on release.
+                // Gate it behind `#if DEBUG` so the identifying line
+                // is compiled out of release builds. The state
+                // transition to `.failed` below is load-bearing and
+                // stays unconditional.
+                #if DEBUG
                 let host = self?.lastTargetHost.prefix(12) ?? ""
                 relayLog.error("writeFrame send error on \(host, privacy: .public)…: \(String(describing: error), privacy: .public)")
+                #endif
                 self?.state = .failed("\(error)")
             }
         })

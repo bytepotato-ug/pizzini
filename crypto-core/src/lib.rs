@@ -13,7 +13,7 @@ use core::ffi::c_char;
 use libsignal_protocol::{IdentityKeyPair, PublicKey};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 mod hashcash;
 mod store;
@@ -75,22 +75,28 @@ pub unsafe extern "C" fn pizzini_identity_keypair_generate(
     // unreachable) OS RNG failure path; on Apple platforms this is getentropy/SecRandom.
     let mut rng = OsRng.unwrap_err();
     let kp = IdentityKeyPair::generate(&mut rng);
-    let bytes = kp.serialize();
+    // `serialize()` returns `public || private_scalar` in cleartext.
+    // F-S1-02: scrub it on EVERY exit path so the freshly-minted
+    // long-term private key never lingers in freed heap for an AFU
+    // image to recover (mirrors the write_blob / serialize legs).
+    let mut bytes = kp.serialize();
 
-    if bytes.len() > out_buf_cap {
+    let result = if bytes.len() > out_buf_cap {
         // SAFETY: caller asserted out_len points to a valid usize.
         unsafe { *out_len = bytes.len() };
-        return PIZZINI_ERR_BUFFER_TOO_SMALL;
-    }
+        PIZZINI_ERR_BUFFER_TOO_SMALL
+    } else {
+        // SAFETY: we just verified bytes.len() <= out_buf_cap, and the caller
+        // asserted that out_buf points to at least out_buf_cap writable bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+            *out_len = bytes.len();
+        }
+        PIZZINI_OK
+    };
 
-    // SAFETY: we just verified bytes.len() <= out_buf_cap, and the caller
-    // asserted that out_buf points to at least out_buf_cap writable bytes.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
-        *out_len = bytes.len();
-    }
-
-    PIZZINI_OK
+    bytes.zeroize();
+    result
 }
 
 // ───── Per-device session store ────────────────────────────────────────
@@ -887,64 +893,12 @@ pub unsafe extern "C" fn pizzini_verify_delivery_token(
     }
 }
 
-/// Verify an arbitrary XEd25519 signature `sig` over `message`, claimed
-/// to be produced by the IdentityKey whose 33-byte serialized public
-/// half is `identity_pub`.
-///
-/// Returns `PIZZINI_OK` on a valid signature, `PIZZINI_ERR_BAD_SIGNATURE`
-/// if the signature does not match, or `PIZZINI_ERR_INVALID_ARG` for
-/// length / null mismatches. Used by the Swift host to authenticate
-/// signed `GroupOp` log entries: the signer's identity-public is
-/// embedded in the op header and the recipient verifies the signature
-/// before applying the op.
-///
-/// # Safety
-/// All pointers must be non-null and refer to memory of the declared
-/// sizes. `identity_pub_len` must equal the IdentityKey wire size
-/// (33 bytes — 1-byte DJB type prefix + 32-byte point).
-#[no_mangle]
-pub unsafe extern "C" fn pizzini_verify_identity_signature(
-    identity_pub: *const u8,
-    identity_pub_len: usize,
-    message: *const u8,
-    message_len: usize,
-    signature: *const u8,
-    signature_len: usize,
-) -> i32 {
-    // Keep the no-tag FFI in source but route every caller
-    // through the v2 form. Internal callers use `_v2` directly; the
-    // no-tag form here is the legacy shim and is removed from cbindgen
-    // via the #[doc(hidden)] attribute. Future call sites MUST take
-    // the v2 path — the tag-less variant is structurally vulnerable to
-    // cross-context signature reuse if a future caller passes
-    // attacker-influenced bytes without their own domain prefix.
-    if identity_pub.is_null() || message.is_null() || signature.is_null() {
-        return PIZZINI_ERR_INVALID_ARG;
-    }
-    // 33 bytes is the libsignal-native IdentityKey wire size.
-    if identity_pub_len != 33 {
-        return PIZZINI_ERR_INVALID_ARG;
-    }
-    // 64 bytes is the XEd25519 signature output libsignal's
-    // `IdentityKeyPair::private_key().calculate_signature(...)` produces.
-    if signature_len != 64 {
-        return PIZZINI_ERR_INVALID_ARG;
-    }
-    // SAFETY: caller asserted slice validity above.
-    let id_bytes = unsafe { std::slice::from_raw_parts(identity_pub, identity_pub_len) };
-    let msg = unsafe { std::slice::from_raw_parts(message, message_len) };
-    let sig = unsafe { std::slice::from_raw_parts(signature, signature_len) };
-
-    let key = match PublicKey::deserialize(id_bytes) {
-        Ok(k) => k,
-        Err(_) => return PIZZINI_ERR_INTERNAL,
-    };
-    if key.verify_signature(msg, sig) {
-        PIZZINI_OK
-    } else {
-        PIZZINI_ERR_BAD_SIGNATURE
-    }
-}
+// F-S1-01: the legacy tag-less `pizzini_verify_identity_signature` was
+// removed. It had no production caller (Swift uses only the `_v2`,
+// domain-separated form below) and exporting a generic, context-free
+// verify over the long-term IdentityKey was a cross-context
+// signature-confusion oracle waiting for a future call site. Only the
+// domain-separated `_v2` form is exported.
 
 /// Domain-separated identity signature verify. The signed
 /// bytes the verifier reconstructs are
@@ -1000,56 +954,12 @@ pub unsafe extern "C" fn pizzini_verify_identity_signature_v2(
     }
 }
 
-/// Sign `payload` with the local IdentityKey's private half. F-203:
-/// used by the iOS client to attach a possession proof to its HELLO
-/// frame so a network-positioned attacker can't squat someone else's
-/// peer_id and drain that peer's queued mail. The relay verifies the
-/// returned 64-byte Ed25519 signature against the IdentityKey extracted
-/// from the HELLO's `peer_id` field.
-///
-/// The store is borrowed immutably — signing doesn't mutate any
-/// libsignal state.
-///
-/// # Safety
-/// `store` must point to a live `DeviceStore`.
-/// `payload` must point to `payload_len` readable bytes.
-/// `out_sig` must point to `out_cap` writable bytes.
-/// `out_len` must point to a valid `usize`.
-#[no_mangle]
-pub unsafe extern "C" fn pizzini_store_identity_sign(
-    store: *mut DeviceStore,
-    payload: *const u8,
-    payload_len: usize,
-    out_sig: *mut u8,
-    out_cap: usize,
-    out_len: *mut usize,
-) -> i32 {
-    // Legacy tag-less signing path. Kept for ABI continuity but no
-    // longer called by Swift (RelayClient.swift uses the _v2 form).
-    // Any future caller MUST prefer the _v2 form.
-    if store.is_null() || payload.is_null() || out_sig.is_null() || out_len.is_null() {
-        return PIZZINI_ERR_INVALID_ARG;
-    }
-    // SAFETY: caller asserted slice + pointer validity.
-    let s = unsafe { &*store };
-    let payload_bytes = unsafe { std::slice::from_raw_parts(payload, payload_len) };
-    let kp = s.local_identity_keypair();
-    let mut rng = OsRng.unwrap_err();
-    let sig = match kp.private_key().calculate_signature(payload_bytes, &mut rng) {
-        Ok(s) => s,
-        Err(_) => return PIZZINI_ERR_INTERNAL,
-    };
-    let sig_bytes: &[u8] = &sig;
-    if sig_bytes.len() > out_cap {
-        unsafe { *out_len = sig_bytes.len() };
-        return PIZZINI_ERR_BUFFER_TOO_SMALL;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(sig_bytes.as_ptr(), out_sig, sig_bytes.len());
-        *out_len = sig_bytes.len();
-    }
-    PIZZINI_OK
-}
+// F-S1-01: the legacy tag-less `pizzini_store_identity_sign` was
+// removed. It signed arbitrary caller-supplied bytes with the long-term
+// IdentityKey private half with no domain-separation prefix — a generic
+// signing oracle. No production caller exists (the iOS HELLO possession
+// proof uses the `_v2`, domain-separated form below). Only `_v2` is
+// exported.
 
 /// Domain-separated identity sign. Signs
 /// `u16_be(context_tag_len) || context_tag || payload`. The tag MUST
@@ -1481,8 +1391,10 @@ pub unsafe extern "C" fn pizzini_store_group_decrypt(
     let s = unsafe { &mut *store };
     let sender = unsafe { std::slice::from_raw_parts(sender_identity, sender_identity_len) };
     let ct = unsafe { std::slice::from_raw_parts(ciphertext, ciphertext_len) };
+    // F-S1-03: scrub the decrypted group plaintext on every exit path so
+    // it does not outlive the copy-out in freed heap.
     let pt = match s.group_decrypt(sender, ct) {
-        Ok(b) => b,
+        Ok(b) => Zeroizing::new(b),
         Err(_) => return PIZZINI_ERR_INTERNAL,
     };
     // SAFETY: out_plaintext/out_plaintext_len asserted valid.

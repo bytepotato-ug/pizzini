@@ -609,7 +609,14 @@ extension ChatStore {
             Storage.upsertGroup(state.groups[gIdx])
             return false
         }
-        let plaintext = Data(trimmed.utf8)
+        // F-S6-01: stamp our current op-chain head into the encrypted
+        // plaintext so recipients can detect a forked group log (an admin
+        // who signed divergent epoch-N ops to different members).
+        let plaintext = GroupChatPlaintext.encode(
+            epoch: state.groups[gIdx].currentEpoch,
+            opDigest: state.groups[gIdx].lastOpDigest,
+            text: trimmed,
+        )
         guard let ciphertext = try? session.groupEncrypt(distributionId: myDist, plaintext: plaintext) else {
             appendGroupSystem(groupAt: gIdx, "Couldn't encrypt this message. Try sending it again.")
             Storage.upsertGroup(state.groups[gIdx])
@@ -1869,8 +1876,15 @@ extension ChatStore {
                 + " decrypted \(plaintext.count) B",
         )
         persistSession()
-        let text = String(data: plaintext, encoding: .utf8)
-            ?? "<\(plaintext.count) non-utf8 bytes>"
+        // F-S6-01: decode the sender's stamped op-chain head and check it
+        // against our local view; a mismatch at a shared epoch proves the
+        // group log forked (an admin equivocated).
+        let decoded = GroupChatPlaintext.decode(plaintext)
+        checkTranscriptConsistency(
+            groupAt: gIdx, sender: sender,
+            senderEpoch: decoded.epoch, senderDigest: decoded.opDigest,
+        )
+        let text = decoded.text.isEmpty ? "<\(plaintext.count) bytes>" : decoded.text
         // Render-time member-name resolution (audit MEDIUM-7): store
         // the sender's peerId on the row so `GroupChatView` resolves
         // the display name dynamically (rename of a 1:1 contact
@@ -1901,6 +1915,53 @@ extension ChatStore {
             markGroupRead(groupID: groupId)
         }
         maybeFireBackgroundHaptic(forIncoming: .group(groupId: groupId))
+    }
+
+    // ─── Equivocation detection (F-S6-01) ────────────────────────────
+
+    /// Compare a sender's stamped op-chain head against our own local
+    /// view. A sender who applied a DIFFERENT op than we did at a SHARED
+    /// epoch is proof the group log forked — an admin showed different
+    /// members different epoch-N ops. We can only compare at an epoch we
+    /// have BOTH applied; if the sender is ahead (catching us up) there is
+    /// nothing to compare yet, which is the normal case and is silent.
+    func checkTranscriptConsistency(
+        groupAt gIdx: Int, sender: Data, senderEpoch: UInt64?, senderDigest: Data?
+    ) {
+        guard gIdx >= 0, gIdx < state.groups.count,
+              let senderEpoch, let senderDigest, !senderDigest.isEmpty
+        else { return }
+        let group = state.groups[gIdx]
+        let localDigest: Data?
+        if senderEpoch == group.currentEpoch {
+            localDigest = group.lastOpDigest.isEmpty ? nil : group.lastOpDigest
+        } else if senderEpoch < group.currentEpoch {
+            localDigest = group.digest(forEpoch: senderEpoch)
+        } else {
+            // Sender is ahead of us — normal catch-up, nothing to compare.
+            localDigest = nil
+        }
+        guard let localDigest, localDigest != senderDigest else { return }
+        flagGroupEquivocation(groupAt: gIdx, sender: sender, epoch: senderEpoch)
+    }
+
+    /// Surface a sticky, deduped equivocation warning once per group.
+    private func flagGroupEquivocation(groupAt gIdx: Int, sender: Data, epoch: UInt64) {
+        let groupId = state.groups[gIdx].id
+        guard !groupEquivocationWarned.contains(groupId) else { return }
+        groupEquivocationWarned.insert(groupId)
+        diagLog(
+            "group",
+            "EQUIVOCATION: \(short(sender)) op-chain head diverges from local view at epoch \(epoch)"
+        )
+        appendGroupSystem(
+            groupAt: gIdx,
+            "⚠️ Security warning: this group's history doesn't match what another "
+                + "member sees. An admin may have shown different members different "
+                + "group changes. Verify the member list in person with someone you "
+                + "trust before sharing anything sensitive here.",
+        )
+        Storage.upsertGroup(state.groups[gIdx])
     }
 
     // ─── Utilities ──────────────────────────────────────────────────
@@ -2008,12 +2069,22 @@ extension ChatStore {
             // active again.
             if let myCard,
                state.groups[gIdx].activeMembers.contains(where: { $0.peerId == myCard.peerId }) {
-                // Re-mint a fresh chain id; the SKDM broadcast hook
-                // below ships it to all other active members.
-                let freshDistribution = UUID()
-                state.groups[gIdx].myCurrentDistributionId = freshDistribution
+                // F-S6-05: a same-drain remove-then-add brought us back as
+                // an active member. The clear above set
+                // `myCurrentDistributionId = nil`, so enrol the chain
+                // PROPERLY via `enrolMyChainOnFirstJoin`, which mints the
+                // libsignal sender-key chain (`senderKeyDistributionCreate`),
+                // records `memberDistributionIds[self]`, marks us active,
+                // and broadcasts the SKDM to every other active member.
+                // The previous code bare-minted a fresh `UUID()` and set it
+                // as `myCurrentDistributionId` WITHOUT creating the
+                // libsignal chain — so the next `groupEncrypt` under that id
+                // failed with no chain (a transient send failure until the
+                // next rotation). `enrolMyChainOnFirstJoin` is idempotent
+                // and proceeds because the id is currently nil.
                 state.groups[gIdx].lastRotatedAt = Date()
-                // Fall through to ensureMySKDMReachesActiveMembers.
+                enrolMyChainOnFirstJoin(groupAt: gIdx, session: session)
+                return
             } else {
                 return
             }

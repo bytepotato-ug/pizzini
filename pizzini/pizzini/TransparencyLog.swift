@@ -223,8 +223,9 @@ enum TransparencyLogConfig {
     /// `scripts/sign-transparency-entry.sh` and committed alongside
     /// the binary SHA they attest to. The fetch is Tor-routed for
     /// `.onion` hosts via `torSession`; for this clearnet GitHub
-    /// host the fetch goes through `URLSession.shared` (documented
-    /// IP-leak trade-off, see `fetchAndCache` comment).
+    /// host the fetch goes through an isolated `ClearnetSession`
+    /// (cookie-less, never `URLSession.shared`) — documented
+    /// IP-leak trade-off, see `fetchAndCache` comment.
     nonisolated static let logURLString: String = "https://raw.githubusercontent.com/bytepotato-ug/pizzini/main/transparency-log.ndjson"
 
     /// Decoded form. Returns nil for unset / malformed keys —
@@ -393,6 +394,56 @@ extension TransparencyLog {
         defaults.set(date.timeIntervalSince1970, forKey: watermarkDefaultsKey)
     }
 
+    // ─── Clearnet fetch cooldown (S5-02) ──────────────────────────
+    //
+    // The transparency-log refresh fires on every "no relays ready →
+    // at least one ready" transition (cold launch, carrier handoff,
+    // network flap, foreground). For the clearnet GitHub URL that made
+    // the fetch a reliable per-reconnect usage beacon binding the
+    // device's real IP to Pizzini, correlatable with Tor activity. To
+    // collapse the beacon frequency we throttle the CLEARNET egress to
+    // at most once per `clearnetFetchCooldown`; inside the window
+    // `fetchAndCache` short-circuits to the on-disk cache without
+    // touching the wire. The cooldown is persisted in durable
+    // UserDefaults (not the evictable Caches dir) so an OS cache purge
+    // can't silently reopen the beacon. Only the real clearnet path is
+    // throttled — the Tor-routed `.onion` mirror and the injected
+    // test session are exempt.
+
+    /// Minimum wall-clock gap between two clearnet log fetches that
+    /// actually hit the wire. 6 h is short enough that an
+    /// operator-published log update propagates within a quarter-day
+    /// while turning the per-reconnect beacon into at most ~4 egresses
+    /// per device per day.
+    static let clearnetFetchCooldown: TimeInterval = 6 * 60 * 60
+
+    /// UserDefaults key holding the `timeIntervalSince1970` of the last
+    /// clearnet fetch that reached the wire. Durable store, same
+    /// rationale as the watermark.
+    private static let clearnetFetchTimestampKey = "pizzini.transparencyLog.lastClearnetFetch"
+
+    /// When did the last clearnet fetch hit the wire? nil if never.
+    /// `defaults` is injectable for tests.
+    static func lastClearnetFetch(defaults: UserDefaults = .standard) -> Date? {
+        guard let epoch = defaults.object(forKey: clearnetFetchTimestampKey) as? Double
+        else { return nil }
+        return Date(timeIntervalSince1970: epoch)
+    }
+
+    /// Record that a clearnet fetch just hit the wire. `defaults` is
+    /// injectable for tests.
+    static func storeClearnetFetch(_ date: Date, defaults: UserDefaults = .standard) {
+        defaults.set(date.timeIntervalSince1970, forKey: clearnetFetchTimestampKey)
+    }
+
+    /// True if a clearnet fetch is still inside the cooldown window and
+    /// should be suppressed (served from cache instead). `now` and
+    /// `defaults` are injectable for tests.
+    static func clearnetFetchOnCooldown(now: Date = Date(), defaults: UserDefaults = .standard) -> Bool {
+        guard let last = lastClearnetFetch(defaults: defaults) else { return false }
+        return now.timeIntervalSince(last) < clearnetFetchCooldown
+    }
+
     /// Count entries in `log` whose signature passes against the
     /// configured operator key. Used by the rollback guard +
     /// returned to the host so the UI can render
@@ -412,7 +463,8 @@ extension TransparencyLog {
     /// pass `nil` and the session is built based on the URL host:
     ///
     ///   • `.onion` host → Tor SOCKS5 (default `OnionTrafficOnly`).
-    ///   • Clearnet host → `URLSession.shared`. The Tor daemon
+    ///   • Clearnet host → isolated `ClearnetSession` (cookie-less,
+    ///     never `URLSession.shared`). The Tor daemon
     ///     refuses clearnet via the SOCKS port at the proxy layer
     ///     (defence-in-depth in case RelayClient forgets to dial
     ///     an `.onion`), so a Tor-routed fetch of a github.com log
@@ -420,7 +472,14 @@ extension TransparencyLog {
     ///     service hostname." Until the operator ships an onion
     ///     mirror of the transparency log, we accept the IP-leak
     ///     trade-off for content-signed integrity. See
-    ///     the threat-model doc, "Known limitations".
+    ///     the threat-model doc, "Known limitations". The clearnet
+    ///     beacon is throttled by a disk-persisted fetch cooldown
+    ///     (S5-02): within `clearnetFetchCooldown` of the last
+    ///     successful clearnet fetch this call short-circuits to the
+    ///     on-disk cache and does NOT hit the wire, so the
+    ///     per-reconnect beacon collapses to at most one egress per
+    ///     cooldown window. The request also no longer forces
+    ///     request-level cache-busting.
     static func fetchAndCache(
         from url: URL? = TransparencyLogConfig.logURL,
         urlSession: URLSession? = nil,
@@ -432,9 +491,22 @@ extension TransparencyLog {
         // slower than that is probably the wrong host.
         var request = URLRequest(url: url)
         request.timeoutInterval = 30
-        request.cachePolicy = .reloadIgnoringLocalCacheData
+        // S5-02: do NOT force request-level cache-busting. The
+        // previous `.reloadIgnoringLocalCacheData` made every refresh
+        // a guaranteed wire hit, turning the clearnet fetch into a
+        // reliable per-reconnect usage beacon. We leave the request on
+        // the default cache policy and rely on (a) the cooldown gate
+        // below to collapse the beacon frequency and (b) the on-disk
+        // NDJSON cache for content. (Note: the isolated
+        // `ClearnetSession` config still disables its own URL cache,
+        // so HTTP-level revalidation is not available here; the
+        // cooldown is the load-bearing mitigation.)
 
         let session: URLSession
+        // S5-02: only the real clearnet egress is throttled; the
+        // Tor-routed onion mirror and the injected test session are
+        // exempt.
+        var isThrottledClearnet = false
         if let urlSession {
             session = urlSession
         } else if url.host?.hasSuffix(".onion") == true {
@@ -457,6 +529,22 @@ extension TransparencyLog {
             // documented in the threat model; the isolated session
             // keeps this fetch unlinkable to the captive-portal probe
             // (no shared cookie jar — F-TOR-02).
+            //
+            // S5-02 cooldown: if a clearnet fetch already hit the wire
+            // within `clearnetFetchCooldown`, do NOT beacon again —
+            // short-circuit to the on-disk cache. This collapses the
+            // per-reconnect clearnet egress to at most once per
+            // cooldown window. On the very first launch (no cache yet)
+            // we still allow the fetch through even on cooldown, so the
+            // log can be populated; otherwise an early reconnect storm
+            // could leave the verifier with an empty log.
+            if clearnetFetchOnCooldown() {
+                let cached = loadCachedLog()
+                if !cached.isEmpty {
+                    return cached
+                }
+            }
+            isThrottledClearnet = true
             session = ClearnetSession.make()
         }
         let (data, response): (Data, URLResponse)
@@ -470,6 +558,16 @@ extension TransparencyLog {
         }
         guard (200...299).contains(http.statusCode) else {
             throw FetchError.http("HTTP \(http.statusCode)")
+        }
+
+        // S5-02: a clearnet egress just completed — arm the cooldown so
+        // the next per-reconnect refresh inside the window serves from
+        // cache instead of beaconing again. Recorded on a successful 2xx
+        // (the wire hit happened) before content validation, so even a
+        // log that later fails the rollback guard still counts toward
+        // the cooldown — the IP egress is what we are rate-limiting.
+        if isThrottledClearnet {
+            storeClearnetFetch(Date())
         }
 
         let entries = parseLog(data)
@@ -540,8 +638,9 @@ extension TransparencyLog {
     /// Build a `URLSession` that routes an onion-hosted transparency
     /// log request through Tor's local SOCKS5 port. The Tor daemon
     /// must be bootstrapped — this throws otherwise. The default
-    /// GitHub-hosted log is clearnet and deliberately uses
-    /// `URLSession.shared` above; an operator-provided onion mirror
+    /// GitHub-hosted log is clearnet and deliberately uses an
+    /// isolated `ClearnetSession` (cookie-less, never
+    /// `URLSession.shared`) above; an operator-provided onion mirror
     /// reaches this helper instead.
     ///
     /// The session is constructed on every fetch (rather than

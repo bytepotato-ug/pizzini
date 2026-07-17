@@ -175,17 +175,31 @@ enum SecureScreenshotSelfTest {
     }
 
     /// Samples a 4×4 grid in the centre 50% of the image. Returns true
-    /// iff the fraction of "red" pixels exceeds `threshold`. Used by
-    /// `run()` — if too much red leaked through the secure container,
-    /// the trick has stopped working.
+    /// iff the fraction of "red" pixels exceeds `threshold` — OR the
+    /// probe image cannot be sampled at all. Used by `run()`, which
+    /// returns `!sampleIsRed(...)`, so "red leaked" and "can't verify"
+    /// both correctly resolve to self-test FAILURE.
+    ///
+    /// **Fail CLOSED (S9-01).** Every unreadable-image path below
+    /// returns `true`, NOT `false`. The reasoning: if we cannot extract
+    /// pixels from the probe — nil `cgImage`, zero dimensions, missing
+    /// `dataProvider`/bytes, or zero usable samples — we have NOT proven
+    /// the secure-text-entry mask suppressed the sentinel, so we must
+    /// not report the mask "effective". Treating "can't verify the mask
+    /// works" as "mask not working" keeps `WindowSecureMask` engaged and
+    /// the degraded-mode notice live, rather than optimistically
+    /// assuming success on a future iOS where the in-process renderer
+    /// returns an un-sampleable frame while the real screenshot service
+    /// still leaks. On every shipping iOS the renderer returns a
+    /// backing-store-backed image, so the happy path is unchanged.
     private static func sampleIsRed(image: UIImage, threshold: Double) -> Bool {
-        guard let cg = image.cgImage else { return false }
+        guard let cg = image.cgImage else { return true }
         let w = cg.width
         let h = cg.height
-        guard w > 0, h > 0 else { return false }
+        guard w > 0, h > 0 else { return true }
         guard let data = cg.dataProvider?.data,
               let bytes = CFDataGetBytePtr(data)
-        else { return false }
+        else { return true }
         let bpr = cg.bytesPerRow
         let bpp = cg.bitsPerPixel / 8
         let alphaInfo = cg.alphaInfo
@@ -220,7 +234,10 @@ enum SecureScreenshotSelfTest {
                 samples += 1
             }
         }
-        guard samples > 0 else { return false }
+        // Fail CLOSED (S9-01): no usable samples means we proved
+        // nothing — report "red leaked" so `run()` marks the mask
+        // degraded rather than effective.
+        guard samples > 0 else { return true }
         return Double(redHits) / Double(samples) > threshold
     }
 

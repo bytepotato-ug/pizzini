@@ -52,11 +52,35 @@ const AAD: &[u8] = b"pizzini.relay.bundle-req-rate.v1";
 /// older is dead weight and dropped.
 const BUCKET_RETENTION_HOURS: u64 = 2;
 
+/// S4-02: global cardinality cap on the `(recipient, hour)` counts map
+/// — the backstop the sibling `chain_seed_rate` map already had
+/// (`CHAIN_SEED_RATE_MAX_ENTRIES`) but this one lacked. A free-to-mint
+/// HELLO identity can compute one hashcash proof per fabricated `to_id`
+/// and land a BUNDLE_REQUEST, inserting a fresh `(to_id, hour)` key each
+/// time; without a cap the encrypted store grows (and is re-serialized +
+/// fsynced) per distinct `to_id`. When inserting a NEW key would exceed
+/// this, the increment fails closed (the store is NOT mutated, NOT
+/// persisted) — bounding absolute store size to ~2h of attacker hashcash
+/// throughput × this cap. Sized well above any plausible legitimate
+/// first-contact fan-out: at 2 retained hour-buckets, this is ~8k
+/// distinct recipients/hour, far past a real single-operator fleet.
+pub const MAX_ENTRIES: usize = 16_384;
+
 /// Inner JSON document: a single `counts` map keyed by
 /// `"{recipient_peer_id_hex}:{hour_bucket}"` for JSON flatness.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct StoreDoc {
     counts: HashMap<String, u32>,
+}
+
+/// Outcome of an `increment`. `Counted(n)` is the post-increment count
+/// for `(recipient, hour)`; `RejectedCardinalityCap` means inserting a
+/// NEW key would have exceeded the global `MAX_ENTRIES` cap, so nothing
+/// was mutated or persisted (S4-02, fail-closed).
+#[derive(Debug, PartialEq, Eq)]
+pub enum IncrementOutcome {
+    Counted(u32),
+    RejectedCardinalityCap,
 }
 
 /// Persistent per-(recipient, hour) BUNDLE_REQUEST acceptance counter.
@@ -69,6 +93,11 @@ pub struct BundleReqRateStore {
     key: [u8; encrypted_file::KEY_LEN],
     /// `(recipient_peer_id, hour_bucket) → accepted count`.
     counts: HashMap<(Vec<u8>, u64), u32>,
+    /// S4-02: global cardinality cap. Defaults to `MAX_ENTRIES`; a
+    /// smaller value can be injected in tests via `set_max_entries` so
+    /// the boundary behaviour is exercised without `MAX_ENTRIES`
+    /// fsync-heavy inserts.
+    max_entries: usize,
 }
 
 // Manual `Debug` to redact the key — same reasoning as the sibling
@@ -100,8 +129,9 @@ impl BundleReqRateStore {
 
         let counts = match fs::read(&path) {
             Ok(bytes) => {
-                let plaintext = encrypted_file::decrypt_with_aad(&key, &bytes, AAD)
-                    .or_else(|_| encrypted_file::decrypt(&key, &bytes))?;
+                // S4-07: AAD-only decrypt (removed the one-time no-AAD
+                // migration fallback; see encrypted_file / sibling stores).
+                let plaintext = encrypted_file::decrypt_with_aad(&key, &bytes, AAD)?;
                 let doc: StoreDoc =
                     serde_json::from_slice(&plaintext).map_err(io::Error::other)?;
                 purge_stale(doc, current_hour)
@@ -110,7 +140,19 @@ impl BundleReqRateStore {
             Err(e) => return Err(e),
         };
 
-        Ok(BundleReqRateStore { path, key, counts })
+        Ok(BundleReqRateStore {
+            path,
+            key,
+            counts,
+            max_entries: MAX_ENTRIES,
+        })
+    }
+
+    /// Test-only: override the cardinality cap so the S4-02 boundary can
+    /// be exercised without `MAX_ENTRIES` fsync-heavy inserts.
+    #[cfg(test)]
+    fn set_max_entries(&mut self, n: usize) {
+        self.max_entries = n;
     }
 
     /// Distinct live `(recipient, hour)` buckets. Drives the startup
@@ -124,6 +166,16 @@ impl BundleReqRateStore {
     /// compare it against the cap with the same atomic-under-lock
     /// semantics the in-memory version had.
     ///
+    /// S4-02: BEFORE inserting a brand-new `(recipient, hour)` key, the
+    /// global cardinality cap (`MAX_ENTRIES`) is checked. If the key is
+    /// new AND the map is already at the cap, the increment fails closed
+    /// — `IncrementOutcome::RejectedCardinalityCap`, no mutation, no
+    /// persist — so a Sybil spraying fabricated `to_id`s cannot grow the
+    /// encrypted store (or its per-request full-map fsync) without bound.
+    /// An EXISTING key is always allowed to increment (it does not grow
+    /// the map), so a real recipient already in the map is never starved
+    /// by attacker-inflated cardinality.
+    ///
     /// `persist()` runs before the count is returned, so any count the
     /// caller acts on is already durable on disk. A crash *during* the
     /// atomic write leaves the previous (pre-increment) file in place
@@ -133,12 +185,17 @@ impl BundleReqRateStore {
     /// This is a vastly smaller window than the old
     /// wipe-the-whole-table-on-restart behaviour, which handed every
     /// recipient a fresh full budget on every bounce.
-    pub fn increment(&mut self, recipient: Vec<u8>, hour: u64) -> io::Result<u32> {
-        let entry = self.counts.entry((recipient, hour)).or_insert(0);
+    pub fn increment(&mut self, recipient: Vec<u8>, hour: u64) -> io::Result<IncrementOutcome> {
+        let key = (recipient, hour);
+        if !self.counts.contains_key(&key) && self.counts.len() >= self.max_entries {
+            // Fail closed: refuse to introduce a new key past the cap.
+            return Ok(IncrementOutcome::RejectedCardinalityCap);
+        }
+        let entry = self.counts.entry(key).or_insert(0);
         *entry = entry.saturating_add(1);
         let count = *entry;
         self.persist()?;
-        Ok(count)
+        Ok(IncrementOutcome::Counted(count))
     }
 
     /// Drop buckets older than `current_hour - BUCKET_RETENTION_HOURS`.
@@ -176,21 +233,29 @@ impl BundleReqRateStore {
 fn purge_stale(doc: StoreDoc, current_hour: u64) -> HashMap<(Vec<u8>, u64), u32> {
     let cutoff = current_hour.saturating_sub(BUCKET_RETENTION_HOURS);
     let mut map = HashMap::with_capacity(doc.counts.len());
+    // S4-08: count rows skipped because the row is malformed (corrupt
+    // composite key / non-numeric hour / non-hex recipient), distinct
+    // from buckets dropped by TTL. Surfaced as an operator count.
+    let mut corrupt = 0usize;
     for (composite, count) in doc.counts {
         let Some((recipient_hex, hour_str)) = composite.rsplit_once(':') else {
+            corrupt += 1;
             continue;
         };
         let Ok(hour) = hour_str.parse::<u64>() else {
+            corrupt += 1;
             continue;
         };
         if hour < cutoff {
             continue;
         }
         let Some(recipient) = encrypted_file::hex_decode(recipient_hex) else {
+            corrupt += 1;
             continue;
         };
         map.insert((recipient, hour), count);
     }
+    encrypted_file::warn_dropped_rows("bundle-req-rate", corrupt);
     map
 }
 
@@ -213,6 +278,17 @@ mod tests {
         dir
     }
 
+    /// Increment and assert it was Counted (not cardinality-rejected),
+    /// returning the post-increment count.
+    fn inc(store: &mut BundleReqRateStore, recipient: Vec<u8>, hour: u64) -> u32 {
+        match store.increment(recipient, hour).unwrap() {
+            IncrementOutcome::Counted(n) => n,
+            IncrementOutcome::RejectedCardinalityCap => {
+                panic!("unexpected cardinality-cap rejection")
+            }
+        }
+    }
+
     #[test]
     fn increment_persists_across_reload() {
         // The core F-S4-02 property: the per-(recipient, hour) count
@@ -222,14 +298,14 @@ mod tests {
         let hour = 480_000u64;
         {
             let mut store = BundleReqRateStore::load_or_create(&dir, hour).unwrap();
-            assert_eq!(store.increment(victim.clone(), hour).unwrap(), 1);
-            assert_eq!(store.increment(victim.clone(), hour).unwrap(), 2);
-            assert_eq!(store.increment(victim.clone(), hour).unwrap(), 3);
+            assert_eq!(inc(&mut store, victim.clone(), hour), 1);
+            assert_eq!(inc(&mut store, victim.clone(), hour), 2);
+            assert_eq!(inc(&mut store, victim.clone(), hour), 3);
         }
         // Reopen in the same hour — the counter is NOT reset.
         let mut store = BundleReqRateStore::load_or_create(&dir, hour).unwrap();
         assert_eq!(store.len(), 1);
-        assert_eq!(store.increment(victim.clone(), hour).unwrap(), 4);
+        assert_eq!(inc(&mut store, victim.clone(), hour), 4);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -240,7 +316,7 @@ mod tests {
         let old_hour = 100u64;
         {
             let mut store = BundleReqRateStore::load_or_create(&dir, old_hour).unwrap();
-            store.increment(victim.clone(), old_hour).unwrap();
+            inc(&mut store, victim.clone(), old_hour);
         }
         // Reopen many hours later — the old bucket is past the
         // retention window and dropped.
@@ -258,8 +334,8 @@ mod tests {
         let hour = 9000u64;
         {
             let mut store = BundleReqRateStore::load_or_create(&dir, hour).unwrap();
-            store.increment(victim.clone(), hour).unwrap();
-            store.increment(victim.clone(), hour).unwrap();
+            inc(&mut store, victim.clone(), hour);
+            inc(&mut store, victim.clone(), hour);
         }
         // One hour later — within BUCKET_RETENTION_HOURS — bucket
         // for `hour` is still present.
@@ -273,13 +349,63 @@ mod tests {
         let dir = fresh_state_dir("gc");
         let victim = vec![0xDD; 33];
         let mut store = BundleReqRateStore::load_or_create(&dir, 1000).unwrap();
-        store.increment(victim.clone(), 1000).unwrap();
-        store.increment(victim.clone(), 1001).unwrap();
+        inc(&mut store, victim.clone(), 1000);
+        inc(&mut store, victim.clone(), 1001);
         // GC at hour 1010: both 1000 and 1001 are older than
         // 1010 - BUCKET_RETENTION_HOURS, so both drop.
         let dropped = store.gc_stale(1010).unwrap();
         assert_eq!(dropped, 2);
         assert_eq!(store.len(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_cardinality_cap_refuses_new_keys_fail_closed() {
+        // S4-02: once the map holds the cap's worth of distinct
+        // (recipient, hour) keys, a NEW key is refused (fail closed, no
+        // growth), but an EXISTING key still increments. Mirrors the
+        // sibling chain_seed_rate cap. Uses a small injected cap so the
+        // boundary is exercised without MAX_ENTRIES fsync-heavy inserts;
+        // the production default is `MAX_ENTRIES`.
+        let dir = fresh_state_dir("cardinality");
+        let hour = 7_000u64;
+        const CAP: usize = 4;
+        let mut store = BundleReqRateStore::load_or_create(&dir, hour).unwrap();
+        store.set_max_entries(CAP);
+        // Fill the map to exactly CAP distinct recipients. Each recipient
+        // differs only in a 4-byte big-endian suffix.
+        for i in 0..CAP as u32 {
+            let mut recipient = vec![0u8; 33];
+            recipient[29..33].copy_from_slice(&i.to_be_bytes());
+            assert_eq!(
+                store.increment(recipient, hour).unwrap(),
+                IncrementOutcome::Counted(1),
+            );
+        }
+        assert_eq!(store.len(), CAP);
+        // A brand-new recipient is now refused — fail closed, no growth.
+        let newcomer = vec![0xEE; 33];
+        assert_eq!(
+            store.increment(newcomer.clone(), hour).unwrap(),
+            IncrementOutcome::RejectedCardinalityCap,
+        );
+        assert_eq!(store.len(), CAP, "map must not grow past the cap");
+        // A new key in a DIFFERENT hour bucket is ALSO refused — the cap
+        // is global across (recipient, hour), not per-hour.
+        assert_eq!(
+            store.increment(newcomer, hour + 1).unwrap(),
+            IncrementOutcome::RejectedCardinalityCap,
+        );
+        assert_eq!(store.len(), CAP);
+        // An ALREADY-PRESENT recipient still increments (it does not add
+        // a new key), so a real recipient in the map is never starved.
+        let mut existing = vec![0u8; 33];
+        existing[29..33].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(
+            store.increment(existing, hour).unwrap(),
+            IncrementOutcome::Counted(2),
+        );
+        assert_eq!(store.len(), CAP);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -298,7 +424,7 @@ mod tests {
         let dir = fresh_state_dir("tampered");
         {
             let mut store = BundleReqRateStore::load_or_create(&dir, 5).unwrap();
-            store.increment(vec![0x11; 33], 5).unwrap();
+            inc(&mut store, vec![0x11; 33], 5);
         }
         let path = dir.join(FILE_NAME);
         let mut bytes = fs::read(&path).unwrap();

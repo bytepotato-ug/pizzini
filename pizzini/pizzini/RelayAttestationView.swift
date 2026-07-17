@@ -21,8 +21,14 @@ import SwiftUI
 ///      log entry. Mismatch → either a stale published entry
 ///      (operator missed a redeploy) or a tampered binary.
 ///
-/// Step 5 is the user-facing side; the in-band comparison against
-/// a fetched transparency log is on the roadmap.
+/// Step 5 is the user-facing side. The in-band comparison against
+/// a fetched transparency log is implemented AND enforced, not just
+/// shown: `ChatStore.computeAttestationVerdict()` fetches the signed
+/// log and compares the relay's reported binary SHA against it
+/// (`.verified` / `.mismatch` / `.unverifiable` / `.notEvaluated`),
+/// and `ChatStore.shouldUseRelayForOutbound()` fails CLOSED for a
+/// bundled relay on `.mismatch`/`.notEvaluated`, gating outbound
+/// sealed traffic until the relay attests.
 struct RelayAttestationView: View {
     @Bindable var store: ChatStore
 
