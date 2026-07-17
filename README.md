@@ -78,8 +78,10 @@ cargo run --example pqxdh_roundtrip -p pizzini-crypto-core
 scripts/build-xcframework.sh                # release
 PROFILE=debug scripts/build-xcframework.sh  # dev
 
-# Embedded Tor static library + headers, pinned by SHA-256 to iCepa
-# Tor.framework v409.6.1. Re-run with REBUILD=1 to refresh after a script bump.
+# Embedded Tor static library + headers, built from source via iCepa's
+# build-xcframework.sh at the pinned tag. ~30-60 min on Apple Silicon
+# (re-runs reuse iCepa's cached intermediate builds). Re-run with
+# REBUILD=1 to refresh after bumping the pinned tag.
 scripts/build-tor-xcframework.sh
 
 # Swift package tests on simulator

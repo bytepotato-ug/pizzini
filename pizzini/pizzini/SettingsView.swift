@@ -24,9 +24,30 @@ import SwiftUI
 ///   reset-identity)
 struct SettingsView: View {
     @Bindable var store: ChatStore
+    /// The optional-purchases coordinator. Lifecycle is owned by
+    /// `AppDelegate` (one shared instance, started at launch); this
+    /// view just reads the entitlement and surfaces the row.
+    @Bindable var subscriptionService: SubscriptionService = .shared
 
     var body: some View {
         Form {
+            if subscriptionService.isEntitled {
+                // Subtle thank-you. Lives at the top — once a user has
+                // chosen to support, the badge is the first thing they
+                // see when they open Settings, but it's a single row,
+                // not a banner.
+                Section {
+                    HStack(spacing: 10) {
+                        Image(systemName: "heart.fill")
+                            .foregroundStyle(.tint)
+                        Text("Thanks for supporting Pizzini")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    .listRowBackground(Color.clear)
+                }
+            }
+
             Section {
                 NavigationLink {
                     RelayHostScreen(store: store)
@@ -165,6 +186,8 @@ struct SettingsView: View {
                     Text("Screenshot protection — degraded")
                 }
             }
+
+            SupportPizziniSection(service: subscriptionService)
 
             Section("Help") {
                 NavigationLink {
