@@ -83,7 +83,7 @@ jobs:
         # a build-time proc-macro dependency pulled in transitively by the
         # verified post-quantum crypto stack:
         #   proc-macro-error2 ← hax-lib-macros 0.3.6 ← hax-lib 0.3.6
-        #     ← libcrux-ml-kem / libcrux-sha3 / spqr  (ML-KEM-768 + SPQR)
+        #     ← libcrux-ml-kem / libcrux-sha3 / spqr  (ML-KEM-1024 + SPQR)
         # It is never reached at runtime and cannot be dropped without
         # bumping the pinned libcrux/hax verification stack. `--deny
         # warnings` stays in force for every other advisory; revisit this
