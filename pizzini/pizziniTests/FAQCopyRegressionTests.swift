@@ -132,6 +132,29 @@ struct FAQCopyRegressionTests {
         #expect(FAQSection.prnu.rawValue == "prnu")
         #expect(FAQSection.documentMetadata.rawValue == "documentMetadata")
         #expect(FAQSection.executableWarning.rawValue == "executableWarning")
+        // The OS-notification-retention advisory banner
+        // (ContentView.osNotificationAdvisoryBanner) deep-links its (i)
+        // button here; renaming the case silently breaks it.
+        #expect(FAQSection.pushNotifications.rawValue == "pushNotifications")
+    }
+
+    /// CVE-2026-28950: the pushNotifications advanced body names the
+    /// first-patched iOS builds ("below 18.7.8 or 26.4.2"). Those
+    /// numbers must track `NotificationRetentionAdvisory.patchedByMajor`
+    /// — the table that actually drives the advisory banner the copy
+    /// describes. If Apple revises the fixed-in versions (or a follow-up
+    /// CVE moves the threshold) and the table is updated, this pin
+    /// forces the FAQ body to change in the same commit instead of
+    /// telling users the wrong minimum iOS version.
+    @Test
+    func pushNotificationsNamesTheRealPatchedBuilds() {
+        let combined = FAQSection.pushNotifications.combinedBody
+        for (major, patched) in NotificationRetentionAdvisory.patchedByMajor {
+            let v = NotificationRetentionAdvisory.versionString(patched)
+            #expect(
+                combined.contains(v),
+                "FAQ pushNotifications copy does not name the patched build \(v) for iOS \(major)")
+        }
     }
 
     /// PZ-H1 / KEM truthfulness: the code ships FIPS-203 ML-KEM-1024

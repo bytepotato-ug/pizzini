@@ -3642,6 +3642,13 @@ final class ChatStore: NSObject {
         // install. (Setting it AFTER the wipe would re-create the
         // plist with a single key, a telltale a fresh install lacks.)
         identityResetBannerPending = false
+        // Same reasoning for the OS-notification-retention advisory:
+        // clear its in-memory dismissal so the post-wipe session
+        // presents the banner exactly as a fresh install on this OS
+        // would, rather than staying hidden because the pre-wipe user
+        // had dismissed it (an in-session duress tell). The persisted
+        // key is dropped with the standard domain by step 5 below.
+        NotificationRetentionAdvisoryState.shared.resetForWipe()
         // Drop the APNs device token under the OLD identity. iOS mints
         // a fresh device token on the next registerForRemoteNotifications
         // call — so a relay-adjacent adversary who recorded the
@@ -3650,6 +3657,19 @@ final class ChatStore: NSObject {
         // The next onboarding pass (which the duress wipe routes the
         // user through, by clearing `onboardingCompleted`) re-registers.
         UIApplication.shared.unregisterForRemoteNotifications()
+        // F-PUSH-03: purge the OS notification surface BEFORE the
+        // multi-second storage erase, so even a mid-wipe process kill
+        // leaves no banners. The delivered "New message" records carry
+        // no content, but their presence, count, and timestamps in the
+        // system notification store are a post-wipe telltale that the
+        // fresh-install-indistinguishability contract can't tolerate —
+        // and CVE-2026-28950 showed that store is exactly what a
+        // forensic pass reads. (On unpatched iOS the OS-level removal
+        // is best-effort by the bug's own nature; on patched builds it
+        // deletes the records. Either way the visible Notification
+        // Center is clean.) Fire-and-forget, adds microseconds; the
+        // caller's fixed 3.0 s latency ceiling is untouched.
+        NotificationHygiene.purgeAll()
         let wipeComplete = Storage.eraseAndReinitialize(preserving: snapshot, clearPasscodes: true)
         // Cryptographic erasure must not be silently reported as done
         // when a key-material delete could not be confirmed.
@@ -3760,6 +3780,14 @@ final class ChatStore: NSObject {
             // the persisted flag; the now-orphaned (empty, uncommitted)
             // DB is reconciled to a clean fresh install by
             // `SQLiteStorage.bootstrap`'s orphan checks on next launch.
+            //
+            // F-PUSH-03: also re-purge Notification Center. APNs
+            // unregistration is asynchronous, so a wake-up already in
+            // flight when the interrupted wipe ran (or one delivered
+            // before iOS processed the unregister) can have landed a
+            // banner since — the same post-wipe telltale duressWipe()
+            // itself purges. Idempotent, fire-and-forget.
+            NotificationHygiene.purgeAll()
             var erased = DBKey.eraseKeyMaterial()
             var tries = 0
             while !erased && tries < 4 {

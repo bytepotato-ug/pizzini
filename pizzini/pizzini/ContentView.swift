@@ -39,6 +39,7 @@ struct ContentView: View {
     @State private var lockManager = LockManager.shared
     @State private var captureMonitor = ScreenCaptureMonitor.shared
     @State private var integrity = DeviceIntegrityMonitor.shared
+    @State private var retentionAdvisory = NotificationRetentionAdvisoryState.shared
     @State private var selectedTab: TabKind = .chats
     @State private var showScanner = false
     /// What the in-flight "Add contact" alert is keyed on: the
@@ -141,6 +142,15 @@ struct ContentView: View {
             // accessible — finish any duress wipe whose key erase could
             // not be confirmed earlier. No-op unless the flag is set.
             store.retryIncompleteDuressWipeIfNeeded()
+            // F-PUSH-03: the generic "New message" banners are spent
+            // the moment the user is in the app — clear them here so
+            // the OS notification store never accumulates an arrival-
+            // time history between app opens. Deliberately on
+            // didActivate (user is actually looking at the app), NOT
+            // in reconnectAfterBackground: that method also runs
+            // headlessly from BGAppRefreshTask, where the user hasn't
+            // seen the banners yet and they must stay up.
+            NotificationHygiene.clearDelivered()
         }
         .fullScreenCover(isPresented: Binding(
             get: { !store.state.onboardingCompleted && store.initError == nil },
@@ -278,6 +288,9 @@ struct ContentView: View {
                 if !store.shouldMaskAppContents {
                     screenshotDegradedBanner
                 }
+                if retentionAdvisory.shouldShow {
+                    osNotificationAdvisoryBanner
+                }
                 // Captive-portal probe verdict. Fires only after a
                 // genuine stall (Tor bootstrap <50% for >30 s) — the
                 // banner replaces the otherwise-opaque "Connecting…"
@@ -408,6 +421,54 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("More info on screenshot protection")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange)
+    }
+
+    /// Advisory shown while the device runs an iOS build that predates
+    /// Apple's CVE-2026-28950 fix (notifications "marked for deletion"
+    /// retained on-device — the store forensic tools read). Pizzini's
+    /// own hygiene can't delete what the OS already failed to delete,
+    /// so the fix is the user's iOS update; dismissible per OS build
+    /// because the user may not be able to update immediately. (i)
+    /// deep-links the notifications FAQ, which explains the residue in
+    /// plain language.
+    private var osNotificationAdvisoryBanner: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "bell.badge.slash.fill")
+                .foregroundStyle(.white)
+                .imageScale(.large)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("iOS update recommended")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                Text("This iOS version can keep notifications on the device after they're deleted. Pizzini's carry no message content, but their timestamps may linger until you update iOS.")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.95))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            Button {
+                integrityFAQ = .pushNotifications
+            } label: {
+                Image(systemName: "info.circle.fill")
+                    .foregroundStyle(.white)
+                    .imageScale(.large)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("More info on this warning")
+            Button {
+                retentionAdvisory.dismiss()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.white)
+                    .imageScale(.large)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss this warning")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)

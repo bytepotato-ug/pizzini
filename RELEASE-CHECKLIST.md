@@ -95,6 +95,10 @@ the QR-camera + Tor-circuit handshake faithfully.
 - [ ] Force-quit during a send → message persists in outbox, retries on next launch.
 - [ ] Duress wipe ends in an empty-but-lived-in state (relay host, UX prefs, auto-lock, Face ID toggle preserved; contacts/groups/keys/outbox all gone). Verify on a real device with a real contact set first.
 - [ ] APNs push payload received on a force-quit device is the literal string `New message` — no peer name, no preview, no count. Confirm via the Notification Service Extension's logs.
+- [ ] Two pushes to a locked device produce ONE banner (the second replaces the first via the collapse ID), and the badge still reflects the true unread count after opening the app.
+- [ ] Opening the app clears all Pizzini entries from Notification Center; a push arriving while the app is foregrounded shows no banner and plays no sound.
+- [ ] After a duress wipe, Notification Center contains no Pizzini entries (F-PUSH-03; real device).
+- [ ] On an iOS build below 18.7.8 / 26.4.2 (if a test device exists), the "iOS update recommended" banner shows, its (i) opens the notifications FAQ, and dismissing it sticks across relaunches on the same iOS build.
 
 ## 6. Polish
 

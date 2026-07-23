@@ -340,6 +340,14 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             a random delay before sending each wake-up to blur that \
             timing. If you want zero Apple involvement, leave \
             notifications off and open the app to fetch.
+
+            Pizzini also cleans up after itself: new banners replace \
+            old ones instead of stacking, everything is cleared from \
+            Notification Center each time you open the app, and the \
+            duress wipe removes them too. One caveat is iOS itself — \
+            some versions kept notifications around even after they \
+            were deleted (Apple fixed this in 2026). Keep iOS updated; \
+            Pizzini shows a warning banner if your version is affected.
             """
 
         case .screenCapture:
@@ -733,6 +741,22 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             hasn't configured an APNs auth key, push is simply \
             disabled — Pizzini still works, you just won't be woken \
             up on incoming messages until you open the app.
+
+            Retention hardening (CVE-2026-28950): in April 2026 Apple \
+            patched an iOS bug where notifications marked for deletion \
+            were retained on-device — it let investigators recover \
+            deleted Signal notification content from a seized iPhone. \
+            Pizzini's exposure is limited to arrival timestamps, since \
+            the payload is content-free, and four defences bound even \
+            that: the relay sends a static collapse ID so successive \
+            wake-ups replace each other instead of stacking; delivered \
+            banners are cleared on every app open; the duress wipe \
+            purges Notification Center; and pushes arriving while the \
+            app is open are never added to Notification Center at all. \
+            What the app cannot do is delete records an unpatched iOS \
+            already failed to delete — on versions below 18.7.8 or \
+            26.4.2 an update advisory appears at the top of the chat \
+            list.
             """
 
         case .screenCapture:
@@ -919,6 +943,12 @@ enum FAQSection: String, CaseIterable, Identifiable, Hashable, Sendable {
             • The APNs push token under the old identity. A new \
               token is minted when you re-register through \
               onboarding.
+            • Delivered "New message" banners in Notification Center. \
+              They contain no message content, but their count and \
+              timestamps would otherwise betray recent activity after \
+              the wipe. (On iOS versions predating Apple's \
+              CVE-2026-28950 fix, the OS itself could retain deleted \
+              notification records — that part only iOS can fix.)
 
             What survives the wipe:
 
