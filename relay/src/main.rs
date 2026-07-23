@@ -1758,7 +1758,7 @@ async fn read_loop(
                     // concurrent HELLO drain can't double-forward) instead
                     // of stranding the frame until the next reconnect;
                     // otherwise wake it with a push.
-                    let now_online = routes.lock().await.contains_key(&parsed.to_id);
+                    let now_online = route_is_live(routes, &parsed.to_id).await;
                     if now_online {
                         dev_peer_log!(
                             "queued type={frame_type} → {} then re-drained (raced reconnect)",
@@ -2036,8 +2036,13 @@ async fn read_loop(
                     // Close the reconnect-drain race (see SEND path): if
                     // the recipient came online between our offline check
                     // and this enqueue, re-drain so the seed isn't
-                    // stranded until its next reconnect.
-                    if routes.lock().await.contains_key(&parsed.to_id) {
+                    // stranded until its next reconnect. Liveness, not
+                    // mere map presence — a half-dead route would
+                    // otherwise send us into `drain_pending`, which wipes
+                    // the peer's queue against the same dead channel.
+                    // This path has no push fallback, so a wrong answer
+                    // here is a silent loss with nothing to soften it.
+                    if route_is_live(routes, &parsed.to_id).await {
                         drain_pending(&parsed.to_id, pending, routes).await;
                     }
                     dev_peer_log!(
@@ -2138,6 +2143,34 @@ fn clamp_ttl(ttl_seconds: u32) -> Duration {
 ///
 /// Expired frames are filtered out inside `drain`; this loop only
 /// sees live entries.
+/// True only when `peer_id` has a route whose writer channel is still
+/// live.
+///
+/// `routes.contains_key()` is NOT a liveness test. A writer task that
+/// has exited leaves its entry in the map: the task deliberately does
+/// no cleanup, and `handle_connection` removes the entry only after
+/// `read_loop` returns — for a half-open socket that can be a full
+/// `FRAME_READ_TIMEOUT` later. So a stale entry lingers for exactly as
+/// long as the half-dead window we care about.
+///
+/// That matters because the re-drain paths recover a frame *because*
+/// `Outbox::send` failed, i.e. precisely when the channel is closed. A
+/// `contains_key` re-check answers "yes, online" in that case and sends
+/// control into `drain_pending`, which removes the peer's whole queue
+/// from the store before discovering the same dead channel — losing the
+/// recovered frame AND everything else queued for that peer, with no
+/// push wake-up. Testing `is_closed()` keeps the half-dead case on the
+/// queue-and-wake path while still detecting a genuine raced reconnect
+/// (a freshly installed sender reports `is_closed() == false`).
+async fn route_is_live(routes: &Routes, peer_id: &[u8]) -> bool {
+    routes
+        .lock()
+        .await
+        .get(peer_id)
+        .map(|tx| !tx.is_closed())
+        .unwrap_or(false)
+}
+
 async fn drain_pending(peer_id: &[u8], pending: &Pending, routes: &Routes) {
     let queue = {
         let mut store = pending.lock().await;
@@ -4306,6 +4339,55 @@ mod tests {
         let _c = gate.try_admit(b"C").expect("C admitted");
         assert_eq!(gate.in_flight_len(), 3);
         assert_eq!(gate.available_permits(), 1);
+    }
+
+    // Half-dead-route liveness. The re-drain paths recover a frame
+    // *because* `Outbox::send` failed — i.e. the route entry exists but
+    // its channel is closed. A `contains_key` re-check answers "online"
+    // in exactly that case and hands control to `drain_pending`, which
+    // removes the peer's whole queue from the store before hitting the
+    // same dead channel: the recovered frame and every other queued
+    // frame are lost, and no push wake-up fires. These pin the
+    // distinction between map presence and channel liveness.
+
+    #[tokio::test]
+    async fn route_is_live_rejects_a_half_dead_route_that_contains_key_accepts() {
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let peer = b"peer-half-dead".to_vec();
+        // Writer task exited: its receiver is dropped, but the entry is
+        // still in the map (handle_connection only removes it once
+        // read_loop returns — up to FRAME_READ_TIMEOUT later).
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        drop(rx);
+        routes.lock().await.insert(peer.clone(), tx);
+
+        // The bug this replaced: presence in the map says "online".
+        assert!(
+            routes.lock().await.contains_key(&peer),
+            "precondition: the stale entry lingers, which is why \
+             contains_key was the wrong test",
+        );
+        // Liveness says otherwise, so the caller keeps the frame queued
+        // and sends a push instead of draining into a dead channel.
+        assert!(!route_is_live(&routes, &peer).await);
+    }
+
+    #[tokio::test]
+    async fn route_is_live_accepts_a_genuine_raced_reconnect() {
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        let peer = b"peer-reconnected".to_vec();
+        // Hold the receiver: this is a freshly installed route from a
+        // reconnect that raced our offline check — the case the
+        // re-drain exists for. It must still drain.
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        routes.lock().await.insert(peer.clone(), tx);
+        assert!(route_is_live(&routes, &peer).await);
+    }
+
+    #[tokio::test]
+    async fn route_is_live_rejects_an_absent_peer() {
+        let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+        assert!(!route_is_live(&routes, b"never-connected").await);
     }
 
     // PZ-M6: the per-connection inbound frame-rate token bucket.
