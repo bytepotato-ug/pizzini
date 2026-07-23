@@ -1241,6 +1241,15 @@ public final class RelayClient: @unchecked Sendable {
                     conn.cancel()
                 }
                 self.connection = nil
+                // Invalidate any SOCKS retry already queued by
+                // `handleSocksFailure` via `queue.asyncAfter`. Cancelling
+                // the connection does NOT cancel that block: it captured
+                // the generation and would still match, fire up to
+                // `socksRetryDelay` later, and re-dial a client the budget
+                // just moved to `.failed` — flipping the UI back off its
+                // terminal state. `disconnect()` bumps for the same
+                // reason; this is the other terminal transition.
+                self.connectGeneration += 1
                 self.state = .failed("Couldn't reach this relay within \(Int(Self.dialBudget))s — network might be blocking Tor.")
             case .connected, .failed, .idle:
                 break
