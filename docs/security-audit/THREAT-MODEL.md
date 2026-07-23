@@ -31,6 +31,17 @@ Current repo claims include:
   — so a post-first-unlock forensic extraction can read that count. It
   carries no peer identity and is overwritten on next launch; accepted
   residual, see F-PUSH-01 / NotificationService.didReceive.)
+  (Update 2026-07-23, F-PUSH-03: the OS notification store retains
+  delivered wake-up records — arrival timestamps, not content — and
+  CVE-2026-28950 showed deletion from that store could silently fail
+  on unpatched iOS. Mitigations shipped: a static `apns-collapse-id`
+  on every wake-up so the store holds at most the latest record; a
+  delivered-banner clear on every app open; a Notification Center
+  purge on the duress wipe and its PZ-M13 retry; foreground pushes
+  presented badge-only so they never enter the store; and an in-app
+  update advisory on pre-18.7.8 / pre-26.4.2 iOS. Residual: records an
+  unpatched OS already failed to delete, and Apple-side APNs metadata,
+  are out of the app's reach.)
 - Relay binaries and transparency entries support release integrity
   checks.
 
@@ -125,6 +136,13 @@ currently calls out App Attest and strict ATS enforcement.
 - App lock and duress wipe paths do not leave easy UI, storage, log,
   snapshot, badge, or state-recovery evidence that contradicts their
   explicit design.
+- Notification Center shows at most the latest content-free wake-up
+  record while the app is unopened, and none after an app open or a
+  duress wipe (F-PUSH-03). On patched iOS the underlying store is
+  bounded the same way; on builds predating the CVE-2026-28950 fix the
+  store may retain replaced or deleted records (the bug itself), so the
+  collapse-id and purge bound the visible surface, not the forensic
+  one, there. Physical-device verification required.
 - Screenshot, screen-capture, notification, pasteboard, share-sheet,
   attachment, and background flows are tested on physical devices, not
   inferred from source alone.

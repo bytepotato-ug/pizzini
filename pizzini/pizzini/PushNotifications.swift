@@ -163,15 +163,23 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
         pushLog.error("APNs registration failed: \(String(describing: error), privacy: .private)")
     }
 
-    /// Show alerts even when the app is foregrounded — useful for dev
-    /// while we're observing the wake-up flow. In production we'd
-    /// probably suppress them when the relevant chat is on screen.
+    /// Foreground presentation: suppress banner, sound, and the
+    /// Notification Center listing while the app is active. The running
+    /// app already renders the incoming message (chat list badge /
+    /// in-chat), so a system banner adds nothing — but presenting it
+    /// would write one more record into the OS notification store,
+    /// which retains delivered notifications (and, on
+    /// pre-CVE-2026-28950-patch iOS, retained even "deleted" ones).
+    /// `.badge` is kept: when the relay socket is down and APNs is the
+    /// only delivery path, the NSE's badge stamp is the sole thing
+    /// keeping the icon count honest, and applying it stores nothing.
+    /// See `ForegroundPresentation` for the pinned policy.
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        completionHandler([.banner, .sound, .badge])
+        completionHandler(ForegroundPresentation.options)
     }
 
     /// Public so the onboarding's "Enable notifications" button can
@@ -197,5 +205,48 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
             pushLog.error("requestAuthorization failed: \(String(describing: error), privacy: .private)")
             return false
         }
+    }
+}
+
+/// What `willPresent` hands back while the app is foregrounded,
+/// extracted as a pinned constant so the suppression is unit-testable
+/// (house pattern: pure decision surface, no UNUserNotificationCenter
+/// in the test host). `.badge` only — no `.banner`, no `.sound`, no
+/// `.list` — so a foreground push never lands in the OS notification
+/// store at all. Rationale in `AppDelegate.userNotificationCenter(_:
+/// willPresent:withCompletionHandler:)`.
+enum ForegroundPresentation {
+    static let options: UNNotificationPresentationOptions = [.badge]
+}
+
+/// F-PUSH-03 (CVE-2026-28950 class): iOS keeps every delivered
+/// notification in a system-wide store that forensic tooling reads —
+/// and on pre-26.4.2 / pre-18.7.8 builds it retained records even
+/// after the user deleted them (the FBI's deleted-Signal-notifications
+/// recovery was this bug). Pizzini's payloads are content-free, so the
+/// exposure is arrival *timestamps*, not text; these helpers starve
+/// even that. Both APIs are void, thread-safe, and fire-and-forget —
+/// callable from any context with no completion to await.
+enum NotificationHygiene {
+    /// App-open hygiene: the generic "New message" banners have served
+    /// their purpose the moment the user is in the app (the badge and
+    /// chat list carry the real state), so drop them from Notification
+    /// Center — and with them the arrival-time history the OS store
+    /// would otherwise accumulate between app opens.
+    static func clearDelivered() {
+        UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+    }
+
+    /// Duress-wipe purge: delivered banners plus any pending local
+    /// requests. Pizzini schedules no local notifications today, so
+    /// the pending half is defence-in-depth against a future
+    /// regression; the delivered half is load-bearing — a Notification
+    /// Center still showing "Pizzini: New message (3h ago)" after the
+    /// wipe would contradict the fresh-install-indistinguishability
+    /// contract (`Storage.postWipeAppState`).
+    static func purgeAll() {
+        let center = UNUserNotificationCenter.current()
+        center.removeAllDeliveredNotifications()
+        center.removeAllPendingNotificationRequests()
     }
 }

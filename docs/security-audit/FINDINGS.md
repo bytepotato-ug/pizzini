@@ -73,3 +73,12 @@ Documentation corrections made with the findings:
 - The full app simulator test plan did not finish green; the failures
   are listed in `REVIEW-MATRIX.md` and must be triaged before using
   that run as a release gate.
+
+## Post-audit remediations
+
+Dated additions after the 2026-05-21 pass; not part of the frozen
+audit record above.
+
+| Date | Severity | Finding | Exploit shape | Fix and evidence |
+| --- | --- | --- | --- | --- |
+| 2026-07-23 | Medium | F-PUSH-03: delivered wake-up records accumulated in the OS notification store and survived the duress wipe. | The iOS notification store retains one record per delivered push (arrival timestamp; content-free by design). CVE-2026-28950 demonstrated forensic recovery from that store, including records "marked for deletion" on unpatched iOS. Post-wipe, a Notification Center still showing "Pizzini: New message" entries contradicted the fresh-install-indistinguishability contract; between app opens the store accumulated a per-message arrival timeline. | Relay sends a static `apns-collapse-id` so successive wake-ups replace one another (Notification Center shows at most one record; on patched iOS the underlying store is bounded too); the app clears delivered banners on every scene activation; `duressWipe()` and the PZ-M13 retry path purge delivered + pending notifications before the storage erase; `willPresent` returns badge-only so foreground pushes never enter the store; an update advisory shows on pre-18.7.8 / pre-26.4.2 iOS. Pinned by `wakeup_payload_is_the_static_content_free_literal` / `wakeup_headers_carry_collapse_id_and_bounded_expiration` (relay, CI-gated via `cargo test`) and `NotificationPrivacyTests` + `FAQCopyRegressionTests` (app). Enforcement gap: CI does not build the full Xcode app (no `Tor.xcframework` in CI), so the app-side pins run only in the mandated local `xcodebuild test` (CONTRIBUTING.md), not yet as a CI gate — a scoped simulator test job is tracked as follow-up. Residual: records an unpatched OS already failed to delete are unreachable from the app; physical-device verification is on the release checklist. |

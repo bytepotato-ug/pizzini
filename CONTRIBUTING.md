@@ -109,6 +109,16 @@ Some UX choices look weird until you remember the threat model:
   regardless of who sent what. Don't "improve" this by adding
   preview text — it would defeat the iOS-notification-database
   extraction defence (CVE-2026-28950 was the precedent).
+- The rest of the notification pipeline is starved on purpose too:
+  wake-ups carry one static `apns-collapse-id` (new banners replace
+  old ones, so Notification Center shows at most the latest record —
+  on patched iOS the underlying store is bounded too; on pre-fix
+  builds a replaced record may linger, which is the CVE itself),
+  delivered banners are cleared on every app open and purged by the
+  duress wipe, and foreground pushes present badge-only. Don't "fix"
+  any of these toward richer, stacking, or longer-lived notifications
+  — the OS notification store is a forensic artifact, and per-peer or
+  per-message collapse IDs would hand Apple a correlation handle.
 - The screenshot mask is unconditional, with no opt-out toggle.
   Don't add one.
 - The duress passcode wipes silently. Don't add a confirmation

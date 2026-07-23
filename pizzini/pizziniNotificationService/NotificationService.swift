@@ -75,8 +75,9 @@ final class NotificationService: UNNotificationServiceExtension {
         // badge cannot be incremented while the app is force-quit without
         // leaving *some* on-disk trace, and a shared-Keychain item would
         // need a new access-group entitlement for marginal benefit. The
-        // "no unread-count leakage" claim in docs/threat-model.md is
-        // scoped to the payload/server, NOT this on-device plist.
+        // "no unread-count leakage" claim in
+        // docs/security-audit/THREAT-MODEL.md is scoped to the
+        // payload/server, NOT this on-device plist.
         suite?.set(next, forKey: SharedAppGroup.unreadCountKey)
         bestAttemptContent.badge = NSNumber(value: next)
         contentHandler(bestAttemptContent)

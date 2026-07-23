@@ -13,6 +13,23 @@
 //! remains. Anything we put in the payload sits there in cleartext, plus
 //! at Apple, plus on the wire to APNs (TLS to Apple, but Apple sees it).
 //!
+//! Retention hardening (F-PUSH-03): every wake-up also carries the same
+//! static `apns-collapse-id`, so a new push *replaces* the previous one
+//! in Notification Center instead of stacking. The visible Notification
+//! Center therefore shows at most one Pizzini record — the latest —
+//! rather than a per-message arrival timeline, which is exactly the
+//! metadata a CVE-2026-28950-style forensic pass would otherwise
+//! harvest from the visible surface. On patched iOS the replaced record
+//! is dropped from the underlying store too; on the pre-fix builds this
+//! CVE is about, the store may still retain replaced records (that IS
+//! the bug), so the collapse ID bounds the visible timeline but not the
+//! forensic one there — see the residual in docs/security-audit. Side
+//! effect: while the device is unreachable APNs stores only the newest
+//! wake-up per collapse ID, so the app-side badge bump can undercount a
+//! burst; the main app resyncs the true count on next launch (see the
+//! iOS NotificationService extension). The ID is one static string for
+//! every user, so it tells Apple nothing the topic header didn't.
+//!
 //! Auth: token-based (ES256 JWT, `.p8` provider key). The JWT is cached
 //! for 50 minutes — Apple permits up to 60 — and re-signed lazily when
 //! it expires.
@@ -69,6 +86,56 @@ const PUSH_EXPIRATION_SECS: u64 = 300;
 /// Absolute `apns-expiration` value for a wake-up sent at `now_secs`.
 fn push_expiration_at(now_secs: u64) -> u64 {
     now_secs.saturating_add(PUSH_EXPIRATION_SECS)
+}
+
+/// F-PUSH-03: static collapse key shared by every wake-up. MUST stay a
+/// single constant — a per-peer or per-message value would hand Apple
+/// (and the on-device notification store) a correlation handle the
+/// content-free payload was designed to withhold. APNs caps collapse
+/// IDs at 64 bytes.
+const COLLAPSE_ID: &str = "new-message";
+
+/// The wake-up's static + time-derived request headers, excluding the
+/// per-request `apns-topic` (bundle id) and `authorization` (JWT).
+/// Extracted from `send_wakeup` — like `wakeup_body()` — so the
+/// F-PUSH-02 expiration and F-PUSH-03 collapse-id invariants are
+/// compile-coupled to a unit-testable surface instead of living as
+/// untested call-site side effects: dropping any entry now fails a
+/// whole-value assertion rather than silently reverting behaviour with
+/// green CI.
+fn wakeup_headers(now_secs: u64) -> [(&'static str, String); 3] {
+    [
+        ("apns-push-type", "alert".to_string()),
+        // F-PUSH-02: bound how long APNs may store-and-redeliver this
+        // wake-up so it can't outlive the queued message or re-couple
+        // delivery timing to the device's reconnect.
+        ("apns-expiration", push_expiration_at(now_secs).to_string()),
+        // F-PUSH-03: successive wake-ups replace each other in
+        // Notification Center — see the module docs.
+        ("apns-collapse-id", COLLAPSE_ID.to_string()),
+    ]
+}
+
+/// The one and only push payload. Extracted from `send_wakeup` so the
+/// "content-free literal" invariant is unit-testable: any field added
+/// here must consciously update the pinned test below, the threat
+/// model, and CONTRIBUTING.md's threat-model-adjacent UX rules.
+fn wakeup_body() -> serde_json::Value {
+    // `mutable-content: 1` makes iOS invoke the app's Notification
+    // Service Extension before displaying. The extension reads the
+    // locally stored unread count from the shared App Group container,
+    // increments it, and stamps the right `badge` on the notification.
+    // We deliberately do NOT send a `badge` field here — the relay
+    // doesn't know (and shouldn't know) the recipient's per-peer unread
+    // count, and APNs only accepts absolute values. Letting the device
+    // do the math keeps the count out of Apple's logs.
+    serde_json::json!({
+        "aps": {
+            "alert": "New message",
+            "sound": "default",
+            "mutable-content": 1
+        }
+    })
 }
 
 impl ApnsConfig {
@@ -180,32 +247,19 @@ impl ApnsClient {
         let jwt = self.current_jwt().await?;
         let token_hex = hex_encode(device_token);
         let url = format!("{}/3/device/{token_hex}", self.cfg.endpoint.host());
-        // `mutable-content: 1` makes iOS invoke our Notification Service
-        // Extension before displaying. The extension reads the locally
-        // stored unread count from the shared App Group container,
-        // increments it, and stamps the right `badge` on the
-        // notification. We deliberately do NOT send a `badge` field
-        // here — the relay doesn't know (and shouldn't know) the
-        // recipient's per-peer unread count, and APNs only accepts
-        // absolute values. Letting the device do the math keeps the
-        // count out of Apple's logs.
-        let body = serde_json::json!({
-            "aps": {
-                "alert": "New message",
-                "sound": "default",
-                "mutable-content": 1
-            }
-        });
-        let resp = self
+        let body = wakeup_body();
+        let mut req = self
             .http
             .post(&url)
             .header("apns-topic", &self.cfg.bundle_id)
-            .header("apns-push-type", "alert")
-            // F-PUSH-02: bound how long APNs may store-and-redeliver this
-            // wake-up so it can't outlive the queued message or re-couple
-            // delivery timing to the device's reconnect.
-            .header("apns-expiration", push_expiration_at(unix_now()).to_string())
-            .header("authorization", format!("bearer {jwt}"))
+            .header("authorization", format!("bearer {jwt}"));
+        // Fold in the wake-up headers (push-type, F-PUSH-02 expiration,
+        // F-PUSH-03 collapse-id) from the shared builder so the
+        // production path and the pinned test agree by construction.
+        for (name, value) in wakeup_headers(unix_now()) {
+            req = req.header(name, value);
+        }
+        let resp = req
             .json(&body)
             .send()
             .await
@@ -281,5 +335,55 @@ mod tests {
         assert!(PUSH_EXPIRATION_SECS < 24 * 60 * 60);
         // No overflow at the u64 ceiling.
         assert_eq!(push_expiration_at(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn wakeup_payload_is_the_static_content_free_literal() {
+        // F-PUSH-03 regression pin: the push payload is one static,
+        // content-free literal. No sender, no peer-id, no preview, no
+        // badge, no per-message field of any kind — the iOS
+        // notification store retains delivered records (and retained
+        // even "deleted" ones on pre-CVE-2026-28950-patch builds), so
+        // any dynamic field added here becomes a forensic artifact.
+        // Whole-value equality means a new field fails this test and
+        // forces a conscious threat-model decision.
+        let expected: serde_json::Value = serde_json::json!({
+            "aps": {
+                "alert": "New message",
+                "sound": "default",
+                "mutable-content": 1
+            }
+        });
+        assert_eq!(wakeup_body(), expected);
+        // Belt and braces against a refactor that keeps these three
+        // keys but grows the envelope.
+        let body = wakeup_body();
+        let top = body.as_object().unwrap();
+        assert_eq!(top.len(), 1);
+        assert_eq!(top["aps"].as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn wakeup_headers_carry_collapse_id_and_bounded_expiration() {
+        // F-PUSH-02 + F-PUSH-03 regression pin. Whole-value equality on
+        // the builder the production path folds into every request: if a
+        // refactor drops or mutates the collapse-id or expiration
+        // header, this fails. The previous is_empty()/len() check could
+        // not catch that — it never touched the header path, so deleting
+        // the `.header("apns-collapse-id", …)` call kept the const
+        // "used" (no dead-code warning) and left CI green while wake-ups
+        // silently reverted to stacking one record per message.
+        let now = 1_760_000_000u64;
+        assert_eq!(
+            wakeup_headers(now),
+            [
+                ("apns-push-type", "alert".to_string()),
+                ("apns-expiration", (now + PUSH_EXPIRATION_SECS).to_string()),
+                ("apns-collapse-id", "new-message".to_string()),
+            ]
+        );
+        // The collapse id must be a single static value (no per-peer /
+        // per-message correlation handle) and fit APNs' 64-byte cap.
+        assert!(COLLAPSE_ID.len() <= 64);
     }
 }
