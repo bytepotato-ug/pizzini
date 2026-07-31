@@ -118,6 +118,18 @@ final class WindowSecureMask: NSObject {
         // Honour the runtime self-test result. When the secure-text-
         // entry trick is known broken on this iOS, applying it would
         // be theatre — return without touching the layer hierarchy.
+        //
+        // Degraded-mode protection (S9-01): this is NOT a silent
+        // fail-open. `shouldMaskAppContents` is false precisely when the
+        // self-test reported the mask degraded (`qrBlockEffective ==
+        // false`), and that same flag drives the PERSISTENT, non-
+        // dismissable degraded banner in `ContentView` (safeAreaInset)
+        // plus the Settings integrity notice — so when we bail here the
+        // user is told the screen must be treated as visible. The
+        // self-test now also fails CLOSED on an un-sampleable probe (see
+        // `SecureScreenshotShield.sampleIsRed`), so we only land in this
+        // degraded branch when the mask is genuinely unverifiable, never
+        // on an optimistic assume-success path.
         guard ChatStore.shared.shouldMaskAppContents else { return }
         // Find the SwiftUI app's main window — the one with a root VC
         // set by `WindowGroup`. `PrivacyShieldWindow`'s overlay window
@@ -154,6 +166,22 @@ final class WindowSecureMask: NSObject {
         //   2. The window must have completed its initial layout pass.
         // Deferring one runloop turn satisfies both on iOS 17/18/26.
         DispatchQueue.main.async { [weak self, weak window] in
+            // Residual (S9-04): the guards below (missing superlayer, or
+            // an unresolvable secure layer at `:resolveSecureLayer`)
+            // return silently without installing a fail-closed cover, so
+            // a rare reparent failure leaves the window unmasked for that
+            // activation. This is NOT a silent degrade in practice: when
+            // the secure-text trick is broken on this iOS the self-test
+            // marks `qrBlockEffective == false` and we never enter
+            // `applyToScene` at all (caught earlier, with the persistent
+            // degraded banner shown). These async guards only fire on a
+            // transient layout/superlayer race, where the next
+            // `sceneDidActivate` re-runs the reparent. A synchronous
+            // PrivacyShieldWindow cover here would fight the app-switcher
+            // shield's lifecycle (it is keyed to scene DE-activation, not
+            // a here-and-now cover), so we leave the retry-on-next-
+            // activation behaviour and document the residual rather than
+            // bolt on a competing cover path.
             guard let self, let window else { return }
             guard let parent = window.layer.superlayer else { return }
 

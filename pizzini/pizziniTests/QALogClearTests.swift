@@ -1,34 +1,16 @@
-import Testing
-import Foundation
-@testable import pizzini
-
-@Suite("QA log clear-on-wipe (F-DUR-01)")
-struct QALogClearTests {
-    // The DEBUG qa.log accumulates peer-id prefixes + event lines. The duress
-    // wipe calls `QALog.clear()` as its final step so no pre-wipe peer graph
-    // survives on tester builds. This pins the clear() mechanism: it removes
-    // both the active and rotated log files deterministically.
-    @Test("clear() removes the active qa.log file")
-    func clearRemovesActiveLog() throws {
-        // `currentLogFileURL()` resolves (and creates) the qa-debug dir and
-        // returns the active log path; nil only on a release build (tests run
-        // DEBUG).
-        guard let url = QALog.currentLogFileURL() else {
-            Issue.record("expected a DEBUG qa-log URL")
-            return
-        }
-        // Deterministically create the file (record() is async; this avoids a
-        // queue race) with sentinel content standing in for peer-id lines.
-        FileManager.default.createFile(
-            atPath: url.path,
-            contents: Data("F-DUR-01 sentinel peer-id line\n".utf8)
-        )
-        #expect(FileManager.default.fileExists(atPath: url.path))
-
-        QALog.clear()
-        #expect(
-            !FileManager.default.fileExists(atPath: url.path),
-            "clear() must remove the qa.log so no pre-wipe content survives"
-        )
-    }
-}
+// The QA-log clear-on-wipe test (F-DUR-01) that used to live here was
+// merged into `QALogTests` (the single `.serialized` QALog suite) as
+// `clearRemovesActiveLogForDuress()`.
+//
+// Why: this was a SEPARATE `@Suite` that touched the same fixed on-disk
+// path (`Library/Application Support/qa-debug/`) as `QALogTests`. Swift
+// Testing's `.serialized` trait only orders the tests WITHIN one suite —
+// two distinct suites still run in parallel — so this suite's `clear()`
+// raced `QALogTests`' `resetDir()` / `record()`, producing flaky
+// "qa.log couldn't be opened" / "qa-debug couldn't be removed" failures
+// in the full bundle (each suite passed in isolation). Folding every
+// qa-debug-touching case into one `.serialized` suite makes that path
+// single-owner and the cases deterministic.
+//
+// This file is intentionally left as documentation only; the Xcode test
+// target still references it.

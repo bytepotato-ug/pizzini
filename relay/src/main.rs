@@ -539,29 +539,20 @@ type Routes = Arc<Mutex<HashMap<PeerId, Outbox>>>;
 /// `push_token_store.rs` for the threat-model framing of the
 /// encryption-at-rest + TTL guard-rails.
 type PushTokens = Arc<Mutex<PushTokenStore>>;
-/// Per-recipient delivery-token verify key. Populated by the
-/// recipient's HELLO and refreshed on every successful
-/// `check_delivery_token` lookup. The value's `Instant` is the last
-/// time we touched the entry; the periodic GC prunes anything older
-/// than `VERIFY_KEY_TTL`.
-///
-/// Why time-based instead of remove-on-disconnect (the F-204 fix
-/// before fix-review): a SEND aimed at a recently-disconnected peer
-/// still needs the recipient's verify_key to pass `check_delivery_token`
-/// — otherwise the frame is dropped before reaching `enqueue_pending`,
-/// breaking the offline-message-delivery feature. Time-based GC
-/// preserves the verify_key for the full token TTL window AND bounds
-/// memory + linkability the same way: an attacker padding peer_ids
-/// gets entries that age out in `VERIFY_KEY_TTL`. N-002.
-type VerifyKeys = Arc<Mutex<HashMap<PeerId, (Vec<u8>, Instant)>>>;
-/// How long a verify_key entry lives without being touched. v1
-/// delivery tokens are gone, but verify_keys are still used for the
-/// sealed-sender `SenderCertificate` validation in libsignal and for
-/// matching BUNDLE_REQUEST → BUNDLE_RESPONSE. 30 days matches the
-/// previous baseline.
-const VERIFY_KEY_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-/// How often the GC walks the verify_keys table.
-const VERIFY_KEY_GC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+// S4-03: the per-recipient `verify_keys` map (peer_id → verify_key)
+// was removed. It was written on every HELLO but read on NO
+// SEND/token/bundle path — token validation is entirely on the
+// hash-chain (`check_delivery_token` → `chain_validators.validate`),
+// the BUNDLE_REQUEST handler uses hashcash + `bundle_req_rate` + the
+// route table, and no `SenderCertificate` validation happens in the
+// relay at all. Its only reads were the /healthz counter and its own
+// GC. As dead 30-day in-memory state it was pure forensic residue (a
+// rolling table of peers who connected, linkable by a live-memory
+// adversary) contradicting the relay's minimise-forensic-surface
+// posture, and the module comments over-claimed it as load-bearing.
+// The HELLO possession proof still verifies the IdentityKey signature
+// over the supplied verify_key (`verify_hello_possession_proof`); that
+// per-connection check did not depend on the persistent map.
 type ChainValidators = Arc<Mutex<chain_validator_store::ChainValidatorStore>>;
 /// HELLO replay set: (peer_id, nonce) keys. Lookup runs on every
 /// HELLO (not every SEND), so the table stays in-memory and cheap.
@@ -619,6 +610,37 @@ const SEND_DEDUPE_MAX_ENTRIES: usize = 10_000;
 /// expired entry lives at most `SEND_DEDUPE_WINDOW + tick` before
 /// it's pruned. Same shape as `spawn_hello_replay_gc`.
 const SEND_DEDUPE_GC_INTERVAL: Duration = Duration::from_secs(150);
+
+/// S4-04: consumed-hashcash-proof replay set. The BUNDLE_REQUEST PoW
+/// challenge binds only `(recipient, hour)`, and `verify_hashcash`
+/// accepts BOTH the current and previous hour, so a single valid
+/// `(recipient, nonce)` proof is otherwise a *replayable bearer token*
+/// for the ~2h acceptance window — a captured proof drives repeated
+/// accepted bundle requests at a victim up to the per-(recipient,hour)
+/// cap, regardless of who replays it. This set records each proof the
+/// FIRST time it is accepted, keyed by `(recipient, nonce, accepted
+/// hour)`, so a second presentation of the same proof inside its window
+/// is rejected. Complements (does not replace) the durable
+/// per-recipient BUNDLE_REQUEST rate limit.
+type HashcashReplayKey = (PeerId, u64, u64);
+type HashcashReplays = Arc<Mutex<HashMap<HashcashReplayKey, Instant>>>;
+/// Validity window for a hashcash proof = the two hour-buckets
+/// `verify_hashcash` accepts (current + previous). A consumed-proof
+/// entry need only outlive that window; 2h + GC slack covers it. After
+/// this, the proof would fail `verify_hashcash` anyway (its hour bucket
+/// is no longer accepted), so the replay entry can be safely evicted.
+const HASHCASH_REPLAY_WINDOW: Duration = Duration::from_secs(2 * 60 * 60);
+/// GC cadence for the consumed-proof set. A bucket leaves the accepted
+/// window at most `HASHCASH_REPLAY_WINDOW + tick` after it was burned.
+const HASHCASH_REPLAY_GC_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// Hard cap on the consumed-proof set so a flood of *distinct* valid
+/// proofs (each costs ~22 bits of work) cannot grow it without bound.
+/// At the cap the oldest entry is evicted before inserting — the same
+/// bounded-growth shape as `SEND_DEDUPE_MAX_ENTRIES`. Eviction can at
+/// worst let an old proof be replayed once more, which is still bounded
+/// by the durable per-(recipient,hour) BUNDLE_REQUEST cap, so it is the
+/// safe direction to fail.
+const HASHCASH_REPLAY_MAX_ENTRIES: usize = 50_000;
 
 /// Per-(sender, recipient) rate-limit on `FRAME_TYPE_CHAIN_SEED_DELIVERY`.
 /// Legitimate use: 1 frame per fresh pair + 1 per chain rotation
@@ -866,7 +888,6 @@ async fn main() -> std::io::Result<()> {
         pending_store_inst.peers_with_queues(),
     );
     let pending: Pending = Arc::new(Mutex::new(pending_store_inst));
-    let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
     let hello_replays: HelloReplays = Arc::new(Mutex::new(HashMap::new()));
     // SEND dedupe across client reconnects. In-memory only; a
     // process bounce wipes the table, which is fine — a SEND that
@@ -877,6 +898,12 @@ async fn main() -> std::io::Result<()> {
     // process lifetime, not to provide end-to-end exactly-once
     // (which libsignal already does).
     let send_dedupes: SendDedupes = Arc::new(Mutex::new(HashMap::new()));
+    // S4-04: in-memory consumed-hashcash-proof replay set. In-memory
+    // only by design — the durable per-(recipient,hour) BUNDLE_REQUEST
+    // cap (`bundle_req_rate`) is the cross-restart backstop; this set
+    // just makes a single captured proof non-reusable within its ~2h
+    // window during one process lifetime.
+    let hashcash_replays: HashcashReplays = Arc::new(Mutex::new(HashMap::new()));
     // Persistent per-(recipient, hour) BUNDLE_REQUEST acceptance
     // counter. Built BEFORE the listener so a corrupt state file
     // surfaces at startup, not silently mid-traffic — and so the
@@ -920,11 +947,11 @@ async fn main() -> std::io::Result<()> {
     spawn_pending_gc(pending.clone());
     spawn_chain_validator_gc(chain_validators.clone());
     spawn_hello_replay_gc(hello_replays.clone());
-    spawn_verify_keys_gc(verify_keys.clone());
     spawn_push_tokens_gc(push_tokens.clone());
     spawn_bundle_req_rate_gc(bundle_req_rate.clone());
     spawn_chain_seed_rate_gc(chain_seed_rate.clone());
     spawn_send_dedupe_gc(send_dedupes.clone());
+    spawn_hashcash_replay_gc(hashcash_replays.clone());
 
     // Health endpoint — separate listener on `PIZZINI_RELAY_HEALTH_BIND`
     // (default `127.0.0.1:7778`). Replies with a one-line JSON snapshot
@@ -940,7 +967,6 @@ async fn main() -> std::io::Result<()> {
                 let routes_h = routes.clone();
                 let pending_h = pending.clone();
                 let push_tokens_h = push_tokens.clone();
-                let verify_keys_h = verify_keys.clone();
                 let chain_validators_h2 = chain_validators.clone();
                 tokio::spawn(async move {
                     if let Err(e) = run_health_server(
@@ -948,7 +974,6 @@ async fn main() -> std::io::Result<()> {
                         routes_h,
                         pending_h,
                         push_tokens_h,
-                        verify_keys_h,
                         chain_validators_h2,
                     )
                     .await
@@ -1007,12 +1032,12 @@ async fn main() -> std::io::Result<()> {
                 let routes = routes.clone();
                 let push_tokens = push_tokens.clone();
                 let pending = pending.clone();
-                let verify_keys = verify_keys.clone();
                 let chain_validators_h = chain_validators.clone();
                 let hello_replays = hello_replays.clone();
                 let bundle_req_rate_h = bundle_req_rate.clone();
                 let chain_seed_rate_h = chain_seed_rate.clone();
                 let send_dedupes_h = send_dedupes.clone();
+                let hashcash_replays_h = hashcash_replays.clone();
                 let apns = apns.clone();
                 let status_snapshot = status_snapshot.clone();
                 tokio::spawn(async move {
@@ -1026,12 +1051,12 @@ async fn main() -> std::io::Result<()> {
                         routes,
                         push_tokens,
                         pending,
-                        verify_keys,
                         chain_validators_h,
                         hello_replays,
                         bundle_req_rate_h,
                         chain_seed_rate_h,
                         send_dedupes_h,
+                        hashcash_replays_h,
                         apns,
                         status_snapshot,
                         peer_addr,
@@ -1059,7 +1084,6 @@ async fn run_health_server(
     routes: Routes,
     pending: Pending,
     push_tokens: PushTokens,
-    verify_keys: VerifyKeys,
     chain_validators: ChainValidators,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1069,7 +1093,6 @@ async fn run_health_server(
         let routes = routes.clone();
         let pending = pending.clone();
         let push_tokens = push_tokens.clone();
-        let verify_keys = verify_keys.clone();
         let chain_validators = chain_validators.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
@@ -1087,10 +1110,11 @@ async fn run_health_server(
                 let connections = routes.lock().await.len();
                 let pending_total = pending.lock().await.total_frames();
                 let push_total = push_tokens.lock().await.len();
-                let verify_total = verify_keys.lock().await.len();
                 let chain_total = chain_validators.lock().await.len();
+                // S4-03: `verify_keys` counter dropped along with the
+                // dead map it reported on.
                 format!(
-                    "{{\"status\":\"ok\",\"connections\":{connections},\"pending_frames\":{pending_total},\"push_tokens\":{push_total},\"verify_keys\":{verify_total},\"chain_validators\":{chain_total}}}\n"
+                    "{{\"status\":\"ok\",\"connections\":{connections},\"pending_frames\":{pending_total},\"push_tokens\":{push_total},\"chain_validators\":{chain_total}}}\n"
                 )
             } else {
                 String::from("not found\n")
@@ -1140,12 +1164,12 @@ async fn handle_connection(
     routes: Routes,
     push_tokens: PushTokens,
     pending: Pending,
-    verify_keys: VerifyKeys,
     chain_validators: ChainValidators,
     hello_replays: HelloReplays,
     bundle_req_rate: BundleReqRate,
     chain_seed_rate: ChainSeedRate,
     send_dedupes: SendDedupes,
+    hashcash_replays: HashcashReplays,
     apns: Option<Arc<ApnsClient>>,
     status_snapshot: Arc<RelayStatus>,
     peer_addr: SocketAddr,
@@ -1174,7 +1198,7 @@ async fn handle_connection(
         e
     })?;
     // F-203: verify the possession proof BEFORE writing anything to the
-    // global routes / verify_keys tables. A failure here means the
+    // global routes table. A failure here means the
     // HELLO came from someone who doesn't hold the IdentityKey private
     // half — typically a network attacker squatting another peer's
     // peer_id to drain queued mail or DoS token verification.
@@ -1183,26 +1207,21 @@ async fn handle_connection(
         return Err(invalid(&format!("HELLO possession proof failed: {e}")));
     }
     let peer_id = parsed_hello.peer_id;
-    let verify_key = parsed_hello.verify_key;
     let peer_hex = hex(&peer_id);
-    // Register / overwrite the recipient's verify key. Token-bearing
-    // SENDs/ACKs to this peer get verified against the latest entry,
-    // so a peer rotating its identity wipes any older stash without a
-    // separate revocation flow. The `Instant` is the GC's last-touched
-    // marker; refreshed on every successful check_delivery_token
-    // lookup so a peer with active inbound traffic stays cached even
-    // when offline themselves.
-    {
-        let mut vk = verify_keys.lock().await;
-        vk.insert(peer_id.clone(), (verify_key, Instant::now()));
-    }
+    // S4-03: the HELLO's verify_key was previously stashed in a
+    // `verify_keys` map here. That map was never read on any
+    // SEND/token/bundle path (token validation is wholly on the
+    // hash-chain), so the stash was dead forensic residue and has been
+    // removed. The possession proof above already verified the
+    // IdentityKey signature over this verify_key for the duration of
+    // the handshake; nothing downstream needs it persisted.
     // Gate peer-id-bearing log lines behind
     // `dev_peer_log!` so the relay's "no per-peer log lines in
     // production" hard rule is enforced in code, not just policy.
     // `dev_peer_log!` is a no-op when `debug_assertions` is off
     // (i.e. `cargo build --release`). Operators who want full logs
     // can run debug builds.
-    dev_peer_log!("[{peer_addr}] HELLO from peer {} (proof verified, verify key registered)", short_hex(&peer_id));
+    dev_peer_log!("[{peer_addr}] HELLO from peer {} (proof verified)", short_hex(&peer_id));
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     // Hold a clone so we can identify "is the entry in the map still ours?"
@@ -1241,6 +1260,7 @@ async fn handle_connection(
         &bundle_req_rate,
         &chain_seed_rate,
         &send_dedupes,
+        &hashcash_replays,
         apns.clone(),
         &peer_id,
         &our_tx,
@@ -1262,16 +1282,12 @@ async fn handle_connection(
             map.remove(&peer_id);
         }
     }
-    // N-002: verify_keys[peer_id] is NOT eagerly removed on disconnect.
-    // The pre-fix-review F-204 patch did that, which broke offline
-    // delivery — incoming SENDs to a recently-disconnected peer rely
-    // on `check_delivery_token` finding the recipient's verify_key,
-    // and a missing key dropped the frame BEFORE `enqueue_pending`
-    // could queue it. Verify_keys lifetime is now governed by
-    // `spawn_verify_keys_gc`, which prunes entries unused for
-    // `VERIFY_KEY_TTL` (= token TTL = 30d). This bounds memory and
-    // post-mortem linkability the same way (entries age out) without
-    // breaking delivery to peers in their first 30d of disconnect.
+    // S4-03: there is no longer a `verify_keys` map to clean up on
+    // disconnect — token validation is entirely on the hash-chain
+    // (`check_delivery_token` → `chain_validators`), so a
+    // recently-disconnected recipient's offline SENDs still validate
+    // without any per-peer verify-key stash. Only the route entry above
+    // is connection-scoped.
     drop(our_tx);
     writer_task.abort();
     dev_peer_log!("[{peer_addr}] disconnected ({peer_hex})");
@@ -1288,6 +1304,7 @@ async fn read_loop(
     bundle_req_rate: &BundleReqRate,
     chain_seed_rate: &ChainSeedRate,
     send_dedupes: &SendDedupes,
+    hashcash_replays: &HashcashReplays,
     apns: Option<Arc<ApnsClient>>,
     self_id: &[u8],
     our_tx: &mpsc::UnboundedSender<Vec<u8>>,
@@ -1402,14 +1419,33 @@ async fn read_loop(
                         continue;
                     }
                 };
-                let outcome = match chain_validators.lock().await.register(reg) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        dev_peer_elog!(
-                            "REGISTER_CHAIN persist failed for {}: {e}",
-                            short_hex(self_id),
-                        );
-                        continue;
+                // S4-01: advance under the validator lock, commit the
+                // fsync off the lock (released by the block) so a
+                // REGISTER_CHAIN flood does not head-of-line-block
+                // concurrent token validation behind its persist.
+                let outcome = {
+                    let staged = {
+                        let mut store = chain_validators.lock().await;
+                        store.register(reg).await
+                    }; // validator lock dropped here
+                    match staged {
+                        Ok((o, persist)) => {
+                            if let Err(e) = persist.commit().await {
+                                dev_peer_elog!(
+                                    "REGISTER_CHAIN persist failed for {}: {e}",
+                                    short_hex(self_id),
+                                );
+                                continue;
+                            }
+                            o
+                        }
+                        Err(e) => {
+                            dev_peer_elog!(
+                                "REGISTER_CHAIN persist failed for {}: {e}",
+                                short_hex(self_id),
+                            );
+                            continue;
+                        }
                     }
                 };
                 match outcome {
@@ -1594,9 +1630,34 @@ async fn read_loop(
                     );
                     continue;
                 }
-                if !verify_hashcash(&parsed.to_id, parsed.hashcash_nonce) {
+                let Some(accepted_hour) =
+                    verify_hashcash(&parsed.to_id, parsed.hashcash_nonce)
+                else {
                     dev_peer_elog!(
                         "rejecting bundle request {} → {}: invalid hashcash (need {HASHCASH_BITS} zero bits)",
+                        short_hex(&parsed.from_id),
+                        short_hex(&parsed.to_id),
+                    );
+                    continue;
+                };
+                // S4-04: reject a REPLAYED proof. The PoW challenge binds
+                // only (recipient, hour) and both the current and previous
+                // hour are accepted, so a captured `(recipient, nonce)`
+                // proof would otherwise be a reusable bearer token for the
+                // ~2h window. Burn it on first acceptance (keyed by the
+                // exact hour it validated under); a second presentation
+                // inside the window is dropped here, before the rate
+                // counter is touched.
+                if hashcash_replay_check_and_consume(
+                    hashcash_replays,
+                    &parsed.to_id,
+                    parsed.hashcash_nonce,
+                    accepted_hour,
+                )
+                .await
+                {
+                    dev_peer_elog!(
+                        "rejecting bundle request {} → {}: hashcash proof already consumed (replay)",
                         short_hex(&parsed.from_id),
                         short_hex(&parsed.to_id),
                     );
@@ -1614,7 +1675,16 @@ async fn read_loop(
                 let over_cap = {
                     let mut store = bundle_req_rate.lock().await;
                     match store.increment(parsed.to_id.clone(), bucket) {
-                        Ok(count) => count > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR,
+                        Ok(bundle_req_rate_store::IncrementOutcome::Counted(count)) => {
+                            count > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR
+                        }
+                        // S4-02: the global cardinality cap was hit —
+                        // introducing this fabricated `to_id` would grow
+                        // the store past `MAX_ENTRIES`. Fail closed:
+                        // reject without forwarding (and without growing
+                        // the store), exactly like an over-the-per-
+                        // recipient-cap request.
+                        Ok(bundle_req_rate_store::IncrementOutcome::RejectedCardinalityCap) => true,
                         Err(e) => {
                             // The persistent counter could not be
                             // written. Fail closed — reject this
@@ -1991,12 +2061,28 @@ async fn check_delivery_token(
         ));
     }
     let v2 = parse_v2_token(&parsed.token).map_err(|e| format!("v2 token malformed: {e}"))?;
-    let mut store = chain_validators.lock().await;
-    let outcome = store
-        .validate(&parsed.to_id, &v2.chain_id, v2.index, &v2.value)
-        .map_err(|e| format!("chain-validator persist failed: {e}"))?;
+    // S4-01: advance the in-memory cursor under the validator lock
+    // (cheap), then RELEASE the lock and commit the durable write off
+    // the lock. Concurrent token validations no longer serialize behind
+    // this SEND's serialize+encrypt+fsync. The commit is still awaited
+    // BEFORE this returns `Ok(())`, so the SEND is only treated as
+    // accepted once the cursor advance is durable — no lost replay
+    // state across restart.
+    let (outcome, persist) = {
+        let mut store = chain_validators.lock().await;
+        store
+            .validate(&parsed.to_id, &v2.chain_id, v2.index, &v2.value)
+            .await
+            .map_err(|e| format!("chain-validator persist failed: {e}"))?
+    }; // validator lock dropped here
     match outcome {
-        chain_validator_store::ValidateOutcome::Accepted => Ok(()),
+        chain_validator_store::ValidateOutcome::Accepted => {
+            persist
+                .commit()
+                .await
+                .map_err(|e| format!("chain-validator persist failed: {e}"))?;
+            Ok(())
+        }
         chain_validator_store::ValidateOutcome::UnknownChain => Err(format!(
             "v2 token references unknown chain for recipient {}",
             short_hex(&parsed.to_id),
@@ -2038,7 +2124,7 @@ fn spawn_chain_validator_gc(validators: ChainValidators) {
         loop {
             tick.tick().await;
             let mut store = validators.lock().await;
-            match store.gc_expired(CHAIN_VALIDATOR_IDLE_TTL) {
+            match store.gc_expired(CHAIN_VALIDATOR_IDLE_TTL).await {
                 Ok(0) => {}
                 Ok(n) => println!("chain-validator GC: pruned {n} → {}", store.len()),
                 Err(e) => eprintln!("[pizzini-relay] chain-validator GC persist failed: {e}"),
@@ -2047,35 +2133,15 @@ fn spawn_chain_validator_gc(validators: ChainValidators) {
     });
 }
 
-/// N-002: prune verify_keys entries unused for `VERIFY_KEY_TTL`. Bounds
-/// memory growth (the F-204 concern) and post-mortem linkability (a
-/// memory dump reveals only peers active in the last `VERIFY_KEY_TTL`)
-/// without breaking offline-message delivery for recently-disconnected
-/// recipients.
+/// Saturating "now minus window" cutoff for the in-memory GC tasks
+/// (SEND-dedupe, chain-seed-rate, HELLO-replay). Bare
+/// `Instant::now() - window` PANICS on underflow when host uptime <
+/// window; tokio intervals fire their first tick immediately, so a GC
+/// task computing a multi-day cutoff would abort on its first run on
+/// any freshly-booted relay (and die silently, leaving its table
+/// unpruned). Clamp to now instead.
 fn instant_cutoff(window: Duration) -> Instant {
-    // Bare `Instant::now() - window` PANICS on underflow when host
-    // uptime < window. tokio intervals fire their first tick
-    // immediately, so a GC task computing a multi-day cutoff would
-    // abort on its first run on any freshly-booted relay — and die
-    // silently, leaving its table unpruned. Clamp to now instead.
     Instant::now().checked_sub(window).unwrap_or_else(Instant::now)
-}
-
-fn spawn_verify_keys_gc(verify_keys: VerifyKeys) {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(VERIFY_KEY_GC_INTERVAL);
-        loop {
-            tick.tick().await;
-            let cutoff = instant_cutoff(VERIFY_KEY_TTL);
-            let mut table = verify_keys.lock().await;
-            let before = table.len();
-            table.retain(|_, (_, last_touched)| *last_touched > cutoff);
-            let after = table.len();
-            if before != after {
-                println!("verify-keys GC: pruned {} → {after}", before - after);
-            }
-        }
-    });
 }
 
 /// Build the per-recipient/per-hour hashcash challenge. F-301: input is
@@ -2107,7 +2173,10 @@ fn current_hour_bucket() -> u64 {
 
 /// Verify hashcash on a BUNDLE_REQUEST. Accepts the current and
 /// previous hour to absorb clock skew across the relay/sender pair.
-fn verify_hashcash(recipient_peer_id: &[u8], nonce: u64) -> bool {
+/// Returns `Some(hour)` with the hour bucket the proof validated under
+/// (so the caller can key the S4-04 replay set on the exact accepted
+/// bucket), or `None` if neither bucket's difficulty was met.
+fn verify_hashcash(recipient_peer_id: &[u8], nonce: u64) -> Option<u64> {
     let now_hour = current_hour_bucket();
     let try_bucket = |hour: u64| -> bool {
         let challenge = build_hashcash_challenge(recipient_peer_id, hour);
@@ -2117,7 +2186,13 @@ fn verify_hashcash(recipient_peer_id: &[u8], nonce: u64) -> bool {
         let hash = hasher.finalize();
         leading_zero_bits(hash.as_bytes()) >= HASHCASH_BITS
     };
-    try_bucket(now_hour) || (now_hour > 0 && try_bucket(now_hour - 1))
+    if try_bucket(now_hour) {
+        Some(now_hour)
+    } else if now_hour > 0 && try_bucket(now_hour - 1) {
+        Some(now_hour - 1)
+    } else {
+        None
+    }
 }
 
 fn leading_zero_bits(bytes: &[u8]) -> u32 {
@@ -2378,6 +2453,62 @@ async fn dedupe_check_and_insert(
     }
     table.insert(key, Instant::now());
     false
+}
+
+/// S4-04: record a hashcash proof as consumed, returning `true` if it
+/// was ALREADY consumed within its validity window (i.e. this is a
+/// replay → reject) and `false` on first sight (→ accept, now burned).
+/// Keyed by `(recipient, nonce, accepted_hour)` — the exact bucket
+/// `verify_hashcash` validated it under — so the same proof presented
+/// again in the same window is caught, while a genuinely fresh proof
+/// for the next hour (different bucket) is unaffected.
+///
+/// Bounded growth: at `HASHCASH_REPLAY_MAX_ENTRIES` the oldest entry by
+/// timestamp is evicted before inserting, mirroring
+/// `dedupe_check_and_insert`. The GC keeps steady-state size far below
+/// the cap.
+async fn hashcash_replay_check_and_consume(
+    replays: &HashcashReplays,
+    recipient_peer_id: &[u8],
+    nonce: u64,
+    accepted_hour: u64,
+) -> bool {
+    let key: HashcashReplayKey = (recipient_peer_id.to_vec(), nonce, accepted_hour);
+    let mut table = replays.lock().await;
+    if table.contains_key(&key) {
+        return true;
+    }
+    if table.len() >= HASHCASH_REPLAY_MAX_ENTRIES {
+        if let Some(oldest) = table
+            .iter()
+            .min_by_key(|(_, t)| **t)
+            .map(|(k, _)| k.clone())
+        {
+            table.remove(&oldest);
+        }
+    }
+    table.insert(key, Instant::now());
+    false
+}
+
+/// GC for the consumed-hashcash-proof set (S4-04). Drops entries older
+/// than `HASHCASH_REPLAY_WINDOW` on every tick; a quiet relay
+/// self-empties within one window.
+fn spawn_hashcash_replay_gc(replays: HashcashReplays) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(HASHCASH_REPLAY_GC_INTERVAL);
+        loop {
+            tick.tick().await;
+            let cutoff = instant_cutoff(HASHCASH_REPLAY_WINDOW);
+            let mut table = replays.lock().await;
+            let before = table.len();
+            table.retain(|_, t| *t > cutoff);
+            let after = table.len();
+            if before != after {
+                println!("hashcash-replay GC: pruned {} → {after}", before - after);
+            }
+        }
+    });
 }
 
 /// GC for the SEND dedupe table. Mirrors `spawn_hello_replay_gc` —
@@ -2792,7 +2923,7 @@ mod tests {
 
     #[test]
     fn instant_cutoff_clamps_oversized_window_without_panic() {
-        // Regression: bare `Instant::now() - VERIFY_KEY_TTL` PANICS when
+        // Regression: bare `Instant::now() - window` PANICS when
         // host uptime is below the window (the common fresh-boot case),
         // which killed the GC tasks on their first tick. `instant_cutoff`
         // must clamp instead of panic — for any window, up to absurd.
@@ -3044,17 +3175,19 @@ mod tests {
             ChainValidatorStore::load_or_create(&tmp_dir, CHAIN_VALIDATOR_IDLE_TTL).unwrap(),
         ));
 
-        // Build a deterministic chain. Hash primitive is BLAKE3 to
-        // match `chain_validator_store::validate` bit-for-bit.
+        // Build a deterministic chain. The step is the S4-05
+        // domain-separated `BLAKE3(CHAIN_STEP_DOMAIN || value)` so it
+        // matches `chain_validator_store::validate` bit-for-bit.
         let seed = [0x77u8; 32];
         let length: u32 = 8;
         let mut positions: Vec<[u8; 32]> = Vec::with_capacity(length as usize + 1);
         positions.push(seed);
         let mut cur = seed;
         for _ in 0..length {
-            let out = blake3::hash(&cur);
-            let mut next = [0u8; 32];
-            next.copy_from_slice(out.as_bytes());
+            let mut h = blake3::Hasher::new();
+            h.update(chain_validator_store::CHAIN_STEP_DOMAIN);
+            h.update(&cur);
+            let next = *h.finalize().as_bytes();
             positions.push(next);
             cur = next;
         }
@@ -3070,6 +3203,11 @@ mod tests {
                 root,
                 length,
             })
+            .await
+            .unwrap()
+            .1
+            .commit()
+            .await
             .unwrap();
 
         // Token at sender-side index 1 = position (length - 1) = positions[7].
@@ -3151,9 +3289,11 @@ mod tests {
         positions.push(seed);
         let mut cur = seed;
         for _ in 0..length {
-            let out = blake3::hash(&cur);
-            let mut next = [0u8; 32];
-            next.copy_from_slice(out.as_bytes());
+            // S4-05 domain-separated chain step (matches validate).
+            let mut h = blake3::Hasher::new();
+            h.update(chain_validator_store::CHAIN_STEP_DOMAIN);
+            h.update(&cur);
+            let next = *h.finalize().as_bytes();
             positions.push(next);
             cur = next;
         }
@@ -3170,6 +3310,11 @@ mod tests {
                 root,
                 length,
             })
+            .await
+            .unwrap()
+            .1
+            .commit()
+            .await
             .unwrap();
         sibling_relay
             .lock()
@@ -3180,6 +3325,11 @@ mod tests {
                 root,
                 length,
             })
+            .await
+            .unwrap()
+            .1
+            .commit()
+            .await
             .unwrap();
 
         let mut observer_token_wire = Vec::with_capacity(TOKEN_V2_LEN);
@@ -3449,43 +3599,6 @@ mod tests {
         assert_ne!(good, *bad.as_bytes());
     }
 
-    // ─── N-002 verify_keys lifetime ───────────────────────────────────────
-
-    /// N-002: the periodic GC prunes verify_keys entries unused for
-    /// `VERIFY_KEY_TTL`. Simulates an old entry by inserting with
-    /// last_touched = `now - VERIFY_KEY_TTL - 1s`.
-    #[tokio::test]
-    async fn n002_verify_keys_gc_prunes_stale_entries() {
-        let verify_keys: VerifyKeys = Arc::new(Mutex::new(HashMap::new()));
-        let stale_pid = vec![0xAAu8; 33];
-        let fresh_pid = vec![0xBBu8; 33];
-        // Stale entry: simulate "30d + 1s ago".
-        let stale_ts = Instant::now()
-            .checked_sub(VERIFY_KEY_TTL + Duration::from_secs(1))
-            .expect("clock arithmetic");
-        verify_keys
-            .lock()
-            .await
-            .insert(stale_pid.clone(), (vec![1u8; 33], stale_ts));
-        verify_keys
-            .lock()
-            .await
-            .insert(fresh_pid.clone(), (vec![2u8; 33], Instant::now()));
-        // Run the GC loop body inline (the real spawn is on a 1h
-        // tick; we just want to test the retain logic).
-        {
-            let cutoff = Instant::now() - VERIFY_KEY_TTL;
-            let mut table = verify_keys.lock().await;
-            table.retain(|_, (_, last_touched)| *last_touched > cutoff);
-        }
-        let table = verify_keys.lock().await;
-        assert!(!table.contains_key(&stale_pid), "stale entry must be GC'd");
-        assert!(
-            table.contains_key(&fresh_pid),
-            "fresh entry must survive GC"
-        );
-    }
-
     /// Audit H2b: per-(recipient, hour) BUNDLE_REQUEST cap. The
     /// counter is now backed by the persistent `BundleReqRateStore`;
     /// this pins the increment-and-check arithmetic so a future
@@ -3496,6 +3609,17 @@ mod tests {
     /// property — that the counter survives a store reload.
     #[tokio::test]
     async fn bundle_req_rate_cap_trips_at_cap_plus_one() {
+        use bundle_req_rate_store::IncrementOutcome;
+        // Extract the count from a Counted outcome; a cardinality-cap
+        // rejection is not expected at this scale.
+        fn counted(o: IncrementOutcome) -> u32 {
+            match o {
+                IncrementOutcome::Counted(n) => n,
+                IncrementOutcome::RejectedCardinalityCap => {
+                    panic!("unexpected cardinality-cap rejection in per-recipient cap test")
+                }
+            }
+        }
         let tmp = tempfile::TempDir::new().unwrap();
         let recipient: PeerId = vec![0x77u8; 33];
         let bucket: u64 = 1_000_000;
@@ -3505,11 +3629,12 @@ mod tests {
         // First `BUNDLE_REQ_PER_RECIPIENT_PER_HOUR` increments must
         // each leave the counter at-or-below the cap (i.e., not over).
         for i in 1..=BUNDLE_REQ_PER_RECIPIENT_PER_HOUR {
-            let count = rate
-                .lock()
-                .await
-                .increment(recipient.clone(), bucket)
-                .unwrap();
+            let count = counted(
+                rate.lock()
+                    .await
+                    .increment(recipient.clone(), bucket)
+                    .unwrap(),
+            );
             assert!(
                 count <= BUNDLE_REQ_PER_RECIPIENT_PER_HOUR,
                 "increment #{i} must stay inside the cap of {}",
@@ -3517,11 +3642,12 @@ mod tests {
             );
         }
         // Increment #(cap + 1) must trip the limit.
-        let count = rate
-            .lock()
-            .await
-            .increment(recipient.clone(), bucket)
-            .unwrap();
+        let count = counted(
+            rate.lock()
+                .await
+                .increment(recipient.clone(), bucket)
+                .unwrap(),
+        );
         assert!(
             count > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR,
             "increment #(cap + 1) must exceed the cap",
@@ -3529,18 +3655,19 @@ mod tests {
         // A different recipient in the same bucket has its own
         // counter and starts fresh.
         let other: PeerId = vec![0x88u8; 33];
-        let other_count = rate.lock().await.increment(other, bucket).unwrap();
+        let other_count = counted(rate.lock().await.increment(other, bucket).unwrap());
         assert!(
             other_count <= BUNDLE_REQ_PER_RECIPIENT_PER_HOUR,
             "fresh recipient must not be capped",
         );
         // The same recipient in a different bucket also starts fresh.
         let other_bucket: u64 = bucket + 1;
-        let next_hour_count = rate
-            .lock()
-            .await
-            .increment(recipient.clone(), other_bucket)
-            .unwrap();
+        let next_hour_count = counted(
+            rate.lock()
+                .await
+                .increment(recipient.clone(), other_bucket)
+                .unwrap(),
+        );
         assert!(
             next_hour_count <= BUNDLE_REQ_PER_RECIPIENT_PER_HOUR,
             "fresh hour bucket must restart the counter for the same recipient",
@@ -3552,10 +3679,86 @@ mod tests {
         drop(rate);
         let mut reloaded =
             BundleReqRateStore::load_or_create(tmp.path(), bucket).unwrap();
-        let count_after_reload = reloaded.increment(recipient, bucket).unwrap();
+        let count_after_reload =
+            counted(reloaded.increment(recipient, bucket).unwrap());
         assert!(
             count_after_reload > BUNDLE_REQ_PER_RECIPIENT_PER_HOUR,
             "the cap counter must survive a relay restart, not reset to zero",
+        );
+    }
+
+    /// S4-04: a hashcash proof is single-use within its validity
+    /// window. The first acceptance burns `(recipient, nonce, hour)`;
+    /// any second presentation of the same triple is rejected as a
+    /// replay. A different nonce, a different recipient, or a different
+    /// hour bucket is independent and still accepted on first sight.
+    #[tokio::test]
+    async fn hashcash_proof_is_single_use_within_window() {
+        let replays: HashcashReplays = Arc::new(Mutex::new(HashMap::new()));
+        let recipient: PeerId = vec![0x42u8; 33];
+        let nonce: u64 = 0xDEAD_BEEF;
+        let hour: u64 = 1_000_000;
+        // First sight: not a replay → accept (false), now burned.
+        assert!(
+            !hashcash_replay_check_and_consume(&replays, &recipient, nonce, hour).await,
+            "first presentation must be accepted",
+        );
+        // Same (recipient, nonce, hour): replay → reject (true).
+        assert!(
+            hashcash_replay_check_and_consume(&replays, &recipient, nonce, hour).await,
+            "a second presentation of the same proof must be rejected as replay",
+        );
+        // Same proof, the OTHER accepted hour bucket (clock-skew bucket):
+        // distinct key, accepted on first sight.
+        assert!(
+            !hashcash_replay_check_and_consume(&replays, &recipient, nonce, hour - 1).await,
+            "the same nonce under a different hour bucket is a distinct proof",
+        );
+        // Different nonce, same recipient/hour: distinct, accepted.
+        assert!(
+            !hashcash_replay_check_and_consume(&replays, &recipient, nonce + 1, hour).await,
+            "a different nonce is a distinct proof",
+        );
+        // Different recipient, same nonce/hour: distinct, accepted.
+        let other: PeerId = vec![0x99u8; 33];
+        assert!(
+            !hashcash_replay_check_and_consume(&replays, &other, nonce, hour).await,
+            "a different recipient is a distinct proof",
+        );
+    }
+
+    /// S4-04: the consumed-proof set is bounded — at
+    /// `HASHCASH_REPLAY_MAX_ENTRIES` the oldest entry is evicted, so a
+    /// flood of distinct valid proofs cannot grow it without bound. The
+    /// table never exceeds the cap; the eviction direction is safe
+    /// (an evicted old proof is still bounded by the durable per-
+    /// recipient BUNDLE_REQUEST cap).
+    #[tokio::test]
+    async fn hashcash_replay_set_is_bounded() {
+        let replays: HashcashReplays = Arc::new(Mutex::new(HashMap::new()));
+        let recipient: PeerId = vec![0x11u8; 33];
+        let hour: u64 = 5;
+        // Fill to exactly the cap with distinct nonces.
+        for n in 0..HASHCASH_REPLAY_MAX_ENTRIES as u64 {
+            assert!(
+                !hashcash_replay_check_and_consume(&replays, &recipient, n, hour).await,
+            );
+        }
+        assert_eq!(replays.lock().await.len(), HASHCASH_REPLAY_MAX_ENTRIES);
+        // One more distinct nonce evicts the oldest; size stays capped.
+        assert!(
+            !hashcash_replay_check_and_consume(
+                &replays,
+                &recipient,
+                HASHCASH_REPLAY_MAX_ENTRIES as u64,
+                hour,
+            )
+            .await,
+        );
+        assert_eq!(
+            replays.lock().await.len(),
+            HASHCASH_REPLAY_MAX_ENTRIES,
+            "replay set must never exceed the cap",
         );
     }
 

@@ -61,8 +61,12 @@ struct ChatGroup: Codable, Identifiable, Sendable {
     /// integrity, so persisting the raw blob is both safe and simpler
     /// than threading `Codable` conformance through `GroupOpKind`'s
     /// associated-value cases. Decode + verify on each application
-    /// attempt; drop after `ChatGroup.pendingOpRetention` (
-    /// fix — the retention is now actually enforced by `replayPending`).
+    /// attempt. F-S6-02: the queue is bounded NOT by a timestamp (an
+    /// op's `timestampMillis` is operator-chosen — a malicious admin can
+    /// claim any value, so a time filter is unenforceable) but by
+    /// `pendingOpsCap` (global) + `pendingOpsPerOperatorCap` (per-admin)
+    /// at queue-INSERT time, and drained/dropped by `replayPending` once
+    /// an op's epoch is superseded or its parent gap closes.
     var pendingOps: [Data]
 
     /// Chat history for this group. Same shape as `Contact.log` so the
@@ -225,13 +229,6 @@ struct ChatGroup: Codable, Identifiable, Sendable {
     /// power-of-two chain length and well within libsignal's safe
     /// SenderKey operating range.
     static let rotationMessageThreshold: UInt32 = 256
-
-    /// How long an unappliable `pendingOp` lingers before we drop it.
-    /// 30 days mirrors the SenderCertificate / delivery-token TTL —
-    /// any op older than that whose parent never arrived is almost
-    /// certainly lost to a relay outage and re-application would
-    /// corrupt state.
-    static let pendingOpRetention: TimeInterval = 30 * 24 * 60 * 60
 
     /// Equivocation-detection window. A divergent op at an
     /// already-applied epoch is caught only when the original op's

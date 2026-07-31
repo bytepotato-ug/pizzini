@@ -87,14 +87,48 @@ struct AppPasscodeTests {
         // user-facing invariant. Verify it's distinct passcodes that
         // get distinct hashes by setting a DIFFERENT duress value.
         try AppPasscode.setDuressPasscode("differentValue")
-        // Atomic slot layout: `salt(32) || hash(32)`.
+        // Atomic slot layout: `salt(32) || hash(32) || role(1)` = 65 B
+        // (S7-08 added the trailing in-blob role discriminator).
         let realBlob = Keychain.read(account: AppPasscode.realSlotAccount)
         let duressBlob = Keychain.read(account: AppPasscode.duressSlotAccount)
-        #expect(realBlob?.count == 64)
-        #expect(duressBlob?.count == 64)
+        #expect(realBlob?.count == 65)
+        #expect(duressBlob?.count == 65)
         let realSalt = realBlob?.prefix(32)
         let duressSalt = duressBlob?.prefix(32)
         #expect(realSalt != duressSalt, "real and duress must use distinct salts")
+    }
+
+    /// S7-08 / S3-03: the real and duress slots must be stored under
+    /// account names that are name-INDISTINGUISHABLE, so a Keychain
+    /// account-name enumeration (the only thing an AFU dump can do
+    /// without decrypting blob ciphertext) cannot derive which slot is
+    /// the duress slot — or even that a duress passcode is configured.
+    @Test("real and duress slot account names are name-indistinguishable")
+    func slotNamesAreIndistinguishable() throws {
+        freshKeychain()
+        let real = AppPasscode.realSlotAccount
+        let duress = AppPasscode.duressSlotAccount
+        // Neither name may be self-describing.
+        #expect(!real.lowercased().contains("duress"))
+        #expect(!duress.lowercased().contains("duress"))
+        #expect(!real.lowercased().contains("real"))
+        #expect(!duress.lowercased().contains("real"))
+        // The two names must be structurally identical: same length and
+        // differing only by a trailing slot index, so the duress slot is
+        // not distinguishable from the real slot by its name alone.
+        #expect(real.count == duress.count)
+        #expect(real != duress)
+        let commonPrefix = String(zip(real, duress).prefix { $0 == $1 }.map(\.0))
+        // The names must share everything except a final disambiguator
+        // (e.g. "passcode-slot-" + "0"/"1").
+        #expect(real.count - commonPrefix.count <= 1)
+        #expect(duress.count - commonPrefix.count <= 1)
+        // And the in-blob role discriminator — not the account name —
+        // is what actually classifies a matched slot: setting only the
+        // duress passcode must still classify correctly via `check`.
+        try AppPasscode.setDuressPasscode("duressOnlyValue")
+        #expect(AppPasscode.check("duressOnlyValue") == .duress)
+        AppPasscode.eraseAll()
     }
 
     @Test("legacy two-row layout is migrated to the atomic slot on first read")
@@ -110,10 +144,14 @@ struct AppPasscodeTests {
         // Reading `isPasscodeSet` triggers the migration internally.
         #expect(AppPasscode.isPasscodeSet)
         // Atomic slot now populated; legacy slots wiped.
+        // F-S7-08: the atomic slot is salt(32) || hash(32) || role(1) =
+        // 65 bytes — the trailing role discriminator carries app-vs-duress
+        // INSIDE the AFU-protected blob so the Keychain account name no
+        // longer reveals which slot is the duress slot.
         let atomic = Keychain.read(account: AppPasscode.realSlotAccount)
-        #expect(atomic?.count == 64)
+        #expect(atomic?.count == 65)
         #expect(atomic?.prefix(32) == salt)
-        #expect(atomic?.suffix(32) == hash)
+        #expect(atomic?.dropFirst(32).prefix(32) == hash)
         #expect(Keychain.read(account: AppPasscode.legacyRealHashAccount) == nil)
         #expect(Keychain.read(account: AppPasscode.legacyRealSaltAccount) == nil)
         AppPasscode.eraseAll()
@@ -147,6 +185,80 @@ struct AppPasscodeTests {
         let wrongResult = lm.submitPasscode("nope!nope")
         #expect(wrongResult == .wrong)
         // Cleanup so subsequent tests see a clean Keychain.
+        AppPasscode.eraseAll()
+    }
+
+    // MARK: - S7-03 brute-force throttle
+
+    @Test("failed-attempt counter persists, increments, and resets")
+    func failedAttemptCounter() {
+        freshKeychain()
+        #expect(AppPasscode.failedAttempts == 0)
+        #expect(AppPasscode.recordFailedAttempt() == 1)
+        #expect(AppPasscode.recordFailedAttempt() == 2)
+        // The counter is read back from Keychain, not memory — it
+        // survives a (simulated) relaunch because nothing in-process
+        // caches it.
+        #expect(AppPasscode.failedAttempts == 2)
+        AppPasscode.resetFailedAttempts()
+        #expect(AppPasscode.failedAttempts == 0)
+    }
+
+    @Test("backoff duration escalates with failure count and is bounded")
+    func backoffEscalates() {
+        // No delay while under the free-attempt floor.
+        #expect(LockManager.backoffDuration(forFailures: 0) == 0)
+        #expect(LockManager.backoffDuration(forFailures: 3) == 0)
+        // Escalating steps.
+        #expect(LockManager.backoffDuration(forFailures: 5) > 0)
+        #expect(
+            LockManager.backoffDuration(forFailures: 8)
+                > LockManager.backoffDuration(forFailures: 5)
+        )
+        // Bounded: the curve saturates and never grows without limit.
+        let ceiling = LockManager.backoffDuration(forFailures: 10)
+        #expect(LockManager.backoffDuration(forFailures: 100) == ceiling)
+        #expect(LockManager.backoffDuration(forFailures: 1_000_000) == ceiling)
+    }
+
+    @Test("a successful unlock resets the brute-force counter")
+    func successResetsThrottle() throws {
+        freshKeychain()
+        try AppPasscode.setPasscode("realreal")
+        let lm = LockManager.shared
+        // `LockManager` is a singleton shared across tests; clear any
+        // in-memory backoff window a prior test left open by doing one
+        // clean unlock (also zeroes the counter).
+        _ = lm.submitPasscode("realreal")
+        // Accrue some wrong guesses.
+        _ = lm.submitPasscode("nope!nope")
+        _ = lm.submitPasscode("nope!nope")
+        #expect(AppPasscode.failedAttempts > 0)
+        // A correct entry clears the counter.
+        #expect(lm.submitPasscode("realreal") == .unlocked)
+        #expect(AppPasscode.failedAttempts == 0)
+        AppPasscode.eraseAll()
+    }
+
+    @Test("duress passcode is accepted even after many failed attempts")
+    func duressNeverThrottled() throws {
+        freshKeychain()
+        try AppPasscode.setPasscode("realreal")
+        try AppPasscode.setDuressPasscode("duressed")
+        let lm = LockManager.shared
+        // Clear any backoff window a prior test left open on the shared
+        // singleton, then drive the failure count well past the backoff
+        // threshold so a fresh backoff window is certainly open.
+        _ = lm.submitPasscode("realreal")
+        for _ in 0..<12 {
+            _ = lm.submitPasscode("nope!nope")
+        }
+        #expect(AppPasscode.failedAttempts > 0)
+        #expect(lm.backoffRemaining > 0, "a backoff window must be active")
+        // The hard S7-03 invariant: the duress passcode is STILL
+        // accepted mid-backoff — a coerced user must never be blocked
+        // from entering it.
+        #expect(lm.submitPasscode("duressed") == .duress)
         AppPasscode.eraseAll()
     }
 }

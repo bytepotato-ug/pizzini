@@ -422,3 +422,49 @@ private func makeOpClaimingDifferentSigner(
         signature: sig,
     )
 }
+
+/// F-S6-01: the group-chat plaintext codec carries the sender's op-chain
+/// head (epoch + lastOpDigest) so recipients can detect a forked group
+/// log. These pin the wire format and the legacy-plaintext fallback.
+@Suite("GroupChatPlaintext codec (F-S6-01)")
+struct GroupChatPlaintextTests {
+    @Test("round-trips epoch + digest + text")
+    func roundTrip() {
+        let digest = Data((0..<32).map { UInt8($0) })
+        let encoded = GroupChatPlaintext.encode(epoch: 42, opDigest: digest, text: "hello group")
+        let decoded = GroupChatPlaintext.decode(encoded)
+        #expect(decoded.epoch == 42)
+        #expect(decoded.opDigest == digest)
+        #expect(decoded.text == "hello group")
+    }
+
+    @Test("empty text and empty digest round-trip")
+    func emptyEdges() {
+        let encoded = GroupChatPlaintext.encode(epoch: 0, opDigest: Data(), text: "")
+        let decoded = GroupChatPlaintext.decode(encoded)
+        #expect(decoded.epoch == 0)
+        #expect(decoded.opDigest == Data())
+        #expect(decoded.text == "")
+    }
+
+    @Test("legacy raw-UTF8 plaintext (no version byte) decodes as text-only")
+    func legacyFallback() {
+        // A pre-F-S6-01 sender ships bare UTF-8 with no 0x01 prefix.
+        let legacy = Data("just text".utf8)
+        let decoded = GroupChatPlaintext.decode(legacy)
+        #expect(decoded.epoch == nil)
+        #expect(decoded.opDigest == nil)
+        #expect(decoded.text == "just text")
+    }
+
+    @Test("a divergent digest at the same epoch is distinguishable")
+    func divergenceVisible() {
+        let d1 = Data(repeating: 0xAA, count: 32)
+        let d2 = Data(repeating: 0xBB, count: 32)
+        let a = GroupChatPlaintext.decode(GroupChatPlaintext.encode(epoch: 5, opDigest: d1, text: "x"))
+        let b = GroupChatPlaintext.decode(GroupChatPlaintext.encode(epoch: 5, opDigest: d2, text: "y"))
+        // Same epoch, different digest → the consistency check fires.
+        #expect(a.epoch == b.epoch)
+        #expect(a.opDigest != b.opDigest)
+    }
+}

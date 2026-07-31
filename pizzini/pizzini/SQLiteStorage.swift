@@ -111,6 +111,11 @@ final class SQLiteStorage {
     /// open produces a clean database.
     static func bootstrap() throws {
         precondition(shared == nil, "SQLiteStorage.bootstrap called twice")
+        // S11-04: silence SQLite/SQLCipher's default os_log device
+        // diagnostics before the first DB is opened. Must run before any
+        // `sqlite3_*` activation so the amalgamation's default-logging
+        // block sees an already-configured (null) log target.
+        suppressSQLiteOSLog()
         let path = try databaseURL().path
         try ensureParentDirectory()
 
@@ -234,6 +239,14 @@ final class SQLiteStorage {
                 storageLog.error("at-rest key rotation FAILED: \(String(describing: error), privacy: .private)")
             }
         }
+
+        // S3-04: the bootstrap-time `reassertDatabaseFileAttributes()`
+        // above runs before any write, so the `-wal`/`-shm` sidecars do
+        // not exist yet for it to attribute. Now that migration (and any
+        // rotation) have written through the connection — or, if neither
+        // wrote, after we force the WAL open — reassert the protection
+        // class + backup-exclusion on all three files explicitly.
+        inst.reassertAfterFirstWrite()
     }
 
     /// Open the database, walking a finite set of key candidates if
@@ -271,7 +284,7 @@ final class SQLiteStorage {
         // state: the key material cannot decrypt the on-disk store.
         // Against a non-existent file it is a genuine fault on a fresh
         // install and propagates as-is.
-        let primaryKey: Data
+        var primaryKey: Data
         do {
             primaryKey = try DBKey.deriveKey(params: params)
         } catch let dbKeyError as DBKey.DBKeyError {
@@ -280,6 +293,12 @@ final class SQLiteStorage {
                 detail: "key derivation failed against an existing database: \(dbKeyError)",
             )
         }
+        // S3-02: the raw 32-byte SQLCipher key must not linger in a heap
+        // `Data` buffer once `Database` has copied it across the C ABI
+        // (`Database` already builds its own scrubable keying buffer and
+        // wipes it — see Database.swift). Overwrite our copy as soon as
+        // we're done with it, whichever path leaves this scope.
+        defer { scrubKey(&primaryKey) }
         do {
             return try Database(path: path, rawKey: primaryKey)
         } catch DatabaseError.keyingFailed(let code) {
@@ -295,7 +314,8 @@ final class SQLiteStorage {
 
         // Candidate 2: the staged rotation salt. `try?` flattens the
         // `Data?` return, so a single optional-bind yields the key.
-        if let stagedKey = try? DBKey.deriveKeyWithStagedSalt(params: params) {
+        if var stagedKey = try? DBKey.deriveKeyWithStagedSalt(params: params) {
+            defer { scrubKey(&stagedKey) }  // S3-02: don't leave the raw key in heap.
             if let db = try? Database(path: path, rawKey: stagedKey) {
                 storageLog.notice("DB opened with staged rotation salt; promoting to live slot")
                 DBKey.promoteStagedSalt()
@@ -305,9 +325,10 @@ final class SQLiteStorage {
 
         // Candidate 3: every historically-shipped preset.
         for preset in DBKey.historicallyShippedParams {
-            guard let presetKey = try? DBKey.deriveKey(params: preset, persistParams: false) else {
+            guard var presetKey = try? DBKey.deriveKey(params: preset, persistParams: false) else {
                 continue
             }
+            defer { scrubKey(&presetKey) }  // S3-02: don't leave the raw key in heap.
             if let db = try? Database(path: path, rawKey: presetKey) {
                 storageLog.notice("DB opened under a historically-shipped Argon2id preset")
                 return db
@@ -320,6 +341,53 @@ final class SQLiteStorage {
         throw BootstrapError.keyMaterialUnavailable(
             detail: "no derivable key opens the on-disk database",
         )
+    }
+
+    /// S11-04: best-effort suppression of SQLite/SQLCipher's default
+    /// `os_log` device-diagnostics sink, run once at process start before
+    /// any DB is opened.
+    ///
+    /// The clean runtime hook is `sqlite3_config(SQLITE_CONFIG_LOG, nil,
+    /// nil)`, which clears the log callback so the amalgamation's
+    /// Apple default-logging block (`pizzini_sqlcipher.c` ~107510, which
+    /// otherwise sets `sqlcipher_log_device=1` at WARN on first
+    /// activation) has no target and stays silent. BUT `sqlite3_config`
+    /// is declared variadic — `int sqlite3_config(int, ...)` — and Swift
+    /// cannot call C variadic functions: the Clang importer omits them
+    /// entirely, so the symbol is simply not available to call from
+    /// Swift. There is no non-variadic shim in `PizziniSQLCipher`
+    /// (adding one would mean editing the vendored amalgamation / the
+    /// SPM target, which is owned elsewhere).
+    ///
+    /// TODO(S11-04): the load-bearing, deterministic fix is at BUILD
+    /// time — add `.define("SQLCIPHER_OMIT_DEFAULT_LOGGING")` (and
+    /// optionally `.define("SQLCIPHER_OMIT_LOG_DEVICE")`) to the
+    /// `PizziniSQLCipher` cSettings in `Package.swift` so the
+    /// `#ifndef SQLCIPHER_OMIT_DEFAULT_LOGGING` auto-enable block is
+    /// compiled out and no os_log device target is ever attached. That
+    /// guard and the cSettings are owned by the build / SPM agent; this
+    /// app-side hook cannot reach them. If a future `PizziniSQLCipher`
+    /// exposes a non-variadic `pizzini_sqlite_silence_log()` wrapper,
+    /// call it here.
+    private static func suppressSQLiteOSLog() {
+        // Intentionally empty: no app-side runtime symbol is callable
+        // from Swift (see doc comment). Kept as a named seam so the
+        // build-flag fix and any future C shim have an obvious home.
+    }
+
+    /// S3-02: overwrite a raw DB-key `Data` buffer in place. Called via
+    /// `defer` at every site that holds a `DBKey.deriveKey(...)` result
+    /// so the 32-byte SQLCipher key does not survive in a freed heap
+    /// page after `Database` has copied it across the C ABI. `resetBytes`
+    /// zeroes the backing store; the empty assignment then drops the now
+    /// all-zero allocation. Best-effort (ARC/COW can in principle have
+    /// retained a copy elsewhere), but `deriveKey`'s result is not shared
+    /// — these are the only references — so this scrubs the live copy.
+    private static func scrubKey(_ key: inout Data) {
+        if !key.isEmpty {
+            key.resetBytes(in: 0..<key.count)
+        }
+        key = Data()
     }
 
     /// Unlink the SQLCipher database file + its WAL/SHM sidecars.
@@ -358,9 +426,16 @@ final class SQLiteStorage {
     /// Set `completeUntilFirstUserAuthentication` + excluded-from-backup
     /// on the live database files. Per-file attributes layer on top of
     /// the parent directory's class — the SHM/WAL sidecars are created
-    /// lazily by SQLCipher on first write, so this is called both at
-    /// bootstrap (covers the main `.sqlite`) and could be re-run after
-    /// the first transaction (covers the sidecars). Setting the same
+    /// lazily by SQLCipher on first write.
+    ///
+    /// **S3-04.** At first bootstrap the `-wal`/`-shm` siblings do not
+    /// exist yet, so the original single call covered only the main
+    /// `.sqlite` and the `fileExists` guard skipped the sidecars. This
+    /// reassertion is now driven through `reassertAfterFirstWrite()`,
+    /// which forces the WAL to materialize before iterating, so all
+    /// three files are reached. Every filesystem call is `try?`-guarded
+    /// individually — a persistent set-attributes failure on one file
+    /// must not abort the reassertion of the others. Setting the same
     /// value is a no-op.
     private func reassertDatabaseFileAttributes() throws {
         let paths = [databasePath, databasePath + "-wal", databasePath + "-shm"]
@@ -376,6 +451,27 @@ final class SQLiteStorage {
                 ofItemAtPath: p,
             )
         }
+    }
+
+    /// S3-04: reassert the protection class + backup-exclusion on the
+    /// `-wal`/`-shm` sidecars (and re-confirm the main `.sqlite`) AFTER
+    /// the DB has taken at least one write.
+    ///
+    /// `reassertDatabaseFileAttributes()` runs once at bootstrap, but in
+    /// WAL mode SQLCipher creates the `-wal`/`-shm` siblings lazily on
+    /// the first write — on an already-migrated DB no bootstrap write
+    /// happens, so those siblings would never get per-file attributes.
+    /// Here we first force the sidecars into existence with a trivial
+    /// WAL-touching statement (`PRAGMA wal_checkpoint(PASSIVE)` opens the
+    /// WAL/SHM pair without mutating user data), then reassert on all
+    /// three. Both the touch and the reassertion are best-effort: a
+    /// failure leaves the parent-directory class + backup-exclusion in
+    /// place (the load-bearing protection) and is non-fatal.
+    private func reassertAfterFirstWrite() {
+        // Force the WAL/SHM pair to exist so the `fileExists` guard in
+        // `reassertDatabaseFileAttributes` does not skip them.
+        try? db.execute("PRAGMA wal_checkpoint(PASSIVE);")
+        try? reassertDatabaseFileAttributes()
     }
 
     // MARK: - DB location

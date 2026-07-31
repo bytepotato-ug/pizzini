@@ -71,6 +71,39 @@ HEADERS_OUT="$REPO_ROOT/swift/Sources/PizziniTorObjC/torheaders"
 VERSION="v409.8.1"
 ICEPA_REPO="https://github.com/iCepa/Tor.framework.git"
 
+# ----- transport trust anchor: hard-coded, enforced commit pin -----
+#
+# A git TAG is mutable: the upstream can force-push it, a compromised
+# iCepa GitHub account can re-point it, or a TLS intermediary on the
+# operator's `git clone` can serve different bytes. Cloning `--branch
+# v409.8.1` is therefore NOT a content pin. This is the single
+# load-bearing anonymity component — every client routes 100% of its
+# traffic through it — so the build MUST refuse to proceed against any
+# commit other than the one we reviewed. Mirrors
+# `scripts/build-sqlcipher-amalgamation.sh`'s SQLCIPHER_PIN_SHA gate:
+# hard-coded SHA, FATAL exit on mismatch, fail CLOSED (never
+# warn-and-build).
+#
+# TOR_PIN_COMMIT is the full 40-char commit that tag `v409.8.1` of
+# iCepa/Tor.framework resolved to at review time
+# (`git ls-remote --tags iCepa/Tor.framework v409.8.1`). The default
+# below is authoritative; the env var only allows an operator to pin a
+# DIFFERENT reviewed commit when bumping VERSION — it can never relax
+# the gate to "unset". Bumping VERSION REQUIRES updating this constant
+# to the new reviewed commit (and re-reviewing the upstream diff); see
+# RELEASE-CHECKLIST.md.
+TOR_PIN_COMMIT="${TOR_PIN_COMMIT:-5fe6e0442625b5b5bedecbd8f10b9e5cb29c8f05}"
+#
+# iCepa pins its own submodules by gitlink. At v409.8.1 the only
+# submodule in the tree is `Tor/onionmasq` (the arti transport; the
+# C-tor source we actually build is fetched separately by iCepa's
+# build-xcframework.sh via `git clone --branch tor-0.4.9.8
+# tpo/core/tor.git`, not as a recursive submodule). We keep
+# `--recursive` for completeness but VERIFY this gitlink so a moved
+# submodule pointer is also caught. Reviewed value for v409.8.1:
+TOR_SUBMODULE_PATH="Tor/onionmasq"
+TOR_SUBMODULE_PIN_COMMIT="${TOR_SUBMODULE_PIN_COMMIT:-641e3349f5b0d181a343496ce0dc94c628f9ac89}"
+
 # ----- helpers -----
 
 # Patch iCepa's build-xcframework.sh so the libtor configure call
@@ -262,30 +295,58 @@ echo "==> Cloning iCepa/Tor.framework $VERSION"
 git clone --depth 1 --branch "$VERSION" --recursive --shallow-submodules \
     "$ICEPA_REPO" "$ICEPA_DIR" 2>&1 | grep -v -E '^(Cloning|remote: |Receiving|Resolving|Updating|Submodule|From )' || true
 
-# F-SUP-02: a git TAG is mutable (the upstream can force-push it, or an
-# account/TLS compromise can serve different bytes), so cloning `--branch
-# v409.8.1` is NOT a content pin. Resolve the cloned commit and, when the
-# operator has pinned one via TOR_PIN_COMMIT, REFUSE to build on any mismatch
-# — this is the transport trust anchor every client routes 100% of traffic
-# through. Without a pin we print the resolved commit (and the tor submodule
-# commit) so the operator can record it and turn on verification.
+# F-SUP-02 / S12-01: a git TAG is mutable (the upstream can force-push
+# it, or an account/TLS compromise can serve different bytes), so cloning
+# `--branch v409.8.1` is NOT a content pin. Resolve the cloned commit and
+# FATAL-exit on any mismatch against the hard-coded TOR_PIN_COMMIT — this
+# is the transport trust anchor every client routes 100% of traffic
+# through, so the gate fails CLOSED. The pin is mandatory: it has a
+# reviewed default at the top of this script and can never be unset (an
+# empty value is itself a fatal misconfiguration). This mirrors
+# build-sqlcipher-amalgamation.sh exactly.
 TOR_RESOLVED_COMMIT="$(git -C "$ICEPA_DIR" rev-parse HEAD)"
-TOR_SUBMODULE_COMMIT="$(git -C "$ICEPA_DIR" submodule status 2>/dev/null | awk '/Tor\/tor/ {print $1}' | tr -d '+-' || true)"
-if [[ -n "${TOR_PIN_COMMIT:-}" ]]; then
-    if [[ "$TOR_RESOLVED_COMMIT" != "$TOR_PIN_COMMIT" ]]; then
-        echo "ERROR: iCepa Tor.framework commit mismatch." >&2
-        echo "  expected (TOR_PIN_COMMIT): $TOR_PIN_COMMIT" >&2
-        echo "  got (tag $VERSION now points at): $TOR_RESOLVED_COMMIT" >&2
-        echo "  Refusing to build the transport library from an unverified commit." >&2
-        exit 1
-    fi
-    echo "==> Verified iCepa commit matches TOR_PIN_COMMIT ($TOR_RESOLVED_COMMIT)"
-else
-    echo "==> WARNING: TOR_PIN_COMMIT is not set — building from tag $VERSION without a content pin."
-    echo "    Record this and re-run with TOR_PIN_COMMIT set to enforce it on every future build:"
-    echo "      TOR_PIN_COMMIT=$TOR_RESOLVED_COMMIT"
-    [[ -n "$TOR_SUBMODULE_COMMIT" ]] && echo "      (tor submodule commit: $TOR_SUBMODULE_COMMIT)"
+
+# A defensively empty pin (e.g. someone passed TOR_PIN_COMMIT= on the
+# command line) must NOT degrade to a warn-and-build. Treat it as fatal.
+if [[ -z "${TOR_PIN_COMMIT:-}" ]]; then
+    echo "FATAL: TOR_PIN_COMMIT is empty." >&2
+    echo "  The embedded Tor commit pin is mandatory and fails closed." >&2
+    echo "  Restore the reviewed default at the top of this script, or set" >&2
+    echo "  TOR_PIN_COMMIT to the reviewed iCepa commit for tag $VERSION." >&2
+    exit 1
 fi
+if [[ "$TOR_RESOLVED_COMMIT" != "$TOR_PIN_COMMIT" ]]; then
+    echo "FATAL: iCepa Tor.framework commit mismatch." >&2
+    echo "  expected (TOR_PIN_COMMIT): $TOR_PIN_COMMIT" >&2
+    echo "  got (tag $VERSION now points at): $TOR_RESOLVED_COMMIT" >&2
+    echo "  The tag may have been force-pushed, or a TLS intermediary served" >&2
+    echo "  a different tree. Refusing to build the transport library from an" >&2
+    echo "  unverified commit. If this is an intentional version bump, review" >&2
+    echo "  the upstream diff and update TOR_PIN_COMMIT at the top of this script." >&2
+    exit 1
+fi
+echo "==> Verified iCepa commit matches TOR_PIN_COMMIT ($TOR_RESOLVED_COMMIT)"
+
+# Also verify the submodule gitlink. `--recursive` is kept, but a moved
+# submodule pointer is a content-substitution vector too, so we resolve
+# the recorded gitlink and FATAL on mismatch. `git submodule status`
+# prints `[+-]<sha> <path> ...`; strip the leading +/- status marker.
+TOR_SUBMODULE_COMMIT="$(git -C "$ICEPA_DIR" submodule status 2>/dev/null \
+    | awk -v p="$TOR_SUBMODULE_PATH" '$2==p {print $1}' | tr -d '+-' || true)"
+if [[ -z "$TOR_SUBMODULE_COMMIT" ]]; then
+    echo "FATAL: expected submodule '$TOR_SUBMODULE_PATH' not found in the iCepa checkout." >&2
+    echo "  iCepa may have restructured its submodules at tag $VERSION." >&2
+    echo "  Re-audit and update TOR_SUBMODULE_PATH / TOR_SUBMODULE_PIN_COMMIT." >&2
+    exit 1
+fi
+if [[ "$TOR_SUBMODULE_COMMIT" != "$TOR_SUBMODULE_PIN_COMMIT" ]]; then
+    echo "FATAL: iCepa submodule '$TOR_SUBMODULE_PATH' commit mismatch." >&2
+    echo "  expected (TOR_SUBMODULE_PIN_COMMIT): $TOR_SUBMODULE_PIN_COMMIT" >&2
+    echo "  got:                                 $TOR_SUBMODULE_COMMIT" >&2
+    echo "  Refusing to build from a moved submodule pointer." >&2
+    exit 1
+fi
+echo "==> Verified $TOR_SUBMODULE_PATH submodule matches pin ($TOR_SUBMODULE_COMMIT)"
 
 patch_icepa_build_script "$ICEPA_DIR/build-xcframework.sh"
 

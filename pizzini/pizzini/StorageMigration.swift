@@ -76,7 +76,50 @@ enum StorageMigration {
         // Includes app-state, outbox, AND device-store round-trips
         // so a `try?` decode failure cannot pretend to have migrated
         // an outbox we couldn't actually parse.
-        try verifyReadback(storage: storage)
+        //
+        // **S3-05 — bounded verify retry + surfaced failure state.**
+        // Verify-before-delete is the correct anti-data-loss ordering:
+        // we must NOT destroy the only copy of the identity seed /
+        // app-state before the SQLCipher copy is confirmed good. But a
+        // verify that fails on EVERY launch (corruption, or a legacy
+        // blob the current decoders reject) used to leave the legacy
+        // AFU-readable plaintext slots (device-store, identity seed,
+        // app-state) present indefinitely with NO user-visible signal —
+        // an AFU extraction then recovers them even though the user
+        // believes their data now lives only inside SQLCipher.
+        //
+        // The fix makes the failure path explicit: count consecutive
+        // verify failures in the (encrypted, in-DB) `meta` table. Below
+        // the bound we rethrow so the next launch retries cleanly with
+        // the legacy slots still intact (a transient failure self-heals).
+        // At the bound we mark an explicit unrecoverable-migration state
+        // (`migrationVerifyExhausted`) — a flag the host can surface —
+        // rather than silently looping forever. The legacy slots are
+        // still NOT deleted (deletion only ever happens after a verify
+        // SUCCEEDS, below), so this never risks data loss; it converts a
+        // silent indefinite-plaintext condition into a flagged, visible
+        // one.
+        do {
+            try verifyReadback(storage: storage)
+        } catch {
+            let attempts = bumpVerifyFailureCount(storage: storage)
+            if attempts >= maxVerifyAttempts {
+                // Persistent failure: surface an explicit error state
+                // instead of silently retaining plaintext legacy slots
+                // forever. Slots are still retained (verify never
+                // succeeded → no delete), but the condition is now
+                // observable and loudly logged.
+                try? setMigrationVerifyExhausted(storage: storage)
+                pzLog("[pizzini.migration] verify FAILED \(attempts)× — marking migration unrecoverable; legacy plaintext slots retained pending manual recovery. error=\(error)")
+                throw MigrationError.verifyExhausted(attempts: attempts, detail: "\(error)")
+            }
+            pzLog("[pizzini.migration] verify failed (attempt \(attempts)/\(maxVerifyAttempts)) — retrying next launch; legacy slots intact. error=\(error)")
+            throw error
+        }
+
+        // Verify succeeded — clear any prior failure tally so a future
+        // unrelated re-run starts from a clean count.
+        clearVerifyFailureCount(storage: storage)
 
         // **Delete-before-flag.** Drop the legacy slots first; only
         // mark the migration complete once the source is gone. A
@@ -87,9 +130,63 @@ enum StorageMigration {
         // it. A process kill in the prior ordering (flag set,
         // deletes pending) left Cellebrite-extractable plaintext
         // copies permanently behind the marker's short-circuit.
+        //
+        // S3-05: this delete is the verify-before-delete completion —
+        // it runs ONLY on the success path above, so the legacy plaintext
+        // slots are gone the moment (and only once) the SQLCipher copy
+        // is confirmed readable.
         deleteAllLegacySlots()
         try setMetaFlag(storage: storage)
         pzLog("[pizzini.migration] Keychain → SQLCipher migration complete")
+    }
+
+    // MARK: - S3-05 verify-failure bookkeeping
+
+    /// Max consecutive verify-readback failures tolerated before the
+    /// migration is marked unrecoverable. Small bound: a verify that
+    /// fails this many launches in a row is a persistent fault (corrupt
+    /// legacy blob / a schema the decoders reject), not a transient
+    /// hiccup, so we stop silently looping and surface it.
+    static let maxVerifyAttempts = 3
+
+    /// `meta` key for the consecutive-verify-failure counter (a single
+    /// big-endian byte; the bound is tiny so one byte is plenty).
+    static let verifyFailureCountKey = "keychain_migration_v1_verify_failures"
+    /// `meta` key set once the verify retries are exhausted. Presence of
+    /// this row is the explicit, queryable unrecoverable-migration state.
+    static let verifyExhaustedKey = "keychain_migration_v1_verify_exhausted"
+
+    /// True iff the migration verify has been marked unrecoverable
+    /// (retries exhausted). The host can read this to surface an error
+    /// banner instead of pretending the migration completed. Best-effort:
+    /// a read failure returns false (treat as "not yet exhausted").
+    static func isVerifyExhausted(storage: SQLiteStorage) -> Bool {
+        // `try?` yields `Data??`; flatten then test presence.
+        let value = (try? metaValue(key: verifyExhaustedKey, storage: storage)) ?? nil
+        return value != nil
+    }
+
+    /// Increment + persist the consecutive-verify-failure counter,
+    /// returning the new count. Best-effort persistence: if the meta
+    /// write fails we still return the incremented value so the in-run
+    /// bound check behaves sensibly.
+    private static func bumpVerifyFailureCount(storage: SQLiteStorage) -> Int {
+        let prior: Int = {
+            guard let data = try? metaValue(key: verifyFailureCountKey, storage: storage),
+                  let byte = data.first else { return 0 }
+            return Int(byte)
+        }()
+        let next = min(prior + 1, 255)
+        try? setMetaValue(key: verifyFailureCountKey, value: Data([UInt8(next)]), storage: storage)
+        return next
+    }
+
+    private static func clearVerifyFailureCount(storage: SQLiteStorage) {
+        try? deleteMetaValue(key: verifyFailureCountKey, storage: storage)
+    }
+
+    private static func setMigrationVerifyExhausted(storage: SQLiteStorage) throws {
+        try setMetaValue(key: verifyExhaustedKey, value: Data([0x01]), storage: storage)
     }
 
     /// Idempotent delete of every legacy Keychain slot. Each row is
@@ -276,11 +373,31 @@ enum StorageMigration {
     }
 
     private static func setMetaFlag(storage: SQLiteStorage) throws {
+        try setMetaValue(key: metaKey, value: Data([0x01]), storage: storage)
+    }
+
+    // MARK: - Generic meta accessors
+
+    /// Read a raw `meta` value by key, or nil if the row is absent.
+    private static func metaValue(key: String, storage: SQLiteStorage) throws -> Data? {
+        let stmt = try storage.db.prepare("SELECT value FROM meta WHERE key = ?;")
+        try stmt.bindAll(key)
+        guard try stmt.step() else { return nil }
+        return stmt.columnBlob(0)
+    }
+
+    /// Upsert a raw `meta` value by key.
+    private static func setMetaValue(key: String, value: Data, storage: SQLiteStorage) throws {
         let stmt = try storage.db.prepare("""
             INSERT INTO meta (key, value) VALUES (?, ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value;
         """)
-        try stmt.bind(metaKey, at: 1).bind(Data([0x01]), at: 2).run()
+        try stmt.bind(key, at: 1).bind(value, at: 2).run()
+    }
+
+    /// Delete a `meta` row by key (idempotent).
+    private static func deleteMetaValue(key: String, storage: SQLiteStorage) throws {
+        try storage.db.prepare("DELETE FROM meta WHERE key = ?;").bindAll(key).run()
     }
 
     enum MigrationError: Error {
@@ -289,5 +406,13 @@ enum StorageMigration {
         case appStateDecodeFailed(detail: String)
         case outboxDecodeFailed(detail: String)
         case outboxRowCountMismatch(expected: Int, actual: Int)
+        /// S3-05: the verify-readback failed on `maxVerifyAttempts`
+        /// consecutive launches. The migration is unrecoverable; the
+        /// legacy plaintext slots are retained (verify never succeeded,
+        /// so they were never deleted — no data loss) but the condition
+        /// is now an explicit, surfaced state (`verifyExhaustedKey` in
+        /// `meta`, readable via `isVerifyExhausted`) instead of a silent
+        /// indefinite-plaintext loop.
+        case verifyExhausted(attempts: Int, detail: String)
     }
 }

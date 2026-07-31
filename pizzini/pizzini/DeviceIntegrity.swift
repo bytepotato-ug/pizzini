@@ -22,14 +22,13 @@ import UIKit
 ///   We render the chat normally and surface a banner.
 /// - Phone home. No telemetry; consistent with the README's "no
 ///   analytics" hard rule. The only record of an integrity flag is
-///   the in-app banner + Settings notice — nothing recoverable from
-///   the system log on a release build. The log call is `os_log` at
-///   `.debug` level, which release iOS drops unless debug logging is
-///   explicitly enabled, so a coercer reading a later sysdiagnose
-///   cannot confirm the check fired.
-/// - Use private APIs. `sysctl(KERN_PROC)`, `_dyld_image_count`,
-///   `FileManager.fileExists`, and `UIApplication.canOpenURL` are all
-///   public; this is App-Store-safe.
+///   the in-app banner in ContentView — nothing is persisted and
+///   nothing recoverable from the system log on a release build. The
+///   log call is `os_log` at `.debug` level, which release iOS drops
+///   unless debug logging is explicitly enabled, so a coercer reading
+///   a later sysdiagnose cannot confirm the check fired.
+/// - Use private APIs. `sysctl(KERN_PROC)`, `_dyld_image_count`, and
+///   `FileManager.fileExists` are all public; this is App-Store-safe.
 ///
 /// **Bypassability**: high, by design. A jailbroken phone with
 /// libtweakloader-style hooks can:
@@ -62,13 +61,8 @@ final class DeviceIntegrityMonitor {
     /// substrings (frida-gadget, cycript, MobileSubstrate, …).
     private(set) var hasSuspiciousDylib: Bool = false
 
-    /// First wall-clock time any flag flipped on. Surfaced to the
-    /// user via the banner so a forensic post-mortem has a timestamp;
-    /// nil if everything is clean.
-    private(set) var detectedAt: Date?
-
-    /// True iff any of the three flags is set. Drives the banner in
-    /// ContentView and the warning section in Settings.
+    /// True iff any of the three flags is set. Drives the
+    /// detection-only informational banner in ContentView.
     var isCompromised: Bool {
         isJailbroken || hasSuspiciousDylib
             // Don't escalate the banner for an attached Xcode debugger
@@ -112,9 +106,6 @@ final class DeviceIntegrityMonitor {
         self.isJailbroken = jb
         self.isDebuggerAttached = dbg
         self.hasSuspiciousDylib = dylib
-        if (jb || dylib || (!Self.isDebugBuild && dbg)) && self.detectedAt == nil {
-            self.detectedAt = Date()
-        }
         // Skip the log line when the ONLY thing that fired is the
         // debugger flag in a DEBUG build — Xcode is always attached
         // during dev work, the user can't act on it, and shipping a
@@ -134,11 +125,11 @@ final class DeviceIntegrityMonitor {
             // unless logging is explicitly enabled, so a coercer
             // who later reads sysdiagnose can't confirm "RASP fired
             // on this device" from the public log stream. The
-            // banner + Settings notice are still visible to the
-            // user — the forensic post-mortem use-case the audit
-            // mentions is preserved for anyone who explicitly
-            // enables debug logging via Console.app, but not for
-            // an opportunistic attacker.
+            // in-app banner is still visible to the user — the
+            // forensic post-mortem use-case the audit mentions is
+            // preserved for anyone who explicitly enables debug
+            // logging via Console.app, but not for an opportunistic
+            // attacker.
             let log = OSLog(subsystem: "app.pizzini.security", category: "integrity")
             os_log(
                 "device integrity flags — jailbroken=%{public}d debugger=%{public}d suspiciousDylib=%{public}d",

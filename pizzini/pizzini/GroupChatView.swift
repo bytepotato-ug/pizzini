@@ -186,7 +186,18 @@ struct GroupChatView: View {
             }
             ToolbarItem(placement: .topBarTrailing) {
                 NavigationLink {
+                    // S9-04: a NavigationStack-pushed destination renders
+                    // as a sibling of the shielded chat root, OUTSIDE the
+                    // root's `.screenCaptureShielded()` overlay. On a
+                    // healthy device the window-level `WindowSecureMask`
+                    // covers it for recording; when that mask is degraded
+                    // (`qrBlockEffective == false`) the in-body recording
+                    // shield is the only defense, so apply it directly to
+                    // the pushed settings view. This blanks the group
+                    // member list + group name during a live recording /
+                    // external display even in the degraded state.
                     GroupSettingsView(store: store, groupID: groupID)
+                        .screenCaptureShielded()
                 } label: {
                     Image(systemName: "gearshape")
                 }
@@ -984,10 +995,30 @@ private struct GroupChatBubble: View {
             bubbleText
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
-                .textSelection(.enabled)
                 .background(bubbleColor)
                 .cornerRadius(12)
                 .overlay(focusedMatchRing)
+                // S9-02: do NOT use `.textSelection(.enabled)` here. The
+                // system Copy that text-selection exposes routes through
+                // UIKit's selection Copy command, which the app cannot
+                // intercept to apply `localOnly`/expiry — so copied
+                // decrypted GROUP plaintext would land on the unscoped
+                // `UIPasteboard.general` and propagate via Universal
+                // Clipboard / Handoff with no expiry. The 1:1 `ChatView`
+                // bubble exposes no copy at all; we instead give group
+                // bubbles an EXPLICIT Copy menu item routed through the
+                // same hardened pasteboard write the identity-card copy
+                // uses (`HardenedPasteboard.copy` → localOnly + expiring
+                // + changeCount-guarded self-clear), so the copy
+                // affordance the FAQ advertises stays available but no
+                // longer leaks across devices or persists indefinitely.
+                .contextMenu {
+                    Button {
+                        HardenedPasteboard.copy(message.text)
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                }
         }
     }
 
@@ -1017,6 +1048,58 @@ private struct GroupChatBubble: View {
         if isFocusedMatch {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(Color.orange, lineWidth: 2)
+        }
+    }
+}
+
+/// Hardened wrapper around `UIPasteboard.general` writes for decrypted
+/// message plaintext (S9-02). Mirrors the identity-card copy in
+/// `ProfileView.actions` (`ContentView.swift`): the write is
+/// `localOnly: true` (suppresses Universal Clipboard / Handoff sync to
+/// paired devices) and `expirationDate`-bounded, with an app-side
+/// `changeCount`-guarded clear as a hard backstop because iOS honours
+/// `expirationDate` inconsistently across versions.
+///
+/// What this does NOT do (honest developer note — never user copy):
+/// `localOnly` does not scope the write to Pizzini. Any other app on
+/// THIS device can still read `UIPasteboard.general` until the entry is
+/// cleared — there is no app-private pasteboard that survives a hand-off
+/// to a third-party app, so that exposure is inherent to any copy
+/// affordance. What we control — cross-device propagation and unbounded
+/// persistence — is what we lock down here, bringing the group-bubble
+/// Copy in line with the app's own hardened standard instead of the raw
+/// `.textSelection` system Copy it replaced.
+@MainActor
+enum HardenedPasteboard {
+    /// Seconds until a copied message auto-expires from the system
+    /// pasteboard. Matches `ProfileView.pasteboardExpirySeconds` (60 s):
+    /// long enough for a quick paste-and-go, short enough to keep the
+    /// on-device exposure window tight for the user who copies and walks
+    /// away.
+    static let expirySeconds: TimeInterval = 60
+
+    /// Write `text` to the system pasteboard with `localOnly` + an
+    /// expiry, then schedule a `changeCount`-guarded self-clear at the
+    /// same deadline. We deliberately do NOT read the pasteboard on this
+    /// path (`pb.string`/`pb.items`/etc. trigger iOS's Handoff "Paste
+    /// from …?" banner); `setObjects` is the authoritative write and its
+    /// contract is "the data is on the pasteboard when this returns."
+    static func copy(_ text: String) {
+        let pb = UIPasteboard.general
+        pb.setObjects(
+            [text],
+            localOnly: true,
+            expirationDate: Date().addingTimeInterval(expirySeconds),
+        )
+        // Capture the generation from the write we just made (a
+        // metadata-only accessor — does not trigger the paste banner).
+        // At the deadline we clear ONLY if nothing replaced our entry
+        // since: if `changeCount` moved, the user or another app put
+        // something else there and wiping would destroy it.
+        let writeGeneration = pb.changeCount
+        DispatchQueue.main.asyncAfter(deadline: .now() + expirySeconds) {
+            guard UIPasteboard.general.changeCount == writeGeneration else { return }
+            UIPasteboard.general.items = []
         }
     }
 }

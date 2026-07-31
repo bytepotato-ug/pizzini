@@ -174,10 +174,17 @@ enum MetadataStripper {
         ) else {
             throw StripError.encodeFailed
         }
-        // Empty metadata = exporter writes a fresh container with the
-        // a/v tracks but no tags. AVFoundation honours this for the
-        // standard Voice Memos / iPhone-camera output formats.
+        // F-S8-02: `session.metadata = []` alone is NOT sufficient under
+        // the passthrough preset — the exporter copies the source's
+        // container-level metadata atoms, so an iPhone-camera clip's
+        // QuickTime `udta/©xyz` (`com.apple.quicktime.location.ISO6709`)
+        // GPS atom survives. `metadataItemFilter = .forSharing()` is the
+        // Apple-blessed filter that strips user-identifying metadata —
+        // location, creation device, etc. — from the copied stream. Set
+        // BOTH: the empty array drops anything we'd otherwise add, and
+        // the share filter drops what passthrough would otherwise copy.
         session.metadata = []
+        session.metadataItemFilter = AVMetadataItemFilter.forSharing()
         let outputFileType = avFileType(forExt: ext)
 
         let semaphore = DispatchSemaphore(value: 0)

@@ -42,9 +42,27 @@ enum AppPasscode {
     /// desync, which used to be possible with the prior two-row design
     /// (crash between salt-write and hash-write would permanently lock
     /// the user out of a passcode they typed correctly).
-    static let realSlotAccount = "app-passcode-slot"
-    /// Sibling row for the duress passcode.
-    static let duressSlotAccount = "duress-passcode-slot"
+    ///
+    /// **S7-08 / S3-03 (anti-forensics): the two slot account names are
+    /// name-INDISTINGUISHABLE.** Previously the real slot was named
+    /// `app-passcode-slot` and the duress slot `duress-passcode-slot`.
+    /// The mere existence of a self-describing `duress-…` account in a
+    /// pre-wipe AFU Keychain dump was a forensic tell that a duress
+    /// passcode is configured at all — undermining deniability of the
+    /// duress capability before the user ever acts. Both slots now use
+    /// generic, structurally-identical names (`passcode-slot-0` /
+    /// `passcode-slot-1`) so a Keychain enumeration of account names
+    /// cannot derive which (if either) is the duress slot. Which slot
+    /// is real vs duress is carried ONLY inside the per-slot blob (a
+    /// role discriminator byte appended after `salt || hash`), which
+    /// lives in the same AfterFirstUnlock-protected ciphertext as the
+    /// Argon2id material — never in the enumerable `kSecAttrAccount`
+    /// attribute. See `Role` and the 65-byte slot layout below.
+    static let realSlotAccount = "passcode-slot-0"
+    /// Sibling row for the duress passcode — name-indistinguishable
+    /// from the real slot (`passcode-slot-1`, same shape as
+    /// `passcode-slot-0`). See `realSlotAccount` for the rationale.
+    static let duressSlotAccount = "passcode-slot-1"
 
     /// Legacy Keychain slot names — written by the pre-atomic-slot
     /// versions of this module. Read once on the first access path
@@ -70,10 +88,35 @@ enum AppPasscode {
     /// floor.
     static let minLength: Int = 6
 
-    /// Fixed sizes for the atomic slot blob layout: `salt(32) || hash(32)`.
+    /// Role discriminator byte stored INSIDE the per-slot blob (never
+    /// in the Keychain account name — see `realSlotAccount`). This is
+    /// what lets verification know whether a matched slot is the real
+    /// or the duress passcode while keeping the on-disk account names
+    /// indistinguishable. The byte values are arbitrary non-zero
+    /// sentinels; an examiner reading the blob still cannot tell which
+    /// slot is which without decrypting the AfterFirstUnlock ciphertext
+    /// AND knowing this mapping, and even then BOTH slots look
+    /// identical in structure (salt||hash||role), so the existence of a
+    /// second slot is not itself a "duress is configured" tell.
+    enum Role: UInt8 {
+        case real = 0x01
+        case duress = 0x02
+    }
+
+    /// Fixed sizes for the atomic slot blob layout:
+    /// `salt(32) || hash(32) || role(1)` = 65 bytes.
+    ///
+    /// Legacy builds wrote a 64-byte blob (`salt || hash`) without the
+    /// trailing role byte; `readSlotSplit` accepts both lengths and
+    /// infers the role from the account when the byte is absent, so an
+    /// in-place upgrade never locks the user out.
     private static let saltLen = 32
     private static let hashLen = 32
-    private static let slotLen = saltLen + hashLen
+    private static let roleLen = 1
+    /// Canonical (current) slot length, including the role byte.
+    private static let slotLen = saltLen + hashLen + roleLen
+    /// Pre-role legacy slot length (`salt || hash` only).
+    private static let legacySlotLen = saltLen + hashLen
 
     /// Deterministic dummy slot used when the corresponding real /
     /// duress slot is unset. The dummy salt is a fixed, all-zero
@@ -112,7 +155,7 @@ enum AppPasscode {
     /// real one (and vice versa) at the UI layer — that check uses
     /// `check(_:)`.
     static func setPasscode(_ passcode: String) throws {
-        try setPasscodeIntoSlot(passcode, account: realSlotAccount)
+        try setPasscodeIntoSlot(passcode, account: realSlotAccount, role: .real)
     }
 
     /// Set or replace the duress passcode. Same shape as `setPasscode`.
@@ -123,7 +166,7 @@ enum AppPasscode {
         if verifyPasscode(passcode) {
             throw PasscodeError.sameAsExisting
         }
-        try setPasscodeIntoSlot(passcode, account: duressSlotAccount)
+        try setPasscodeIntoSlot(passcode, account: duressSlotAccount, role: .duress)
     }
 
     /// Remove the real passcode. Used when the user disables app-
@@ -217,6 +260,61 @@ enum AppPasscode {
     static func eraseAll() {
         secureDelete(account: realSlotAccount)
         secureDelete(account: duressSlotAccount)
+        // The brute-force attempt counter is part of the lock state;
+        // a true clean slate has no recorded failures. (On the duress
+        // path the whole Keychain service is torn down anyway, but be
+        // explicit so a partial `eraseAll` from settings also resets.)
+        resetFailedAttempts()
+    }
+
+    // MARK: - Brute-force throttle (S7-03)
+    //
+    // A persistent failed-attempt counter. Stored in its OWN Keychain
+    // row (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, like the
+    // slots) so it SURVIVES an app kill/relaunch and cannot be reset by
+    // force-quitting the app — an attacker grinding the passcode gate
+    // gains nothing by killing the process between guesses. The counter
+    // drives an escalating backoff delay in `LockManager` (it does NOT
+    // auto-wipe — see S7-03: wipe-on-N is a DoS for a fat-fingered user
+    // and is deliberately omitted). Reset to zero on any successful
+    // real-OR-duress unlock.
+
+    /// Keychain account for the persistent failed-attempt counter.
+    /// Generic, non-self-describing name (does not say "passcode" or
+    /// "lock") so it adds no forensic signal beyond the slots
+    /// themselves. Single little-endian `UInt32` payload.
+    static let failedAttemptsAccount = "ui-state-counter-0"
+
+    /// Current persisted count of consecutive failed passcode entries.
+    /// Reads return 0 when the row is absent (fresh install / after a
+    /// successful unlock). Capped well below `UInt32.max` on write.
+    static var failedAttempts: Int {
+        guard let data = Keychain.read(account: failedAttemptsAccount),
+              data.count == MemoryLayout<UInt32>.size else {
+            return 0
+        }
+        var value: UInt32 = 0
+        _ = withUnsafeMutableBytes(of: &value) { data.copyBytes(to: $0) }
+        return Int(UInt32(littleEndian: value))
+    }
+
+    /// Increment the persisted failed-attempt counter and return the
+    /// new value. Bounded so the stored value can never overflow; the
+    /// backoff curve in `LockManager` saturates long before the cap.
+    @discardableResult
+    static func recordFailedAttempt() -> Int {
+        let next = min(failedAttempts + 1, 1_000_000)
+        var le = UInt32(next).littleEndian
+        let blob = withUnsafeBytes(of: &le) { Data($0) }
+        _ = Keychain.write(blob, account: failedAttemptsAccount)
+        return next
+    }
+
+    /// Clear the failed-attempt counter. Called on every successful
+    /// unlock (real OR duress) so a legitimate user never accrues
+    /// backoff across sessions.
+    static func resetFailedAttempts() {
+        Keychain.delete(account: failedAttemptsAccount)
     }
 
     // MARK: - Argon2id glue
@@ -224,6 +322,7 @@ enum AppPasscode {
     private static func setPasscodeIntoSlot(
         _ passcode: String,
         account: String,
+        role: Role,
     ) throws {
         guard !passcode.isEmpty else { throw PasscodeError.empty }
         guard passcode.count >= minLength else {
@@ -244,12 +343,17 @@ enum AppPasscode {
         } catch {
             throw PasscodeError.derivationFailed
         }
-        // Atomic write: salt + hash in one Keychain row. A torn write
-        // is now impossible — the prior two-row design could leave a
-        // new salt next to an old hash on crash.
+        // Atomic write: salt + hash + role in one Keychain row. A torn
+        // write is now impossible — the prior two-row design could leave
+        // a new salt next to an old hash on crash. The trailing role
+        // byte records whether this is the real or duress slot WITHOUT
+        // encoding that into the (enumerable) account name — see
+        // `realSlotAccount` / `Role` for the S7-08 anti-forensics
+        // rationale.
         var slot = Data(capacity: slotLen)
         slot.append(salt)
         slot.append(hash)
+        slot.append(role.rawValue)
         guard Keychain.write(slot, account: account) else {
             throw PasscodeError.keychainWriteFailed
         }
@@ -285,7 +389,13 @@ enum AppPasscode {
     /// the same two legacy-account probes the miss path makes — same
     /// three reads either way — and discard their results.
     private static func readSlot(_ account: String) -> Data? {
-        if let data = Keychain.read(account: account), data.count == slotLen {
+        // Accept BOTH the canonical 65-byte (`salt||hash||role`) and the
+        // pre-role 64-byte (`salt||hash`) layouts. A device upgraded
+        // in-place may still hold the 64-byte blob until the next
+        // `setPasscode`; `readSlotSplit` infers the role from the
+        // account in that case, so the user is never locked out.
+        if let data = Keychain.read(account: account),
+           data.count == slotLen || data.count == legacySlotLen {
             // Atomic slot hit. Issue the two legacy probes anyway so
             // the observable Keychain-read count is identical to the
             // miss path; results discarded.
@@ -323,13 +433,16 @@ enum AppPasscode {
     /// per device (the legacy reads return nil after the deletes).
     private static func migrateLegacySlot(into account: String) -> Data? {
         let (legacyHashAccount, legacySaltAccount): (String, String)
+        let role: Role
         switch account {
         case realSlotAccount:
             legacyHashAccount = legacyRealHashAccount
             legacySaltAccount = legacyRealSaltAccount
+            role = .real
         case duressSlotAccount:
             legacyHashAccount = legacyDuressHashAccount
             legacySaltAccount = legacyDuressSaltAccount
+            role = .duress
         default:
             return nil
         }
@@ -349,6 +462,7 @@ enum AppPasscode {
         var blob = Data(capacity: slotLen)
         blob.append(legacySalt)
         blob.append(legacyHash)
+        blob.append(role.rawValue)
         guard Keychain.write(blob, account: account) else {
             // Couldn't write the new slot — leave legacy rows in place
             // so a retry later still has the material.
@@ -362,8 +476,15 @@ enum AppPasscode {
 
     private static func readSlotSplit(_ account: String) -> (Data, Data)? {
         guard let data = readSlot(account) else { return nil }
-        let salt = data.prefix(saltLen)
-        let hash = data.suffix(hashLen)
+        // Take salt and hash from fixed offsets so the trailing role
+        // byte (canonical 65-byte layout) is excluded; a legacy 64-byte
+        // blob has no role byte and slices identically. `data` is a
+        // Keychain-returned `Data` whose indices start at 0, but slice
+        // defensively from the base to be index-origin independent.
+        guard data.count >= legacySlotLen else { return nil }
+        let base = data.startIndex
+        let salt = data[base ..< base + saltLen]
+        let hash = data[base + saltLen ..< base + saltLen + hashLen]
         return (Data(salt), Data(hash))
     }
 

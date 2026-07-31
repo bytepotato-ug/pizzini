@@ -40,6 +40,34 @@ final class NotificationService: UNNotificationServiceExtension {
         // first posture extends to badge-as-oracle): no NSE bump at
         // all, the badge stays at whatever the main app last wrote.
         let suite = UserDefaults(suiteName: SharedAppGroup.identifier)
+        // S7-05 — wiped/duress-state awareness.
+        //
+        // After a duress wipe the relay may still hold the old peer-id →
+        // APNs-token mapping for up to its token TTL, so an inbound SEND
+        // to the OLD identity can still fire a "New message" push at a
+        // device the user just made look freshly installed. With no
+        // wiped-state gate the NSE would paint that alert + badge — a
+        // tell a coercer reads. If the main app has set the duress-wiped
+        // sentinel in the App Group (it MUST set it on the duress path,
+        // BEFORE it clears the rest of the suite — that side is owned by
+        // the main app and tracked separately), suppress the
+        // notification entirely: deliver EMPTY content (no alert, no
+        // sound, no badge) so nothing surfaces on the supposedly-fresh
+        // device.
+        //
+        // Robustness: if the key is absent (the normal case, and the
+        // case for any build whose main app hasn't set it yet) we fall
+        // through to the existing behavior. The NSE never crashes on a
+        // missing key.
+        if suite?.bool(forKey: SharedAppGroup.duressWipedKey) == true {
+            // Deliver content that shows the user nothing. We cannot
+            // legally "drop" a delivered push from the NSE, but handing
+            // back stripped content with no alert/sound/badge renders
+            // it invisible — the device stays looking fresh-installed.
+            let silent = UNMutableNotificationContent()
+            contentHandler(silent)
+            return
+        }
         let panicLockBadge = suite?.bool(forKey: SharedAppGroup.suppressBadgeKey) ?? false
         if panicLockBadge {
             contentHandler(bestAttemptContent)
@@ -120,4 +148,20 @@ enum SharedAppGroup {
     /// mirror in `pizzini/SharedAppGroup.swift` for the full reasoning.
     static let mainAppActiveEpochKey = "mainAppActiveEpoch"
     static let mainAppActiveWindow: TimeInterval = 30
+
+    /// S7-05 — duress/wiped sentinel. A `Bool` the MAIN APP must set to
+    /// `true` on the duress-wipe path (BEFORE it clears the rest of the
+    /// App Group suite / re-bootstraps), signalling that the device has
+    /// been duress-wiped and the NSE must NOT surface any "New message"
+    /// alert or badge for pushes that arrive against the old identity
+    /// (the relay can keep firing them until its token TTL expires).
+    /// When absent or `false` the NSE behaves exactly as before.
+    ///
+    /// NOTE FOR THE MAIN-APP SIDE (owned separately): set this key in
+    /// the shared suite at the START of the duress wipe and DO NOT
+    /// remove it as part of clearing the suite — a fresh install simply
+    /// never has it, which is the same observable as a wiped device that
+    /// later clears it on the user's deliberate re-onboarding. Mirror
+    /// this constant in `pizzini/SharedAppGroup.swift`.
+    static let duressWipedKey = "duressWiped"
 }

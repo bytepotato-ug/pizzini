@@ -1203,7 +1203,14 @@ public final class TorController: ObservableObject {
             if let t = outcome.token {
                 Self.removeObserverUnsafe(controller, t)
             }
+            // S5-03/S11-02: `address` is the onion prefix — an
+            // identifying artifact that persists to the on-disk
+            // unified log at `.error` on release. Gate the line behind
+            // `#if DEBUG`; the `continuation.resume(throwing:)` below
+            // is load-bearing and stays unconditional.
+            #if DEBUG
             torLog.error("hsfetch: FAILED address=\(self.address.prefix(8), privacy: .public)… reason=\(reason, privacy: .public)")
+            #endif
             continuation.resume(
                 throwing: TorControllerError.hsDescriptorUnavailable(
                     onion: address,
@@ -1218,7 +1225,13 @@ public final class TorController: ObservableObject {
             if let t = outcome.token {
                 Self.removeObserverUnsafe(controller, t)
             }
+            // S5-03/S11-02: onion prefix persists to the on-disk
+            // unified log at `.error` on release — gate behind
+            // `#if DEBUG`. The `continuation.resume(throwing:)` below
+            // is load-bearing and stays unconditional.
+            #if DEBUG
             torLog.error("hsfetch: TIMEOUT address=\(self.address.prefix(8), privacy: .public)… after \(Int(seconds))s")
+            #endif
             continuation.resume(
                 throwing: TorControllerError.hsDescriptorUnavailable(
                     onion: address,
@@ -1408,7 +1421,16 @@ public final class TorController: ObservableObject {
             }
             return
         }
+        // S5-03/S11-02: the path fingerprint
+        // (`status:isConstrained:interfaceTypes`) is a network-mobility
+        // identifier — logging it at `.notice` persists a timestamped
+        // WiFi↔cellular roaming ledger to the on-disk unified log on
+        // release. Gate the line behind `#if DEBUG`; the circuit
+        // rotation / redial logic below is load-bearing and stays
+        // unconditional.
+        #if DEBUG
         torLog.notice("path: changed \(previous ?? "<nil>", privacy: .public) → \(fp, privacy: .public) — rotating circuits")
+        #endif
         // Await tor's acknowledgement of NEWNYM (or a short fixed
         // grace period) BEFORE posting the redial notification. If
         // the redial's fresh SOCKS5 dials began before tor honoured

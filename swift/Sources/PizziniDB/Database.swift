@@ -63,14 +63,33 @@ public final class Database {
         // path. The fix uses the C API + hex form so the SQL
         // never reaches `sqlite3_exec` (and can't be captured into
         // a thrown `DatabaseError.executeFailed.sql` that an NSLog
-        // caller would dump to the unified log). The hex string
-        // lives only on the local Swift stack for the duration of
-        // this call.
-        let hexKey = rawKey.map { String(format: "%02x", $0) }.joined()
-        let xHexKey = "x'\(hexKey)'"
-        let keyingRC: Int32 = xHexKey.withCString { cstr in
-            sqlite3_key_v2(dbHandle, nil, cstr, Int32(strlen(cstr)))
+        // caller would dump to the unified log).
+        //
+        // F-S3-02: build the `x'<hex>'` keying material in a MUTABLE
+        // byte buffer we can scrub, NOT a Swift `String`. A `String`'s
+        // heap backing cannot be reliably zeroed and may be copied by
+        // the runtime, so materializing the key as a `String` left a
+        // 64-hex-char copy of the DB key in the heap for an AFU image
+        // to recover (the old "lives only on the local Swift stack"
+        // comment was false). The buffer is wiped immediately after the
+        // keying call, before any PRAGMA runs.
+        let hexDigits = Array("0123456789abcdef".utf8)
+        var keyBuf = [UInt8]()
+        keyBuf.reserveCapacity(rawKey.count * 2 + 3)
+        keyBuf.append(UInt8(ascii: "x"))
+        keyBuf.append(UInt8(ascii: "'"))
+        for b in rawKey {
+            keyBuf.append(hexDigits[Int(b >> 4)])
+            keyBuf.append(hexDigits[Int(b & 0x0f)])
         }
+        keyBuf.append(UInt8(ascii: "'"))
+        let keyLen = Int32(keyBuf.count)
+        let keyingRC: Int32 = keyBuf.withUnsafeBytes { raw in
+            sqlite3_key_v2(dbHandle, nil, raw.baseAddress, keyLen)
+        }
+        // Scrub the hex-key buffer the moment SQLCipher has copied it
+        // into its own (memory-secured) cache.
+        for i in keyBuf.indices { keyBuf[i] = 0 }
         guard keyingRC == SQLITE_OK else {
             throw DatabaseError.keyingFailed(code: keyingRC)
         }

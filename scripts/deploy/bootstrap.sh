@@ -31,6 +31,16 @@
 # step; until it's done, encryption-at-rest of the relay's
 # push-token store is provided by the relay itself (ChaCha20-
 # Poly1305 with a key file alongside) but the OS disk is plaintext.
+#
+# AT-REST EXPOSURE NOTE (S12-02): because the OS disk is plaintext,
+# the onion hs_ed25519_secret_key (the relay's permanent identity,
+# installed to /var/lib/tor/pizzini) and the APNs auth key
+# (/etc/pizzini-relay/apns-auth.p8) are readable from a provider-side
+# disk snapshot, a rescue-console image, or a physical seizure with
+# NO shell access required. Single-operator / single-provider means a
+# warrant to the provider reaches both. Landing LUKS (or at minimum
+# moving the onion secret onto encrypted storage) is the fix; rotate
+# both secrets if the box is ever snapshotted or physically accessed.
 
 set -euo pipefail
 
@@ -106,6 +116,16 @@ echo "[bootstrap]   sha256: $(sha256sum /usr/local/bin/pizzini-relay | awk '{pri
 
 # ---- 6. APNs key ----
 # Mode 0640 root:pizzini-relay — the relay reads via group, can't write.
+#
+# S12-05: this `apns-auth.p8` is a LIVE Apple APNs signing key. The
+# canonical home for it is here (referenced via APNS_AUTH_KEY_PATH in
+# the env file), NOT a developer working tree. The repo's `.gitignore`
+# covers `*.p8` / `AuthKey_*.p8` so it can't be committed, but keep the
+# source key in a secrets manager / OS keychain, out of any synced or
+# backed-up directory (Time Machine, iCloud, Finder sync), and rotate
+# it on a schedule. A stolen key lets an attacker mint push-auth tokens
+# (spoof/suppress the "New message" wake — a metadata/availability
+# nuisance; E2EE content is unaffected).
 install -m 0640 -o root -g pizzini-relay "$STAGE/apns-auth.p8" /etc/pizzini-relay/apns-auth.p8
 
 # ---- 7. env file ----
@@ -244,58 +264,68 @@ if [[ ! -s /home/pizzini-admin/.ssh/authorized_keys ]]; then
     echo "[bootstrap]   seed sources tried: /root/.ssh/authorized_keys, /root/.ssh/authorized_keys2, /etc/ssh/authorized_keys/root, sshd -G AuthorizedKeysFile, SUDO_USER home" >&2
     exit 1
 fi
-# Capability-restricted sudo. The pre-fix `NOPASSWD: ALL` made any
-# remote code execution that landed as `pizzini-admin` an instant
-# root escalation; cap to the smallest set of commands the
-# break-glass story actually needs:
-#
-#   * systemctl  — restart / status / journal-style ops
-#   * journalctl — read service logs to diagnose
-#   * apt-get update / upgrade — apply security patches manually if
-#     unattended-upgrades got stuck
-#   * nft list ruleset — inspect the firewall without mutating it
-#   * tail / less of /var/log — read log files unrelated to journald
-#
-# Anything destructive beyond service restarts (useradd,
-# usermod, partition ops, mount changes) still requires the
-# operator to first log in as root via a recovery image or
-# Hetzner / Cherry Servers' rescue console. That's a deliberate
-# operational handcuff: a pwned shell user can't, e.g., add their
-# own SSH key to /root or rotate the box password.
 install -d -m 0750 -o root -g root /etc/sudoers.d
+# S12-02: capability-restricted sudo (NOT NOPASSWD: ALL). A blanket
+# `NOPASSWD: ALL` turns any code execution that lands as pizzini-admin
+# (a stolen SSH key, a future management-surface bug) into instant
+# password-free root — read/rotate the onion hs_ed25519_secret_key and
+# the APNs key, or plant a backdoored relay binary. We cap to the
+# smallest set the break-glass + canonical-deploy stories actually
+# need. Anything destructive beyond these (useradd, usermod, partition
+# ops, mount changes, writing /root) still requires the operator to log
+# in as root via the provider's rescue console — a deliberate handcuff:
+# a pwned pizzini-admin shell cannot add its own key to /root or rotate
+# the box password.
 cat > /etc/sudoers.d/90-pizzini-admin <<'SUDOEOF'
 # Pizzini relay shell account — installed by scripts/deploy/bootstrap.sh.
 #
-# Full NOPASSWD: ALL. The rationale: pizzini-admin authenticates by
-# SSH key only (`PasswordAuthentication no`, `PermitRootLogin no` in
-# 90-pizzini-hardening.conf). There is no realistic path to a
-# pizzini-admin shell on this box without that key — the relay binary
-# runs as a different user (pizzini-relay) under a systemd sandbox,
-# no web service runs as pizzini-admin, and no cron jobs are
-# installed for it. The capability-restrict that lived here briefly
-# (systemctl + journalctl + apt-get + tail + less only) was
-# theoretical defense-in-depth that imposed real operational pain:
-# every relay-protocol bump needs a binary refresh, every config
-# tweak needs a sudoers update, and routing the operator through
-# the provider's web console for each one didn't scale.
+# Capability-restricted NOPASSWD. pizzini-admin authenticates by SSH
+# key only (`PasswordAuthentication no`, `PermitRootLogin no` in
+# 90-pizzini-hardening.conf). These are the only commands the operator
+# needs for routine work; everything else falls back to a root rescue
+# console on purpose.
 #
-# What still hardens this box and survives:
-#   * Root SSH off, password auth off (90-pizzini-hardening.conf)
-#   * fail2ban on sshd
-#   * nftables drop-by-default in + out
-#   * AppArmor on tor; systemd sandbox on the relay service
-#   * Onion-only inbound (no 7777 on the public internet)
-#   * The relay binary runs as pizzini-relay, not pizzini-admin
-pizzini-admin ALL=(ALL) NOPASSWD: ALL
+#   * systemctl  — restart / status the relay + tor + firewall units
+#   * journalctl — read service logs to diagnose
+#   * apt-get update / upgrade / dist-upgrade — apply security patches
+#     manually if unattended-upgrades got stuck
+#   * nft list ruleset — inspect the firewall without mutating it
+#   * tail / less of /var/log — read log files unrelated to journald
+#
+# What also hardens this box: root SSH off + password auth off
+# (90-pizzini-hardening.conf), fail2ban on sshd, nftables drop-by-
+# default in+out, AppArmor on tor + systemd sandbox on the relay,
+# onion-only inbound, and the relay binary running as pizzini-relay
+# (not pizzini-admin).
+Cmnd_Alias PIZZINI_SVC = /bin/systemctl, /usr/bin/systemctl
+Cmnd_Alias PIZZINI_LOG = /bin/journalctl, /usr/bin/journalctl, \
+                         /usr/bin/tail /var/log/*, /usr/bin/less /var/log/*
+Cmnd_Alias PIZZINI_PKG = /usr/bin/apt-get update, /usr/bin/apt-get upgrade, \
+                         /usr/bin/apt-get dist-upgrade
+Cmnd_Alias PIZZINI_FW  = /usr/sbin/nft list ruleset
+pizzini-admin ALL=(root) NOPASSWD: PIZZINI_SVC, PIZZINI_LOG, PIZZINI_PKG, PIZZINI_FW
 SUDOEOF
 chmod 0440 /etc/sudoers.d/90-pizzini-admin
-# Validate the sudoers drop-in before continuing — a syntax error
+# Path-restricted relay-binary install — the ONLY destructive write the
+# canonical deploy path (scripts/deploy/redeploy-relay.sh) needs. Scoped
+# to the exact `install` invocation with fixed mode/owner/group and
+# fixed source+dest paths, so a pwned pizzini-admin cannot use it to
+# overwrite arbitrary files. Kept in its own 91-… drop-in so the deploy
+# capability is auditable separately from the break-glass set above.
+cat > /etc/sudoers.d/91-pizzini-relay-update <<'SUDOEOF'
+# Pizzini relay binary deploy — installed by scripts/deploy/bootstrap.sh.
+# Used by scripts/deploy/redeploy-relay.sh. Path-restricted on purpose.
+pizzini-admin ALL=(root) NOPASSWD: /usr/bin/install -m 0755 -o root -g root /tmp/pizzini-relay-new /usr/local/bin/pizzini-relay
+SUDOEOF
+chmod 0440 /etc/sudoers.d/91-pizzini-relay-update
+# Validate BOTH sudoers drop-ins before continuing — a syntax error
 # in a sudoers.d file can break sudo entirely. `visudo -cf` parses
-# without applying. If it rejects our file, remove it and fall
-# back to passwordful sudo so we don't soft-lock the operator.
-if ! visudo -cf /etc/sudoers.d/90-pizzini-admin >/dev/null 2>&1; then
+# without applying. If either is rejected, remove both and abort so we
+# don't soft-lock the operator (root SSH is still up at this point).
+if ! visudo -cf /etc/sudoers.d/90-pizzini-admin >/dev/null 2>&1 \
+   || ! visudo -cf /etc/sudoers.d/91-pizzini-relay-update >/dev/null 2>&1; then
     echo "[bootstrap] sudoers drop-in failed validation — removing" >&2
-    rm -f /etc/sudoers.d/90-pizzini-admin
+    rm -f /etc/sudoers.d/90-pizzini-admin /etc/sudoers.d/91-pizzini-relay-update
     exit 1
 fi
 
@@ -310,13 +340,17 @@ if ! ssh-keygen -l -f /home/pizzini-admin/.ssh/authorized_keys >/dev/null 2>&1; 
     ssh-keygen -l -f /home/pizzini-admin/.ssh/authorized_keys 2>&1 | head -10 >&2
     exit 1
 fi
-# Second pre-hardening sanity: pizzini-admin must be able to sudo
-# non-interactively. With NOPASSWD: ALL this is trivially true, but
-# the check is cheap and guards against a future sudoers tightening
-# that accidentally requires a password.
-if ! runuser -l pizzini-admin -c 'sudo -n true' 2>/dev/null; then
+# Second pre-hardening sanity: pizzini-admin must be able to run an
+# ALLOWED command non-interactively (no password prompt). We probe a
+# command that is actually in the capability-restricted set
+# (`systemctl --version`, covered by the PIZZINI_SVC alias and side-
+# effect-free) rather than `sudo -n true` — under the cap-restricted
+# sudoers `true` is NOT permitted, so probing it would always fail.
+# This catches a future sudoers tightening that accidentally requires a
+# password before we disable root login and lock ourselves out.
+if ! runuser -l pizzini-admin -c 'sudo -n systemctl --version' >/dev/null 2>&1; then
     echo "[bootstrap] refusing to harden sshd: pizzini-admin cannot sudo non-interactively" >&2
-    runuser -l pizzini-admin -c 'sudo -n true' 2>&1 | head -5 >&2
+    runuser -l pizzini-admin -c 'sudo -n systemctl --version' 2>&1 | head -5 >&2
     exit 1
 fi
 
@@ -522,9 +556,11 @@ echo "Bootstrap complete."
 echo
 echo "SSH access:"
 echo "  ssh pizzini-admin@$(hostname --ip-address 2>/dev/null | awk '{print $1}')"
-echo "  (root login disabled by the sshd hardening; pizzini-admin"
-echo "   has NOPASSWD sudo and the same authorized_keys you used"
-echo "   to run this bootstrap.)"
+echo "  (root login disabled by the sshd hardening; pizzini-admin has"
+echo "   CAPABILITY-RESTRICTED NOPASSWD sudo — systemctl / journalctl /"
+echo "   apt-get / nft-list / the path-restricted relay-binary install"
+echo "   only — and the same authorized_keys you used to run this"
+echo "   bootstrap. Anything destructive needs the provider rescue console.)"
 echo
 echo ".onion address:"
 echo "  $(cat /var/lib/tor/pizzini/hostname)"
@@ -544,4 +580,11 @@ systemctl is-active pizzini-relay.service tor.service nftables.service fail2ban.
 echo
 echo "TODO (follow-up hardening, not done in this pass):"
 echo "  - full-disk LUKS encryption with dropbear-initramfs remote unlock."
+echo "    NOTE: until this lands, the OS disk is plaintext, so the onion"
+echo "    hs_ed25519_secret_key (/var/lib/tor/pizzini) and the APNs key"
+echo "    (/etc/pizzini-relay/apns-auth.p8) are recoverable from a"
+echo "    provider-side disk snapshot, a rescue-console image, or a"
+echo "    seizure WITHOUT any shell access. Treat the box as if those"
+echo "    secrets could leak at rest, and rotate them if it is ever"
+echo "    snapshotted by the provider or physically accessed."
 echo "================================================================"

@@ -84,12 +84,14 @@ final class AttachmentReassembler {
     /// Receive-side memoisation of completed transfers, keyed on
     /// `peer + attachmentId` (matching `pending`, not on attachmentId
     /// alone — F-ATT-05) and valued by completion time so stale entries
-    /// can be reaped. Defends against the same-attachmentId-replay
-    /// attack where a sender re-ships chunks under the same
-    /// `attachmentId` after the receiver removed the pending entry on
-    /// completion — without this guard the second transfer would
-    /// truncate-overwrite the existing assembled file, swapping the
-    /// bytes behind a chat row the user already accepted.
+    /// can be reaped. Defends against the SAME-sender replay where a peer
+    /// re-ships chunks under the same `attachmentId` after the receiver
+    /// removed the pending entry on completion. Cross-SENDER collisions
+    /// (a different peer reusing another sender's observed attachmentId)
+    /// are prevented at the storage layer instead: F-S8-01 namespaces the
+    /// on-disk path by sender (`incoming/{sender}/{id}/`), so two senders'
+    /// transfers can never resolve to the same file regardless of this
+    /// in-memory map.
     private var completedAttachmentIds: [Data: Date] = [:]
 
     /// Map key: `peer + attachmentId` (49 bytes for a libsignal IdentityKey).
@@ -150,8 +152,10 @@ final class AttachmentReassembler {
                 expiresAt: now.addingTimeInterval(Self.partialTTL),
             )
             pending[key] = entry
-            // Ensure the dir exists.
-            _ = try? AttachmentSandbox.inboundDirectory(forAttachmentId: envelope.attachmentId)
+            // Ensure the dir exists (namespaced by sender — F-S8-01).
+            _ = try? AttachmentSandbox.inboundDirectory(
+                forAttachmentId: envelope.attachmentId, sender: peer
+            )
         }
 
         guard var entry = pending[key] else {
@@ -189,7 +193,7 @@ final class AttachmentReassembler {
 
         // Persist this chunk to its index file.
         guard let chunkURL = chunkFileURL(
-            attachmentId: envelope.attachmentId, index: envelope.chunkIndex
+            attachmentId: envelope.attachmentId, sender: peer, index: envelope.chunkIndex
         ) else {
             return .rejected(.writeFailed)
         }
@@ -224,7 +228,7 @@ final class AttachmentReassembler {
                 // re-drain could re-send) doesn't compound the issue.
                 pending.removeValue(forKey: key)
                 if let dir = try? AttachmentSandbox.inboundDirectory(
-                    forAttachmentId: entry.attachmentId
+                    forAttachmentId: entry.attachmentId, sender: entry.peer
                 ) {
                     try? FileManager.default.removeItem(at: dir)
                 }
@@ -253,7 +257,9 @@ final class AttachmentReassembler {
     func discard(peer: Data, attachmentId: Data) {
         let key = peer + attachmentId
         pending.removeValue(forKey: key)
-        if let dir = try? AttachmentSandbox.inboundDirectory(forAttachmentId: attachmentId) {
+        if let dir = try? AttachmentSandbox.inboundDirectory(
+            forAttachmentId: attachmentId, sender: peer
+        ) {
             try? FileManager.default.removeItem(at: dir)
         }
     }
@@ -263,7 +269,9 @@ final class AttachmentReassembler {
     private func finalize(_ entry: Pending) -> Result<Completion, Reason> {
         let dir: URL
         do {
-            dir = try AttachmentSandbox.inboundDirectory(forAttachmentId: entry.attachmentId)
+            dir = try AttachmentSandbox.inboundDirectory(
+                forAttachmentId: entry.attachmentId, sender: entry.peer
+            )
         } catch {
             return .failure(.writeFailed)
         }
@@ -300,7 +308,9 @@ final class AttachmentReassembler {
 
         var written: UInt64 = 0
         for i in 0..<entry.chunkCount {
-            guard let cu = chunkFileURL(attachmentId: entry.attachmentId, index: i) else {
+            guard let cu = chunkFileURL(
+                attachmentId: entry.attachmentId, sender: entry.peer, index: i
+            ) else {
                 return .failure(.writeFailed)
             }
             do {
@@ -320,7 +330,9 @@ final class AttachmentReassembler {
         // Wipe the per-chunk staging files now that they're all
         // concatenated. The assembled file stays.
         for i in 0..<entry.chunkCount {
-            if let cu = chunkFileURL(attachmentId: entry.attachmentId, index: i) {
+            if let cu = chunkFileURL(
+                attachmentId: entry.attachmentId, sender: entry.peer, index: i
+            ) {
                 try? FileManager.default.removeItem(at: cu)
             }
         }
@@ -335,8 +347,10 @@ final class AttachmentReassembler {
         ))
     }
 
-    private func chunkFileURL(attachmentId: Data, index: UInt32) -> URL? {
-        guard let dir = try? AttachmentSandbox.inboundDirectory(forAttachmentId: attachmentId)
+    private func chunkFileURL(attachmentId: Data, sender: Data, index: UInt32) -> URL? {
+        guard let dir = try? AttachmentSandbox.inboundDirectory(
+            forAttachmentId: attachmentId, sender: sender
+        )
         else { return nil }
         let url = dir.appending(
             path: String(format: "chunk-%05u.bin", index),

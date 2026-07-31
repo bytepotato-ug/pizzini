@@ -89,7 +89,7 @@ use libsignal_protocol::{
 use uuid::Uuid;
 use rand::{Rng, TryRngCore as _, rngs::OsRng};
 use sha2::Sha512;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 // Crypto-core runs inside the iOS process. Peer-aware diagnostics
 // (which print peer identity_pubs) are gated on an explicit RUNTIME
@@ -301,6 +301,15 @@ pub struct SealReceived {
     pub message_id: [u8; 16],
     pub plaintext: Vec<u8>,
     pub is_duplicate: bool,
+}
+
+// F-S1-03: scrub the recovered plaintext when the result struct drops.
+// The FFI copies `plaintext` into the caller buffer before this struct
+// goes out of scope, so the cleartext never lingers in freed heap.
+impl Drop for SealReceived {
+    fn drop(&mut self) {
+        self.plaintext.zeroize();
+    }
 }
 
 /// Failure modes of `seal_receive`, kept distinct so the FFI can hand
@@ -815,7 +824,10 @@ impl DeviceStore {
         // both produce the same wire size, indistinguishable to the
         // relay. The receiver's `seal_receive` strips the padding
         // transparently before returning to the caller.
-        let padded_plaintext = pad_plaintext(plaintext)?;
+        // F-S1-03: wrap the outbound cleartext so it is scrubbed on every
+        // exit path (including the `?` error paths below), not left in
+        // freed heap for an AFU image.
+        let padded_plaintext = Zeroizing::new(pad_plaintext(plaintext)?);
         let inner = message_encrypt(
             &padded_plaintext,
             &peer_addr,
@@ -1026,7 +1038,12 @@ impl DeviceStore {
             // peer running mismatched padding code surfaces here as
             // an explicit error instead of returning garbage to the
             // chat UI.
-            Ok(padded) => unpad_plaintext(&padded)?,
+            // F-S1-03: the ratchet output is cleartext; scrub it once the
+            // length-prefixed padding has been stripped.
+            Ok(padded) => {
+                let padded = Zeroizing::new(padded);
+                unpad_plaintext(&padded)?
+            }
             Err(SignalProtocolError::DuplicatedMessage(timestamp, counter)) => {
                 // libsignal's ratchet rejected the inner ciphertext
                 // because its (chain, counter) pair was already

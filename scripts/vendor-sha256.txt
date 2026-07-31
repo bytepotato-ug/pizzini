@@ -1,0 +1,24 @@
+# Vendored-dependency-tree integrity anchor (S12-04).
+#
+# This file pins a single SHA-256 digest over the ENTIRE `cargo vendor`
+# tree used by the reproducible relay build. `scripts/build-relay-release.sh`
+# regenerates `vendor/` per machine (it is gitignored), then hashes the
+# whole tree and FATAL-aborts the build if the digest does not match the
+# value below. This closes the gap that git sources such as libsignal
+# carry no content checksum in Cargo.lock — their integrity otherwise
+# rests on a SHA-1 commit ref alone.
+#
+# The digest is computed as:
+#   find vendor -type f -print0 | LC_ALL=C sort -z \
+#     | xargs -0 sha256sum | sha256sum | awk '{print $1}'
+#
+# HOW TO PIN / RE-PIN:
+#   On a machine with cargo + network (this could not be generated in the
+#   audit environment, which has neither), run:
+#       VENDOR_PIN=update scripts/build-relay-release.sh
+#   Review the resulting hash, then commit this file alongside Cargo.lock.
+#   Re-pin on every deliberate dependency bump (any Cargo.lock change).
+#
+# Until a real hash is recorded here, the sentinel below makes the relay
+# build FAIL CLOSED rather than trust an unverified vendored tree.
+UNPINNED

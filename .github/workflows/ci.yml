@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual + weekly trigger for the heavier reproducible-build job
+  # (S12-03/S12-04), which is too slow to run on every PR.
+  workflow_dispatch:
+  schedule:
+    # Mondays 04:00 UTC.
+    - cron: "0 4 * * 1"
 
 # Drop write scopes by default. Each job re-grants the narrower
 # scopes it actually needs.
@@ -29,9 +35,14 @@ jobs:
       # resolves to and inject code into our macOS runner. Bump
       # deliberately, copying the SHA from the upstream release.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # 1.84.0
+        # SHA pins the ACTION (dtolnay/rust-toolchain), not the Rust
+        # version. The `toolchain:` input below selects the compiler and
+        # MUST match rust-toolchain.toml / the production relay build
+        # (1.95.0) — CI that compiles/tests/audits under a different
+        # toolchain than production validates neither (S12-03).
+        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # action @1.84.0 release
         with:
-          toolchain: "1.84.0"
+          toolchain: "1.95.0"
       - name: Set up protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
         with:
@@ -56,9 +67,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # 1.84.0
+        # SHA pins the action; `toolchain:` selects the compiler. Audit
+        # under the production toolchain (1.95.0), same as the relay
+        # build and rust-toolchain.toml (S12-03).
+        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # action @1.84.0 release
         with:
-          toolchain: "1.84.0"
+          toolchain: "1.95.0"
       - name: Install cargo-audit
         # `^0.21` could not parse newer RustSec advisory-db TOML
         # frontmatter (e.g. RUSTSEC-2026-0073) and errored out loading
@@ -122,9 +136,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # 1.84.0
+        # SHA pins the action; `toolchain:` selects the compiler. Build
+        # the iOS slices under the production toolchain (1.95.0), same as
+        # rust-toolchain.toml and the relay build (S12-03).
+        uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # action @1.84.0 release
         with:
-          toolchain: "1.84.0"
+          toolchain: "1.95.0"
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
       - name: Set up protoc
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
@@ -153,3 +170,84 @@ jobs:
         # the Swift import without changing the C header doesn't slip
         # through.
         run: swift test --package-path . 2>&1 | tee /tmp/swift-test.log || true
+
+  toolchain-consistency:
+    # S12-03: assert that the toolchain CI compiles/tests/audits under
+    # is the SAME one the production relay build and the reproducibility
+    # foundation use. If these three drift, the transparency-log
+    # "two operators get the same digest" promise is hollow and CI
+    # validates a different compiler than ships. Cheap, runs every PR.
+    name: Toolchain pin consistency (CI == prod)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert CI toolchain == rust-toolchain.toml == relay build image
+        run: |
+          set -euo pipefail
+          # Canonical source of truth.
+          pinned="$(grep -E '^[[:space:]]*channel[[:space:]]*=' rust-toolchain.toml \
+                    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+          if [ -z "$pinned" ]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"; exit 1
+          fi
+          echo "rust-toolchain.toml channel: $pinned"
+          # The reproducible relay build's Docker image must match.
+          relay_img="$(grep -oE 'rust:[0-9]+\.[0-9]+\.[0-9]+-bookworm' \
+                       scripts/build-relay-release.sh | head -1)"
+          if [ "$relay_img" != "rust:${pinned}-bookworm" ]; then
+            echo "::error::build-relay-release.sh image ($relay_img) != rust:${pinned}-bookworm"
+            exit 1
+          fi
+          echo "relay build image: $relay_img — OK"
+          # Every `toolchain: "x.y.z"` input in this workflow must equal
+          # the pin (or be absent so rust-toolchain.toml governs).
+          bad="$(grep -nE 'toolchain:[[:space:]]*"[0-9]' .github/workflows/ci.yml \
+                 | grep -v "\"$pinned\"" || true)"
+          if [ -n "$bad" ]; then
+            echo "::error::CI toolchain input(s) differ from rust-toolchain.toml ($pinned):"
+            echo "$bad"
+            exit 1
+          fi
+          echo "all CI toolchain inputs match $pinned — OK"
+
+  reproducible-relay-build:
+    # S12-03/S12-04: machine-verify the reproducible relay build. Runs
+    # the canonical build-relay-release.sh inside the pinned Docker
+    # image and asserts the produced binary hash is RECORDED in the
+    # committed transparency log (so a build that does not reproduce a
+    # logged digest is caught). Heavy (full Docker toolchain build), so
+    # it is gated to workflow_dispatch + the weekly schedule, NOT every
+    # PR — keeping the per-PR jobs green-able and fast.
+    name: Reproducible relay build (scheduled)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build relay in pinned Docker image + assert hash recorded
+        run: |
+          set -euo pipefail
+          # build-relay-release.sh re-execs itself into rust:1.95.0-bookworm
+          # via docker (available on ubuntu-latest runners) and prints a
+          # single-line transparency-log entry with binary_sha256.
+          out="$(scripts/build-relay-release.sh | tee /dev/stderr)"
+          sha="$(printf '%s\n' "$out" \
+                 | grep -oE '"binary_sha256":"[0-9a-f]{64}"' \
+                 | grep -oE '[0-9a-f]{64}' | tail -1)"
+          if [ -z "$sha" ]; then
+            echo "::error::could not extract binary_sha256 from build output"; exit 1
+          fi
+          echo "built binary_sha256: $sha"
+          # The hash MUST already be recorded in the committed
+          # transparency log — an unrecorded digest means the build did
+          # not reproduce a signed/published binary (or the log is stale).
+          if [ ! -f transparency-log.ndjson ]; then
+            echo "::error::transparency-log.ndjson missing — cannot verify reproducibility"
+            exit 1
+          fi
+          if ! grep -qF "$sha" transparency-log.ndjson; then
+            echo "::error::built binary_sha256 ($sha) is NOT recorded in transparency-log.ndjson"
+            echo "  Either the build did not reproduce the published binary, or the log"
+            echo "  was not updated for HEAD. Investigate before publishing."
+            exit 1
+          fi
+          echo "binary_sha256 is recorded in transparency-log.ndjson — reproducibility OK"

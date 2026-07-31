@@ -157,3 +157,76 @@ enum GroupEnvelope {
         ))
     }
 }
+
+/// F-S6-01: codec for the END-TO-END-ENCRYPTED group-chat plaintext.
+///
+/// A malicious/coerced admin can sign DIFFERENT epoch-N ops to different
+/// members (e.g. `AddMember X` to Bob, `AddMember Y` to Carol) and
+/// partition the group permanently: each member's local op chain is
+/// internally self-consistent, and single-view equivocation detection
+/// (`recentOpDigests`, `memberSetRoot`, the parent-digest chain) can
+/// NEVER fire because members never compare their op chains with each
+/// other.
+///
+/// To make divergence detectable we piggyback the sender's current
+/// op-chain head — `(currentEpoch, lastOpDigest)` — on every group chat
+/// message. The head travels INSIDE the sender-key-encrypted plaintext,
+/// so it is end-to-end confidential and authenticated as the sender's
+/// (libsignal's SenderKey MAC covers it). On receive, the recipient
+/// compares the sender's claimed digest at a shared epoch against its own
+/// `recentOpDigests`; a mismatch is a proof of a forked log and raises an
+/// equivocation alarm. Two members on divergent branches now detect the
+/// fork the first time either one messages the group.
+///
+/// Wire format (the group_encrypt plaintext):
+///   `0x01 ‖ u64_be(epoch) ‖ u8(digestLen) ‖ digest ‖ utf8(text)`
+/// A leading byte other than `0x01` is treated as a legacy raw-UTF-8
+/// plaintext with no transcript head (forward/backward compatible).
+enum GroupChatPlaintext {
+    static let version1: UInt8 = 0x01
+
+    static func encode(epoch: UInt64, opDigest: Data, text: String) -> Data {
+        var out = Data()
+        out.append(version1)
+        out.appendBigEndian(epoch)
+        let clipped = opDigest.prefix(255)
+        out.append(UInt8(clipped.count))
+        out.append(Data(clipped))
+        out.append(Data(text.utf8))
+        return out
+    }
+
+    struct Decoded {
+        /// nil when the plaintext carried no transcript head (legacy).
+        let epoch: UInt64?
+        let opDigest: Data?
+        let text: String
+    }
+
+    static func decode(_ data: Data) -> Decoded {
+        guard let first = data.first, first == version1 else {
+            // Legacy / plain: the whole buffer is the message text.
+            return Decoded(epoch: nil, opDigest: nil, text: String(decoding: data, as: UTF8.self))
+        }
+        let base = data.startIndex
+        // 1 (ver) + 8 (epoch) + 1 (digestLen) = 10 header bytes minimum.
+        guard data.count >= 10 else {
+            return Decoded(epoch: nil, opDigest: nil, text: "")
+        }
+        var idx = base + 1
+        var epoch: UInt64 = 0
+        for _ in 0..<8 {
+            epoch = (epoch << 8) | UInt64(data[idx])
+            idx += 1
+        }
+        let digestLen = Int(data[idx])
+        idx += 1
+        guard data.count - data.distance(from: base, to: idx) >= digestLen else {
+            return Decoded(epoch: nil, opDigest: nil, text: "")
+        }
+        let digest = Data(data[idx..<(idx + digestLen)])
+        idx += digestLen
+        let text = String(decoding: data[idx..<data.endIndex], as: UTF8.self)
+        return Decoded(epoch: epoch, opDigest: digest, text: text)
+    }
+}

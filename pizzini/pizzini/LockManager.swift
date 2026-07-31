@@ -85,6 +85,65 @@ final class LockManager {
     /// by `unlockAfterDuress`.
     private(set) var wipeInFlight: Bool = false
 
+    // MARK: - Brute-force throttle (S7-03)
+    //
+    // App-level rate limit on passcode entry. The persistent
+    // failed-attempt COUNTER lives in `AppPasscode` (a ThisDeviceOnly
+    // Keychain row that survives an app kill — an attacker cannot reset
+    // it by force-quitting between guesses). This LockManager layer
+    // turns that count into an escalating BACKOFF WINDOW: after enough
+    // consecutive wrong guesses, additional WRONG guesses are bounced
+    // for a growing delay, so a scripted attacker grinding the gate is
+    // slowed far below the raw 2×Argon2id (~500 ms) per-guess cost.
+    //
+    // Two hard invariants:
+    //   1. The duress (and real) passcode is ALWAYS evaluated and
+    //      honored, even mid-backoff — a coerced user must never be
+    //      blocked from entering the duress passcode. The throttle only
+    //      ever delays/no-ops a `.neither` (wrong) result.
+    //   2. No auto-wipe-on-N. Wiping after N failures would be a denial
+    //      of service for a fat-fingered legitimate user (S7-03 calls
+    //      this out explicitly); any wipe-on-N would have to be an
+    //      opt-in setting. We add the throttle + delay only.
+
+    /// Number of consecutive failures tolerated before the backoff
+    /// curve begins to bite. Below this, wrong guesses are accepted at
+    /// full speed (the Argon2id cost is the only limiter) so an
+    /// occasional fat-finger has no friction.
+    private static let backoffFreeAttempts = 4
+
+    /// Monotonic (`CLOCK_UPTIME_RAW`) deadline before which a WRONG
+    /// guess is bounced without consuming a new attempt. Uptime-based
+    /// for the same reason as `backgroundedAtUptime`: a coercer winding
+    /// the wall clock cannot shorten the backoff. `nil` when no backoff
+    /// is active. Not persisted (the persistent signal is the counter
+    /// in `AppPasscode`); on relaunch the counter re-establishes the
+    /// curve from the first post-relaunch wrong guess.
+    private var backoffUntilUptime: TimeInterval?
+
+    /// Escalating backoff duration for a given consecutive-failure
+    /// count. Zero for the first few failures, then grows in steps. The
+    /// curve is bounded (saturates at a ceiling) so a legitimate user
+    /// who eventually remembers the passcode is never locked out for an
+    /// unbounded time — the duress passcode also remains enterable
+    /// throughout regardless of this value.
+    static func backoffDuration(forFailures failures: Int) -> TimeInterval {
+        switch failures {
+        case ..<backoffFreeAttempts: return 0      // 0–3 failures: no delay
+        case backoffFreeAttempts..<7: return 5      // 4–6: 5 s
+        case 7..<10: return 30                       // 7–9: 30 s
+        default: return 60                           // 10+: 60 s (ceiling)
+        }
+    }
+
+    /// Seconds remaining in the current backoff window, or 0 if none.
+    /// Exposed so a UI could surface "try again in N s" (the lock
+    /// overlay does not currently, but the value is available).
+    var backoffRemaining: TimeInterval {
+        guard let backoffUntilUptime else { return 0 }
+        return max(0, backoffUntilUptime - Self.uptimeSeconds())
+    }
+
     /// CLOCK_UPTIME_RAW seconds since boot at the moment the scene
     /// went to background. Monotonic — a user who manually winds the
     /// device clock backward in Settings.app cannot extend the unlock
@@ -267,6 +326,12 @@ final class LockManager {
             do {
                 try await authenticate(reason: "Unlock Pizzini")
                 isLocked = false
+                // A successful biometric unlock is also a "the owner is
+                // here" signal — clear any accrued passcode-failure
+                // backoff (S7-03) so a few mistyped passcodes before a
+                // Face ID success don't leave a stale lockout window.
+                AppPasscode.resetFailedAttempts()
+                backoffUntilUptime = nil
             } catch {
                 // `lastError` already populated on non-cancel failures.
             }
@@ -346,15 +411,51 @@ final class LockManager {
         if wipeInFlight {
             return .wrong
         }
-        switch AppPasscode.check(entry) {
+        // **S7-03 invariant: evaluate the passcode FIRST, unconditionally.**
+        // The brute-force throttle below must never block a real or
+        // duress passcode — a coerced user has to be able to enter the
+        // duress passcode even mid-backoff. So we always run the full
+        // (constant-cost) check; the throttle only ever affects the
+        // handling of a `.neither` (wrong) result.
+        let match = AppPasscode.check(entry)
+        switch match {
         case .real:
+            // Successful unlock — clear the brute-force state so a
+            // legitimate user never carries backoff into the next
+            // session.
+            AppPasscode.resetFailedAttempts()
+            backoffUntilUptime = nil
             isLocked = false
             isPasscodeSheetPresented = false
             lastError = nil
             return .unlocked
         case .duress:
+            // Duress is a "successful" entry from the throttle's point
+            // of view: reset the counter so the post-wipe fresh-install
+            // state carries no failure residue, and never let the
+            // backoff have interfered with reaching this branch.
+            AppPasscode.resetFailedAttempts()
+            backoffUntilUptime = nil
             return .duress
         case .neither:
+            // Wrong guess. If we're inside an active backoff window,
+            // bounce WITHOUT consuming a new attempt or extending the
+            // window — this is what rate-limits a scripted attacker:
+            // their wrong guesses during the window are no-ops. (Real /
+            // duress already returned above, so this never blocks a
+            // legitimate or coerced unlock.)
+            if backoffRemaining > 0 {
+                return .wrong
+            }
+            // Outside any window: record the failure persistently and,
+            // if we've crossed the free-attempt threshold, open an
+            // escalating backoff window before the next wrong guess is
+            // honored.
+            let failures = AppPasscode.recordFailedAttempt()
+            let delay = Self.backoffDuration(forFailures: failures)
+            if delay > 0 {
+                backoffUntilUptime = Self.uptimeSeconds() + delay
+            }
             return .wrong
         }
     }

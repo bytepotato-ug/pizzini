@@ -120,6 +120,35 @@ struct QALogTests {
         let url = try #require(QALog.currentLogFileURL())
         #expect(FileManager.default.fileExists(atPath: url.path))
     }
+
+    /// F-DUR-01: the duress wipe calls `QALog.clear()` as its final step
+    /// so no pre-wipe peer graph survives on tester builds. Pins that
+    /// `clear()` removes the active log deterministically.
+    ///
+    /// Merged here from the former separate `QALogClearTests` suite: two
+    /// distinct suites both touching the fixed `qa-debug` path raced under
+    /// Swift Testing's parallel runner (`.serialized` only orders tests
+    /// WITHIN a suite, not across suites), producing flaky
+    /// "qa.log not found" / "permission denied" failures. Keeping every
+    /// `qa-debug`-touching test inside this one `.serialized` suite makes
+    /// the path single-owner and the cases deterministic.
+    @Test("clear() removes the active qa.log file (F-DUR-01)")
+    func clearRemovesActiveLogForDuress() throws {
+        try Self.resetDir()
+        let url = try #require(QALog.currentLogFileURL())
+        // `record()` is async; create the file deterministically with a
+        // sentinel standing in for peer-id lines.
+        FileManager.default.createFile(
+            atPath: url.path,
+            contents: Data("F-DUR-01 sentinel peer-id line\n".utf8),
+        )
+        #expect(FileManager.default.fileExists(atPath: url.path))
+        QALog.clear()
+        #expect(
+            !FileManager.default.fileExists(atPath: url.path),
+            "clear() must remove the qa.log so no pre-wipe content survives",
+        )
+    }
     #endif
 
     /// rotatedLogFileURL returns nil when no rotation has happened.

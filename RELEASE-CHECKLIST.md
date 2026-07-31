@@ -109,6 +109,9 @@ the QR-camera + Tor-circuit handshake faithfully.
 - [ ] All the above ticked.
 - [ ] `xcodebuild ... -only-testing:pizziniTests test` passes on the target simulator.
 - [ ] `cargo test --workspace` passes.
+- [ ] **Embedded Tor commit pin enforced.** `scripts/build-tor-xcframework.sh` carries the hard-coded `TOR_PIN_COMMIT` (and `TOR_SUBMODULE_PIN_COMMIT`) for the current `VERSION`, and a clean build of `scripts/build-tor-xcframework.sh` printed `Verified iCepa commit matches TOR_PIN_COMMIT` (it fails closed otherwise). If `VERSION` was bumped this cycle, the pin was re-reviewed against the upstream diff and updated — never left to resolve a mutable tag.
+- [ ] **Vendored relay tree checksum matches.** `scripts/build-relay-release.sh` verified the regenerated `vendor/` tree against the committed `scripts/vendor-sha256.txt` (FATAL on drift). If a dependency was bumped this cycle, the manifest was regenerated (`scripts/build-relay-release.sh VENDOR_PIN=update`) and committed alongside `Cargo.lock`.
+- [ ] **APNs key out of the working tree.** The live `AuthKey_*.p8` is NOT sitting in the repo working tree on the release machine; it lives in a secrets manager / OS keychain and is referenced via `APNS_AUTH_KEY_PATH`, kept out of any synced/backed-up directory, and rotated on schedule.
 - [ ] Reproducible relay build matches the operator co-signer's hash.
 - [ ] Tag the release. `git tag v1.x.y && git push --tags`.
 - [ ] Sign the new relay binary's SHA-256 with the operator key, append the transparency-log line, commit.

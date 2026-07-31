@@ -101,6 +101,25 @@ extension View {
     /// while iOS reports a screen recording or an external display.
     /// Apply to any surface that contains chat / contact / QR data.
     ///
+    /// **Coverage of presented content (S9-04).** This overlay
+    /// composites as a `ZStack` sibling of the MODIFIED content only, so
+    /// it does NOT automatically reach SwiftUI `.sheet` content or
+    /// NavigationStack-pushed destinations (they render at window level /
+    /// as siblings of the shielded root). On a healthy device the
+    /// window-level `WindowSecureMask` black-frames the whole `UIWindow`
+    /// for recording too, covering those surfaces; when that mask is
+    /// degraded this in-body shield is the only recording defense, so
+    /// sensitive sheets / pushed views must apply `.screenCaptureShielded()`
+    /// THEMSELVES (done for `SafetyNumberView` and `GroupSettingsView`).
+    ///
+    /// **Documented residual.** Out-of-process content cannot be covered
+    /// by any in-process SwiftUI overlay: the OS photo / document picker
+    /// (`PHPicker`, `UIDocumentPicker`) renders in a separate process, so
+    /// neither this shield nor the `WindowSecureMask` reparent can blank
+    /// it during a recording. Those surfaces show the OS photo library /
+    /// file browser, not Pizzini chat content, so the leak is bounded to
+    /// what the user is already exposing to the picker.
+    ///
     /// Reads `ScreenCaptureMonitor.shared` directly inside a
     /// `@MainActor` body rather than via a default arg — Swift 6
     /// rejects a main-actor-isolated default expression on a

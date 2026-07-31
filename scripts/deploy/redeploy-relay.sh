@@ -88,39 +88,46 @@ preflight_host() {
         err "[$host] pizzini-relay.service not present — was bootstrap.sh ever run here?"
         return 1
     fi
-    # Sudoers preflight. We accept TWO equivalent grants:
+    # Sudoers preflight. The ONLY accepted grant for the binary install
+    # is the path-restricted entry from 91-pizzini-relay-update (the
+    # current bootstrap.sh default).
     #
-    #   (a) the path-restricted entry from 91-pizzini-relay-update
-    #       (current bootstrap.sh default — recommended), OR
-    #
-    #   (b) the legacy `NOPASSWD: ALL` (older bootstraps, e.g. the
-    #       DE box was provisioned before the capability-restrict
-    #       commit landed — functionally permits the install just
-    #       fine, but is broader than we'd write today).
-    #
-    # Both are sufficient for the deploy. If neither matches, we
-    # error out with the exact one-liner the operator can paste into
-    # the provider's root console.
+    # S12-02: we DELIBERATELY no longer accept a legacy
+    # `(ALL) NOPASSWD: ALL` grant. A blanket grant makes any pwned
+    # pizzini-admin shell instant root (rotate the onion secret key,
+    # plant a backdoored binary), so a box still carrying it is a finding
+    # to FIX, not a state to tolerate. If we detect it, we refuse to
+    # deploy and tell the operator to re-run bootstrap.sh (which installs
+    # the capability-restricted 90-… + path-restricted 91-… drop-ins) or
+    # to fix it by hand via the provider console.
     local allowed
     allowed="$(ssh -o BatchMode=yes "$host" 'sudo -ln' 2>/dev/null || true)"
+    if grep -qE '\(ALL\)[[:space:]]+NOPASSWD:[[:space:]]+ALL' <<<"$allowed"; then
+        err "[$host] INSECURE sudoers: pizzini-admin still has '(ALL) NOPASSWD: ALL'."
+        err "[$host] This box was provisioned before the capability-restrict; it"
+        err "[$host] turns any pizzini-admin shell into instant root. Refusing to"
+        err "[$host] deploy until it is fixed. Re-run bootstrap.sh on this box, or"
+        err "[$host] log in as root via the provider console and replace it:"
+        err "[$host]   rm -f /etc/sudoers.d/90-pizzini-admin"
+        err "[$host]   # then re-run scripts/deploy/bootstrap.sh to install the"
+        err "[$host]   # capability-restricted 90-… + path-restricted 91-… drop-ins"
+        return 1
+    fi
     local has_install=0
     if grep -qF '/usr/bin/install -m 0755 -o root -g root /tmp/pizzini-relay-new /usr/local/bin/pizzini-relay' <<<"$allowed"; then
         has_install=1
-    elif grep -qE '\(ALL\)[[:space:]]+NOPASSWD:[[:space:]]+ALL' <<<"$allowed"; then
-        has_install=1
-        warn "[$host] legacy NOPASSWD: ALL — works, but consider tightening to the path-restricted 91-pizzini-relay-update entry"
     fi
     if (( has_install == 0 )); then
         err "[$host] missing sudoers entry — '/usr/bin/install -m 0755 -o root -g root /tmp/pizzini-relay-new /usr/local/bin/pizzini-relay'"
         err "[$host] fix: log in as root via the provider's web console and run:"
-        err "[$host]   printf 'pizzini-admin ALL=(ALL) NOPASSWD: /usr/bin/install -m 0755 -o root -g root /tmp/pizzini-relay-new /usr/local/bin/pizzini-relay\\n' > /etc/sudoers.d/91-pizzini-relay-update"
+        err "[$host]   printf 'pizzini-admin ALL=(root) NOPASSWD: /usr/bin/install -m 0755 -o root -g root /tmp/pizzini-relay-new /usr/local/bin/pizzini-relay\\n' > /etc/sudoers.d/91-pizzini-relay-update"
         err "[$host]   chmod 0440 /etc/sudoers.d/91-pizzini-relay-update"
         err "[$host]   visudo -c"
         return 1
     fi
-    # Sudoers: systemctl restart must be allowed (covered by 90-pizzini-admin
-    # or the legacy NOPASSWD: ALL).
-    if ! grep -qE '/(usr/)?bin/systemctl|\(ALL\)[[:space:]]+NOPASSWD:[[:space:]]+ALL' <<<"$allowed"; then
+    # Sudoers: systemctl restart must be allowed (covered by the
+    # capability-restricted 90-pizzini-admin drop-in's PIZZINI_SVC alias).
+    if ! grep -qE '/(usr/)?(s?bin/)?systemctl' <<<"$allowed"; then
         err "[$host] missing sudoers entry — 'systemctl' (90-pizzini-admin drop-in)"
         return 1
     fi

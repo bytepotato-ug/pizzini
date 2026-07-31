@@ -101,6 +101,41 @@ enum DBKey {
     /// `params` defaults to the production preset; callers that need
     /// fast tests (or run inside CI where 250 ms × every-test would
     /// be noticeable) pass a smaller preset via `Argon2id.Params`.
+    ///
+    /// **S3-01 (HIGH) — documented residual, NOT fixed here.** Every
+    /// input to this derivation is reachable in the After-First-Unlock
+    /// (AFU) device state with NO user-secret binding the unwrap:
+    ///   - the SE-wrapped seed (`wrapAccount`), the salt (`saltAccount`)
+    ///     and the params (`paramsAccount`) are all stored
+    ///     `AfterFirstUnlockThisDeviceOnly` (see `Keychain.write`);
+    ///   - the SE wrapping key is created with `.privateKeyUsage` ONLY
+    ///     and `AfterFirstUnlockThisDeviceOnly` (see `createEnclaveKey`),
+    ///     so `SecKeyCreateDecryptedData` (`unwrapSeed`) succeeds AFU
+    ///     with no biometric / passcode prompt.
+    /// Consequently an AFU forensic extraction (Cellebrite/GrayKey-class
+    /// threat #2) can REPLAY this exact derivation and open the store —
+    /// `unwrapSeed` then `Argon2id.derive`. Because the Argon2id input is
+    /// a 32-byte FULL-ENTROPY SE seed (not a low-entropy passcode), the
+    /// iteration cost adds ZERO brute-force resistance once the chain is
+    /// reached: there is nothing to guess, so M/T/P are irrelevant to
+    /// the AFU adversary.
+    ///
+    /// The recommended fix (a product-architecture decision handled
+    /// SEPARATELY — deliberately not implemented here because it would
+    /// break background message receipt / the NSE-adjacent background
+    /// drain) is to MIX THE APP PASSCODE into the Argon2id input — a
+    /// passcode-bound derivation (e.g. `Argon2id.derive(passphrase: seed
+    /// ‖ passcode-derived-secret, …)`, or gating `unwrapSeed` behind a
+    /// `kSecAccessControl` `.devicePasscode`/`.userPresence` SE key) —
+    /// while leaving only a minimal AFU-readable item for the
+    /// notification-service badge path. That restores brute-force
+    /// resistance (the seed alone no longer derives the key in AFU) at
+    /// the cost of a one-time passcode prompt the background paths must
+    /// then degrade around. NOTE the in-code "NSE badge math path"
+    /// rationale in `createEnclaveKey` is inaccurate per the audit (the
+    /// NSE only does App Group integer math; the genuine AFU consumer is
+    /// the `BGAppRefreshTask` backlog drain) — do NOT tighten the
+    /// accessibility class here without re-routing that path first.
     static func deriveKey(
         params: Argon2id.Params = .production,
         persistParams: Bool = true,

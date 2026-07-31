@@ -1,8 +1,8 @@
 //! Persistent push-token store.
 //!
 //! The relay's primary trust posture is "minimise forensic surface" —
-//! several in-memory maps (`routes`, `verify_keys`, `replays`,
-//! `hello_replays`) are still deliberately wiped on restart. Push
+//! several in-memory maps (`routes`, `hello_replays`, `send_dedupes`)
+//! are still deliberately wiped on restart. Push
 //! tokens are one of two places where that posture costs the user
 //! something tangible: when the relay restarts, every paired device
 //! loses push delivery until the iOS app foregrounds and re-publishes
@@ -153,13 +153,13 @@ impl PushTokenStore {
 
         let map = match fs::read(&tokens_path) {
             Ok(bytes) => {
-                // Try the domain-AAD decrypt first; on failure (pre-
-                // file written without AAD), fall back to
-                // the no-AAD decrypt. Either way, the next persist
-                // writes the file back with AAD so subsequent reads
-                // take the fast path.
-                let plaintext = encrypted_file::decrypt_with_aad(&key, &bytes, AAD)
-                    .or_else(|_| encrypted_file::decrypt(&key, &bytes))?;
+                // S4-07: AAD-only decrypt. The previous unconditional
+                // no-AAD fallback was a one-time migration shim for files
+                // written before this store adopted per-store AAD; it
+                // weakened AEAD domain separation for the binary's
+                // lifetime and is removed. A blob that does not verify
+                // under this store's AAD fails the load (refuse to start).
+                let plaintext = encrypted_file::decrypt_with_aad(&key, &bytes, AAD)?;
                 let doc: StoreDoc = serde_json::from_slice(&plaintext).map_err(io::Error::other)?;
                 purge_stale(doc, MAX_TOKEN_AGE)
             }
@@ -267,20 +267,31 @@ fn purge_stale(doc: StoreDoc, max_age: Duration) -> HashMap<Vec<u8>, (Vec<u8>, u
     let now = encrypted_file::unix_now();
     let cutoff = now.saturating_sub(max_age.as_secs());
     let mut map = HashMap::with_capacity(doc.entries.len());
+    // S4-08: count rows skipped because the peer-id or token is
+    // malformed (non-hex), distinct from rows dropped by TTL. Surfaced
+    // as an operator count, no peer-id / token.
+    let mut corrupt = 0usize;
     for (peer_hex, entry) in doc.entries {
         if entry.last_refreshed_unix < cutoff {
             continue;
         }
         let peer_id = match encrypted_file::hex_decode(&peer_hex) {
             Some(p) => p,
-            None => continue,
+            None => {
+                corrupt += 1;
+                continue;
+            }
         };
         let token = match encrypted_file::hex_decode(&entry.token_hex) {
             Some(t) => t,
-            None => continue,
+            None => {
+                corrupt += 1;
+                continue;
+            }
         };
         map.insert(peer_id, (token, entry.last_refreshed_unix));
     }
+    encrypted_file::warn_dropped_rows("push-token", corrupt);
     map
 }
 

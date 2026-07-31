@@ -23,7 +23,7 @@ Signal is the reference. Pizzini diverges where Signal made compromises we don't
 | iOS app | Swift + SwiftUI, native only |
 | FFI | Rust to Swift via C ABI (cbindgen) |
 | Storage | SQLCipher v4.6.1 (vendored amalgamation). Key derivation: Secure-Enclave-resident P-256 → ECIES → 32-byte seed in Keychain → Argon2id (M=64 MiB, T=3, P=1) → raw SQLCipher key |
-| Transport | Tor via embedded Tor.framework v409.8.1 (iCepa), pinned by git tag + a verified commit at build time |
+| Transport | Tor via embedded Tor.framework v409.8.1 (iCepa), pinned to a hard-coded, reviewed upstream commit that the build enforces (FATAL exit on mismatch — the git tag alone is mutable and not trusted) |
 | Relay | Rust, stateless. Live fleet in DE / NO / US |
 | License | AGPL-3.0-or-later |
 
@@ -78,8 +78,12 @@ cargo run --example pqxdh_roundtrip -p pizzini-crypto-core
 scripts/build-xcframework.sh                # release
 PROFILE=debug scripts/build-xcframework.sh  # dev
 
-# Embedded Tor static library + headers, pinned by git tag v409.8.1 and a
-# verified commit (TOR_PIN_COMMIT) to iCepa Tor.framework. Re-run with
+# Embedded Tor static library + headers from iCepa Tor.framework. The
+# build is pinned to a hard-coded, reviewed upstream commit
+# (TOR_PIN_COMMIT, with the iCepa submodule gitlink also verified) and
+# FATAL-exits if tag v409.8.1 ever resolves to a different commit — the
+# git tag is mutable and is not the trust anchor. No env var is needed;
+# the pin is enforced on every build and fails closed. Re-run with
 # REBUILD=1 to refresh after a script bump.
 scripts/build-tor-xcframework.sh
 
