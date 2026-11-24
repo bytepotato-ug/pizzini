@@ -21,6 +21,7 @@ jobs:
   cargo-test:
     name: Rust workspace tests
     runs-on: macos-15
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       # Pin third-party Actions by full SHA.
@@ -128,6 +129,7 @@ jobs:
   ios-build:
     name: iOS device + simulator slices build clean
     runs-on: macos-15
+    timeout-minutes: 60
     needs: cargo-test
     steps:
       - uses: actions/checkout@v4
